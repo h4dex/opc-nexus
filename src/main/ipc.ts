@@ -1,0 +1,378 @@
+/**
+ * IPC 白名单（PRD 12.2：不允许 Renderer 透传任意命令）
+ * Renderer 仅能调用此处显式注册的方法；密钥操作只通过 safeStorage 句柄。
+ */
+import { BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
+import type { Database } from './services/database.js';
+import type { Orchestrator } from './services/orchestrator.js';
+import type { ExecutorRegistry } from './services/executor/index.js';
+import type { EngineManager } from './services/engineManager.js';
+import type { ChannelManager } from './services/channelManager.js';
+import type { FeishuChannel } from './services/channels/feishuChannel.js';
+import type { WecomChannel } from './services/channels/wecomChannel.js';
+import type { WeixinChannel } from './services/channels/wechatChannel.js';
+import type { Scheduler } from './services/scheduler.js';
+import type { ApprovalBroker } from './services/approvalBroker.js';
+import type { ResourceMonitor } from './services/resourceMonitor.js';
+import type { McpManager } from './services/mcpManager.js';
+import type { SkillManager } from './services/skillManager.js';
+import type { ProviderManager } from './services/providerManager.js';
+import type { WorkflowEngine } from './services/workflowEngine.js';
+import type { TeamEngine } from './services/teamEngine.js';
+import { importFromHermes, exportToHermes } from './services/hermesSync.js';
+import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
+import { loadConfig, saveConfig } from './services/config.js';
+import type { AppConfig, CreateAgentInput, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch } from '../shared/types.js';
+import { hostname, release } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { app } from 'electron';
+
+export interface IpcDeps {
+  db: Database;
+  orchestrator: Orchestrator;
+  executors: ExecutorRegistry;
+  engines: EngineManager;
+  channels: ChannelManager;
+  feishu: FeishuChannel;
+  wecom: WecomChannel;
+  weixin: WeixinChannel;
+  scheduler: Scheduler;
+  broker: ApprovalBroker;
+  monitor: ResourceMonitor;
+  mcp: McpManager;
+  skills: SkillManager;
+  providers: ProviderManager;
+  workflows: WorkflowEngine;
+  teams: TeamEngine;
+  getMainWindow: () => BrowserWindow | null;
+}
+
+export function registerIpc(deps: IpcDeps) {
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, getMainWindow } = deps;
+
+  const broadcast = (channel: string, payload: unknown) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send(channel, payload);
+    }
+  };
+  const pushSnapshot = () => broadcast('aibox:snapshot', buildSnapshot(deps));
+
+  // 编排器状态变化 → 推送全量快照（本地事件到 UI ≤ 2 秒）；审批挂起即时可见
+  orchestrator.onChange(pushSnapshot);
+  broker.onChange(pushSnapshot);
+  // 任务输出流式推送（逐字显示，无需轮询）
+  orchestrator.onOutput((taskId, chunk) => {
+    broadcast('aibox:taskOutput', { taskId, chunk });
+  });
+  // 资源样本 → 实时推送
+  monitor.onSample(() => {
+    broadcast('aibox:resources', {
+      history: monitor.getHistory(),
+      health: monitor.getHealth()
+    });
+  });
+
+  // ---------- 查询 ----------
+  ipcMain.handle('aibox:getSnapshot', () => buildSnapshot(deps));
+  ipcMain.handle('aibox:getResourceHistory', () => ({ history: monitor.getHistory(), health: monitor.getHealth() }));
+  ipcMain.handle('aibox:getSystemInfo', (): SystemInfo => ({
+    platform: process.platform,
+    osVersion: release(),
+    hostname: hostname(),
+    uptimeSec: Math.floor(process.uptime()),
+    appVersion: app.getVersion()
+  }));
+
+  // ---------- 数字员工 ----------
+  ipcMain.handle('aibox:createAgent', (_e, input: CreateAgentInput) => orchestrator.createAgent(input));
+  ipcMain.handle('aibox:startAgent', (_e, id: string) => orchestrator.startAgent(id));
+  ipcMain.handle('aibox:stopAgent', (_e, id: string) => orchestrator.stopAgent(id));
+  // 助手人设编辑（soul.md / agents.md / user.md / 权限模式）
+  ipcMain.handle('aibox:updateAgentPersona', (_e, id: string, patch: AgentPersonaPatch) => {
+    const a = orchestrator.updateAgentPersona(id, patch);
+    pushSnapshot();
+    return a;
+  });
+  // AI 辅助生成人设：用已配置的 LLM 供应商生成 soul.md + agents.md + role
+  ipcMain.handle('aibox:generatePersona', async (_e, description: string) => {
+    const { getProviderSettings, readProviderKey } = await import('./services/provider.js');
+    const settings = getProviderSettings(db);
+    const key = readProviderKey(db);
+    if (!settings || !key) throw new Error('请先在设置页配置模型供应商');
+    const prompt = `请根据以下描述生成一个 AI 助手的配置，用 JSON 格式输出：
+{"name":"助手名称","role":"职责描述(50-100字)","soulMd":"身份与性格(100-200字)","agentsMd":"行为指令(5条规则)","systemPrompt":"系统提示词(50-100字)","permissionMode":"readonly或standard"}
+
+描述：${description}
+
+仅输出 JSON，不要其他内容。`;
+    const res = await fetch(`${settings.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model: settings.model, messages: [{ role: 'user', content: prompt }], max_tokens: 1000 })
+    });
+    if (!res.ok) throw new Error(`LLM 请求失败: HTTP ${res.status}`);
+    const data = await res.json() as { choices?: { message?: { content?: string } }[] };
+    const content = data.choices?.[0]?.message?.content ?? '';
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('AI 输出格式异常，请重试');
+    return JSON.parse(jsonMatch[0]) as { name: string; role: string; soulMd: string; agentsMd: string; systemPrompt: string; permissionMode: string };
+  });
+  // 会话（持续多轮对话）
+  ipcMain.handle('aibox:listConversations', (_e, agentId: string) => orchestrator.listConversations(agentId));
+  ipcMain.handle('aibox:chatWithAgent', (_e, agentId: string, message: string, conversationId?: string) => {
+    const r = orchestrator.chatWithAgent(agentId, message, conversationId);
+    pushSnapshot();
+    return r;
+  });
+  // 用量统计
+  ipcMain.handle('aibox:getUsageStats', () => orchestrator.usageStats());
+
+  // ---------- MCP 服务器管理 ----------
+  ipcMain.handle('aibox:listMcpServers', () => mcp.list());
+  ipcMain.handle('aibox:createMcpServer', (_e, input: { name: string; command: string; args?: string[]; env?: Record<string, string> }) => mcp.create(input));
+  ipcMain.handle('aibox:removeMcpServer', (_e, id: string) => mcp.remove(id));
+  ipcMain.handle('aibox:toggleMcpServer', (_e, id: string, enabled: boolean) => mcp.toggle(id, enabled));
+  ipcMain.handle('aibox:startMcpServer', (_e, id: string) => mcp.start(id));
+  ipcMain.handle('aibox:stopMcpServer', (_e, id: string) => mcp.stop(id));
+  ipcMain.handle('aibox:getMcpTools', () => mcp.allTools());
+  ipcMain.handle('aibox:callMcpTool', (_e, serverId: string, toolName: string, args: Record<string, unknown>) => mcp.callTool(serverId, toolName, args));
+
+  // ---------- Skills 管理 ----------
+  ipcMain.handle('aibox:listSkills', () => skills.list());
+  ipcMain.handle('aibox:createSkill', (_e, input: { name: string; description?: string; content?: string }) => skills.create(input));
+  ipcMain.handle('aibox:updateSkill', (_e, id: string, patch: { name?: string; description?: string; content?: string; enabled?: boolean }) => skills.update(id, patch));
+  ipcMain.handle('aibox:removeSkill', (_e, id: string) => skills.remove(id));
+  ipcMain.handle('aibox:bindSkill', (_e, agentId: string, skillId: string) => skills.bindAgent(agentId, skillId));
+  ipcMain.handle('aibox:unbindSkill', (_e, agentId: string, skillId: string) => skills.unbindAgent(agentId, skillId));
+  ipcMain.handle('aibox:getAgentSkills', (_e, agentId: string) => skills.forAgent(agentId));
+
+  // ---------- Hermes 同步 ----------
+  ipcMain.handle('aibox:importFromHermes', () => importFromHermes(mcp, skills));
+  ipcMain.handle('aibox:exportToHermes', () => exportToHermes(mcp, skills));
+
+  // ---------- 多供应商管理 ----------
+  ipcMain.handle('aibox:listProviders', () => providers.list());
+  ipcMain.handle('aibox:createProvider', (_e, input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }) => providers.create(input));
+  ipcMain.handle('aibox:updateProvider', (_e, id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }) => providers.update(id, patch));
+  ipcMain.handle('aibox:removeProvider', (_e, id: string) => providers.remove(id));
+
+  // ---------- Prompt 模板 ----------
+  ipcMain.handle('aibox:listTemplates', () => (db.raw.prepare('SELECT * FROM prompt_templates ORDER BY created_at DESC').all() as unknown as { id: string; name: string; content: string; category: string; created_at: number }[]).map((r) => ({ id: r.id, name: r.name, content: r.content, category: r.category, createdAt: r.created_at })));
+  ipcMain.handle('aibox:createTemplate', (_e, input: { name: string; content: string; category?: string }) => {
+    const id = `tpl-${randomUUID().slice(0, 8)}`;
+    db.raw.prepare('INSERT INTO prompt_templates(id, name, content, category, created_at) VALUES(?,?,?,?,?)').run(id, input.name, input.content, input.category ?? 'general', Date.now());
+    return { id, ...input };
+  });
+  ipcMain.handle('aibox:removeTemplate', (_e, id: string) => db.raw.prepare('DELETE FROM prompt_templates WHERE id = ?').run(id));
+
+  // ---------- Agent 克隆/导入导出 ----------
+  ipcMain.handle('aibox:cloneAgent', (_e, id: string, newName: string) => {
+    const agent = orchestrator.listAgents().find((a) => a.id === id);
+    if (!agent) throw new Error('助手不存在');
+    return orchestrator.createAgent({
+      name: newName || `${agent.name} (副本)`, role: agent.role, systemPrompt: agent.systemPrompt,
+      soulMd: agent.soulMd, agentsMd: agent.agentsMd, userMd: agent.userMd,
+      engineId: agent.engineId, workspace: agent.workspace, permissionMode: agent.permissionMode,
+      concurrencyLimit: agent.concurrencyLimit, channelIds: []
+    });
+  });
+  ipcMain.handle('aibox:exportAgent', (_e, id: string) => {
+    const agent = orchestrator.listAgents().find((a) => a.id === id);
+    if (!agent) throw new Error('助手不存在');
+    const { id: _id, lifecycle: _l, archived: _a, createdAt: _c, updatedAt: _u, avatarColor: _av, ...exportable } = agent;
+    return JSON.stringify(exportable, null, 2);
+  });
+
+  // ---------- 任务 DAG 工作流 ----------
+  ipcMain.handle('aibox:listWorkflows', () => workflows.list());
+  ipcMain.handle('aibox:createWorkflow', (_e, input: { name: string; steps: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[] }) => workflows.create(input));
+  ipcMain.handle('aibox:updateWorkflow', (_e, id: string, patch: { name?: string; steps?: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[] }) => workflows.update(id, patch));
+  ipcMain.handle('aibox:removeWorkflow', (_e, id: string) => workflows.remove(id));
+  ipcMain.handle('aibox:triggerWorkflow', (_e, id: string) => {
+    const r = workflows.trigger(id);
+    pushSnapshot();
+    return r;
+  });
+
+  // ---------- 专家团 ----------
+  ipcMain.handle('aibox:listTeams', () => teams.list());
+  ipcMain.handle('aibox:createTeam', (_e, input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable' }) => teams.create(input));
+  ipcMain.handle('aibox:updateTeam', (_e, id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable' }) => teams.update(id, patch));
+  ipcMain.handle('aibox:removeTeam', (_e, id: string) => teams.remove(id));
+  ipcMain.handle('aibox:triggerTeam', (_e, id: string, task: string) => {
+    const r = teams.trigger(id, task);
+    pushSnapshot();
+    return r;
+  });
+
+  // ---------- 任务 ----------
+  ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string) => orchestrator.createTask(agentId, title));
+  ipcMain.handle('aibox:cancelTask', (_e, id: string) => orchestrator.cancelTask(id));
+  ipcMain.handle('aibox:pauseTask', (_e, id: string) => orchestrator.pauseTask(id));
+  ipcMain.handle('aibox:resumeTask', (_e, id: string) => orchestrator.resumeTask(id));
+  ipcMain.handle('aibox:decideApproval', (_e, id: string, approve: boolean) => orchestrator.decideApproval(id, approve));
+  // 追问/续跑（P2b）：新任务继承会话锚点
+  ipcMain.handle('aibox:createFollowUpTask', (_e, parentTaskId: string, title: string) => orchestrator.createFollowUpTask(parentTaskId, title));
+  // 任务详情：事件时间线 + 产物全文（13.2 审计可追溯）
+  ipcMain.handle('aibox:getTaskEvents', (_e, taskId: string) => orchestrator.taskEvents(taskId));
+  ipcMain.handle('aibox:getTaskResult', (_e, taskId: string) => orchestrator.taskResult(taskId));
+
+  // ---------- 引擎 ----------
+  // 真实自动安装（npm -g，下载地址取配置文件）；完成后重新检测并推送快照
+  ipcMain.handle('aibox:installEngine', async (_e, id: string) => {
+    pushSnapshot(); // 立即反映 INSTALLING 状态
+    const r = await engines.install(id);
+    pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:detectEngines', async () => {
+    const list = await engines.detect();
+    pushSnapshot();
+    return list;
+  });
+  ipcMain.handle('aibox:getInstallGuide', (_e, id: string) => engines.installGuide(id));
+  ipcMain.handle('aibox:openExternal', (_e, url: string) => {
+    if (/^https:\/\//.test(url)) void shell.openExternal(url); // 外链一律系统浏览器，仅放行 https
+  });
+  ipcMain.handle('aibox:authEngine', (_e, id: string) => {
+    engines.markAuthed(id);
+    pushSnapshot();
+  });
+  ipcMain.handle('aibox:setDefaultEngine', (_e, id: string) => {
+    engines.setDefault(id);
+    pushSnapshot();
+  });
+
+  // ---------- 模型供应商（Hermes；密钥仅存 safeStorage，Renderer 只见脱敏视图） ----------
+  ipcMain.handle('aibox:getProviderConfig', () => getProviderConfig(db));
+  ipcMain.handle('aibox:saveProviderConfig', async (_e, input: { baseUrl: string; model: string; apiKey?: string }) => {
+    saveProviderConfig(db, input);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'provider.save', target: input.baseUrl, result: 'ok' });
+    await engines.detect(); // 配置齐备后 Hermes 转 HEALTHY
+    pushSnapshot();
+    return getProviderConfig(db);
+  });
+  ipcMain.handle('aibox:testProvider', (_e, override?: { baseUrl?: string; apiKey?: string }) => testProvider(db, override));
+
+  // ---------- 应用配置文件（下载源等；不含密钥） ----------
+  ipcMain.handle('aibox:getAppConfig', () => loadConfig());
+  ipcMain.handle('aibox:setAppConfig', (_e, patch: Partial<AppConfig>) => {
+    const next = saveConfig(patch);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'config.save', target: 'aibox.config.json', result: 'ok' });
+    return next;
+  });
+
+  // ---------- 定时任务（P3a） ----------
+  ipcMain.handle('aibox:createSchedule', (_e, input: ScheduleInput) => {
+    const s = scheduler.create(input);
+    pushSnapshot();
+    return s;
+  });
+  ipcMain.handle('aibox:toggleSchedule', (_e, id: string, enabled: boolean) => {
+    scheduler.toggle(id, enabled);
+    pushSnapshot();
+  });
+  ipcMain.handle('aibox:deleteSchedule', (_e, id: string) => {
+    scheduler.remove(id);
+    pushSnapshot();
+  });
+
+  // ---------- 渠道 ----------
+  // 飞书真实接入（P3c）：保存凭据（secret 走 safeStorage）并建立长连接
+  ipcMain.handle('aibox:configureFeishu', async (_e, appId: string, appSecret: string) => {
+    feishu.saveCredentials(appId, appSecret);
+    const r = await feishu.connect();
+    pushSnapshot();
+    return r;
+  });
+  // 企业微信智能机器人真实接入：官方长连接 API 模式（BotID/Secret，Secret 走 safeStorage）
+  ipcMain.handle('aibox:configureWecom', async (_e, botId: string, secret: string) => {
+    wecom.saveCredentials(botId, secret);
+    const r = await wecom.connect();
+    pushSnapshot();
+    return r;
+  });
+  // 个人微信真实接入：本地 Bot 桥接接口（回环 WebSocket，令牌走 safeStorage）
+  ipcMain.handle('aibox:configureWeixin', async (_e, bridgeUrl: string, token: string) => {
+    weixin.saveCredentials(bridgeUrl, token);
+    const r = await weixin.connect();
+    pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:setupChannel', (_e, id: string, accountName: string) => {
+    channels.setup(id, accountName);
+    setTimeout(pushSnapshot, 1500);
+  });
+  ipcMain.handle('aibox:disconnectChannel', (_e, id: string) => {
+    if (id === 'ch-feishu') feishu.disconnect();
+    if (id === 'ch-wecom') wecom.disconnect();
+    if (id === 'ch-weixin') weixin.disconnect();
+    channels.disconnect(id);
+    pushSnapshot();
+  });
+  ipcMain.handle('aibox:bindChannel', (_e, channelId: string, agentId: string) => {
+    channels.bindAgent(channelId, agentId);
+    pushSnapshot();
+  });
+  ipcMain.handle('aibox:unbindChannel', (_e, channelId: string, agentId: string) => {
+    channels.unbindAgent(channelId, agentId);
+    pushSnapshot();
+  });
+
+  // ---------- 设置 ----------
+  ipcMain.handle('aibox:getSetting', (_e, key: string) => db.getSetting(key, null));
+  ipcMain.handle('aibox:setSetting', (_e, key: string, value: unknown) => db.setSetting(key, value));
+  // 窗口控制：全屏切换
+  ipcMain.handle('aibox:toggleFullscreen', () => {
+    const win = getMainWindow();
+    if (win) win.setFullScreen(!win.isFullScreen());
+    return win?.isFullScreen() ?? false;
+  });
+  ipcMain.handle('aibox:isFullscreen', () => getMainWindow()?.isFullScreen() ?? false);
+
+  // ---------- 工作目录选择（7.2：必须由用户选择并进入允许列表） ----------
+  ipcMain.handle('aibox:pickDirectory', async () => {
+    const win = getMainWindow();
+    if (!win) return null;
+    const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
+    return r.canceled ? null : r.filePaths[0];
+  });
+
+  // ---------- 凭据（15.1：密钥不进入 Renderer/localStorage，仅存系统密钥库） ----------
+  ipcMain.handle('aibox:storeSecret', (_e, ref: string, secret: string) => {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用');
+    const buf = safeStorage.encryptString(secret);
+    db.setSetting(`secret:${ref}`, buf.toString('base64'));
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'secret.store', target: ref, result: 'ok' });
+  });
+  ipcMain.handle('aibox:hasSecret', (_e, ref: string) => db.getSetting<string | null>(`secret:${ref}`, null) !== null);
+}
+
+function buildSnapshot(deps: IpcDeps) {
+  const todos = deps.orchestrator.todos();
+  // 系统级待办：无可用执行器提醒 + 资源告警（遗留修复）
+  const executorAvailable = deps.engines.hasUsableExecutor();
+  const systemTodos: TodoItem[] = [];
+  if (!executorAvailable) {
+    systemTodos.push({
+      id: 'sys-no-executor',
+      title: '未检测到可用执行引擎，请到引擎中心安装 CLI 或配置 Hermes 供应商',
+      owner: '引擎中心', dueText: '尽快处理', severity: 'high', kind: 'system'
+    });
+  }
+  for (const [i, msg] of deps.monitor.getAlerts().entries()) {
+    systemTodos.push({ id: `sys-alert-${i}`, title: msg, owner: '系统监控', dueText: '资源告警', severity: 'high', kind: 'system' });
+  }
+  return {
+    stats: deps.orchestrator.stats(),
+    agentCards: deps.orchestrator.agentCards(),
+    tasks: deps.orchestrator.listTasks(),
+    todos: [...systemTodos, ...todos].slice(0, 12),
+    approvals: deps.orchestrator.listApprovals(),
+    engines: deps.engines.list(),
+    channels: deps.channels.list(),
+    schedules: deps.scheduler.list(),
+    // 至少一个可用执行器（CLI 健康或 Hermes 已配置）才能支持系统正常运行
+    executorAvailable
+  };
+}

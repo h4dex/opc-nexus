@@ -1,0 +1,15 @@
+node_modules/
+out/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+screenshots/
+*.png
+!.npmrc
+d.ps1
+d2.ps1
+d3.ps1
+d4.ps1
+pwcap.ps1
+uia.txt
