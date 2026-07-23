@@ -95,6 +95,7 @@ const api = {
   exportAgent: (id: string): Promise<string> => ipcRenderer.invoke('aibox:exportAgent', id),
   importAgent: (json: string): Promise<{ ok: boolean; message: string; agent?: Agent }> => ipcRenderer.invoke('aibox:importAgent', json),
   batchAgentAction: (ids: string[], action: 'start' | 'stop' | 'delete'): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:batchAgentAction', ids, action),
+  getAgentDetail: (agentId: string): Promise<{ tasks: { id: string; title: string; status: string; progress: number; createdAt: number }[]; usage: { totalTokens: number; inputTokens: number; outputTokens: number; calls: number }; events: { id: string; eventType: string; createdAt: number }[] }> => ipcRenderer.invoke('aibox:getAgentDetail', agentId),
 
   // 可视化工作流引擎
   listWorkflows: (): Promise<WorkflowDef[]> => ipcRenderer.invoke('aibox:listWorkflows'),
@@ -127,6 +128,9 @@ const api = {
   saveTeamConfig: (teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveTeamConfig', teamId, config),
   getTeamStats: (teamId: string): Promise<{ totalRuns: number; avgDurationMs: number; successRate: number }> => ipcRenderer.invoke('aibox:getTeamStats', teamId),
   getSubtaskOutput: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getSubtaskOutput', taskId),
+  saveTeamAsTemplate: (teamId: string, name?: string): Promise<{ ok: boolean; message: string; id?: string }> => ipcRenderer.invoke('aibox:saveTeamAsTemplate', teamId, name),
+  listTeamTemplates: (): Promise<{ id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[]> => ipcRenderer.invoke('aibox:listTeamTemplates'),
+  removeTeamTemplate: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeamTemplate', id),
 
   // 任务
   createTask: (agentId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title),

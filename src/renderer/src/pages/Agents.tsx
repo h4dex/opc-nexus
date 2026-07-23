@@ -35,6 +35,7 @@ export function Agents() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchMsg, setBatchMsg] = useState('');
   const [importMsg, setImportMsg] = useState('');
+  const [detailAgent, setDetailAgent] = useState<Agent | null>(null);
 
   if (!snapshot) return null;
   const { agentCards } = snapshot;
@@ -210,7 +211,7 @@ export function Agents() {
                       <input type="checkbox" checked={selected.has(agent.id)} onChange={() => toggleSelect(agent.id)} style={{ accentColor: 'var(--accent)' }} />
                     </td>
                     <td style={{ padding: '12px 12px' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setDetailAgent(agent)}>
                         <div style={{ width: 32, height: 32, borderRadius: 8, background: `${agent.avatarColor}22`, color: agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13 }}>
                           {agent.name.slice(0, 1)}
                         </div>
@@ -320,7 +321,92 @@ export function Agents() {
       )}
 
       {editAgent && <AgentEditor agent={editAgent} onClose={() => setEditAgent(null)} />}
+      {detailAgent && <AgentDetailDrawer agent={detailAgent} onClose={() => setDetailAgent(null)} onEdit={() => { setEditAgent(detailAgent); setDetailAgent(null); }} />}
       {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.card)} onClose={() => setCtx(null)} />}
     </>
+  );
+}
+
+/** 员工详情抽屉：最近任务 + Token 统计 + 活动日志 */
+function AgentDetailDrawer({ agent, onClose, onEdit }: { agent: Agent; onClose: () => void; onEdit: () => void }) {
+  const [detail, setDetail] = useState<{
+    tasks: { id: string; title: string; status: string; progress: number; createdAt: number }[];
+    usage: { totalTokens: number; inputTokens: number; outputTokens: number; calls: number };
+    events: { id: string; eventType: string; createdAt: number }[];
+  } | null>(null);
+
+  if (!detail) {
+    void window.aibox.getAgentDetail(agent.id).then(setDetail);
+    return null;
+  }
+
+  const statusLabel = (s: string) => ({ QUEUED: '排队', RUNNING: '执行中', COMPLETED: '完成', FAILED: '失败', CANCELLED: '取消', PAUSED: '暂停' }[s] ?? s);
+  const statusColor = (s: string) => s === 'COMPLETED' ? 'var(--success)' : s === 'FAILED' ? 'var(--danger)' : s === 'RUNNING' ? 'var(--accent)' : 'var(--text-3)';
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.4)', zIndex: 900 }} onClick={onClose}>
+      <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: 420, background: 'var(--card-bg)', borderLeft: '1px solid var(--border)', padding: 20, overflowY: 'auto', boxShadow: '-4px 0 24px rgba(0,0,0,.3)' }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ width: 40, height: 40, borderRadius: 10, background: `${agent.avatarColor}22`, color: agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 16 }}>{agent.name.slice(0, 1)}</div>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 15 }}>{agent.name}</div>
+              <div style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{agent.role.slice(0, 30)}</div>
+            </div>
+          </div>
+          <button className="btn small" onClick={onClose}>×</button>
+        </div>
+
+        {/* Token 统计 */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 16 }}>
+          <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', textAlign: 'center' }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--accent)' }}>{detail.usage.totalTokens.toLocaleString()}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)' }}>总 Token</div>
+          </div>
+          <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', textAlign: 'center' }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--success)' }}>{detail.usage.calls}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)' }}>调用次数</div>
+          </div>
+          <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', textAlign: 'center' }}>
+            <div style={{ fontSize: 14, fontWeight: 650, color: 'var(--text-1)' }}>{detail.usage.inputTokens.toLocaleString()}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)' }}>输入 Token</div>
+          </div>
+          <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', textAlign: 'center' }}>
+            <div style={{ fontSize: 14, fontWeight: 650, color: 'var(--text-1)' }}>{detail.usage.outputTokens.toLocaleString()}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)' }}>输出 Token</div>
+          </div>
+        </div>
+
+        {/* 最近任务 */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>最近任务</div>
+          {detail.tasks.length === 0 && <div style={{ fontSize: 12, color: 'var(--text-3)' }}>暂无任务记录</div>}
+          {detail.tasks.map((t) => (
+            <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 6, background: 'var(--input-bg)', marginBottom: 4, fontSize: 12 }}>
+              <span style={{ width: 7, height: 7, borderRadius: '50%', background: statusColor(t.status), flexShrink: 0 }} />
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-1)' }}>{t.title}</span>
+              <span style={{ color: statusColor(t.status), fontWeight: 600, fontSize: 11 }}>{statusLabel(t.status)}</span>
+              <span style={{ color: 'var(--text-3)', fontSize: 10.5 }}>{new Date(t.createdAt).toLocaleDateString('zh-CN')}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* 活动日志 */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>活动日志</div>
+          {detail.events.length === 0 && <div style={{ fontSize: 12, color: 'var(--text-3)' }}>暂无活动</div>}
+          <div style={{ maxHeight: 160, overflowY: 'auto', fontSize: 11.5, lineHeight: 2 }}>
+            {detail.events.map((e) => (
+              <div key={e.id} style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+                <span style={{ color: 'var(--text-3)', fontFamily: 'monospace', fontSize: 10.5, minWidth: 60 }}>{new Date(e.createdAt).toLocaleTimeString('zh-CN', { hour12: false })}</span>
+                <span style={{ color: 'var(--text-2)' }}>{e.eventType}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <button className="btn primary" style={{ width: '100%', justifyContent: 'center' }} onClick={onEdit}>编辑员工配置</button>
+      </div>
+    </div>
   );
 }

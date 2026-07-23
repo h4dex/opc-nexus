@@ -135,6 +135,9 @@ export function Teams() {
         </div>
       </div>
 
+      {/* 自定义模板 */}
+      <CustomTemplates />
+
       <div style={{ display: 'grid', gap: 14 }}>
         {teams.map((team) => (
           <div className="card" key={team.id} style={{ padding: 18 }}>
@@ -193,6 +196,7 @@ export function Teams() {
               <button className="btn small" onClick={() => setEditTeam(team)}>编辑团队</button>
               <button className="btn small" onClick={() => setHistoryTeam(team)}>执行历史</button>
               <button className="btn small" onClick={() => setConfigTeam(team)}>配置</button>
+              <button className="btn small" onClick={() => void window.aibox.saveTeamAsTemplate(team.id).then((r) => { setDeployMsg(r.message); setTimeout(() => setDeployMsg(''), 3000); })}>保存为模板</button>
             </div>
 
             {/* 流水线进度面板 */}
@@ -537,6 +541,35 @@ function TeamConfigModal({ team, onClose }: { team: TeamData; onClose: () => voi
           <button className="btn primary" onClick={() => void save()}>保存配置</button>
           {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** 自定义模板管理：列出/删除用户保存的团队模板 */
+function CustomTemplates() {
+  const [templates, setTemplates] = useState<{ id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[] | null>(null);
+
+  if (!templates) {
+    void window.aibox.listTeamTemplates().then(setTemplates);
+    return null;
+  }
+  if (templates.length === 0) return null;
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 13.5, fontWeight: 650, marginBottom: 10, color: 'var(--text-1)' }}>📁 自定义模板（从团队保存）</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 12 }}>
+        {templates.map((tpl) => (
+          <div key={tpl.id} className="card" style={{ padding: 14 }}>
+            <div style={{ fontWeight: 650, fontSize: 13.5, marginBottom: 4 }}>{tpl.name}</div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 8, lineHeight: 1.6 }}>{tpl.description}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8 }}>
+              {tpl.mode === 'coordinate' ? '🎯 协调模式' : '🔄 圆桌模式'} · {Array.isArray(tpl.members) ? tpl.members.length : 0} 位成员
+            </div>
+            <button className="btn small danger" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void window.aibox.removeTeamTemplate(tpl.id).then(() => setTemplates((prev) => prev?.filter((t) => t.id !== tpl.id) ?? null))}>删除模板</button>
+          </div>
+        ))}
       </div>
     </div>
   );

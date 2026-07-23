@@ -238,6 +238,12 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return { ok: true, message: `已对 ${count} 位员工执行「${action === 'start' ? '启用' : action === 'stop' ? '停用' : '删除'}」操作` };
   });
+  ipcMain.handle('aibox:getAgentDetail', (_e, agentId: string) => {
+    const tasks = orchestrator.listTasks().filter((t) => t.agentId === agentId).slice(0, 10);
+    const usage = db.raw.prepare('SELECT COALESCE(SUM(total_tokens),0) as total, COALESCE(SUM(input_tokens),0) as input, COALESCE(SUM(output_tokens),0) as output, COUNT(*) as calls FROM usage_records WHERE agent_id = ?').get(agentId) as { total: number; input: number; output: number; calls: number };
+    const events = (db.raw.prepare("SELECT id, event_type, created_at FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = ? ORDER BY created_at DESC LIMIT 5) ORDER BY created_at DESC LIMIT 30").all(agentId) as { id: string; event_type: string; created_at: number }[]).map((e) => ({ id: e.id, eventType: e.event_type, createdAt: e.created_at }));
+    return { tasks, usage: { totalTokens: usage.total, inputTokens: usage.input, outputTokens: usage.output, calls: usage.calls }, events };
+  });
 
   // ---------- 可视化工作流引擎 ----------
   workflows.onBroadcast(broadcast);
@@ -294,6 +300,9 @@ export function registerIpc(deps: IpcDeps) {
   });
   ipcMain.handle('aibox:getTeamStats', (_e, teamId: string) => teams.getStats(teamId));
   ipcMain.handle('aibox:getSubtaskOutput', (_e, taskId: string) => teams.getSubtaskOutput(taskId));
+  ipcMain.handle('aibox:saveTeamAsTemplate', (_e, teamId: string, name?: string) => teams.saveAsTemplate(teamId, name));
+  ipcMain.handle('aibox:listTeamTemplates', () => teams.listTemplates());
+  ipcMain.handle('aibox:removeTeamTemplate', (_e, id: string) => teams.removeTemplate(id));
 
   // ---------- 任务 ----------
   ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string) => orchestrator.createTask(assertId(agentId, 'agentId'), assertString(title, 'title', 1, 500)));

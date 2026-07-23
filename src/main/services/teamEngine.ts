@@ -436,4 +436,36 @@ _生成时间：${new Date().toLocaleString()}_
     const row = this.db.raw.prepare('SELECT result FROM tasks WHERE id = ?').get(taskId) as { result?: string } | undefined;
     return row?.result ?? null;
   }
+
+  // ---------- 自定义模板 ----------
+
+  /** 保存当前团队为自定义模板 */
+  saveAsTemplate(teamId: string, name?: string): { ok: boolean; message: string; id?: string } {
+    const team = this.list().find((t) => t.id === teamId);
+    if (!team) return { ok: false, message: '团队不存在' };
+    const id = `tpl-${randomUUID().slice(0, 8)}`;
+    const members = [team.coordinatorId, ...team.memberIds].map((mid) => {
+      const agent = this.orchestrator.listAgents().find((a) => a.id === mid);
+      return agent ? { name: agent.name, role: agent.role, soulMd: agent.soulMd, agentsMd: agent.agentsMd, permissionMode: agent.permissionMode } : null;
+    }).filter(Boolean);
+    this.db.raw.prepare('INSERT INTO team_templates(id, name, description, mode, members_json, created_at) VALUES(?,?,?,?,?,?)')
+      .run(id, name || team.name, `自定义模板（来自团队「${team.name}」）`, team.mode, JSON.stringify(members), Date.now());
+    return { ok: true, message: `已保存为模板「${name || team.name}」`, id };
+  }
+
+  /** 列出自定义模板 */
+  listTemplates(): { id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[] {
+    return (this.db.raw.prepare('SELECT * FROM team_templates ORDER BY created_at DESC').all() as unknown as {
+      id: string; name: string; description: string; mode: string; members_json: string; created_at: number;
+    }[]).map((r) => {
+      let members: unknown[] = [];
+      try { members = JSON.parse(r.members_json); } catch { /* empty */ }
+      return { id: r.id, name: r.name, description: r.description, mode: r.mode, members, createdAt: r.created_at };
+    });
+  }
+
+  /** 删除自定义模板 */
+  removeTemplate(id: string) {
+    this.db.raw.prepare('DELETE FROM team_templates WHERE id = ?').run(id);
+  }
 }
