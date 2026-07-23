@@ -156,7 +156,7 @@ function ProviderCard() {
   const testConn = async (p: ProviderItem) => {
     setTesting(p.id);
     try {
-      const r = await window.aibox.testProvider({ baseUrl: p.baseUrl });
+      const r = await window.aibox.testProviderById(p.id);
       setTestResult((prev) => ({ ...prev, [p.id]: { ok: r.ok, msg: r.ok ? `连接成功 (${r.latencyMs}ms)` : r.error ?? '失败' } }));
     } finally { setTesting(null); }
   };

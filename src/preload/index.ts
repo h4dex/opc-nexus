@@ -86,6 +86,7 @@ const api = {
   createProvider: (input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }): Promise<unknown> => ipcRenderer.invoke('aibox:createProvider', input),
   updateProvider: (id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }): Promise<void> => ipcRenderer.invoke('aibox:updateProvider', id, patch),
   removeProvider: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeProvider', id),
+  testProviderById: (id: string): Promise<{ ok: boolean; latencyMs: number; error: string | null }> => ipcRenderer.invoke('aibox:testProviderById', id),
 
   // Prompt 模板
   listTemplates: (): Promise<{ id: string; name: string; content: string; category: string }[]> => ipcRenderer.invoke('aibox:listTemplates'),

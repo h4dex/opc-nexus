@@ -203,6 +203,7 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:createProvider', (_e, input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }) => providers.create(input));
   ipcMain.handle('aibox:updateProvider', (_e, id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }) => providers.update(id, patch));
   ipcMain.handle('aibox:removeProvider', (_e, id: string) => providers.remove(id));
+  ipcMain.handle('aibox:testProviderById', (_e, id: string) => providers.testById(id));
 
   // ---------- Prompt 模板 ----------
   ipcMain.handle('aibox:listTemplates', () => (db.raw.prepare('SELECT * FROM prompt_templates ORDER BY created_at DESC').all() as unknown as { id: string; name: string; content: string; category: string; created_at: number }[]).map((r) => ({ id: r.id, name: r.name, content: r.content, category: r.category, createdAt: r.created_at })));

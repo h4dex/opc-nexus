@@ -96,4 +96,26 @@ export class ProviderManager {
     if (!b64 || !safeStorage.isEncryptionAvailable()) return '';
     try { return safeStorage.decryptString(Buffer.from(b64, 'base64')); } catch { return ''; }
   }
+
+  /** 按供应商 ID 测试连接（自动取该供应商的 baseUrl + 解密 Key） */
+  async testById(id: string): Promise<{ ok: boolean; latencyMs: number; error: string | null }> {
+    const row = this.db.raw.prepare('SELECT * FROM providers WHERE id = ?').get(id) as { base_url: string; model: string; api_key_ref: string } | undefined;
+    if (!row) return { ok: false, latencyMs: 0, error: '供应商不存在' };
+    const key = row.api_key_ref ? this.decryptKey(row.api_key_ref) : '';
+    if (!key) return { ok: false, latencyMs: 0, error: '该供应商未配置 API Key' };
+    const baseUrl = row.base_url.replace(/\/+$/, '');
+    const started = Date.now();
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15_000);
+      const res = await fetch(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: ctrl.signal });
+      clearTimeout(timer);
+      const latencyMs = Date.now() - started;
+      if (res.ok) return { ok: true, latencyMs, error: null };
+      const body = await res.text().catch(() => '');
+      return { ok: false, latencyMs, error: `HTTP ${res.status}: ${body.slice(0, 160)}` };
+    } catch (err) {
+      return { ok: false, latencyMs: Date.now() - started, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
 }
