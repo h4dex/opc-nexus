@@ -26,6 +26,22 @@ function sinceForRange(key: RangeKey): number | null {
   return Date.now() - 30 * 86400000;
 }
 
+/** 模型单价（元/百万 Token，输入+输出综合均价） */
+const MODEL_PRICING: Record<string, number> = {
+  'deepseek-chat': 2, 'deepseek-reasoner': 4, 'gpt-4o-mini': 1.5, 'gpt-4o': 15,
+  'qwen-plus': 4, 'qwen-turbo': 1, 'moonshot-v1-8k': 12, 'llama3.1': 0
+};
+const DEFAULT_PRICE = 2; // 未知模型默认 2 元/百万 Token
+
+function estimateCost(byModel: { model: string; input: number; output: number; total: number }[]): string {
+  let totalCost = 0;
+  for (const m of byModel) {
+    const price = MODEL_PRICING[m.model] ?? DEFAULT_PRICE;
+    totalCost += (m.total / 1_000_000) * price;
+  }
+  return totalCost < 0.01 ? '<0.01' : totalCost.toFixed(2);
+}
+
 export function Usage() {
   const { snapshot } = useApp();
   const [range, setRange] = useState<RangeKey>('7d');
@@ -67,7 +83,7 @@ export function Usage() {
       ) : (
         <>
           {/* 总览卡片 */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 16 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 16 }}>
             <div className="card" style={{ textAlign: 'center' }}>
               <div style={{ fontSize: 26, fontWeight: 700, color: 'var(--accent)' }}>{data.total.total.toLocaleString()}</div>
               <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>总 Token</div>
@@ -79,6 +95,10 @@ export function Usage() {
             <div className="card" style={{ textAlign: 'center' }}>
               <div style={{ fontSize: 26, fontWeight: 700, color: 'var(--warning)' }}>{data.total.output.toLocaleString()}</div>
               <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>输出 Token</div>
+            </div>
+            <div className="card" style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 26, fontWeight: 700, color: 'var(--purple, #8a5cf6)' }}>¥{estimateCost(data.byModel)}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 4 }}>估算费用</div>
             </div>
           </div>
 
