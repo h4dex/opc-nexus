@@ -106,6 +106,7 @@ export interface WsLike {
   on(event: 'message', cb: (data: Buffer | string) => void): void;
   on(event: 'close', cb: (code: number, reason: Buffer) => void): void;
   on(event: 'error', cb: (err: Error) => void): void;
+  removeListener(event: string, cb: (...args: unknown[]) => void): void;
 }
 
 export type WsCtor = new (url: string, opts?: { handshakeTimeout?: number }) => WsLike;

@@ -1,9 +1,10 @@
-/** 数字员工管理：列表视图 + 状态/权限/引擎一览 + 快捷操作（编辑/启停/克隆/归档） */
+/** 数字员工管理：列表视图 + 状态/权限/引擎一览 + 快捷操作（编辑/启停/克隆/归档） + 右键菜单 */
 import { useState } from 'react';
 import { useApp } from '../store';
 import { AgentEditor } from '../components/AgentEditor';
+import { ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconPlay, IconStop, IconPlus } from '../components/icons';
-import type { Agent } from '@shared/types';
+import type { Agent, AgentCardView } from '@shared/types';
 
 const PERM_LABEL: Record<string, { text: string; color: string }> = {
   readonly: { text: '只读', color: 'var(--text-3)' },
@@ -23,9 +24,25 @@ const LIFECYCLE_LABEL: Record<string, { text: string; color: string }> = {
 export function Agents() {
   const { snapshot, setWizardOpen } = useApp();
   const [editAgent, setEditAgent] = useState<Agent | null>(null);
+  const [ctx, setCtx] = useState<{ x: number; y: number; card: AgentCardView } | null>(null);
 
   if (!snapshot) return null;
   const { agentCards } = snapshot;
+
+  /** 右键菜单项（按员工状态动态生成） */
+  const ctxItems = (card: AgentCardView): CtxMenuItem[] => {
+    const agent = card.agent;
+    const ready = agent.lifecycle === 'READY';
+    return [
+      { label: '编辑 / 设置', onClick: () => setEditAgent(agent) },
+      { label: '打开工作目录', onClick: () => void window.aibox.openAgentWorkspace(agent.id) },
+      { divider: true, label: '', onClick: () => {} },
+      ready
+        ? { label: '停用', onClick: () => void window.aibox.stopAgent(agent.id) }
+        : { label: '启用', onClick: () => void window.aibox.startAgent(agent.id) },
+      { label: '克隆', onClick: () => void window.aibox.cloneAgent(agent.id, `${agent.name} (副本)`) }
+    ];
+  };
 
   return (
     <>
@@ -58,7 +75,8 @@ export function Agents() {
               const lc = LIFECYCLE_LABEL[agent.lifecycle] ?? LIFECYCLE_LABEL.DISABLED;
               const perm = PERM_LABEL[agent.permissionMode] ?? PERM_LABEL.standard;
               return (
-                <tr key={agent.id} style={{ borderTop: '1px solid var(--border)' }}>
+                <tr key={agent.id} style={{ borderTop: '1px solid var(--border)' }}
+                  onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, card }); }}>
                   <td style={{ padding: '12px 16px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <div style={{ width: 32, height: 32, borderRadius: 8, background: `${agent.avatarColor}22`, color: agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13 }}>
@@ -92,7 +110,7 @@ export function Agents() {
                         <span key={m} title={`MCP: ${m}`} style={{ fontSize: 10.5, padding: '1px 6px', borderRadius: 3, background: 'rgba(16,185,129,.1)', color: 'var(--success)', border: '1px solid var(--success)', whiteSpace: 'nowrap' }}>{m}</span>
                       ))}
                       {card.skills.length === 0 && card.mcpServers.length === 0 && (
-                        <span style={{ fontSize: 11, color: 'var(--text-3)' }}>未配置</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-3)' }}>—</span>
                       )}
                     </div>
                   </td>
@@ -121,6 +139,7 @@ export function Agents() {
       </div>
 
       {editAgent && <AgentEditor agent={editAgent} onClose={() => setEditAgent(null)} />}
+      {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.card)} onClose={() => setCtx(null)} />}
     </>
   );
 }

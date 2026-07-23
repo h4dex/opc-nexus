@@ -45,6 +45,7 @@ interface WecomFrame {
     voice?: { url?: string; aeskey?: string; recognize?: string };
     file?: { url?: string; aeskey?: string; filename?: string; filesize?: number };
     image?: { url?: string; aeskey?: string };
+    video?: { url?: string; aeskey?: string; filename?: string; filesize?: number };
     event?: { eventtype?: string };
   };
 }
@@ -294,8 +295,17 @@ export class WecomChannel {
         this.respondStream(ws, reqId, '图片下载失败，请重试。');
         return;
       }
+    } else if (body.msgtype === 'video') {
+      const filePath = this.downloadAndDecrypt(body.video?.url, body.video?.aeskey, body.video?.filename ?? `video_${Date.now()}.mp4`);
+      if (filePath) {
+        attachments.push(filePath);
+        text = `[视频已接收] ${body.video?.filename ?? '视频文件'}，已保存到工作目录：${filePath}`;
+      } else {
+        this.respondStream(ws, reqId, '视频下载失败，请重试。');
+        return;
+      }
     } else {
-      this.respondStream(ws, reqId, '暂不支持该消息类型，请发送文本/语音/文件。');
+      this.respondStream(ws, reqId, '暂不支持该消息类型，请发送文本/语音/图片/视频/文件。');
       return;
     }
 
@@ -318,7 +328,7 @@ export class WecomChannel {
       ack: (message) => this.respondStream(ws, reqId, message),
       final: (message) => {
         if (gen !== this.generation || !pushChatId) return;
-        this.sendMarkdown(pushChatId, pushChatType, message);
+        this.sendFinalResult(pushChatId, pushChatType, message);
       }
     });
   }
@@ -369,5 +379,140 @@ export class WecomChannel {
     } catch {
       /* 推送失败不中断渠道 */
     }
+  }
+
+  // ---------- 媒体上传 + 发送（两步异步：upload → media_id → send） ----------
+
+  /** 文件大小上限（企微官方：图片 10MB，文件 20MB） */
+  private static readonly MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+  private static readonly MAX_FILE_BYTES = 20 * 1024 * 1024;
+
+  /**
+   * 上传媒体文件到企微，获取 media_id（异步等待响应）。
+   * 协议：aibot_upload_file { type, filename, base64 } → 响应 { media_id }
+   */
+  private uploadMedia(type: 'image' | 'file' | 'voice', filePath: string, filename: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const ws = this.ws;
+      if (!ws) { resolve(null); return; }
+      const reqId = randomUUID();
+      const timeout = setTimeout(() => { cleanup(); resolve(null); }, 30_000);
+
+      const onMsg = (raw: unknown) => {
+        try {
+          const frame = JSON.parse(typeof raw === 'string' ? raw : (raw as Buffer).toString('utf8')) as WecomFrame;
+          if (frame.headers?.req_id === reqId) {
+            cleanup();
+            if (frame.errcode === 0 && (frame as Record<string, unknown>).media_id) {
+              resolve((frame as Record<string, unknown>).media_id as string);
+            } else if (frame.errcode === 0 && (frame as { body?: { media_id?: string } }).body?.media_id) {
+              resolve((frame as { body?: { media_id?: string } }).body!.media_id!);
+            } else {
+              resolve(null);
+            }
+          }
+        } catch { /* 非目标帧 */ }
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        ws.removeListener('message', onMsg);
+      };
+      ws.on('message', onMsg);
+
+      try {
+        const buf = readFileSync(filePath);
+        ws.send(JSON.stringify({
+          cmd: 'aibot_upload_file',
+          headers: { req_id: reqId },
+          body: { type, filename, base64: buf.toString('base64') }
+        }));
+      } catch {
+        cleanup();
+        resolve(null);
+      }
+    });
+  }
+
+  /** 发送图片：先上传获取 media_id，再引用发送；URL 则嵌入 markdown */
+  async sendImage(chatId: string, chatType: number, imageSource: string): Promise<boolean> {
+    try {
+      // 远程 URL → 直接嵌入 markdown（无需上传）
+      if (/^https?:\/\//i.test(imageSource)) {
+        this.sendMarkdown(chatId, chatType, `![图片](${imageSource})`);
+        return true;
+      }
+      // 本地文件 → 检查大小 → 上传 → 发送
+      const buf = readFileSync(imageSource);
+      if (buf.length > WecomChannel.MAX_IMAGE_BYTES) {
+        this.sendMarkdown(chatId, chatType, `[图片过大无法发送] ${imageSource}（${(buf.length / 1024 / 1024).toFixed(1)}MB > 10MB 上限）`);
+        return false;
+      }
+      const filename = imageSource.split(/[\\/]/).pop() ?? `image_${Date.now()}.png`;
+      const mediaId = await this.uploadMedia('image', imageSource, filename);
+      if (!mediaId) {
+        // 上传失败回退：尝试 markdown 嵌入路径提示
+        this.sendMarkdown(chatId, chatType, `[图片上传失败] ${filename}`);
+        return false;
+      }
+      this.ws?.send(JSON.stringify({
+        cmd: 'aibot_send_msg',
+        headers: { req_id: randomUUID() },
+        body: { chatid: chatId, chat_type: chatType, msgtype: 'image', image: { media_id: mediaId } }
+      }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 发送文件：先上传获取 media_id，再引用发送 */
+  async sendFile(chatId: string, chatType: number, filePath: string, filename?: string): Promise<boolean> {
+    try {
+      const buf = readFileSync(filePath);
+      if (buf.length > WecomChannel.MAX_FILE_BYTES) {
+        this.sendMarkdown(chatId, chatType, `[文件过大无法发送] ${filename ?? filePath}（${(buf.length / 1024 / 1024).toFixed(1)}MB > 20MB 上限）`);
+        return false;
+      }
+      const name = filename ?? filePath.split(/[\\/]/).pop() ?? 'file';
+      const mediaId = await this.uploadMedia('file', filePath, name);
+      if (!mediaId) {
+        this.sendMarkdown(chatId, chatType, `[文件上传失败] ${name}`);
+        return false;
+      }
+      this.ws?.send(JSON.stringify({
+        cmd: 'aibot_send_msg',
+        headers: { req_id: randomUUID() },
+        body: { chatid: chatId, chat_type: chatType, msgtype: 'file', file: { media_id: mediaId } }
+      }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 智能发送终态结果：检测产物中的文件路径，图片/文件异步上传发送，文本走 markdown */
+  private sendFinalResult(chatId: string, chatType: number, message: string) {
+    const imgExts = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+    const filePathRegex = /(?:[A-Za-z]:[\\/]|\/{1,2}|~[\/])[\w\-.\\/ ]+\.\w{1,6}/g;
+    const paths = message.match(filePathRegex) ?? [];
+    const mediaPaths = paths.filter((p) => {
+      try { return readFileSync(p.trim()).length > 0; } catch { return false; }
+    });
+
+    let textPart = message;
+    const mediaSends: Promise<boolean>[] = [];
+    for (const p of mediaPaths) {
+      const trimmed = p.trim();
+      if (imgExts.test(trimmed)) {
+        mediaSends.push(this.sendImage(chatId, chatType, trimmed));
+      } else {
+        mediaSends.push(this.sendFile(chatId, chatType, trimmed));
+      }
+      textPart = textPart.replace(p, '').trim();
+    }
+    // 剩余文本走 markdown（不等待媒体上传完成，文本先发）
+    if (textPart) this.sendMarkdown(chatId, chatType, textPart);
+    // 媒体异步发送，失败静默
+    void Promise.allSettled(mediaSends);
   }
 }

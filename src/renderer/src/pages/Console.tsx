@@ -2,11 +2,11 @@
  * 执行监控（参考 Hermes Studio 对话式执行轨迹）：
  * 左侧任务列表（活跃任务置顶 + 旋转指示器）；右侧选中任务的实时执行流——
  * 阶段切换、工具调用（可展开参数/结果）、LLM 输出、审批干预（批准/拒绝按钮）。
- * 执行中任务每 2s 自动刷新事件流并滚动到底部。
+ * 执行中任务通过 onTaskOutput 流式推送实时追加，辅以 5s 低频轮询补全非 output 事件。
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { useApp } from '../store';
-import { TASK_STATUS_META } from '../components/common';
+import { TASK_STATUS_META, ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconCheck, IconX, IconPlay } from '../components/icons';
 import type { Task, TaskEvent, Approval } from '@shared/types';
 
@@ -22,6 +22,7 @@ export function Console() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [result, setResult] = useState<string | null>(null);
+  const [ctx, setCtx] = useState<{ x: number; y: number; task: Task } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   if (!snapshot) return null;
@@ -38,18 +39,43 @@ export function Console() {
   const selected = tasks.find((t) => t.id === selectedId) ?? sorted[0] ?? null;
   const isRunning = selected && ['RUNNING', 'WAITING_APPROVAL', 'QUEUED'].includes(selected.status);
 
-  // 加载选中任务的事件流
+  /** 右键菜单项（按任务状态动态生成） */
+  const ctxItems = (t: Task): CtxMenuItem[] => {
+    const items: CtxMenuItem[] = [
+      { label: '查看执行流', onClick: () => setSelectedId(t.id) },
+      { label: '打开产物目录', onClick: () => void window.aibox.openTaskWorkspace(t.id) }
+    ];
+    if (['RUNNING', 'PAUSED', 'QUEUED'].includes(t.status)) {
+      items.push({ divider: true, label: '', onClick: () => {} }, { label: '取消任务', danger: true, onClick: () => void window.aibox.cancelTask(t.id) });
+    }
+    return items;
+  };
+
+  // 加载选中任务的事件流（初始全量 + 流式追加 + 5s 低频补全）
+  const selectedIdRef = useRef<string | null>(null);
+  const loadEvents = useCallback(() => {
+    if (!selectedIdRef.current) return;
+    void window.aibox.getTaskEvents(selectedIdRef.current).then(setEvents);
+    void window.aibox.getTaskResult(selectedIdRef.current).then(setResult);
+  }, []);
+
   useEffect(() => {
     if (!selected) return;
+    selectedIdRef.current = selected.id;
     setSelectedId(selected.id);
-    const load = () => {
-      void window.aibox.getTaskEvents(selected.id).then(setEvents);
-      void window.aibox.getTaskResult(selected.id).then(setResult);
-    };
-    load();
-    const timer = setInterval(load, 2000);
-    return () => clearInterval(timer);
-  }, [selected?.id]);
+    loadEvents();
+    // 流式输出实时追加（无需等待轮询）
+    const unsub = window.aibox.onTaskOutput(({ taskId, chunk }) => {
+      if (taskId !== selectedIdRef.current) return;
+      setEvents((prev) => [...prev, {
+        id: `rt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        taskId, eventType: 'output', payload: { chunk }, createdAt: Date.now()
+      } as TaskEvent]);
+    });
+    // 5s 低频轮询补全 stage/progress/tool_call 等非 output 事件
+    const timer = setInterval(loadEvents, 5000);
+    return () => { unsub(); clearInterval(timer); };
+  }, [selected?.id, loadEvents]);
 
   // 自动滚动到底部
   useEffect(() => {
@@ -74,6 +100,7 @@ export function Console() {
             const active = ['RUNNING', 'WAITING_APPROVAL'].includes(t.status);
             return (
               <button key={t.id} onClick={() => setSelectedId(t.id)}
+                onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, task: t }); }}
                 style={{
                   display: 'block', width: '100%', textAlign: 'left', padding: '10px 12px', marginBottom: 4,
                   borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 12.5, lineHeight: 1.6,
@@ -137,6 +164,8 @@ export function Console() {
           )}
         </div>
       </div>
+
+      {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.task)} onClose={() => setCtx(null)} />}
     </>
   );
 }
@@ -169,12 +198,27 @@ function ApprovalCard({ approval }: { approval: Approval }) {
   );
 }
 
-/** 单条事件行：按类型渲染不同样式（工具调用可展开） */
+/** 单条事件行：按类型渲染不同样式（工具调用可展开，output 终端风格） */
 function EventRow({ event }: { event: TaskEvent }) {
   const [expanded, setExpanded] = useState(false);
   const color = EVENT_COLOR[event.eventType] ?? 'var(--text-3)';
   const time = new Date(event.createdAt).toLocaleTimeString('zh-CN', { hour12: false });
   const p = event.payload;
+
+  // CLI / LLM 实时输出：终端风格展示（让用户看到引擎在做什么）
+  if (event.eventType === 'output') {
+    const chunk = String(p.chunk ?? p.text ?? '');
+    if (!chunk.trim()) return null;
+    return (
+      <pre style={{
+        margin: '2px 0', padding: '6px 12px', background: '#0d1117', borderRadius: 6,
+        fontSize: 11.5, lineHeight: 1.7, color: '#c9d1d9', whiteSpace: 'pre-wrap',
+        wordBreak: 'break-all', borderLeft: '3px solid var(--accent)', maxHeight: 300, overflowY: 'auto'
+      }}>
+        {chunk.slice(0, 4000)}
+      </pre>
+    );
+  }
 
   // 工具调用：可展开参数/结果
   if (event.eventType === 'tool_call') {

@@ -50,7 +50,9 @@ export class CliExecutor implements ExecutorAdapter {
 
   private buildCommand(prompt: string, task: Task, agent: Agent): { bin: string; args: string[] } {
     // P1a 静态限权：permissionMode → CLI 沙箱/权限参数；渠道来源任务 trusted 降级为 standard（10.5），autonomous 不降级
-    const mode = task.source === 'channel' && agent.permissionMode === 'trusted' ? 'standard' : agent.permissionMode;
+    // 专家团任务（source='team'）默认完全自主（autonomous），无需人工审批
+    const baseMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    const mode = task.source === 'channel' && baseMode === 'trusted' ? 'standard' : baseMode;
     if (this.kind === 'codex-cli') {
       // codex exec --json：非交互执行，stdout 输出 JSONL 事件流；有 session 则 resume 续跑（P2b）
       const sandbox = mode === 'readonly' ? 'read-only' : (mode === 'trusted' || mode === 'autonomous') ? 'danger-full-access' : 'workspace-write';
@@ -77,7 +79,7 @@ export class CliExecutor implements ExecutorAdapter {
   }
 
   start(task: Task, agent: Agent, cb: ExecutorCallbacks): void {
-    const workspace = agent.workspace || join(app.getPath('userData'), 'workspaces', agent.id);
+    const workspace = task.workspaceOverride || agent.workspace || join(app.getPath('userData'), 'workspaces', agent.id);
     try {
       mkdirSync(workspace, { recursive: true });
     } catch (err) {

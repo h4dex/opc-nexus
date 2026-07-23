@@ -56,9 +56,22 @@ export function Channels() {
                 限制：{c.limitation}
               </div>
 
+              {/* 重连策略可视化：RECONNECTING 状态显示重连信息 */}
+              {c.status === 'RECONNECTING' && (
+                <div style={{ fontSize: 12, color: 'var(--accent)', background: 'var(--accent-soft)', borderRadius: 8, padding: '8px 12px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className="dot orange" style={{ animation: 'pulse 1s infinite' }} />
+                  断线重连中…（指数退避策略：5s → 10s → 30s → 60s，最多重试 20 次后转入 ERROR）
+                </div>
+              )}
+              {c.status === 'ERROR' && (
+                <div style={{ fontSize: 12, color: 'var(--danger)', background: 'var(--danger-soft)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
+                  连接异常，重连已耗尽。请检查凭据或网络后重新配置。
+                </div>
+              )}
+
               <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 12 }}>
                 绑定员工：{c.boundAgentIds.length
-                  ? c.boundAgentIds.map((id) => agentCards.find((a) => a.agent.id === id)?.agent.name ?? id).join('、')
+                  ? [...new Set(c.boundAgentIds)].map((id) => agentCards.find((a) => a.agent.id === id)?.agent.name ?? id).join('、')
                   : '未绑定'}
               </div>
 

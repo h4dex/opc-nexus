@@ -24,6 +24,7 @@ import { ProviderManager } from './services/providerManager.js';
 import { WorkflowEngine } from './services/workflowEngine.js';
 import { WfPlatformManager } from './services/wfPlatformManager.js';
 import { TeamEngine } from './services/teamEngine.js';
+import { CollabManager } from './services/collabManager.js';
 import { WebServer } from './services/webServer.js';
 import { registerIpc } from './ipc.js';
 
@@ -126,18 +127,24 @@ app.whenReady().then(async () => {
   const executors = new ExecutorRegistry(db, broker, providerManager);
   const orchestrator = new Orchestrator(db, executors, broker);
   const monitor = new ResourceMonitor();
+  monitor.setDatabase(db);
   const scheduler = new Scheduler(db, orchestrator);
   const mcpManager = new McpManager(db);
   const skillManager = new SkillManager(db);
   const wfPlatformMgr = new WfPlatformManager(db);
   const workflowEngine = new WorkflowEngine(db, providerManager, wfPlatformMgr);
   const teamEngine = new TeamEngine(db, orchestrator);
+  const collabManager = new CollabManager(db);
   const feishu = new FeishuChannel(db, orchestrator);
     const wecom = new WecomChannel(db, orchestrator, broker);
     const weixin = new WeixinChannel(db, orchestrator, broker);
 
   // 工具循环的委派能力（P3b）与调度保护门禁（11.2）注入
   executors.setToolHost(orchestrator.toolHost());
+  // 浏览器自动化管理器（Playwright/CDP）注入
+  const { BrowserManager } = await import('./services/browserManager.js');
+  const browserMgr = new BrowserManager();
+  executors.setBrowserManager(browserMgr);
   orchestrator.setDispatchGuard(() => monitor.getGuardReason());
   // 阈值来自设置页（settings.thresholds）；新告警边沿推系统通知
   monitor.setThresholdProvider(() => {
@@ -150,6 +157,7 @@ app.whenReady().then(async () => {
   channels.ensureChannels();
   // 先执行崩溃恢复（清理上次异常遗留），再写入种子数据（首次启动），避免种子任务被误标 INTERRUPTED
   orchestrator.recoverAfterRestart();
+  teamEngine.recoverRuns();
   seedIfEmpty(db);
   // 凭据引导文件自动导入（credentials.bootstrap.json → safeStorage，导入后重命名）
   importCredentialsBootstrap(db);
@@ -170,7 +178,7 @@ app.whenReady().then(async () => {
     if (reconnectable.includes(statusOf('ch-weixin'))) void weixin.connect();
   }
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, getMainWindow: () => mainWindow });
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, getMainWindow: () => mainWindow });
 
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });

@@ -275,6 +275,40 @@ export class EngineManager {
     return { ok: true, message: `${entry.name} 已卸载` };
   }
 
+  /** 重启引擎：重新检测指定引擎（Hermes 重新读取供应商配置，CLI 重新定位二进制 + 取版本）。
+   *  用于修改配置后刷新引擎状态，无需重启整个应用。 */
+  async restart(id: string): Promise<EngineInstallResult> {
+    const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (id === 'eng-hermes') {
+      // Hermes：重新检测供应商配置是否就绪
+      this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
+      const ready = providerReady(this.db);
+      return { ok: ready, message: ready ? 'Hermes 引擎已重新加载，供应商配置生效' : 'Hermes 引擎未就绪：请先在设置页完成模型供应商配置' };
+    }
+    if (!entry) {
+      // 外部 ACP 引擎
+      const ext = externalAcpEntries().find((e) => e.id === id);
+      if (!ext) return { ok: false, message: '未知引擎' };
+      const command = acpCommandFor(id);
+      if (!command) return { ok: false, message: '引擎命令未配置' };
+      const probe = await probeAcpEngine(command);
+      this.db.raw.prepare('UPDATE engines SET status = ?, version = ? WHERE id = ?').run(probe.ok ? 'HEALTHY' : 'NOT_INSTALLED', probe.ok ? 'acp' : null, id);
+      return { ok: probe.ok, message: probe.ok ? `${ext.name} 重新连接成功` : `${ext.name} 连接失败，请检查引擎进程` };
+    }
+    // CLI 引擎：重新定位二进制 + 取版本
+    const { bin } = effective(entry);
+    if (!bin) return { ok: false, message: `${entry.name} 不支持重启操作` };
+    const found = await locateBin(bin);
+    if (!found) {
+      this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(id);
+      return { ok: false, message: `${entry.name} 未检测到可执行文件，请确认已安装并在 PATH 中` };
+    }
+    const version = await binVersion(found);
+    this.db.raw.prepare("UPDATE engines SET status = 'HEALTHY', version = ?, path = ? WHERE id = ?").run(version ?? 'unknown', found, id);
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.restart', target: id, result: 'ok' });
+    return { ok: true, message: `${entry.name} 已重新检测（v${version ?? 'unknown'}），配置已生效` };
+  }
+
   /** 查询 npm registry 上的最新版本 */
   async latestVersion(id: string): Promise<string | null> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
@@ -290,12 +324,13 @@ export class EngineManager {
     } catch { return null; }
   }
 
-  /** 系统 Runtime 环境检测：Node.js / npm / Python */
+  /** 系统 Runtime 环境检测：Node.js / npm / Python / Git */
   async checkRuntime(): Promise<{ name: string; installed: boolean; version: string | null; path: string | null }[]> {
     const runtimes = [
       { name: 'Node.js', bin: 'node', args: ['--version'] },
       { name: 'npm', bin: 'npm', args: ['--version'] },
-      { name: 'Python', bin: process.platform === 'win32' ? 'python' : 'python3', args: ['--version'] }
+      { name: 'Python', bin: process.platform === 'win32' ? 'python' : 'python3', args: ['--version'] },
+      { name: 'Git', bin: 'git', args: ['--version'] }
     ];
     const results: { name: string; installed: boolean; version: string | null; path: string | null }[] = [];
     for (const rt of runtimes) {
@@ -345,6 +380,16 @@ export class EngineManager {
       }
     } else if (name === 'npm') {
       return { ok: false, message: 'npm 随 Node.js 一起安装，请先安装 Node.js' };
+    } else if (name === 'Git') {
+      if (isWin) {
+        cmd = 'cmd.exe';
+        args = ['/d', '/s', '/c', 'winget', 'install', 'Git.Git', '--accept-package-agreements', '--accept-source-agreements'];
+      } else if (isLinux) {
+        cmd = '/bin/bash';
+        args = ['-c', 'sudo apt-get update && sudo apt-get install -y git'];
+      } else {
+        cmd = 'brew'; args = ['install', 'git'];
+      }
     } else {
       return { ok: false, message: `不支持自动安装 ${name}` };
     }

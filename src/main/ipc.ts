@@ -20,6 +20,7 @@ import type { ProviderManager } from './services/providerManager.js';
 import type { WorkflowEngine } from './services/workflowEngine.js';
 import type { WfPlatformManager } from './services/wfPlatformManager.js';
 import type { TeamEngine } from './services/teamEngine.js';
+import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
@@ -27,6 +28,17 @@ import type { AppConfig, CreateAgentInput, ScheduleInput, SystemInfo, TodoItem, 
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { app } from 'electron';
+
+/** 轻量级运行时参数校验（防御异常/恶意输入穿透） */
+function assertString(v: unknown, field: string, min = 1, max = 500): string {
+  if (typeof v !== 'string' || v.length < min || v.length > max) {
+    throw new Error(`参数 ${field} 无效（需 ${min}-${max} 字符）`);
+  }
+  return v;
+}
+function assertId(v: unknown, field = 'id'): string {
+  return assertString(v, field, 1, 100);
+}
 
 export interface IpcDeps {
   db: Database;
@@ -46,11 +58,12 @@ export interface IpcDeps {
   workflows: WorkflowEngine;
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
+  collab: CollabManager;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, wfPlatforms, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, wfPlatforms, collab, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -86,9 +99,14 @@ export function registerIpc(deps: IpcDeps) {
   }));
 
   // ---------- 数字员工 ----------
-  ipcMain.handle('aibox:createAgent', (_e, input: CreateAgentInput) => orchestrator.createAgent(input));
-  ipcMain.handle('aibox:startAgent', (_e, id: string) => orchestrator.startAgent(id));
-  ipcMain.handle('aibox:stopAgent', (_e, id: string) => orchestrator.stopAgent(id));
+  ipcMain.handle('aibox:createAgent', (_e, input: CreateAgentInput) => {
+    assertString(input?.name, 'name', 2, 30);
+    assertString(input?.role, 'role', 2, 500);
+    assertString(input?.engineId, 'engineId', 1, 100);
+    return orchestrator.createAgent(input);
+  });
+  ipcMain.handle('aibox:startAgent', (_e, id: string) => orchestrator.startAgent(assertId(id)));
+  ipcMain.handle('aibox:stopAgent', (_e, id: string) => orchestrator.stopAgent(assertId(id)));
   // 助手人设编辑（soul.md / agents.md / user.md / 权限模式）
   ipcMain.handle('aibox:updateAgentPersona', (_e, id: string, patch: AgentPersonaPatch) => {
     const a = orchestrator.updateAgentPersona(id, patch);
@@ -125,6 +143,13 @@ export function registerIpc(deps: IpcDeps) {
     const r = orchestrator.chatWithAgent(agentId, message, conversationId);
     pushSnapshot();
     return r;
+  });
+  // 会话管理：重命名 / 删除
+  ipcMain.handle('aibox:renameConversation', (_e, id: string, title: string) => {
+    db.raw.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, id);
+  });
+  ipcMain.handle('aibox:deleteConversation', (_e, id: string) => {
+    db.raw.prepare('DELETE FROM conversations WHERE id = ?').run(id);
   });
   // 用量统计
   ipcMain.handle('aibox:getUsageStats', () => orchestrator.usageStats());
@@ -197,6 +222,7 @@ export function registerIpc(deps: IpcDeps) {
     return r;
   });
   ipcMain.handle('aibox:getWorkflowRunState', (_e, id: string) => workflows.getRunState(id));
+  ipcMain.handle('aibox:listWorkflowRuns', (_e, id: string) => workflows.listRuns(id));
   ipcMain.handle('aibox:publishWorkflowAsSkill', (_e, id: string) => {
     const r = workflows.publishAsSkill(id);
     pushSnapshot();
@@ -207,6 +233,14 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return r;
   });
+  ipcMain.handle('aibox:exportWorkflow', (_e, id: string) => workflows.exportWorkflow(id));
+  ipcMain.handle('aibox:importWorkflow', (_e, json: string) => {
+    const r = workflows.importWorkflow(json);
+    if (r.ok) pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:validateWorkflow', (_e, wf: { nodes: unknown[]; edges: unknown[] }) => workflows.validate(wf as { nodes: never[]; edges: never[] }));
+  ipcMain.handle('aibox:saveWfVariables', (_e, wfId: string, variables: unknown[]) => workflows.saveVariables(wfId, variables as never[]));
   // ---------- 外部工作流平台（Coze / Dify） ----------
   ipcMain.handle('aibox:listWfPlatforms', () => wfPlatforms.list());
   ipcMain.handle('aibox:saveWfPlatform', (_e, input: { id?: string; name: string; baseUrl: string; token?: string }) => wfPlatforms.save(input));
@@ -215,21 +249,22 @@ export function registerIpc(deps: IpcDeps) {
 
   // ---------- 专家团 ----------
   ipcMain.handle('aibox:listTeams', () => teams.list());
-  ipcMain.handle('aibox:createTeam', (_e, input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable' }) => teams.create(input));
-  ipcMain.handle('aibox:updateTeam', (_e, id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable' }) => teams.update(id, patch));
+  ipcMain.handle('aibox:createTeam', (_e, input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }) => teams.create(input));
+  ipcMain.handle('aibox:updateTeam', (_e, id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }) => teams.update(id, patch));
   ipcMain.handle('aibox:removeTeam', (_e, id: string) => teams.remove(id));
   ipcMain.handle('aibox:triggerTeam', (_e, id: string, task: string) => {
     const r = teams.trigger(id, task);
     pushSnapshot();
     return r;
   });
+  ipcMain.handle('aibox:getTeamRuns', (_e, teamId: string) => teams.listRuns(assertId(teamId, 'teamId')));
 
   // ---------- 任务 ----------
-  ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string) => orchestrator.createTask(agentId, title));
-  ipcMain.handle('aibox:cancelTask', (_e, id: string) => orchestrator.cancelTask(id));
-  ipcMain.handle('aibox:pauseTask', (_e, id: string) => orchestrator.pauseTask(id));
-  ipcMain.handle('aibox:resumeTask', (_e, id: string) => orchestrator.resumeTask(id));
-  ipcMain.handle('aibox:decideApproval', (_e, id: string, approve: boolean) => orchestrator.decideApproval(id, approve));
+  ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string) => orchestrator.createTask(assertId(agentId, 'agentId'), assertString(title, 'title', 1, 500)));
+  ipcMain.handle('aibox:cancelTask', (_e, id: string) => orchestrator.cancelTask(assertId(id)));
+  ipcMain.handle('aibox:pauseTask', (_e, id: string) => orchestrator.pauseTask(assertId(id)));
+  ipcMain.handle('aibox:resumeTask', (_e, id: string) => orchestrator.resumeTask(assertId(id)));
+  ipcMain.handle('aibox:decideApproval', (_e, id: string, approve: boolean) => orchestrator.decideApproval(assertId(id), approve === true));
   // 追问/续跑（P2b）：新任务继承会话锚点
   ipcMain.handle('aibox:createFollowUpTask', (_e, parentTaskId: string, title: string) => orchestrator.createFollowUpTask(parentTaskId, title));
   // 任务详情：事件时间线 + 产物全文（13.2 审计可追溯）
@@ -261,6 +296,11 @@ export function registerIpc(deps: IpcDeps) {
     return r;
   });
   ipcMain.handle('aibox:getEngineLatestVersion', (_e, id: string) => engines.latestVersion(id));
+  ipcMain.handle('aibox:restartEngine', async (_e, id: string) => {
+    const r = await engines.restart(assertId(id));
+    pushSnapshot();
+    return r;
+  });
   ipcMain.handle('aibox:checkRuntime', () => engines.checkRuntime());
   ipcMain.handle('aibox:installRuntime', async (_e, name: string) => {
     const r = await engines.installRuntime(name);
@@ -269,6 +309,19 @@ export function registerIpc(deps: IpcDeps) {
   });
   ipcMain.handle('aibox:openExternal', (_e, url: string) => {
     if (/^https:\/\//.test(url)) void shell.openExternal(url); // 外链一律系统浏览器，仅放行 https
+  });
+  // 打开产物目录 / 工作目录（系统资源管理器）
+  ipcMain.handle('aibox:openTaskWorkspace', async (_e, taskId: string) => {
+    const ws = orchestrator.resolveTaskWorkspace(assertId(taskId, 'taskId'));
+    if (!ws) return { ok: false, message: '无法定位产物目录' };
+    const err = await shell.openPath(ws);
+    return err ? { ok: false, message: err } : { ok: true, message: '' };
+  });
+  ipcMain.handle('aibox:openAgentWorkspace', async (_e, agentId: string) => {
+    const ws = orchestrator.resolveAgentWorkspace(assertId(agentId, 'agentId'));
+    if (!ws) return { ok: false, message: '无法定位工作目录' };
+    const err = await shell.openPath(ws);
+    return err ? { ok: false, message: err } : { ok: true, message: '' };
   });
   ipcMain.handle('aibox:authEngine', (_e, id: string) => {
     engines.markAuthed(id);
@@ -358,6 +411,9 @@ export function registerIpc(deps: IpcDeps) {
   // ---------- 设置 ----------
   ipcMain.handle('aibox:getSetting', (_e, key: string) => db.getSetting(key, null));
   ipcMain.handle('aibox:setSetting', (_e, key: string, value: unknown) => db.setSetting(key, value));
+  // 数据库维护：完整性检查 + 手动清理
+  ipcMain.handle('aibox:integrityCheck', () => db.integrityCheck());
+  ipcMain.handle('aibox:manualCleanup', () => { db.cleanupRetention(); return { ok: true, message: '数据清理完成' }; });
   // 窗口控制：全屏切换
   ipcMain.handle('aibox:toggleFullscreen', () => {
     const win = getMainWindow();
@@ -382,6 +438,35 @@ export function registerIpc(deps: IpcDeps) {
     db.audit({ id: randomUUID(), actor: 'admin', action: 'secret.store', target: ref, result: 'ok' });
   });
   ipcMain.handle('aibox:hasSecret', (_e, ref: string) => db.getSetting<string | null>(`secret:${ref}`, null) !== null);
+
+  // ---------- 多机协同 ----------
+  ipcMain.handle('aibox:collab:checkGit', async () => {
+    const runtimes = await engines.checkRuntime();
+    return runtimes.find((r) => r.name === 'Git') ?? { name: 'Git', installed: false, version: null, path: null };
+  });
+  ipcMain.handle('aibox:collab:installGit', () => engines.installRuntime('Git'));
+  ipcMain.handle('aibox:collab:listWorkspaces', () => collab.listWorkspaces());
+  ipcMain.handle('aibox:collab:createWorkspace', (_e, input: { name: string; repoPath: string; conventions?: string; gitRules?: string; mcpPort?: number; gitPort?: number }) => {
+    assertString(input?.name, 'name', 1, 50);
+    assertString(input?.repoPath, 'repoPath', 1, 500);
+    return collab.createWorkspace(input);
+  });
+  ipcMain.handle('aibox:collab:removeWorkspace', (_e, id: string) => collab.removeWorkspace(assertId(id)));
+  ipcMain.handle('aibox:collab:startWorkspace', (_e, id: string) => collab.startWorkspace(assertId(id)));
+  ipcMain.handle('aibox:collab:stopWorkspace', (_e, id: string) => { collab.stopWorkspace(assertId(id)); });
+  ipcMain.handle('aibox:collab:listTasks', (_e, workspaceId: string) => collab.listTasks(assertId(workspaceId, 'workspaceId')));
+  ipcMain.handle('aibox:collab:createTask', (_e, workspaceId: string, input: { title: string; description?: string; branchName?: string }) => {
+    assertString(input?.title, 'title', 1, 200);
+    return collab.createTask(assertId(workspaceId, 'workspaceId'), input);
+  });
+  ipcMain.handle('aibox:collab:reviewTask', (_e, taskId: string, result: 'accept' | 'reject', comment: string) => {
+    return collab.reviewTask(assertId(taskId, 'taskId'), result, comment ?? '');
+  });
+  ipcMain.handle('aibox:collab:listAgents', (_e, workspaceId: string) => collab.listAgents(assertId(workspaceId, 'workspaceId')));
+  ipcMain.handle('aibox:collab:getConnectInfo', (_e, workspaceId: string) => collab.getConnectInfo(assertId(workspaceId, 'workspaceId')));
+  ipcMain.handle('aibox:collab:updateRules', (_e, id: string, patch: { conventions?: string; gitRules?: string }) => {
+    collab.updateRules(assertId(id), patch);
+  });
 }
 
 function buildSnapshot(deps: IpcDeps) {

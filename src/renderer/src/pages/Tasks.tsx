@@ -1,16 +1,19 @@
 /** 任务中心（PRD 5 信息架构 / 8.x 审批与失败处理） */
 import { useEffect, useState } from 'react';
 import { useApp } from '../store';
-import { TASK_STATUS_META, Modal, ProgressBar } from '../components/common';
+import { TASK_STATUS_META, Modal, ProgressBar, ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconCheck, IconPause, IconPlay, IconStop, IconX } from '../components/icons';
 import type { Task, TaskEvent } from '@shared/types';
 
 type TabKey = 'active' | 'approval' | 'done';
 
+interface CtxState { x: number; y: number; task: Task }
+
 export function Tasks() {
   const { snapshot } = useApp();
   const [tab, setTab] = useState<TabKey>('active');
   const [detailId, setDetailId] = useState<string | null>(null);
+  const [ctx, setCtx] = useState<CtxState | null>(null);
   if (!snapshot) return null;
 
   const { tasks, approvals, agentCards } = snapshot;
@@ -21,6 +24,23 @@ export function Tasks() {
   const done = tasks.filter((t) => ['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(t.status));
 
   const list: Task[] = tab === 'active' ? active : tab === 'approval' ? waiting : done;
+
+  /** 右键菜单：根据任务状态动态生成菜单项 */
+  const ctxItems = (t: Task): CtxMenuItem[] => {
+    const items: CtxMenuItem[] = [
+      { label: '查看详情', onClick: () => setDetailId(t.id) },
+      { label: '打开产物目录', onClick: () => void window.aibox.openTaskWorkspace(t.id) },
+    ];
+    if (['COMPLETED', 'FAILED'].includes(t.status)) {
+      items.push({ label: '追问 / 续跑', onClick: () => setDetailId(t.id) });
+    }
+    if (t.status === 'RUNNING') items.push({ label: '暂停', onClick: () => void window.aibox.pauseTask(t.id) });
+    if (t.status === 'PAUSED') items.push({ label: '继续', onClick: () => void window.aibox.resumeTask(t.id) });
+    if (['RUNNING', 'PAUSED', 'QUEUED'].includes(t.status)) {
+      items.push({ divider: true, label: '', onClick: () => {} }, { label: '取消任务', danger: true, onClick: () => void window.aibox.cancelTask(t.id) });
+    }
+    return items;
+  };
 
   return (
     <>
@@ -75,7 +95,8 @@ export function Tasks() {
             {list.map((t) => {
               const meta = TASK_STATUS_META[t.status];
               return (
-                <tr key={t.id} style={{ cursor: 'pointer' }} onClick={() => setDetailId(t.id)}>
+                <tr key={t.id} style={{ cursor: 'pointer' }} onClick={() => setDetailId(t.id)}
+                  onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, task: t }); }}>
                   <td style={{ fontWeight: 550 }}>{t.title}</td>
                   <td>{agentName.get(t.agentId) ?? '—'}</td>
                   <td><span className="tag gray">{sourceLabel(t.source)}</span></td>
@@ -116,6 +137,8 @@ export function Tasks() {
             onOpen={setDetailId} onClose={() => setDetailId(null)} />
         ) : null;
       })()}
+
+      {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.task)} onClose={() => setCtx(null)} />}
     </>
   );
 }
@@ -255,5 +278,5 @@ function TaskDetailModal({ task, tasks, agentName, onOpen, onClose }: {
 }
 
 function sourceLabel(s: Task['source']): string {
-  return { desktop: '桌面', channel: '消息渠道', schedule: '定时', webhook: 'Webhook', delegated: '子代理' }[s];
+  return { desktop: '桌面', channel: '消息渠道', schedule: '定时', webhook: 'Webhook', delegated: '子代理', team: '专家团' }[s];
 }

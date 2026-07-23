@@ -6,15 +6,21 @@
  */
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, resolve, sep } from 'node:path';
+import { execFile } from 'node:child_process';
 import type { Task } from '../../../shared/types.js';
 
 export type ToolRisk = 'safe' | 'write' | 'danger';
+
+/** 工具所需能力标签（与 AgentCapabilities 字段对应，未标记则无额外要求） */
+export type ToolCapability = 'network' | 'shell' | 'install' | 'browser' | 'computer';
 
 export interface ToolContext {
   workspace: string;
   agentId: string;
   taskId: string;
   host: ToolHost | null;
+  /** 浏览器管理器（browser 能力工具使用，由执行器注入） */
+  browserMgr?: import('../browserManager.js').BrowserManager | null;
 }
 
 /** 编排器能力注入（委托创建/等待子任务），由 main 装配 */
@@ -34,12 +40,70 @@ export interface ToolDef {
   name: string;
   description: string;
   risk: ToolRisk;
+  /** 需要员工开启对应能力开关才注册该工具（未设置 = 无额外要求） */
+  requiresCapability?: ToolCapability;
   inputSchema: Record<string, unknown>;
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<string>;
 }
 
 const MAX_READ_CHARS = 24_000;
 const MAX_DELEGATE_WAIT_MS = 10 * 60_000;
+
+// ---------- Web 搜索辅助（国内优先：Bing 中国 → DuckDuckGo 回退） ----------
+
+/** Bing 中国搜索（cn.bing.com 国内可达，无需 API Key，抓取 HTML 解析摘要） */
+async function searchBing(query: string): Promise<string | null> {
+  try {
+    const url = `https://cn.bing.com/search?q=${encodeURIComponent(query)}&count=6`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(12_000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36' }
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    // 解析搜索结果：<li class="b_algo"> 内含 <h2><a href="...">title</a></h2> 和 <p>snippet</p>
+    const results: string[] = [];
+    const blocks = html.split(/class="b_algo"/).slice(1, 7);
+    for (const block of blocks) {
+      const titleMatch = block.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+      const snippetMatch = block.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+      if (!titleMatch) continue;
+      const link = titleMatch[1] ?? '';
+      const title = titleMatch[2]?.replace(/<[^>]+>/g, '').trim() ?? '';
+      const snippet = snippetMatch?.[1]?.replace(/<[^>]+>/g, '').trim() ?? '';
+      if (title) results.push(`- ${title}${snippet ? `：${snippet.slice(0, 150)}` : ''}\n  ${link}`);
+    }
+    if (results.length === 0) return null;
+    return `搜索结果（Bing）：\n${results.join('\n')}`;
+  } catch {
+    return null; // 网络不可达时静默回退到下一个搜索源
+  }
+}
+
+/** DuckDuckGo Instant Answer API（海外回退，免费无需 Key） */
+async function searchDuckDuckGo(query: string): Promise<string | null> {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8_000) });
+    if (!res.ok) return null;
+    const data = await res.json() as {
+      AbstractText?: string; AbstractURL?: string; Answer?: string;
+      RelatedTopics?: { Text?: string; FirstURL?: string }[];
+      Results?: { Text?: string; FirstURL?: string }[];
+    };
+    const parts: string[] = [];
+    if (data.Answer) parts.push(`答案：${data.Answer}`);
+    if (data.AbstractText) parts.push(`摘要：${data.AbstractText}\n来源：${data.AbstractURL ?? ''}`);
+    const topics = [...(data.Results ?? []), ...(data.RelatedTopics ?? [])].slice(0, 6);
+    for (const t of topics) {
+      if (t.Text) parts.push(`- ${t.Text}${t.FirstURL ? ` (${t.FirstURL})` : ''}`);
+    }
+    if (parts.length === 0) return null;
+    return parts.join('\n');
+  } catch {
+    return null;
+  }
+}
 
 /** 路径防护：拒绝逃逸 workspace 的任何路径（含 ..、绝对路径指向外部） */
 function resolveInWorkspace(workspace: string, relPath: unknown): string {
@@ -175,37 +239,425 @@ export const TOOLS: ToolDef[] = [
       required: ['query']
     },
     risk: 'safe',
+    requiresCapability: 'network',
     async execute(args) {
       const query = String(args.query ?? '').slice(0, 100);
       if (!query) throw new Error('请提供搜索关键词');
-      // DuckDuckGo Instant Answer API（免费无需 Key）+ HTML 搜索回退
-      try {
-        const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-        const data = await res.json() as {
-          AbstractText?: string; AbstractURL?: string; Answer?: string;
-          RelatedTopics?: { Text?: string; FirstURL?: string }[];
-          Results?: { Text?: string; FirstURL?: string }[];
-        };
-        const parts: string[] = [];
-        if (data.Answer) parts.push(`答案：${data.Answer}`);
-        if (data.AbstractText) parts.push(`摘要：${data.AbstractText}\n来源：${data.AbstractURL ?? ''}`);
-        const topics = [...(data.Results ?? []), ...(data.RelatedTopics ?? [])].slice(0, 6);
-        for (const t of topics) {
-          if (t.Text) parts.push(`- ${t.Text}${t.FirstURL ? ` (${t.FirstURL})` : ''}`);
-        }
-        if (parts.length === 0) return `未找到「${query}」的直接答案，建议尝试更具体的关键词。`;
-        return parts.join('\n');
-      } catch (err) {
-        throw new Error(`搜索失败：${err instanceof Error ? err.message : String(err)}`);
+      // 策略：Bing 中国（国内可达）→ DuckDuckGo（海外回退）
+      const bingResult = await searchBing(query);
+      if (bingResult) return bingResult;
+      const ddgResult = await searchDuckDuckGo(query);
+      if (ddgResult) return ddgResult;
+      return `未找到「${query}」的相关结果，建议尝试更具体的关键词或检查网络连接。`;
+    }
+  },
+  {
+    name: 'http_request',
+    description: '发起 HTTP/HTTPS 网络请求，返回响应体（最多 16000 字符）。支持 GET/POST/PUT/DELETE。',
+    risk: 'write',
+    requiresCapability: 'network',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '完整 URL（http:// 或 https://）' },
+        method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'HTTP 方法，默认 GET' },
+        headers: { type: 'object', description: '请求头（可选）' },
+        body: { type: 'string', description: '请求体（可选，POST/PUT 时使用）' }
+      },
+      required: ['url']
+    },
+    async execute(args) {
+      const url = String(args.url ?? '');
+      if (!/^https?:\/\//i.test(url)) throw new Error('仅允许 http:// 或 https:// 协议的请求');
+      const method = String(args.method ?? 'GET').toUpperCase();
+      const rawHeaders = (args.headers ?? {}) as Record<string, string>;
+      // 清洗 header 值：HTTP 规范要求 header 值为 Latin-1（≤255），非 ASCII 字符需剥离或编码
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(rawHeaders)) {
+        headers[k] = String(v).replace(/[^\x20-\x7E]/g, '').trim() || 'AiBoxDash-Agent';
       }
+      const body = typeof args.body === 'string' ? args.body : undefined;
+      const res = await fetch(url, {
+        method,
+        headers: { 'User-Agent': 'AiBoxDash-Agent/1.0', ...headers },
+        body: method !== 'GET' ? body : undefined,
+        signal: AbortSignal.timeout(30_000)
+      });
+      const text = await res.text();
+      const truncated = text.length > 16_000 ? `${text.slice(0, 16_000)}\n…（已截断，共 ${text.length} 字符）` : text;
+      return `HTTP ${res.status} ${res.statusText}\n${truncated}`;
+    }
+  },
+  {
+    name: 'run_command',
+    description: '在工作目录内执行系统命令（shell），返回 stdout+stderr（最多 16000 字符）。超时 5 分钟。',
+    risk: 'danger',
+    requiresCapability: 'shell',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '要执行的命令（如 dir / ls / node script.js）' },
+        cwd: { type: 'string', description: '工作目录（相对员工 workspace，默认根目录）' }
+      },
+      required: ['command']
+    },
+    async execute(args, ctx) {
+      const command = String(args.command ?? '').trim();
+      if (!command) throw new Error('请提供要执行的命令');
+      const cwd = resolveInWorkspace(ctx.workspace, args.cwd ?? '.');
+      const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/bash';
+      const shellArg = process.platform === 'win32' ? '/c' : '-c';
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(shell, [shellArg, command], { cwd, timeout: 5 * 60_000, maxBuffer: 1024 * 1024, shell: false }, (err, stdout, stderr) => {
+          const out = (stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '');
+          const truncated = out.length > 16_000 ? `${out.slice(0, 16_000)}\n…（已截断）` : out;
+          if (err && !stdout && !stderr) {
+            rejectP(new Error(`命令执行失败：${err.message}`));
+          } else {
+            resolveP(truncated || '（无输出）');
+          }
+        });
+      });
+    }
+  },
+  {
+    name: 'install_package',
+    description: '安装软件包（支持 npm/pip/apt）。用于安装 MCP 工具、Skills 依赖、Python 库等。',
+    risk: 'danger',
+    requiresCapability: 'install',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        manager: { type: 'string', enum: ['npm', 'pip', 'apt'], description: '包管理器' },
+        packages: { type: 'array', items: { type: 'string' }, description: '要安装的包名列表' },
+        global: { type: 'boolean', description: 'npm 是否全局安装（-g），默认 false' },
+        cwd: { type: 'string', description: 'npm 工作目录（相对员工 workspace）' }
+      },
+      required: ['manager', 'packages']
+    },
+    async execute(args, ctx) {
+      const manager = String(args.manager ?? '');
+      const packages = (args.packages ?? []) as string[];
+      if (packages.length === 0) throw new Error('请提供要安装的包名');
+      // 安全校验：包名只允许合法字符
+      for (const pkg of packages) {
+        if (!/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i.test(pkg)) {
+          throw new Error(`包名不合法：${pkg}（仅允许 npm/pip 标准包名字符）`);
+        }
+      }
+      let bin: string, cmdArgs: string[];
+      if (manager === 'npm') {
+        bin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+        const g = args.global ? ['-g'] : [];
+        cmdArgs = ['install', ...g, ...packages];
+      } else if (manager === 'pip') {
+        bin = process.platform === 'win32' ? 'pip' : 'pip3';
+        cmdArgs = ['install', ...packages];
+      } else if (manager === 'apt') {
+        bin = 'apt-get';
+        cmdArgs = ['install', '-y', ...packages];
+      } else {
+        throw new Error(`不支持的包管理器：${manager}（支持 npm/pip/apt）`);
+      }
+      const cwd = manager === 'npm' ? resolveInWorkspace(ctx.workspace, args.cwd ?? '.') : undefined;
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(bin, cmdArgs, { cwd, timeout: 10 * 60_000, maxBuffer: 2 * 1024 * 1024, shell: false }, (err, stdout, stderr) => {
+          const out = (stdout || '') + (stderr ? `\n[stderr]\n${stderr.slice(0, 2000)}` : '');
+          if (err) {
+            rejectP(new Error(`安装失败：${err.message}\n${(stderr || '').slice(0, 500)}`));
+          } else {
+            resolveP(`安装完成：${packages.join(', ')}\n${out.slice(0, 4000)}`);
+          }
+        });
+      });
+    }
+  },
+  // ---------- 浏览器自动化（Playwright / CDP） ----------
+  {
+    name: 'browser_navigate',
+    description: '导航到指定 URL（启动或复用浏览器实例）。返回页面标题。',
+    risk: 'write',
+    requiresCapability: 'browser',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '目标 URL（http:// 或 https://）' },
+        cdp_url: { type: 'string', description: '可选：CDP 直连地址（如 http://127.0.0.1:9222），用于连接已有 Chrome' }
+      },
+      required: ['url']
+    },
+    async execute(args, ctx) {
+      if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
+      return ctx.browserMgr.navigate(ctx.agentId, String(args.url), args.cdp_url ? String(args.cdp_url) : undefined);
+    }
+  },
+  {
+    name: 'browser_click',
+    description: '点击页面上的元素（CSS 选择器）',
+    risk: 'write',
+    requiresCapability: 'browser',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS 选择器（如 button.submit / #login-btn / a[href="/next"]）' }
+      },
+      required: ['selector']
+    },
+    async execute(args, ctx) {
+      if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
+      return ctx.browserMgr.click(ctx.agentId, String(args.selector));
+    }
+  },
+  {
+    name: 'browser_type',
+    description: '在页面输入框中填写文本（CSS 选择器定位）',
+    risk: 'write',
+    requiresCapability: 'browser',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS 选择器（如 input[name="q"] / #search-box）' },
+        text: { type: 'string', description: '要输入的文本' }
+      },
+      required: ['selector', 'text']
+    },
+    async execute(args, ctx) {
+      if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
+      return ctx.browserMgr.type(ctx.agentId, String(args.selector), String(args.text));
+    }
+  },
+  {
+    name: 'browser_screenshot',
+    description: '对当前页面截图，返回截图文件路径。可指定元素选择器截取局部。',
+    risk: 'safe',
+    requiresCapability: 'browser',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: '可选：截取指定元素（CSS 选择器），不填则截全页' }
+      }
+    },
+    async execute(args, ctx) {
+      if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
+      const r = await ctx.browserMgr.screenshot(ctx.agentId, args.selector ? String(args.selector) : undefined);
+      return `截图已保存：${r.path}`;
+    }
+  },
+  {
+    name: 'browser_evaluate',
+    description: '在页面中执行 JavaScript 代码，返回结果。',
+    risk: 'write',
+    requiresCapability: 'browser',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        script: { type: 'string', description: '要执行的 JS 代码（如 document.title / document.querySelectorAll("a").length）' }
+      },
+      required: ['script']
+    },
+    async execute(args, ctx) {
+      if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
+      return ctx.browserMgr.evaluate(ctx.agentId, String(args.script));
+    }
+  },
+  {
+    name: 'browser_get_content',
+    description: '获取当前页面的文本内容（body innerText，最多 16000 字符）',
+    risk: 'safe',
+    requiresCapability: 'browser',
+    inputSchema: { type: 'object', properties: {} },
+    async execute(_args, ctx) {
+      if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
+      return ctx.browserMgr.getContent(ctx.agentId);
+    }
+  },
+  // ---------- Computer Use（桌面操控） ----------
+  {
+    name: 'computer_screenshot',
+    description: '截取当前桌面屏幕，返回截图文件路径。用于观察屏幕内容。',
+    risk: 'safe',
+    requiresCapability: 'computer',
+    inputSchema: { type: 'object', properties: {} },
+    async execute(_args, ctx) {
+      const { join: pJoin } = await import('node:path');
+      const { mkdirSync: mk, readFileSync: rf } = await import('node:fs');
+      const { app: electronApp } = await import('electron');
+      const dir = pJoin(electronApp.getPath('userData'), 'aibox-data', 'screenshots');
+      mk(dir, { recursive: true });
+      const filePath = pJoin(dir, `desktop_${ctx.agentId}_${Date.now()}.png`);
+      // Windows: PowerShell 截屏；Linux: scrot/gnome-screenshot
+      const script = process.platform === 'win32'
+        ? `Add-Type -AssemblyName System.Windows.Forms; $s=[System.Windows.Forms.SystemInformation]::VirtualScreen; $bmp=New-Object System.Drawing.Bitmap($s.Width,$s.Height); $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($s.Location,[System.Drawing.Point]::Empty,$s.Size); $bmp.Save('${filePath.replace(/\\/g, '\\\\')}'); $g.Dispose(); $bmp.Dispose()`
+        : `scrot '${filePath}'`;
+      const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+      const shellArg = process.platform === 'win32' ? '-NoProfile' : '-c';
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(shell, [shellArg, script], { timeout: 15_000, shell: false }, (err) => {
+          if (err) rejectP(new Error(`截屏失败：${err.message}`));
+          else resolveP(`桌面截图已保存：${filePath}`);
+        });
+      });
+    }
+  },
+  {
+    name: 'computer_click',
+    description: '在桌面指定坐标点击鼠标。',
+    risk: 'write',
+    requiresCapability: 'computer',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'X 坐标（像素）' },
+        y: { type: 'number', description: 'Y 坐标（像素）' },
+        button: { type: 'string', enum: ['left', 'right'], description: '鼠标按键，默认 left' }
+      },
+      required: ['x', 'y']
+    },
+    async execute(args) {
+      const x = Number(args.x) || 0;
+      const y = Number(args.y) || 0;
+      const button = String(args.button ?? 'left');
+      const script = process.platform === 'win32'
+        ? `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x},${y}); Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class MouseSim {
+  [DllImport("user32.dll")] public static extern void mouse_event(int f,int x,int y,int d,int i);
+  public static void Click(bool right){
+    int down = right?0x0008:0x0002; int up = right?0x0010:0x0004;
+    mouse_event(down,0,0,0,0); mouse_event(up,0,0,0,0);
+  }
+}
+'@; [MouseSim]::Click(${button === 'right' ? '$true' : '$false'})`
+        : `xdotool mousemove ${x} ${y} click ${button === 'right' ? 3 : 1}`;
+      const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+      const shellArg = process.platform === 'win32' ? '-NoProfile' : '-c';
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(shell, [shellArg, script], { timeout: 10_000, shell: false }, (err) => {
+          if (err) rejectP(new Error(`点击失败：${err.message}`));
+          else resolveP(`已在 (${x}, ${y}) 执行${button === 'right' ? '右键' : '左键'}点击`);
+        });
+      });
+    }
+  },
+  {
+    name: 'computer_type',
+    description: '模拟键盘输入文本（在当前焦点位置）',
+    risk: 'write',
+    requiresCapability: 'computer',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: '要输入的文本' }
+      },
+      required: ['text']
+    },
+    async execute(args) {
+      const text = String(args.text ?? '');
+      if (!text) throw new Error('请提供要输入的文本');
+      // Windows: SendKeys；Linux: xdotool
+      const escaped = text.replace(/[+^%~(){}[\]]/g, '{$&}');
+      const script = process.platform === 'win32'
+        ? `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped.replace(/'/g, "''")}')`
+        : `xdotool type --clearmodifiers '${text.replace(/'/g, "'\\''")}'`;
+      const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+      const shellArg = process.platform === 'win32' ? '-NoProfile' : '-c';
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(shell, [shellArg, script], { timeout: 10_000, shell: false }, (err) => {
+          if (err) rejectP(new Error(`输入失败：${err.message}`));
+          else resolveP(`已输入 ${text.length} 个字符`);
+        });
+      });
+    }
+  },
+  {
+    name: 'computer_key',
+    description: '模拟按键组合（如 Ctrl+C、Enter、Alt+Tab）',
+    risk: 'write',
+    requiresCapability: 'computer',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        keys: { type: 'string', description: '按键组合（如 Enter / Ctrl+C / Alt+Tab / Ctrl+Shift+S）' }
+      },
+      required: ['keys']
+    },
+    async execute(args) {
+      const keys = String(args.keys ?? '');
+      if (!keys) throw new Error('请提供按键组合');
+      // 转换为 SendKeys 格式：Ctrl→^, Alt→%, Shift→+
+      const sendkeys = keys
+        .replace(/Ctrl/i, '^').replace(/Alt/i, '%').replace(/Shift/i, '+')
+        .replace(/\+/g, '+').replace(/Enter/i, '{ENTER}').replace(/Tab/i, '{TAB}')
+        .replace(/Escape|Esc/i, '{ESC}').replace(/Backspace/i, '{BS}')
+        .replace(/Delete|Del/i, '{DEL}').replace(/Space/i, ' ');
+      const script = process.platform === 'win32'
+        ? `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${sendkeys.replace(/'/g, "''")}')`
+        : `xdotool key '${keys.toLowerCase().replace(/ctrl/g, 'ctrl').replace(/alt/g, 'alt').replace(/shift/g, 'shift')}'`;
+      const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+      const shellArg = process.platform === 'win32' ? '-NoProfile' : '-c';
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(shell, [shellArg, script], { timeout: 10_000, shell: false }, (err) => {
+          if (err) rejectP(new Error(`按键失败：${err.message}`));
+          else resolveP(`已执行按键：${keys}`);
+        });
+      });
+    }
+  },
+  {
+    name: 'computer_scroll',
+    description: '在指定坐标滚动鼠标滚轮',
+    risk: 'write',
+    requiresCapability: 'computer',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'X 坐标' },
+        y: { type: 'number', description: 'Y 坐标' },
+        direction: { type: 'string', enum: ['up', 'down'], description: '滚动方向' },
+        clicks: { type: 'number', description: '滚动格数（默认 3）' }
+      },
+      required: ['x', 'y', 'direction']
+    },
+    async execute(args) {
+      const x = Number(args.x) || 0;
+      const y = Number(args.y) || 0;
+      const dir = String(args.direction ?? 'down');
+      const clicks = Number(args.clicks) || 3;
+      const script = process.platform === 'win32'
+        ? `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x},${y}); Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class WheelSim {
+  [DllImport("user32.dll")] public static extern void mouse_event(int f,int x,int y,int d,int i);
+  public static void Scroll(int delta){ mouse_event(0x0800,0,0,delta,0); }
+}
+'@; [WheelSim]::Scroll(${dir === 'up' ? clicks * 120 : -(clicks * 120)})`
+        : `xdotool mousemove ${x} ${y} click ${dir === 'up' ? 4 : 5}`;
+      const shell = process.platform === 'win32' ? 'powershell.exe' : '/bin/bash';
+      const shellArg = process.platform === 'win32' ? '-NoProfile' : '-c';
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(shell, [shellArg, script], { timeout: 10_000, shell: false }, (err) => {
+          if (err) rejectP(new Error(`滚动失败：${err.message}`));
+          else resolveP(`已在 (${x}, ${y}) 向${dir === 'up' ? '上' : '下'}滚动 ${clicks} 格`);
+        });
+      });
     }
   }
 ];
 
-/** 按权限模式过滤可注册工具：readonly 仅 safe；standard/trusted/autonomous 全量 */
-export function toolsForPermission(mode: 'readonly' | 'standard' | 'trusted' | 'autonomous'): ToolDef[] {
-  return mode === 'readonly' ? TOOLS.filter((t) => t.risk === 'safe') : TOOLS;
+/** 按权限模式 + 能力开关过滤可注册工具 */
+export function toolsForPermission(
+  mode: 'readonly' | 'standard' | 'trusted' | 'autonomous',
+  capabilities?: { network?: boolean; shell?: boolean; install?: boolean; browser?: boolean; computer?: boolean }
+): ToolDef[] {
+  let tools = mode === 'readonly' ? TOOLS.filter((t) => t.risk === 'safe') : TOOLS;
+  // 能力开关过滤：未开启对应能力的工具不注册给 LLM
+  if (capabilities) {
+    tools = tools.filter((t) => {
+      if (!t.requiresCapability) return true;
+      return capabilities[t.requiresCapability] === true;
+    });
+  }
+  return tools;
 }
 
 /** OpenAI function calling 声明格式 */

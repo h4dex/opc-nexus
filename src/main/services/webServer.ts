@@ -2,13 +2,16 @@
  * 本地 Web 管理服务器：支持局域网远程访问，用于工控机无人值守场景。
  * - 复用 renderer 构建产物作为前端页面（与桌面端完全一致的 UI）
  * - REST API 镜像关键 IPC 通道（供应商/员工/渠道/引擎/设置）
- * - 简单 Token 认证（Bearer token，可在设置页配置，默认 aibox-admin）
- * - 监听 0.0.0.0:PORT（默认 3210，可配置）
+ * - Token 认证（Bearer token，可在设置页配置，默认 aibox-admin）
+ * - 会话 Token 过期机制：登录后颁发 session token，默认 24h 过期
+ * - 请求频率限制：单 IP 每分钟最多 120 次请求，认证接口每分钟 10 次
+ * - 监听 0.0.0.0:PORT（默认 28889，可配置）
  * - 主进程启动时自动开启，与桌面窗口并行运行
  */
 import express from 'express';
 import cors from 'cors';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
 import type { EngineManager } from './engineManager.js';
@@ -33,10 +36,23 @@ export interface WebServerDeps {
 
 const DEFAULT_PORT = 28889;
 const DEFAULT_TOKEN = 'aibox-admin';
+/** 会话 Token 过期时间（默认 24 小时） */
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+/** 通用接口频率限制：单 IP 每分钟最多请求数 */
+const RATE_LIMIT_PER_MIN = 120;
+/** 认证接口频率限制：单 IP 每分钟最多尝试次数 */
+const AUTH_RATE_LIMIT_PER_MIN = 10;
+
+interface SessionEntry { token: string; expiresAt: number; }
+interface RateBucket { count: number; resetAt: number; }
 
 export class WebServer {
   private app: ReturnType<typeof express> | null = null;
   private server: ReturnType<ReturnType<typeof express>['listen']> | null = null;
+  /** 活跃会话 Token 池（内存，重启后失效需重新登录） */
+  private sessions = new Map<string, SessionEntry>();
+  /** 频率限制桶（key = ip 或 ip:auth） */
+  private rateBuckets = new Map<string, RateBucket>();
 
   constructor(private deps: WebServerDeps) {}
 
@@ -48,24 +64,57 @@ export class WebServer {
     return this.deps.db.getSetting<string>('webToken', DEFAULT_TOKEN);
   }
 
+  /** 频率限制检查（滑动窗口简化为固定窗口） */
+  private checkRate(key: string, limit: number): boolean {
+    const now = Date.now();
+    const bucket = this.rateBuckets.get(key);
+    if (!bucket || now >= bucket.resetAt) {
+      this.rateBuckets.set(key, { count: 1, resetAt: now + 60_000 });
+      return true;
+    }
+    bucket.count++;
+    return bucket.count <= limit;
+  }
+
+  /** 清理过期会话和频率桶（每 5 分钟） */
+  private startCleanup() {
+    setInterval(() => {
+      const now = Date.now();
+      for (const [k, v] of this.sessions) { if (now >= v.expiresAt) this.sessions.delete(k); }
+      for (const [k, v] of this.rateBuckets) { if (now >= v.resetAt) this.rateBuckets.delete(k); }
+    }, 5 * 60_000);
+  }
+
   start() {
     const { db, orchestrator, engines, channels, providers, mcp, skills, teams } = this.deps;
     const app = express();
     this.app = app;
+    this.startCleanup();
 
     app.use(cors());
     app.use(express.json());
 
-    // Token 认证中间件（静态资源和健康检查免认证）
+    // 全局频率限制中间件
     app.use((req, res, next) => {
-      if (req.path === '/api/health' || req.path.startsWith('/assets/') || req.path === '/' || req.path === '/index.html') {
+      const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+      if (!this.checkRate(ip, RATE_LIMIT_PER_MIN)) {
+        return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
+      }
+      next();
+    });
+
+    // Token 认证中间件（静态资源、健康检查、登录接口免认证）
+    app.use((req, res, next) => {
+      if (req.path === '/api/health' || req.path === '/api/login' || req.path.startsWith('/assets/') || req.path === '/' || req.path === '/index.html') {
         return next();
       }
       const auth = req.headers.authorization;
-      if (auth !== `Bearer ${this.token}`) {
-        return res.status(401).json({ error: '未授权：请提供有效的 Access Token' });
-      }
-      next();
+      const bearerToken = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+      // 支持永久 Token（设置页配置的原始 token）或会话 Token
+      if (bearerToken === this.token) return next();
+      const session = bearerToken ? this.sessions.get(bearerToken) : null;
+      if (session && Date.now() < session.expiresAt) return next();
+      return res.status(401).json({ error: '未授权：请提供有效的 Access Token 或先登录获取会话 Token' });
     });
 
     // 静态文件：复用 renderer 构建产物
@@ -81,6 +130,21 @@ export class WebServer {
     // 健康检查（免认证）
     app.get('/api/health', (_req, res) => {
       res.json({ ok: true, version: '1.0.0', agents: orchestrator.listAgents().length });
+    });
+
+    // 登录：用永久 Token 换取有时效的会话 Token（防暴力破解）
+    app.post('/api/login', (req, res) => {
+      const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+      if (!this.checkRate(`${ip}:auth`, AUTH_RATE_LIMIT_PER_MIN)) {
+        return res.status(429).json({ error: '登录尝试过于频繁，请 1 分钟后再试' });
+      }
+      const { token } = req.body as { token?: string };
+      if (token !== this.token) {
+        return res.status(401).json({ error: 'Token 无效' });
+      }
+      const sessionToken = randomBytes(32).toString('hex');
+      this.sessions.set(sessionToken, { token: sessionToken, expiresAt: Date.now() + SESSION_TTL_MS });
+      res.json({ ok: true, sessionToken, expiresAt: Date.now() + SESSION_TTL_MS });
     });
 
     // 快照（完整状态）

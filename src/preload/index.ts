@@ -7,7 +7,9 @@ import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
   ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
-  WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent
+  WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
+  CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
+  TeamRun
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -47,6 +49,10 @@ const api = {
   /** 发送消息给助手（创建/继续会话） */
   chatWithAgent: (agentId: string, message: string, conversationId?: string): Promise<{ conversationId: string; task: Task }> =>
     ipcRenderer.invoke('aibox:chatWithAgent', agentId, message, conversationId),
+  /** 会话重命名 */
+  renameConversation: (id: string, title: string): Promise<void> => ipcRenderer.invoke('aibox:renameConversation', id, title),
+  /** 删除会话 */
+  deleteConversation: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteConversation', id),
   /** Token / 模型调用统计 */
   getUsageStats: (): Promise<{ total: { input: number; output: number; total: number }; byModel: { model: string; input: number; output: number; total: number; count: number }[]; recent: { id: string; agentId: string; model: string; input: number; output: number; total: number; createdAt: number }[] }> =>
     ipcRenderer.invoke('aibox:getUsageStats'),
@@ -97,6 +103,11 @@ const api = {
   getWorkflowRunState: (id: string): Promise<{ nodeId: string; status: string }[] | null> => ipcRenderer.invoke('aibox:getWorkflowRunState', id),
   publishWorkflowAsSkill: (id: string): Promise<{ ok: boolean; message: string; skillId?: string }> => ipcRenderer.invoke('aibox:publishWorkflowAsSkill', id),
   unpublishWorkflowSkill: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:unpublishWorkflowSkill', id),
+  listWorkflowRuns: (id: string): Promise<{ id: string; workflowId: string; status: string; error: string | null; nodeResults: Record<string, { status: string; output?: string; error?: string }>; startedAt: number; endedAt: number | null; durationMs: number | null }[]> => ipcRenderer.invoke('aibox:listWorkflowRuns', id),
+  exportWorkflow: (id: string): Promise<string | null> => ipcRenderer.invoke('aibox:exportWorkflow', id),
+  importWorkflow: (json: string): Promise<{ ok: boolean; message: string; workflow?: WorkflowDef }> => ipcRenderer.invoke('aibox:importWorkflow', json),
+  validateWorkflow: (wf: { nodes: unknown[]; edges: unknown[] }): Promise<{ valid: boolean; errors: string[]; warnings: string[] }> => ipcRenderer.invoke('aibox:validateWorkflow', wf),
+  saveWfVariables: (wfId: string, variables: { name: string; defaultValue: string; description?: string }[]): Promise<void> => ipcRenderer.invoke('aibox:saveWfVariables', wfId, variables),
   // 外部工作流平台（Coze / Dify）
   listWfPlatforms: (): Promise<WfPlatformConfig[]> => ipcRenderer.invoke('aibox:listWfPlatforms'),
   saveWfPlatform: (input: { id?: string; name: string; baseUrl: string; token?: string }): Promise<WfPlatformConfig> => ipcRenderer.invoke('aibox:saveWfPlatform', input),
@@ -104,11 +115,12 @@ const api = {
   testWfPlatform: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:testWfPlatform', id),
 
   // 专家团
-  listTeams: (): Promise<{ id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; createdAt: number }[]> => ipcRenderer.invoke('aibox:listTeams'),
-  createTeam: (input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable' }): Promise<unknown> => ipcRenderer.invoke('aibox:createTeam', input),
-  updateTeam: (id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable' }): Promise<void> => ipcRenderer.invoke('aibox:updateTeam', id, patch),
+  listTeams: (): Promise<{ id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; workspace: string; createdAt: number }[]> => ipcRenderer.invoke('aibox:listTeams'),
+  createTeam: (input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }): Promise<unknown> => ipcRenderer.invoke('aibox:createTeam', input),
+  updateTeam: (id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }): Promise<void> => ipcRenderer.invoke('aibox:updateTeam', id, patch),
   removeTeam: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeam', id),
-  triggerTeam: (id: string, task: string): Promise<{ ok: boolean; message: string; finalTaskId?: string }> => ipcRenderer.invoke('aibox:triggerTeam', id, task),
+  triggerTeam: (id: string, task: string): Promise<{ ok: boolean; message: string; runId?: string }> => ipcRenderer.invoke('aibox:triggerTeam', id, task),
+  getTeamRuns: (teamId: string): Promise<TeamRun[]> => ipcRenderer.invoke('aibox:getTeamRuns', teamId),
 
   // 任务
   createTask: (agentId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title),
@@ -132,9 +144,13 @@ const api = {
   updateEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:updateEngine', id),
   uninstallEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:uninstallEngine', id),
   getEngineLatestVersion: (id: string): Promise<string | null> => ipcRenderer.invoke('aibox:getEngineLatestVersion', id),
+  /** 重启引擎：重新检测/加载配置，无需重启应用 */
+  restartEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:restartEngine', id),
   checkRuntime: (): Promise<{ name: string; installed: boolean; version: string | null; path: string | null }[]> => ipcRenderer.invoke('aibox:checkRuntime'),
   installRuntime: (name: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:installRuntime', name),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('aibox:openExternal', url),
+  openTaskWorkspace: (taskId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openTaskWorkspace', taskId),
+  openAgentWorkspace: (agentId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openAgentWorkspace', agentId),
   authEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:authEngine', id),
   setDefaultEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:setDefaultEngine', id),
 
@@ -166,11 +182,30 @@ const api = {
   // 设置 / 目录 / 凭据
   getSetting: (key: string): Promise<unknown> => ipcRenderer.invoke('aibox:getSetting', key),
   setSetting: (key: string, value: unknown): Promise<void> => ipcRenderer.invoke('aibox:setSetting', key, value),
+  /** 数据库完整性检查 */
+  integrityCheck: (): Promise<{ ok: boolean; message: string; repaired: number }> => ipcRenderer.invoke('aibox:integrityCheck'),
+  /** 手动数据清理 */
+  manualCleanup: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:manualCleanup'),
   toggleFullscreen: (): Promise<boolean> => ipcRenderer.invoke('aibox:toggleFullscreen'),
   isFullscreen: (): Promise<boolean> => ipcRenderer.invoke('aibox:isFullscreen'),
   pickDirectory: (): Promise<string | null> => ipcRenderer.invoke('aibox:pickDirectory'),
   storeSecret: (ref: string, secret: string): Promise<void> => ipcRenderer.invoke('aibox:storeSecret', ref, secret),
   hasSecret: (ref: string): Promise<boolean> => ipcRenderer.invoke('aibox:hasSecret', ref),
+
+  // 多机协同
+  collabCheckGit: (): Promise<{ name: string; installed: boolean; version: string | null; path: string | null }> => ipcRenderer.invoke('aibox:collab:checkGit'),
+  collabInstallGit: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:collab:installGit'),
+  collabListWorkspaces: (): Promise<CollabWorkspace[]> => ipcRenderer.invoke('aibox:collab:listWorkspaces'),
+  collabCreateWorkspace: (input: { name: string; repoPath: string; conventions?: string; gitRules?: string; mcpPort?: number; gitPort?: number }): Promise<CollabWorkspace> => ipcRenderer.invoke('aibox:collab:createWorkspace', input),
+  collabRemoveWorkspace: (id: string): Promise<void> => ipcRenderer.invoke('aibox:collab:removeWorkspace', id),
+  collabStartWorkspace: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:collab:startWorkspace', id),
+  collabStopWorkspace: (id: string): Promise<void> => ipcRenderer.invoke('aibox:collab:stopWorkspace', id),
+  collabListTasks: (workspaceId: string): Promise<CollabTask[]> => ipcRenderer.invoke('aibox:collab:listTasks', workspaceId),
+  collabCreateTask: (workspaceId: string, input: { title: string; description?: string; branchName?: string }): Promise<CollabTask> => ipcRenderer.invoke('aibox:collab:createTask', workspaceId, input),
+  collabReviewTask: (taskId: string, result: 'accept' | 'reject', comment: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:collab:reviewTask', taskId, result, comment),
+  collabListAgents: (workspaceId: string): Promise<CollabAgent[]> => ipcRenderer.invoke('aibox:collab:listAgents', workspaceId),
+  collabGetConnectInfo: (workspaceId: string): Promise<CollabConnectInfo | null> => ipcRenderer.invoke('aibox:collab:getConnectInfo', workspaceId),
+  collabUpdateRules: (id: string, patch: { conventions?: string; gitRules?: string }): Promise<void> => ipcRenderer.invoke('aibox:collab:updateRules', id, patch),
 
   // 事件订阅
   onSnapshot: (fn: (s: Snapshot) => void): (() => void) => {

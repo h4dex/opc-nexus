@@ -76,6 +76,9 @@ export class ChannelManager {
   }
 
   bindAgent(channelId: string, agentId: string) {
+    // 幂等绑定：已存在则跳过，避免重复绑定产生多行（导致“绑定员工”重复显示）
+    const existing = this.db.raw.prepare('SELECT id FROM channel_routes WHERE channel_id = ? AND agent_id = ?').get(channelId, agentId);
+    if (existing) return;
     this.db.raw.prepare('INSERT INTO channel_routes(id, channel_id, conversation_key, agent_id, policy) VALUES(?, ?, ?, ?, ?)')
       .run(randomUUID(), channelId, '*', agentId, '{}');
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'channel.bind', target: `${channelId}→${agentId}`, result: 'ok' });

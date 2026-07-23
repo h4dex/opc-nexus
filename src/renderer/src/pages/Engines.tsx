@@ -44,6 +44,12 @@ export function Engines() {
     if (g.url) void window.aibox.openExternal(g.url);
   };
 
+  const restart = async (id: string) => {
+    setInstallMsg((m) => ({ ...m, [id]: { ok: true, message: '正在重新检测引擎…' } }));
+    const r = await window.aibox.restartEngine(id);
+    setInstallMsg((m) => ({ ...m, [id]: r }));
+  };
+
   return (
     <>
       <div className="page-head">
@@ -128,6 +134,11 @@ export function Engines() {
                 )}
                 {e.status === 'AUTH_REQUIRED' && (
                   <button className="btn small primary" onClick={() => void window.aibox.authEngine(e.id)}>登录授权</button>
+                )}
+                {(e.status === 'HEALTHY' || e.status === 'DEGRADED' || e.status === 'SETUP_REQUIRED') && (
+                  <button className="btn small" onClick={() => void restart(e.id)} title="重新检测引擎状态，加载最新配置">
+                    <IconRefresh size={13} />重启引擎
+                  </button>
                 )}
                 {e.status === 'HEALTHY' && !e.isDefault && (
                   <button className="btn small" onClick={() => void window.aibox.setDefaultEngine(e.id)}>设为默认</button>

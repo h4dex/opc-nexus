@@ -18,7 +18,7 @@ import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
 
 const TIMEOUT_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
-const MAX_ROUNDS = 15;
+const MAX_ROUNDS = 30;
 
 interface RunningRun {
   controller: AbortController;
@@ -43,11 +43,16 @@ export class LlmApiExecutor implements ExecutorAdapter {
   readonly kind: ExecutorKind = 'llm-api';
   private running = new Map<string, RunningRun>();
   private host: ToolHost | null = null;
+  private browserMgr: import('../browserManager.js').BrowserManager | null = null;
 
   constructor(private db: Database, private broker: ApprovalBroker, private providerMgr?: ProviderManager) {}
 
   setToolHost(host: ToolHost) {
     this.host = host;
+  }
+
+  setBrowserManager(mgr: import('../browserManager.js').BrowserManager) {
+    this.browserMgr = mgr;
   }
 
   private config(): ProviderSettings {
@@ -152,7 +157,9 @@ export class LlmApiExecutor implements ExecutorAdapter {
     const sessionId = task.sessionId ?? `llm-${randomUUID()}`;
     if (!task.sessionId) cb.onSession?.(task.id, sessionId);
 
-    const tools = toolsForPermission(agent.permissionMode);
+    // 专家团任务（source='team'）默认完全自主，无需人工审批，由 AI 自助判断
+    const effectivePermission = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    const tools = toolsForPermission(effectivePermission, agent.capabilities);
     const userPrompt = `当前任务：${task.title}\n请执行该任务并输出结构化结果（Markdown）。`;
 
     // 组合人设 system prompt：soul.md + agents.md + user.md + 基础 prompt + 绑定 skills
@@ -256,14 +263,23 @@ export class LlmApiExecutor implements ExecutorAdapter {
       return msg;
     }
 
-    // 审批门禁：autonomous 完全跳过；standard 的写/删工具必须人工批准；渠道任务写类工具一律审批（不受 trusted 豁免，但受 autonomous 豁免）
-    const channelStrict = task.source === 'channel' && agent.permissionMode !== 'autonomous';
-    const needApproval = tool.risk !== 'safe' && agent.permissionMode !== 'autonomous' && (agent.permissionMode === 'standard' || channelStrict);
-    if (tool.risk !== 'safe' && agent.permissionMode === 'readonly') {
+    // 审批门禁（四级权限语义）：
+    //   readonly  → 禁止写入类工具（上方已拦截）
+    //   standard  → write + danger 均需人工批准
+    //   trusted   → 仅 danger（删除等高危）需审批，write 自动通过
+    //   autonomous→ 完全跳过，无需任何审批
+    // 渠道来源任务（source='channel'）：trusted 降级为 standard（10.5），autonomous 不降级
+    // 专家团任务（source='team'）：effectivePermission 已拾升为 autonomous，完全免审批
+    const effectivePermission = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    if (tool.risk !== 'safe' && effectivePermission === 'readonly') {
       const msg = '当前员工为只读权限模式，禁止执行写入类操作';
       record('tool_result', { name: call.name, error: msg });
       return msg;
     }
+    const effectiveMode = task.source === 'channel' && effectivePermission === 'trusted' ? 'standard' : effectivePermission;
+    const needApproval = tool.risk !== 'safe' && effectiveMode !== 'autonomous' && (
+      effectiveMode === 'standard' || (effectiveMode === 'trusted' && tool.risk === 'danger')
+    );
     if (needApproval) {
       const approvalType = tool.risk === 'danger' ? 'delete' : call.name === 'delegate_task' ? 'admin' : 'write_workspace';
       const approved = await this.broker.request({
@@ -282,7 +298,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
     }
 
     try {
-      const ctx: ToolContext = { workspace: agent.workspace, agentId: agent.id, taskId: task.id, host: this.host };
+      const ctx: ToolContext = { workspace: task.workspaceOverride || agent.workspace, agentId: agent.id, taskId: task.id, host: this.host, browserMgr: this.browserMgr };
       const result = await tool.execute(args, ctx);
       record('tool_result', { name: call.name, result: result.slice(0, 2000) });
       cb.onOutput(task.id, `\n[工具 ${call.name}] ${result.slice(0, 400)}\n`);

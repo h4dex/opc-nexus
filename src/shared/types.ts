@@ -45,11 +45,25 @@ export type DerivedAgentStatus = 'error' | 'running' | 'paused' | 'starting' | '
 /** readonly=只读 / standard=写入需审批 / trusted=全信任 / autonomous=完全自主（无需任何审批） */
 export type PermissionMode = 'readonly' | 'standard' | 'trusted' | 'autonomous';
 
+/** 数字员工能力开关（独立于权限模式，控制是否注册对应工具） */
+export interface AgentCapabilities {
+  /** 允许发起 HTTP/HTTPS 网络请求（web_search / http_request / MCP 远程调用） */
+  network: boolean;
+  /** 允许执行系统命令（run_command 工具） */
+  shell: boolean;
+  /** 允许安装软件包（install_package 工具：npm/pip/apt 等） */
+  install: boolean;
+  /** 允许浏览器自动化（Playwright / CDP：网页导航、点击、截图、JS执行） */
+  browser: boolean;
+  /** 允许桌面操控（Computer Use：屏幕截图、鼠标点击、键盘输入、滚动） */
+  computer: boolean;
+}
+
 export type EngineType = 'hermes' | 'codex' | 'claude-code' | 'zcode' | 'opencode' | 'kimicode' | 'external';
 
 export type ChannelType = 'weixin' | 'wecom' | 'feishu' | 'qq';
 
-export type TaskSource = 'desktop' | 'channel' | 'schedule' | 'webhook' | 'delegated';
+export type TaskSource = 'desktop' | 'channel' | 'schedule' | 'webhook' | 'delegated' | 'team';
 
 // ---------- 核心实体（13.1 核心表） ----------
 
@@ -66,6 +80,8 @@ export interface Agent {
   engineId: string;
   workspace: string;
   permissionMode: PermissionMode;
+  /** 能力开关（网络/命令/安装），未配置时默认全关 */
+  capabilities: AgentCapabilities;
   concurrencyLimit: number;
   archived: boolean;
   avatarColor: string;      // 卡片主题色
@@ -141,6 +157,7 @@ export interface Task {
   error: string | null;
   result: string | null;    // 执行产物全文（截断 16KB）
   sessionId: string | null; // 会话锚点（CLI resume / LLM 上下文重建，追问时继承）
+  workspaceOverride: string | null; // 任务级工作空间覆盖（团队共享工作空间）
   createdAt: number;
   startedAt: number | null;
   endedAt: number | null;
@@ -307,6 +324,8 @@ export interface AgentPersonaPatch {
   agentsMd?: string;
   userMd?: string;
   permissionMode?: PermissionMode;
+  /** 能力开关（网络/命令/安装） */
+  capabilities?: Partial<AgentCapabilities>;
 }
 
 /** 会话（每个助手可持续多轮对话，上下文跨任务保持） */
@@ -344,7 +363,7 @@ export interface ExecutionEvent {
 // ---------- 可视化工作流引擎 ----------
 
 /** 工作流节点类型 */
-export type WfNodeType = 'ai' | 'cli' | 'python' | 'http' | 'coze' | 'dify' | 'start' | 'end';
+export type WfNodeType = 'ai' | 'cli' | 'python' | 'http' | 'coze' | 'dify' | 'condition' | 'loop' | 'delay' | 'subflow' | 'start' | 'end';
 
 /** 工作流节点配置（按类型不同字段不同） */
 export interface WfNodeConfig {
@@ -371,6 +390,23 @@ export interface WfNodeConfig {
   // Dify 工作流节点
   difyWorkflowId?: string;
   difyInputs?: Record<string, string>;
+  // 条件分支节点
+  condition?: string;           // 条件表达式，如 "{{node1}} != ''"
+  trueTarget?: string;          // 条件为真时的目标节点 ID
+  falseTarget?: string;         // 条件为假时的目标节点 ID
+  // 循环节点
+  loopVariable?: string;        // 循环变量名（引用上下文中的列表）
+  loopItems?: string;           // 循环项（逗号分隔或变量引用）
+  loopBody?: string;            // 循环体内执行的节点 ID 列表（逗号分隔）
+  // 延时节点
+  delaySeconds?: number;        // 延时秒数
+  // 子工作流节点
+  subflowId?: string;           // 引用的子工作流 ID
+  subflowInputs?: Record<string, string>; // 传入子工作流的参数
+  // 错误处理（通用）
+  retryCount?: number;          // 失败重试次数（0=不重试）
+  retryDelay?: number;          // 重试间隔（秒）
+  fallbackNodeId?: string;      // 失败降级目标节点 ID
   // 通用
   platformRef?: string;
   outputVar?: string;
@@ -399,17 +435,45 @@ export interface WfEdge {
   target: string;
 }
 
+/** 工作流全局变量定义 */
+export interface WfVariable {
+  name: string;
+  defaultValue: string;
+  description?: string;
+}
+
 export interface WorkflowDef {
   id: string;
   name: string;
   description: string;
   nodes: WfNode[];
   edges: WfEdge[];
+  variables?: WfVariable[];    // 全局变量
+  version?: number;            // 版本号
   status: 'idle' | 'running' | 'completed' | 'failed';
   publishedAsSkill: boolean;
   skillId: string | null;
   createdAt: number;
   lastRunAt: number | null;
+}
+
+/** 工作流执行历史记录 */
+export interface WfRunRecord {
+  id: string;
+  workflowId: string;
+  status: 'running' | 'completed' | 'failed';
+  error: string | null;
+  nodeResults: Record<string, { status: string; output?: string; error?: string }>;
+  startedAt: number;
+  endedAt: number | null;
+  durationMs: number | null;
+}
+
+/** 工作流校验结果 */
+export interface WfValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
 }
 
 /** 工作流节点执行事件（实时推送到前端） */
@@ -420,4 +484,89 @@ export interface WfNodeEvent {
   output?: string;
   error?: string;
   timestamp: number;
+}
+
+// ---------- 多机协同 ----------
+
+/** 协同工作区状态 */
+export type CollabWorkspaceStatus = 'idle' | 'active' | 'stopped';
+
+/** 协同子任务状态 */
+export type CollabTaskStatus = 'pending' | 'claimed' | 'in_progress' | 'submitted' | 'accepted' | 'rejected';
+
+/** 远程 Agent 状态 */
+export type CollabAgentStatus = 'online' | 'offline';
+
+export interface CollabWorkspace {
+  id: string;
+  name: string;
+  repoPath: string;
+  conventions: string;
+  gitRules: string;
+  mcpPort: number;
+  gitPort: number;
+  status: CollabWorkspaceStatus;
+  createdAt: number;
+}
+
+export interface CollabTask {
+  id: string;
+  workspaceId: string;
+  title: string;
+  description: string;
+  branchName: string;
+  status: CollabTaskStatus;
+  assignedAgent: string | null;
+  assignedAt: number | null;
+  submittedAt: number | null;
+  reviewResult: string | null;
+  createdAt: number;
+}
+
+export interface CollabAgent {
+  id: string;
+  workspaceId: string;
+  name: string;
+  endpoint: string;
+  status: CollabAgentStatus;
+  lastHeartbeat: number;
+  connectedAt: number;
+}
+
+/** 协同连接信息（供远程 Agent 配置） */
+export interface CollabConnectInfo {
+  mcpUrl: string;
+  gitUrl: string;
+  token: string;
+  workspaceName: string;
+}
+
+// ---------- 专家团流水线 ----------
+
+/** 团队执行子任务状态 */
+export type TeamRunSubtaskStatus = 'pending' | 'running' | 'done' | 'failed';
+
+/** 团队执行流水线阶段 */
+export type TeamRunPhase = 'decompose' | 'execute' | 'review' | 'done' | 'failed';
+
+export interface TeamRunSubtask {
+  agent: string;          // 成员名
+  agentId: string;
+  subtask: string;
+  taskId: string | null;
+  status: TeamRunSubtaskStatus;
+}
+
+export interface TeamRun {
+  id: string;
+  teamId: string;
+  taskText: string;
+  phase: TeamRunPhase;
+  currentStep: number;
+  totalSteps: number;
+  subtasks: TeamRunSubtask[];
+  finalResult: string | null;
+  error: string | null;
+  createdAt: number;
+  endedAt: number | null;
 }

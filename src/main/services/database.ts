@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 10;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   progress INTEGER NOT NULL DEFAULT 0,
   stage TEXT NOT NULL DEFAULT '',
   error TEXT,
+  workspace_override TEXT,
   created_at INTEGER NOT NULL,
   started_at INTEGER,
   ended_at INTEGER
@@ -235,13 +236,75 @@ CREATE TABLE IF NOT EXISTS workflows (
   last_run_at INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS workflow_runs (
+  id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL REFERENCES workflows(id),
+  status TEXT NOT NULL DEFAULT 'running',
+  node_results TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS teams (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   coordinator_id TEXT NOT NULL,
   member_ids TEXT NOT NULL DEFAULT '[]',
   mode TEXT NOT NULL DEFAULT 'coordinate',
+  workspace TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS team_runs (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL REFERENCES teams(id),
+  task_text TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT 'decompose',
+  current_step INTEGER NOT NULL DEFAULT 0,
+  total_steps INTEGER NOT NULL DEFAULT 0,
+  subtasks_json TEXT NOT NULL DEFAULT '[]',
+  final_result TEXT,
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  ended_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS collab_workspaces (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  conventions TEXT NOT NULL DEFAULT '',
+  git_rules TEXT NOT NULL DEFAULT '',
+  mcp_port INTEGER NOT NULL DEFAULT 28890,
+  git_port INTEGER NOT NULL DEFAULT 28891,
+  invite_token TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'idle',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collab_tasks (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES collab_workspaces(id),
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  branch_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  assigned_agent TEXT,
+  assigned_at INTEGER,
+  submitted_at INTEGER,
+  review_result TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collab_agents (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES collab_workspaces(id),
+  name TEXT NOT NULL,
+  endpoint TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'online',
+  last_heartbeat INTEGER NOT NULL,
+  connected_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(agent_id, status);
@@ -437,6 +500,36 @@ export class Database {
         addCol('workflows', 'published_as_skill', 'INTEGER NOT NULL DEFAULT 0');
         addCol('workflows', 'skill_id', 'TEXT');
       }
+      if (prev < 7) {
+        // v7：多机协同
+      }
+      if (prev < 8) {
+        // v8：数字员工能力开关（网络/命令/安装）
+        addCol('agents', 'capabilities_json', "TEXT NOT NULL DEFAULT '{}'");
+      }
+      if (prev < 9) {
+        // v9：专家团流水线（团队共享工作空间 + 执行记录 + 任务级工作空间覆盖）
+        addCol('teams', 'workspace', "TEXT NOT NULL DEFAULT ''");
+        addCol('tasks', 'workspace_override', 'TEXT');
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS team_runs (
+          id TEXT PRIMARY KEY,
+          team_id TEXT NOT NULL REFERENCES teams(id),
+          task_text TEXT NOT NULL,
+          phase TEXT NOT NULL DEFAULT 'decompose',
+          current_step INTEGER NOT NULL DEFAULT 0,
+          total_steps INTEGER NOT NULL DEFAULT 0,
+          subtasks_json TEXT NOT NULL DEFAULT '[]',
+          final_result TEXT,
+          error TEXT,
+          created_at INTEGER NOT NULL,
+          ended_at INTEGER
+        )`);
+      }
+      if (prev < 10) {
+        // v10：工作流增强（全局变量 + 版本号）
+        addCol('workflows', 'variables_json', "TEXT NOT NULL DEFAULT '[]'");
+        addCol('workflows', 'version', 'INTEGER NOT NULL DEFAULT 1');
+      }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');
     } catch (err) {
@@ -530,5 +623,26 @@ export class Database {
       this.raw.prepare('DELETE FROM resource_samples WHERE created_at < ?').run(d7);
       this.raw.prepare('DELETE FROM audit_logs WHERE created_at < ?').run(d365);
     });
+  }
+
+  /** 数据库完整性检查：PRAGMA integrity_check + 孤立记录修复（设置页可手动触发） */
+  integrityCheck(): { ok: boolean; message: string; repaired: number } {
+    let repaired = 0;
+    // 1. SQLite 完整性检查
+    const result = this.raw.prepare('PRAGMA integrity_check').get() as { integrity_check: string } | undefined;
+    const integrityOk = result?.integrity_check === 'ok';
+    // 2. 修复孤立记录（引用已删除任务的残留数据）
+    this.transaction(() => {
+      const orphanEvents = this.raw.prepare('DELETE FROM task_events WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      const orphanMsgs = this.raw.prepare('DELETE FROM task_messages WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      const orphanRuns = this.raw.prepare('DELETE FROM agent_runs WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      const orphanApprovals = this.raw.prepare('DELETE FROM approvals WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      const orphanSkills = this.raw.prepare('DELETE FROM agent_skills WHERE agent_id NOT IN (SELECT id FROM agents)').run().changes;
+      repaired = orphanEvents + orphanMsgs + orphanRuns + orphanApprovals + orphanSkills;
+    });
+    const msg = integrityOk
+      ? repaired > 0 ? `数据库结构完整，已清理 ${repaired} 条孤立记录` : '数据库结构完整，无异常'
+      : `数据库完整性检查异常：${result?.integrity_check ?? '未知错误'}`;
+    return { ok: integrityOk, message: msg, repaired };
   }
 }

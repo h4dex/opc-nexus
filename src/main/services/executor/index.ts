@@ -39,6 +39,11 @@ export class ExecutorRegistry {
     this.llm.setToolHost(host);
   }
 
+  /** 注入浏览器管理器（Playwright/CDP 工具使用） */
+  setBrowserManager(mgr: import('../browserManager.js').BrowserManager) {
+    this.llm.setBrowserManager(mgr);
+  }
+
   private engineType(engineId: string): string {
     const row = this.db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as { type: string } | undefined;
     return row?.type ?? 'hermes';

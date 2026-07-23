@@ -458,11 +458,12 @@ select option:hover, select option:checked {
   transition: background 0.15s, color 0.15s, filter 0.15s;
 }
 .btn:hover { background: var(--btn-bg-hover); }
-.btn.primary { background: var(--accent); color: #fff; }
-.btn.primary:hover { background: var(--accent); filter: brightness(1.1); }
+.btn.primary, .btn.btn-primary { background: var(--accent); color: #fff; }
+.btn.primary:hover, .btn.btn-primary:hover { background: var(--accent); filter: brightness(1.1); }
 .btn.danger { color: var(--danger); }
 .btn.danger:hover { background: var(--danger-soft); color: var(--danger); }
-.btn.small { padding: 5px 12px; font-size: 12px; }
+.btn.small, .btn.btn-sm { padding: 5px 12px; font-size: 12px; }
+.btn.btn-xs { padding: 3px 8px; font-size: 11px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ---------- 弹窗 ---------- */
@@ -514,9 +515,52 @@ select option:hover, select option:checked {
 }
 .field .hint { font-size: 11.5px; color: var(--text-3); margin-top: 4px; }
 
+/* 独立输入组件（不依赖 .field 包裹，供弹窗/页面直接使用） */
+.input {
+  width: 100%;
+  background: var(--input-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 13.5px;
+  color: var(--text-1);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.input:hover { border-color: var(--border-strong); }
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.input::placeholder { color: var(--text-3); }
+textarea.input { resize: vertical; line-height: 1.5; }
+
 .steps { display: flex; gap: 6px; margin-bottom: 20px; }
 .step-dot { flex: 1; height: 4px; border-radius: 2px; background: var(--ring-track); transition: background 0.2s; }
 .step-dot.on { background: var(--accent); }
+
+/* ---------- 右键上下文菜单 ---------- */
+.ctx-menu {
+  position: fixed; z-index: 1000; min-width: 160px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: var(--shadow);
+  animation: fadeIn 0.12s ease;
+}
+.ctx-menu-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; padding: 7px 12px;
+  border: none; background: transparent;
+  color: var(--text-1); font-size: 13px; text-align: left;
+  border-radius: 6px; cursor: pointer;
+  transition: background 0.12s;
+}
+.ctx-menu-item:hover { background: var(--hover-bg); }
+.ctx-menu-item.danger { color: var(--danger); }
+.ctx-menu-item.danger:hover { background: var(--danger-soft); }
+.ctx-menu-divider { height: 1px; background: var(--divider); margin: 5px 4px; }
 
 .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip {

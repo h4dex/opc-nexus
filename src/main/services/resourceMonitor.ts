@@ -1,14 +1,30 @@
 /**
  * 跨平台资源监控（PRD 11.x）
  * Windows: WMI / 性能计数器；Ubuntu: /proc、sysfs、nvidia-smi。
- * 采集失败返回 null —— 界面显示"未知"，不伪造 0%（6.5 验收）。
+ * 采集失败返回 null —— 界面显示“未知”，不伪造 0%（6.5 验收）。
+ * 持久化：每 30s 将采样写入 resource_samples 表，保留 7 天，支持长期趋势分析。
  */
 import si from 'systeminformation';
 import { app } from 'electron';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
 import type { GpuSample, ResourceSample, ServiceHealth } from '../../shared/types.js';
+import type { Database } from './database.js';
 
-const HISTORY_LIMIT = 300; // 每2秒一条 → 保留最近10分钟
+/** nvidia-smi 兑底：systeminformation 在 Windows+NVIDIA 下常拿不到利用率，直接查 nvidia-smi */
+function nvidiaSmiUtilization(): Promise<number | null> {
+  return new Promise((resolve) => {
+    execFile('nvidia-smi', ['--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], { timeout: 5000, shell: false }, (err, stdout) => {
+      if (err) return resolve(null);
+      const val = parseFloat((stdout || '').trim().split(/\r?\n/)[0]);
+      resolve(Number.isFinite(val) ? Math.round(val * 10) / 10 : null);
+    });
+  });
+}
+
+const HISTORY_LIMIT = 300; // 内存保留最近10分钟（实时图表）
+const PERSIST_INTERVAL = 30_000; // 每 30s 持久化一次
+const RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 保留 7 天
 
 export interface Thresholds {
   cpu: number;
@@ -23,6 +39,7 @@ const DISK_BLOCK_BYTES = 2 * 1024 ** 3;
 export class ResourceMonitor {
   private history: ResourceSample[] = [];
   private timer: NodeJS.Timeout | null = null;
+  private persistTimer: NodeJS.Timeout | null = null;
   private listeners = new Set<(s: ResourceSample) => void>();
   private health: ServiceHealth = { runtime: 'healthy', gateway: 'healthy', database: 'healthy' };
   /** 阈值提供方（读 settings，由 main 注入） */
@@ -32,6 +49,13 @@ export class ResourceMonitor {
   private cpuOverSince: number | null = null;
   private memOverSince: number | null = null;
   private activeAlerts = new Map<string, string>();
+  private db: Database | null = null;
+  private lastPersistAt = 0;
+
+  /** 注入数据库实例（由 main 装配后调用，启用持久化） */
+  setDatabase(db: Database) {
+    this.db = db;
+  }
 
   setThresholdProvider(fn: () => Thresholds) {
     this.thresholds = fn;
@@ -93,11 +117,15 @@ export class ResourceMonitor {
     if (this.timer) return;
     void this.sampleOnce();
     this.timer = setInterval(() => void this.sampleOnce(), intervalMs);
+    // 持久化定时器：每 30s 写入 DB + 清理过期数据
+    this.persistTimer = setInterval(() => this.persistAndCleanup(), PERSIST_INTERVAL);
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
+    if (this.persistTimer) clearInterval(this.persistTimer);
     this.timer = null;
+    this.persistTimer = null;
   }
 
   onSample(fn: (s: ResourceSample) => void): () => void {
@@ -107,6 +135,19 @@ export class ResourceMonitor {
 
   getHistory(): ResourceSample[] {
     return this.history;
+  }
+
+  /** 长期趋势查询：从 DB 读取指定时间范围的降采样数据（最多返回 500 点） */
+  getTrend(rangeMs: number): { timestamp: number; cpu: number | null; memory: number | null; gpu: number | null; temp: number | null }[] {
+    if (!this.db) return [];
+    const since = Date.now() - rangeMs;
+    const rows = this.db.raw.prepare(
+      'SELECT created_at, cpu, memory, gpu, temp FROM resource_samples WHERE created_at >= ? ORDER BY created_at'
+    ).all(since) as { created_at: number; cpu: number | null; memory: number | null; gpu: number | null; temp: number | null }[];
+    // 降采样：超过 500 点时等间距抽取
+    if (rows.length <= 500) return rows.map((r) => ({ timestamp: r.created_at, cpu: r.cpu, memory: r.memory, gpu: r.gpu, temp: r.temp }));
+    const step = Math.ceil(rows.length / 500);
+    return rows.filter((_, i) => i % step === 0).map((r) => ({ timestamp: r.created_at, cpu: r.cpu, memory: r.memory, gpu: r.gpu, temp: r.temp }));
   }
 
   getHealth(): ServiceHealth {
@@ -127,6 +168,23 @@ export class ResourceMonitor {
       } catch {
         /* listener 异常不影响采集 */
       }
+    }
+  }
+
+  /** 持久化当前采样到 DB + 清理 7 天前的旧数据 */
+  private persistAndCleanup() {
+    if (!this.db) return;
+    const last = this.history[this.history.length - 1];
+    if (!last) return;
+    try {
+      this.db.raw.prepare(
+        'INSERT INTO resource_samples(scope, scope_id, cpu, memory, gpu, vram, temp, created_at) VALUES(?,?,?,?,?,?,?,?)'
+      ).run('system', '', last.cpu, last.memoryPercent, last.gpu?.utilization ?? null, last.gpu?.vramUsed ?? null, last.gpu?.temperature ?? null, last.timestamp);
+      // 清理过期数据（保留 7 天）
+      const cutoff = Date.now() - RETENTION_MS;
+      this.db.raw.prepare('DELETE FROM resource_samples WHERE created_at < ?').run(cutoff);
+    } catch {
+      /* 持久化失败不影响主流程 */
     }
   }
 
@@ -170,6 +228,10 @@ export class ResourceMonitor {
             vramTotal: typeof g.memoryTotal === 'number' ? g.memoryTotal * 1024 * 1024 : null,
             temperature: typeof g.temperatureGpu === 'number' ? g.temperatureGpu : null
           };
+          // 利用率缺失时用 nvidia-smi 兑底（Windows+NVIDIA 常见）
+          if (gpu.utilization == null) {
+            gpu.utilization = await nvidiaSmiUtilization();
+          }
         }
       }
       if (fsSize.status === 'fulfilled') {

@@ -1,12 +1,13 @@
 /** 工作流节点配置面板：根据节点类型渲染不同表单字段 */
 import { useState } from 'react';
-import type { WfNodeConfig, WfNodeType, WfPlatformConfig } from '@shared/types';
+import type { WfNodeConfig, WfNodeType, WfPlatformConfig, WorkflowDef } from '@shared/types';
 
 interface Props {
   nodeType: WfNodeType;
   label: string;
   config: WfNodeConfig;
   platforms: WfPlatformConfig[];
+  workflows?: WorkflowDef[];
   onChange: (label: string, config: WfNodeConfig) => void;
   onClose: () => void;
 }
@@ -39,7 +40,7 @@ function KVEditor({ value, onChange }: { value: Record<string, string>; onChange
   );
 }
 
-export function WfNodePanel({ nodeType, label, config, platforms, onChange, onClose }: Props) {
+export function WfNodePanel({ nodeType, label, config, platforms, workflows, onChange, onClose }: Props) {
   const set = (patch: Partial<WfNodeConfig>) => onChange(label, { ...config, ...patch });
   const setLabel = (l: string) => onChange(l, config);
 
@@ -140,12 +141,75 @@ export function WfNodePanel({ nodeType, label, config, platforms, onChange, onCl
         </>
       )}
 
+      {nodeType === 'condition' && (
+        <>
+          <label style={labelStyle}>条件表达式（支持 {'{{nodeId}}'} 变量）</label>
+          <input style={{ ...inputStyle, marginBottom: 8 }} value={config.condition ?? ''} onChange={(e) => set({ condition: e.target.value })} placeholder="例如: {{node1}} != '' 或 {{node2}} contains 'ok'" />
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 12, lineHeight: 1.6 }}>
+            支持: != / == / contains / 非空即真。输出 'true' 或 'false'，下游节点根据输出值选择分支。
+          </div>
+          <label style={labelStyle}>True 分支目标节点 ID（可选）</label>
+          <input style={{ ...inputStyle, marginBottom: 12 }} value={config.trueTarget ?? ''} onChange={(e) => set({ trueTarget: e.target.value })} placeholder="留空则用连线" />
+          <label style={labelStyle}>False 分支目标节点 ID（可选）</label>
+          <input style={{ ...inputStyle, marginBottom: 12 }} value={config.falseTarget ?? ''} onChange={(e) => set({ falseTarget: e.target.value })} placeholder="留空则用连线" />
+        </>
+      )}
+
+      {nodeType === 'loop' && (
+        <>
+          <label style={labelStyle}>循环变量名</label>
+          <input style={{ ...inputStyle, marginBottom: 12 }} value={config.loopVariable ?? ''} onChange={(e) => set({ loopVariable: e.target.value })} placeholder="item" />
+          <label style={labelStyle}>循环项（逗号分隔或 {'{{nodeId}}'} 引用）</label>
+          <input style={{ ...inputStyle, marginBottom: 12 }} value={config.loopItems ?? ''} onChange={(e) => set({ loopItems: e.target.value })} placeholder="a, b, c 或 {{node1}}" />
+          <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.6 }}>
+            每次循环将当前项存入 context[变量名]，索引存入 context[变量名_index]。输出为 JSON 数组。
+          </div>
+        </>
+      )}
+
+      {nodeType === 'delay' && (
+        <>
+          <label style={labelStyle}>延时秒数</label>
+          <input style={{ ...inputStyle, marginBottom: 12 }} type="number" min={0} max={3600} value={config.delaySeconds ?? 1} onChange={(e) => set({ delaySeconds: Number(e.target.value) })} />
+          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>工作流将在此节点暂停指定时间后继续执行下游节点。</div>
+        </>
+      )}
+
+      {nodeType === 'subflow' && (
+        <>
+          <label style={labelStyle}>引用工作流</label>
+          <select style={{ ...inputStyle, marginBottom: 12 }} value={config.subflowId ?? ''} onChange={(e) => set({ subflowId: e.target.value })}>
+            <option value="">选择工作流…</option>
+            {(workflows ?? []).map((wf) => <option key={wf.id} value={wf.id}>{wf.name}</option>)}
+          </select>
+          <label style={labelStyle}>传入参数</label>
+          <KVEditor value={config.subflowInputs ?? {}} onChange={(v) => set({ subflowInputs: v })} />
+        </>
+      )}
+
       <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
         <label style={labelStyle}>输出变量名（默认 = 节点 ID）</label>
         <input style={inputStyle} value={config.outputVar ?? ''} onChange={(e) => set({ outputVar: e.target.value })} placeholder="留空则用节点 ID" />
         <label style={{ ...labelStyle, marginTop: 10 }}>超时（秒）</label>
         <input style={inputStyle} type="number" value={config.timeout ?? 120} onChange={(e) => set({ timeout: Number(e.target.value) })} />
       </div>
+
+      {/* 错误处理（重试/降级） */}
+      {nodeType !== 'condition' && nodeType !== 'delay' && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <label style={{ ...labelStyle, color: 'var(--warning)' }}>错误处理</label>
+          <label style={labelStyle}>失败重试次数（0 = 不重试）</label>
+          <input style={{ ...inputStyle, marginBottom: 10 }} type="number" min={0} max={10} value={config.retryCount ?? 0} onChange={(e) => set({ retryCount: Number(e.target.value) })} />
+          {(config.retryCount ?? 0) > 0 && (
+            <>
+              <label style={labelStyle}>重试间隔（秒）</label>
+              <input style={{ ...inputStyle, marginBottom: 10 }} type="number" min={1} max={60} value={config.retryDelay ?? 2} onChange={(e) => set({ retryDelay: Number(e.target.value) })} />
+            </>
+          )}
+          <label style={labelStyle}>失败降级目标节点 ID（可选）</label>
+          <input style={inputStyle} value={config.fallbackNodeId ?? ''} onChange={(e) => set({ fallbackNodeId: e.target.value })} placeholder="留空则工作流失败" />
+        </div>
+      )}
     </div>
   );
 }

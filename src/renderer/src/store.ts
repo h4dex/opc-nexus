@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { Snapshot, ResourcePayload } from '../../preload/index';
 
-export type RouteKey = 'dashboard' | 'office' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'chat' | 'teams' | 'market' | 'engines' | 'channels' | 'usage' | 'system' | 'settings';
+export type RouteKey = 'dashboard' | 'office' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'chat' | 'teams' | 'collab' | 'market' | 'engines' | 'channels' | 'usage' | 'system' | 'settings';
 
 interface AppState {
   snapshot: Snapshot | null;

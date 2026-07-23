@@ -10,12 +10,23 @@ type OfficeAction =
   | 'working' | 'gaming' | 'sleeping' | 'phone' | 'coffee'
   | 'reading' | 'meditate' | 'error' | 'starting' | 'noodles';
 
-function getOfficeAction(card: AgentCardView): { action: OfficeAction; bubble?: string; label: string } {
+function getOfficeAction(card: AgentCardView): { action: OfficeAction; bubble?: string; tooltip?: string; label: string } {
   if (card.derivedStatus === 'error') return { action: 'error', bubble: '出错了…', label: '故障' };
   if (card.derivedStatus === 'starting') return { action: 'starting', bubble: '准备开工!', label: '启动中' };
   if (card.derivedStatus === 'paused') return { action: 'coffee', bubble: '休息一下~', label: '暂停' };
-  if (card.derivedStatus === 'running')
-    return { action: 'working', bubble: card.currentTask?.title.slice(0, 10) || '编码中…', label: '工作中' };
+  if (card.derivedStatus === 'running') {
+    const raw = card.currentTask?.title ?? '';
+    // 清理标题：去换行/标题符号；团队任务标题为完整 prompt，提取团队名或任务描述
+    const oneLine = raw.replace(/[#*_`>]/g, '').replace(/\s+/g, ' ').trim();
+    const teamMatch = oneLine.match(/你正在参与团队「([^」]+)」/);
+    const taskMatch = oneLine.match(/你的子任务（第 \d+ 步）\s*([^\n]{2,12})/);
+    let short = '编码中…';
+    if (teamMatch) short = `协作:${teamMatch[1]}`;
+    else if (taskMatch) short = taskMatch[1];
+    else if (oneLine) short = oneLine;
+    if (short.length > 12) short = short.slice(0, 12) + '…';
+    return { action: 'working', bubble: short, tooltip: oneLine || undefined, label: '工作中' };
+  }
   const idlePool: { action: OfficeAction; bubble: string; label: string }[] = [
     { action: 'gaming', bubble: '摸鱼中~', label: '摸鱼' },
     { action: 'sleeping', bubble: 'zzZ', label: '打盹' },
@@ -43,7 +54,7 @@ function shadeColor(color: string, percent: number): string {
 
 /* ---------- 单个工位组件 ---------- */
 function Workstation({ card }: { card: AgentCardView }) {
-  const { action, bubble, label } = getOfficeAction(card);
+  const { action, bubble, tooltip, label } = getOfficeAction(card);
   const { hair, shirt } = palette(card.agent.avatarColor);
   const isWorking = action === 'working';
   const isError = action === 'error';
@@ -52,7 +63,7 @@ function Workstation({ card }: { card: AgentCardView }) {
     <div className={`ws ${isError ? 'ws-error' : ''}`}>
       {/* 对话气泡 */}
       {bubble && (
-        <div className={`ws-bubble ${isWorking ? 'ws-bubble-work' : ''}`}>
+        <div className={`ws-bubble ${isWorking ? 'ws-bubble-work' : ''}`} title={tooltip}>
           {bubble}
           <i />
         </div>

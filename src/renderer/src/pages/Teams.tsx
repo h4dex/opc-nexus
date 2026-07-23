@@ -1,13 +1,18 @@
-/** 专家团管理：模板一键组建 + 创建团队 + 提交团队任务 */
-import { useEffect, useState } from 'react';
+/** 专家团管理：模板一键组建 + 创建团队 + 提交团队任务 + 流水线进度 */
+import { useEffect, useState, useCallback } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
 import { TEAM_TEMPLATES, type TeamTemplate } from '../data/teamTemplates';
+import type { TeamRun } from '../../../shared/types';
 
 interface TeamData {
-  id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; createdAt: number;
+  id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; workspace: string; createdAt: number;
 }
+
+const PHASE_LABEL: Record<string, string> = {
+  decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败'
+};
 
 export function Teams() {
   const { snapshot } = useApp();
@@ -17,10 +22,29 @@ export function Teams() {
   const [triggerMsg, setTriggerMsg] = useState<Record<string, string>>({});
   const [deploying, setDeploying] = useState<string | null>(null);
   const [deployMsg, setDeployMsg] = useState('');
+  /** 每个团队最新一次流水线记录 */
+  const [runs, setRuns] = useState<Record<string, TeamRun | null>>({});
 
   useEffect(() => {
     void window.aibox.listTeams().then(setTeams);
   }, [snapshot?.tasks.length]);
+
+  /** 轮询活跃流水线进度（2s，有未完成 run 时） */
+  const hasActiveRun = Object.values(runs).some((r) => r && ['decompose', 'execute', 'review'].includes(r.phase));
+  const pollRuns = useCallback(() => {
+    for (const t of teams) {
+      void window.aibox.getTeamRuns(t.id).then((list) => {
+        setRuns((prev) => ({ ...prev, [t.id]: list[0] ?? null }));
+      });
+    }
+  }, [teams]);
+
+  useEffect(() => {
+    pollRuns();
+    if (!hasActiveRun) return;
+    const timer = setInterval(pollRuns, 2000);
+    return () => clearInterval(timer);
+  }, [pollRuns, hasActiveRun]);
 
   if (!snapshot) return null;
   const agents = snapshot.agentCards.filter((c) => c.agent.lifecycle === 'READY');
@@ -33,6 +57,8 @@ export function Teams() {
     setTriggerMsg((m) => ({ ...m, [teamId]: r.message }));
     setTaskInput((m) => ({ ...m, [teamId]: '' }));
     setTimeout(() => setTriggerMsg((m) => ({ ...m, [teamId]: '' })), 4000);
+    // 立即拉取新 run
+    void window.aibox.getTeamRuns(teamId).then((list) => setRuns((prev) => ({ ...prev, [teamId]: list[0] ?? null })));
   };
 
   /** 一键组建模板团队：自动创建缺失员工 + 创建团队 */
@@ -117,8 +143,9 @@ export function Teams() {
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 650, fontSize: 15 }}>{team.name}</div>
                 <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 2 }}>
-                  {team.mode === 'coordinate' ? '🎯 主Agent协调模式' : '🔄 专家圆桌模式'}
+                  {team.mode === 'coordinate' ? '🎯 主专家协调：拆解→逐步分派→验收' : '🔄 专家圆桌：多视角观点→总结'}
                 </div>
+                {team.workspace && <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>📁 {team.workspace}</div>}
               </div>
               <button className="btn small danger" onClick={() => void window.aibox.removeTeam(team.id).then(() => setTeams((t) => t.filter((x) => x.id !== team.id)))}>
                 <IconX size={12} />解散
@@ -155,12 +182,58 @@ export function Teams() {
                 {triggerMsg[team.id]}
               </div>
             )}
+
+            {/* 流水线进度面板 */}
+            {runs[team.id] && <RunProgress run={runs[team.id]!} />}
           </div>
         ))}
       </div>
 
       {createOpen && <CreateTeamModal onClose={() => setCreateOpen(false)} onCreated={(t) => { setTeams((prev) => [t, ...prev]); setCreateOpen(false); }} />}
     </>
+  );
+}
+
+/** 流水线进度面板：阶段指示器 + 子任务状态 + 最终结论 */
+function RunProgress({ run }: { run: TeamRun }) {
+  const active = ['decompose', 'execute', 'review'].includes(run.phase);
+  const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : s === 'running' ? 'var(--accent)' : 'var(--text-3)';
+  const statusLabel = (s: string) => s === 'done' ? '完成' : s === 'failed' ? '失败' : s === 'running' ? '执行中' : '等待';
+
+  return (
+    <div style={{ marginTop: 12, padding: '12px 14px', borderRadius: 8, background: 'var(--input-bg)', border: '1px solid var(--card-border)' }}>
+      {/* 阶段指示器 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: run.subtasks.length > 0 ? 10 : 0 }}>
+        <span style={{ fontSize: 12, fontWeight: 650, color: run.phase === 'failed' ? 'var(--danger)' : run.phase === 'done' ? 'var(--success)' : 'var(--accent)' }}>
+          {run.phase === 'done' ? '✅' : run.phase === 'failed' ? '❌' : '⚙️'} {PHASE_LABEL[run.phase] ?? run.phase}
+        </span>
+        {run.phase === 'execute' && run.totalSteps > 0 && (
+          <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>子任务 {run.currentStep}/{run.totalSteps}</span>
+        )}
+        {active && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>· {run.taskText.slice(0, 40)}{run.taskText.length > 40 ? '…' : ''}</span>}
+      </div>
+
+      {/* 子任务列表 */}
+      {run.subtasks.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {run.subtasks.map((st, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 12 }}>
+              <span style={{ color: statusColor(st.status), fontWeight: 650, flexShrink: 0 }}>● {statusLabel(st.status)}</span>
+              <span style={{ color: 'var(--text-1)', fontWeight: 550, flexShrink: 0 }}>{st.agent}</span>
+              <span style={{ color: 'var(--text-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{st.subtask}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 错误 / 最终结论 */}
+      {run.error && <div style={{ marginTop: 8, fontSize: 12, color: 'var(--danger)' }}>{run.error}</div>}
+      {run.phase === 'done' && run.finalResult && (
+        <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-1)', background: 'var(--card)', padding: '8px 10px', borderRadius: 6, maxHeight: 120, overflowY: 'auto', whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
+          {run.finalResult}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -171,6 +244,7 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
   const [coordinatorId, setCoordinatorId] = useState('');
   const [memberIds, setMemberIds] = useState<string[]>([]);
   const [mode, setMode] = useState<'coordinate' | 'roundtable'>('coordinate');
+  const [workspace, setWorkspace] = useState('');
   const [busy, setBusy] = useState(false);
 
   if (!snapshot) return null;
@@ -180,11 +254,16 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
     setMemberIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
   };
 
+  const pickDir = async () => {
+    const dir = await window.aibox.pickDirectory();
+    if (dir) setWorkspace(dir);
+  };
+
   const create = async () => {
     if (!name.trim() || !coordinatorId) return;
     setBusy(true);
     try {
-      const t = await window.aibox.createTeam({ name: name.trim(), coordinatorId, memberIds: memberIds.filter((id) => id !== coordinatorId), mode });
+      const t = await window.aibox.createTeam({ name: name.trim(), coordinatorId, memberIds: memberIds.filter((id) => id !== coordinatorId), mode, workspace: workspace.trim() || undefined });
       onCreated(t as TeamData);
     } finally {
       setBusy(false);
@@ -227,6 +306,14 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
           <option value="">选择协调者…</option>
           {agents.map((c) => <option key={c.agent.id} value={c.agent.id}>{c.agent.name}（{c.agent.role}）</option>)}
         </select>
+      </div>
+
+      <div className="field">
+        <label>共享工作目录（可选，留空自动创建）— 团队成员共享，通过 MD 文件交接</label>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} placeholder="默认：userData/workspaces/team-{id}" style={{ flex: 1 }} />
+          <button className="btn small" onClick={() => void pickDir()}>选择</button>
+        </div>
       </div>
 
       <div className="field">

@@ -24,15 +24,15 @@ type Row = Record<string, unknown>;
 
 const STAGES = ['理解需求', '规划步骤', '调用工具', '生成产物', '校验结果'];
 
-/** 模拟环境后续任务池：员工完成当前任务后自动领取新任务，保持工作台动态均衡 */
-const FOLLOW_UP_TASKS = [
+/** 演示模式后续任务池（仅 demoAutoTasks 开启时生效，生产环境完全隔离） */
+const DEMO_TASK_POOL = [
   '数据同步与核对', '例行报表生成', '异常记录复核', '客户资料更新',
   '库存快照比对', '工单流转跟踪', '日志归档整理', '指标看板刷新',
   '待办事项跟进', '周报素材汇总', '接口连通性巡检', '文档版本整理'
 ];
 
-/** 工作台目标执行人数：围绕该水位自动补位（演示环境≈8 执行 / 4 空闲） */
-const TARGET_RUNNING = 8;
+/** 默认演示水位（可通过 settings.demoTargetRunning 配置） */
+const DEFAULT_TARGET_RUNNING = 8;
 
 export class Orchestrator {
   private listeners = new Set<() => void>();
@@ -151,24 +151,32 @@ export class Orchestrator {
     }
   }
 
+  /** 读取可配置的演示水位（settings.demoTargetRunning），生产环境设为 0 即关闭自动补位 */
+  private targetRunning(): number {
+    return this.db.getSetting<number>('demoTargetRunning', DEFAULT_TARGET_RUNNING);
+  }
+
   /** 为无活跃任务且处于演示模式的 READY 员工补充后续任务（可开关；资源保护时暂停；真实引擎员工不自动派单） */
   private replenishTasks() {
     if (!this.db.getSetting<boolean>('demoAutoTasks', true)) return;
     if (this.dispatchGuard() !== null) return;
+    const target = this.targetRunning();
+    if (target <= 0) return; // 水位为 0 = 生产模式，不自动补位
     const active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").get() as { c: number }).c;
-    if (active >= TARGET_RUNNING) return;
+    if (active >= target) return;
     const idleRows = this.db.raw
       .prepare(
         `SELECT id, engine_id FROM agents WHERE archived = 0 AND lifecycle = 'READY' AND id NOT IN
          (SELECT agent_id FROM tasks WHERE status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED'))`
       )
       .all() as { id: string; engine_id: string }[];
+    // 仅对演示模式（simulated）员工补位，真实引擎员工绝不自动派单
     const idle = idleRows.filter((a) => this.executors.kindFor(a.engine_id) === 'simulated');
-    const quota = Math.min(2, TARGET_RUNNING - active, idle.length);
+    const quota = Math.min(2, target - active, idle.length);
     for (let i = 0; i < quota; i++) {
       const pick = Math.floor(Math.random() * idle.length);
       const [agent] = idle.splice(pick, 1); // 剔除已选，避免同周期重复派单
-      const title = FOLLOW_UP_TASKS[Math.floor(Math.random() * FOLLOW_UP_TASKS.length)];
+      const title = DEMO_TASK_POOL[Math.floor(Math.random() * DEMO_TASK_POOL.length)];
       this.createTask(agent.id, title);
     }
   }
@@ -176,6 +184,11 @@ export class Orchestrator {
   // ---------- 查询 ----------
 
   private mapAgent(r: Row): Agent {
+    let capabilities = { network: false, shell: false, install: false, browser: false, computer: false };
+    try {
+      const raw = r.capabilities_json as string | undefined;
+      if (raw) capabilities = { ...capabilities, ...(JSON.parse(raw) as Partial<typeof capabilities>) };
+    } catch { /* 解析失败用默认值 */ }
     return {
       id: r.id as string, name: r.name as string, role: r.role as string,
       systemPrompt: r.system_prompt as string,
@@ -183,6 +196,7 @@ export class Orchestrator {
       lifecycle: r.lifecycle as Agent['lifecycle'],
       engineId: r.engine_id as string, workspace: r.workspace as string,
       permissionMode: r.permission_mode as Agent['permissionMode'],
+      capabilities,
       concurrencyLimit: r.concurrency_limit as number, archived: (r.archived as number) === 1,
       avatarColor: r.avatar_color as string, createdAt: r.created_at as number, updatedAt: r.updated_at as number
     };
@@ -195,6 +209,7 @@ export class Orchestrator {
       status: r.status as TaskStatus, priority: r.priority as number, progress: r.progress as number,
       stage: r.stage as string, error: r.error as string | null, result: (r.result as string | null) ?? null,
       sessionId: (r.session_id as string | null) ?? null,
+      workspaceOverride: (r.workspace_override as string | null) ?? null,
       createdAt: r.created_at as number, startedAt: r.started_at as number | null, endedAt: r.ended_at as number | null
     };
   }
@@ -222,6 +237,23 @@ export class Orchestrator {
     return r?.result ?? null;
   }
 
+  /** 解析任务产物目录：task.workspaceOverride > agent.workspace > userData/workspaces/agentId */
+  resolveTaskWorkspace(taskId: string): string | null {
+    const row = this.db.raw.prepare('SELECT agent_id, workspace_override FROM tasks WHERE id = ?').get(taskId) as { agent_id: string; workspace_override: string | null } | undefined;
+    if (!row) return null;
+    if (row.workspace_override) return row.workspace_override;
+    const agent = this.getAgent(row.agent_id);
+    if (!agent) return null;
+    return agent.workspace || join(app.getPath('userData'), 'workspaces', agent.id);
+  }
+
+  /** 解析员工工作目录 */
+  resolveAgentWorkspace(agentId: string): string | null {
+    const agent = this.getAgent(agentId);
+    if (!agent) return null;
+    return agent.workspace || join(app.getPath('userData'), 'workspaces', agent.id);
+  }
+
   listAgents(): Agent[] {
     return (this.db.raw.prepare('SELECT * FROM agents WHERE archived = 0 ORDER BY created_at').all() as Row[]).map((r) => this.mapAgent(r));
   }
@@ -239,6 +271,10 @@ export class Orchestrator {
     if (patch.agentsMd !== undefined) { fields.push('agents_md = ?'); values.push(patch.agentsMd); }
     if (patch.userMd !== undefined) { fields.push('user_md = ?'); values.push(patch.userMd); }
     if (patch.permissionMode !== undefined) { fields.push('permission_mode = ?'); values.push(patch.permissionMode); }
+    if (patch.capabilities !== undefined) {
+      const merged = { ...agent.capabilities, ...patch.capabilities };
+      fields.push('capabilities_json = ?'); values.push(JSON.stringify(merged));
+    }
     if (fields.length === 0) return agent;
     fields.push('updated_at = ?'); values.push(Date.now());
     values.push(id);
@@ -488,8 +524,9 @@ export class Orchestrator {
   }
 
   /** 创建任务：该员工无活跃任务且未超并发 → 立即经执行器派发；否则进入 QUEUED 等待 FIFO 调度。
-   *  opts.parentId：委派/追问的父任务；opts.sessionId：继承会话锚点（P2b 追问续跑） */
-  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string } = {}): Task {
+   *  opts.parentId：委派/追问的父任务；opts.sessionId：继承会话锚点（P2b 追问续跑）；
+   *  opts.workspaceOverride：任务级工作空间覆盖（团队共享工作空间） */
+  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string } = {}): Task {
     const now = Date.now();
     const id = randomUUID();
     const agent = this.getAgent(agentId);
@@ -499,8 +536,8 @@ export class Orchestrator {
     const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null;
     this.db.transaction(() => {
       this.db.raw.prepare(
-        'INSERT INTO tasks(id, agent_id, title, source, parent_id, status, priority, progress, stage, error, session_id, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, NULL)'
-      ).run(id, agentId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, now, canRun ? now : null);
+        'INSERT INTO tasks(id, agent_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, NULL)'
+      ).run(id, agentId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, opts.workspaceOverride ?? null, now, canRun ? now : null);
       if (canRun) {
         this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
           .run(randomUUID(), agentId, id, process.pid, randomUUID(), 'RUNNING', now);
@@ -512,6 +549,22 @@ export class Orchestrator {
     if (canRun) this.dispatchTask(task, agent);
     this.emit();
     return task;
+  }
+
+  /** 等待任务到达终态（供团队流水线等编排逻辑轮询；超时返回 null） */
+  waitForTask(taskId: string, timeoutMs: number): Promise<Task | null> {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const check = () => {
+        const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+        if (!row) return resolve(null);
+        const t = this.mapTask(row);
+        if (['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(t.status)) return resolve(t);
+        if (Date.now() - started >= timeoutMs) return resolve(null);
+        setTimeout(check, 2000);
+      };
+      check();
+    });
   }
 
   /** 追问/续跑（P2b）：新任务继承父任务的会话锚点，执行器以 resume/上下文重建方式继续 */

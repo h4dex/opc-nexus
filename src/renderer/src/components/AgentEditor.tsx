@@ -1,7 +1,7 @@
-/** 助手编辑弹窗：权限快捷切换 + 人设配置（soul.md / agents.md / user.md）+ 预设模板 + 组合预览 */
+/** 助手编辑弹窗：权限快捷切换 + 能力开关 + 人设配置（soul.md / agents.md / user.md）+ 预设模板 + 组合预览 */
 import { useState } from 'react';
 import { Modal } from '../components/common';
-import type { Agent, PermissionMode } from '@shared/types';
+import type { Agent, AgentCapabilities, PermissionMode } from '@shared/types';
 
 const PERM_OPTIONS: { value: PermissionMode; label: string; desc: string; color: string }[] = [
   { value: 'readonly', label: '只读', desc: '仅允许读取操作，写入/删除一律禁止', color: 'var(--text-3)' },
@@ -28,6 +28,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
   const [systemPrompt, setSystemPrompt] = useState(agent.systemPrompt);
   const [role, setRole] = useState(agent.role);
   const [permMode, setPermMode] = useState<PermissionMode>(agent.permissionMode);
+  const [caps, setCaps] = useState<AgentCapabilities>(agent.capabilities ?? { network: false, shell: false, install: false, browser: false, computer: false });
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
@@ -36,7 +37,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     setBusy(true);
     setSaved(false);
     await window.aibox.updateAgentPersona(agent.id, {
-      role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode
+      role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps
     });
     setBusy(false);
     setSaved(true);
@@ -154,8 +155,37 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
             <textarea style={{ ...textareaStyle, minHeight: 100 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)}
               placeholder="额外的系统级指令…" />
           </div>
+
+          {/* 能力开关 */}
+          <div className="field">
+            <label>能力开关（控制该员工可使用的工具类型，开启后即时生效）</label>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 8 }}>
+              {([
+                { key: 'network' as const, icon: '🌐', label: 'HTTP/HTTPS 网络请求', desc: '允许 web_search、http_request、MCP 远程调用等网络操作' },
+                { key: 'shell' as const, icon: '⌨️', label: '系统命令执行', desc: '允许 run_command 工具，在工作目录内执行 shell 命令' },
+                { key: 'install' as const, icon: '📦', label: '软件包安装', desc: '允许 install_package 工具，安装 npm/pip/apt 包（MCP 工具、Skills 依赖等）' },
+                { key: 'browser' as const, icon: '🖥️', label: '浏览器自动化（Playwright/CDP）', desc: '允许网页导航、点击、输入、截图、JS执行、CDP直连 Chrome' },
+                { key: 'computer' as const, icon: '🖱️', label: '桌面操控（Computer Use）', desc: '允许屏幕截图、鼠标点击、键盘输入、按键组合、滚轮操作' }
+              ]).map((item) => (
+                <label key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', padding: '8px 12px', borderRadius: 8, background: caps[item.key] ? 'var(--accent-soft)' : 'var(--input-bg)', border: `1px solid ${caps[item.key] ? 'var(--accent)' : 'var(--border)'}` }}>
+                  <input type="checkbox" checked={caps[item.key]} onChange={(e) => setCaps((c) => ({ ...c, [item.key]: e.target.checked }))}
+                    style={{ width: 16, height: 16, accentColor: 'var(--accent)' }} />
+                  <span style={{ fontSize: 16 }}>{item.icon}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)' }}>{item.label}</div>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>{item.desc}</div>
+                  </div>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: caps[item.key] ? 'var(--success)' : 'var(--text-3)' }}>
+                    {caps[item.key] ? '已开启' : '关闭'}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
           <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
             权限模式已在顶部设置。当前：<b style={{ color: PERM_OPTIONS.find((p) => p.value === permMode)?.color }}>{PERM_OPTIONS.find((p) => p.value === permMode)?.label}</b>
+            <br />能力开关独立于权限模式：即使权限为“完全自主”，未开启的能力对应工具也不会注册给模型。
           </div>
         </>
       )}

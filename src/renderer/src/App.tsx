@@ -10,6 +10,7 @@ import { Console } from './pages/Console';
 import { Chat } from './pages/Chat';
 import { Market } from './pages/Market';
 import { Teams } from './pages/Teams';
+import { Collab } from './pages/Collab';
 import { Workflows } from './pages/Workflows';
 import { Usage } from './pages/Usage';
 import { Engines } from './pages/Engines';
@@ -34,6 +35,7 @@ const NAV: { key: RouteKey; label: string; icon: React.ReactNode }[] = [
   { key: 'chat', label: '对话', icon: <IconMessage size={17} /> },
   { key: 'market', label: '员工市场', icon: <IconUser size={17} /> },
   { key: 'teams', label: '专家团', icon: <IconUser size={17} /> },
+  { key: 'collab', label: '多机协同', icon: <IconFlow size={17} /> },
   { key: 'engines', label: '引擎中心', icon: <IconChip size={17} /> },
   { key: 'channels', label: '连接中心', icon: <IconPlug size={17} /> },
   { key: 'usage', label: '用量统计', icon: <IconMonitor size={17} /> },
@@ -107,6 +109,7 @@ export function App() {
           {route === 'chat' && <Chat />}
           {route === 'market' && <Market />}
           {route === 'teams' && <Teams />}
+          {route === 'collab' && <Collab />}
           {route === 'engines' && <Engines />}
           {route === 'channels' && <Channels />}
           {route === 'usage' && <Usage />}

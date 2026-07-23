@@ -25,6 +25,7 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "marked": "^18.0.7",
+    "playwright-core": "^1.61.1",
     "sql.js": "^1.14.1",
     "systeminformation": "^5.25.11",
     "ws": "^8.21.1",
