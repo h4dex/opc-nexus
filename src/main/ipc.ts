@@ -410,11 +410,10 @@ export function registerIpc(deps: IpcDeps) {
     return r;
   });
   ipcMain.handle('aibox:getEngineRouting', () => {
-    const raw = db.raw.prepare("SELECT value FROM settings WHERE key = 'engine_routing'").get() as { value?: string } | undefined;
-    try { return raw?.value ? JSON.parse(raw.value) : {}; } catch { return {}; }
+    return db.getSetting<Record<string, string>>('engine_routing', {});
   });
   ipcMain.handle('aibox:saveEngineRouting', (_e, rules: Record<string, string>) => {
-    db.raw.prepare("INSERT INTO settings(key, value) VALUES('engine_routing', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(rules));
+    db.setSetting('engine_routing', rules);
     return { ok: true };
   });
 
