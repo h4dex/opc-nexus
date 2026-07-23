@@ -1,8 +1,9 @@
-/** 专家团管理：创建团队（选协调者+成员+模式）+ 提交团队任务 + 查看执行状态 */
+/** 专家团管理：模板一键组建 + 创建团队 + 提交团队任务 */
 import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
+import { TEAM_TEMPLATES, type TeamTemplate } from '../data/teamTemplates';
 
 interface TeamData {
   id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; createdAt: number;
@@ -14,6 +15,8 @@ export function Teams() {
   const [createOpen, setCreateOpen] = useState(false);
   const [taskInput, setTaskInput] = useState<Record<string, string>>({});
   const [triggerMsg, setTriggerMsg] = useState<Record<string, string>>({});
+  const [deploying, setDeploying] = useState<string | null>(null);
+  const [deployMsg, setDeployMsg] = useState('');
 
   useEffect(() => {
     void window.aibox.listTeams().then(setTeams);
@@ -32,6 +35,42 @@ export function Teams() {
     setTimeout(() => setTriggerMsg((m) => ({ ...m, [teamId]: '' })), 4000);
   };
 
+  /** 一键组建模板团队：自动创建缺失员工 + 创建团队 */
+  const deployTemplate = async (tpl: TeamTemplate) => {
+    setDeploying(tpl.id);
+    setDeployMsg('');
+    try {
+      const existingNames = new Set(snapshot?.agentCards.map((c) => c.agent.name) ?? []);
+      const engineId = snapshot?.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? 'eng-hermes';
+      const allAgents = [tpl.coordinator, ...tpl.members];
+      const nameToId = new Map<string, string>();
+
+      for (const ag of allAgents) {
+        if (existingNames.has(ag.name)) {
+          const found = snapshot?.agentCards.find((c) => c.agent.name === ag.name);
+          if (found) nameToId.set(ag.name, found.agent.id);
+        } else {
+          const created = await window.aibox.createAgent({
+            name: ag.name, role: ag.role, systemPrompt: '', soulMd: ag.soulMd, agentsMd: ag.agentsMd, userMd: '',
+            engineId, workspace: '', permissionMode: ag.permissionMode, concurrencyLimit: 1, channelIds: []
+          });
+          nameToId.set(ag.name, created.id);
+        }
+      }
+
+      const coordinatorId = nameToId.get(tpl.coordinator.name)!;
+      const memberIds = tpl.members.map((m) => nameToId.get(m.name)!).filter(Boolean);
+      const team = await window.aibox.createTeam({ name: tpl.name, coordinatorId, memberIds, mode: tpl.mode });
+      setTeams((prev) => [team as unknown as TeamData, ...prev]);
+      setDeployMsg(`✅ 「${tpl.name}」组建成功！${allAgents.length} 位员工就位。`);
+      setTimeout(() => setDeployMsg(''), 4000);
+    } catch (e) {
+      setDeployMsg(`❌ 组建失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDeploying(null);
+    }
+  };
+
   return (
     <>
       <div className="page-head">
@@ -44,9 +83,29 @@ export function Teams() {
 
       {teams.length === 0 && (
         <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-3)' }}>
-          还没有专家团。点击「组建团队」创建一个多 Agent 协作团队。
+          还没有专家团。从下方模板一键组建，或点击「组建团队」自定义创建。
         </div>
       )}
+
+      {/* 团队模板 */}
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 650, marginBottom: 10, color: 'var(--text-1)' }}>🚀 团队模板（一键组建，缺失员工自动创建）</div>
+        {deployMsg && <div style={{ fontSize: 12.5, marginBottom: 10, color: deployMsg.startsWith('✅') ? 'var(--success)' : 'var(--danger)' }}>{deployMsg}</div>}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 12 }}>
+          {TEAM_TEMPLATES.map((tpl) => (
+            <div key={tpl.id} className="card" style={{ padding: 14 }}>
+              <div style={{ fontWeight: 650, fontSize: 13.5, marginBottom: 4 }}>{tpl.name}</div>
+              <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 8, lineHeight: 1.6 }}>{tpl.description}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 10 }}>
+                👑 {tpl.coordinator.name} + {tpl.members.map((m) => m.name).join('、')}
+              </div>
+              <button className="btn small primary" disabled={deploying === tpl.id} onClick={() => void deployTemplate(tpl)} style={{ width: '100%', justifyContent: 'center' }}>
+                {deploying === tpl.id ? '组建中…' : '一键组建'}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
 
       <div style={{ display: 'grid', gap: 14 }}>
         {teams.map((team) => (

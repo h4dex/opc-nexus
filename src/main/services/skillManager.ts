@@ -68,4 +68,15 @@ export class SkillManager {
     ).all(agentId) as unknown as { id: string; name: string; description: string; content: string; enabled: number; created_at: number }[])
       .map((r) => ({ id: r.id, name: r.name, description: r.description, content: r.content, enabled: r.enabled === 1, createdAt: r.created_at }));
   }
+
+  /** 判断 skill 是否为工作流引用（content 以 "workflow:" 开头） */
+  isWorkflowSkill(skill: Skill): boolean {
+    return skill.content.startsWith('workflow:');
+  }
+
+  /** 提取工作流 ID（从 skill.content 中解析） */
+  getWorkflowId(skill: Skill): string | null {
+    if (!this.isWorkflowSkill(skill)) return null;
+    return skill.content.slice('workflow:'.length);
+  }
 }

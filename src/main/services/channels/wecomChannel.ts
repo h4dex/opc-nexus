@@ -8,8 +8,11 @@
  *   disconnected_event 被服务端踢下线，本端如实转 ERROR 不再自动抢线
  * - 频率约束（官方）：单会话 30 条/分钟；本端仅回执 + 终态两条，天然满足
  */
-import { randomUUID } from 'node:crypto';
-import { safeStorage } from 'electron';
+import { randomUUID, createDecipheriv } from 'node:crypto';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
+import { app, safeStorage } from 'electron';
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
@@ -39,6 +42,9 @@ interface WecomFrame {
     from?: { userid?: string };
     msgtype?: string;
     text?: { content?: string };
+    voice?: { url?: string; aeskey?: string; recognize?: string };
+    file?: { url?: string; aeskey?: string; filename?: string; filesize?: number };
+    image?: { url?: string; aeskey?: string };
     event?: { eventtype?: string };
   };
 }
@@ -244,7 +250,7 @@ export class WecomChannel {
     }
   }
 
-  /** 消息回调 → 公共渠道任务链路；即时回执透传 req_id，终态结果走主动推送 */
+  /** 消息回调 → 支持文本/语音(ASR)/文件；即时回执透传 req_id，终态结果走主动推送 */
   private handleMessage(gen: number, ws: WsLike, frame: WecomFrame) {
     const body = frame.body ?? {};
     const reqId = frame.headers?.req_id;
@@ -255,12 +261,49 @@ export class WecomChannel {
       this.seenMsgIds.push(msgid);
       if (this.seenMsgIds.length > 200) this.seenMsgIds.shift();
     }
-    if (body.msgtype !== 'text') {
-      this.respondStream(ws, reqId, '暂只支持文本消息，请用文字描述任务。');
+
+    let text = '';
+    const attachments: string[] = [];
+
+    if (body.msgtype === 'text') {
+      text = String(body.text?.content ?? '').replace(/^@\S+\s*/, '').trim();
+    } else if (body.msgtype === 'voice') {
+      // 语音消息：企微内置 ASR 转文字（recognize 字段）
+      text = body.voice?.recognize?.trim() ?? '';
+      if (!text) {
+        this.respondStream(ws, reqId, '语音识别失败，请用文字描述任务。');
+        return;
+      }
+      text = `[语音转文字] ${text}`;
+    } else if (body.msgtype === 'file') {
+      // 文件消息：下载 + AES 解密 → 存入 workspace
+      const filePath = this.downloadAndDecrypt(body.file?.url, body.file?.aeskey, body.file?.filename);
+      if (filePath) {
+        attachments.push(filePath);
+        text = `[文件已接收] ${body.file?.filename ?? '未知文件'}，已保存到工作目录。请处理该文件。`;
+      } else {
+        this.respondStream(ws, reqId, '文件下载失败，请重试。');
+        return;
+      }
+    } else if (body.msgtype === 'image') {
+      const filePath = this.downloadAndDecrypt(body.image?.url, body.image?.aeskey, `image_${Date.now()}.png`);
+      if (filePath) {
+        attachments.push(filePath);
+        text = `[图片已接收] 已保存到工作目录：${filePath}`;
+      } else {
+        this.respondStream(ws, reqId, '图片下载失败，请重试。');
+        return;
+      }
+    } else {
+      this.respondStream(ws, reqId, '暂不支持该消息类型，请发送文本/语音/文件。');
       return;
     }
-    // 群聊消息去掉 @机器人 前缀
-    const text = String(body.text?.content ?? '').replace(/^@\S+\s*/, '').trim();
+
+    if (!text) {
+      this.respondStream(ws, reqId, '未识别到有效内容，请重试。');
+      return;
+    }
+
     // 渠道审批拦截：回复“批准/拒绝”触发审批决策
     if (tryChannelApproval(this.db, this.broker, CHANNEL_ID, text, (msg) => this.respondStream(ws, reqId, msg))) return;
     // 终态推送目标：群聊用 chatid（chat_type=2），单聊用发送者 userid（chat_type=1）
@@ -278,6 +321,27 @@ export class WecomChannel {
         this.sendMarkdown(pushChatId, pushChatType, message);
       }
     });
+  }
+
+  /** 下载企微文件/图片并 AES-256-CBC 解密，存入应用数据目录 */
+  private downloadAndDecrypt(url?: string, aeskey?: string, filename?: string): string | null {
+    if (!url) return null;
+    try {
+      const tmpPath = join(app.getPath('userData'), 'aibox-data', 'downloads', filename ?? `file_${Date.now()}`);
+      mkdirSync(join(app.getPath('userData'), 'aibox-data', 'downloads'), { recursive: true });
+      execFileSync('curl', ['-sL', '-o', tmpPath, url], { timeout: 30_000 });
+      if (aeskey) {
+        const encrypted = readFileSync(tmpPath);
+        const key = Buffer.from(aeskey, 'base64');
+        const iv = key.subarray(0, 16);
+        const decipher = createDecipheriv('aes-256-cbc', key, iv);
+        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+        writeFileSync(tmpPath, decrypted);
+      }
+      return tmpPath;
+    } catch {
+      return null;
+    }
   }
 
   /** 即时回执：aibot_respond_msg 流式消息一次完成（finish=true，透传回调 req_id） */

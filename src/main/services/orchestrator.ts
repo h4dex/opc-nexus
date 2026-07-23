@@ -6,6 +6,9 @@
  * - 崩溃恢复：启动时扫描 RUNNING 记录，无法恢复的标记 INTERRUPTED（13.2）
  */
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { app } from 'electron';
 import type { Database } from './database.js';
 import type { ExecutorRegistry } from './executor/index.js';
 import type { ExecutorCallbacks } from './executor/types.js';
@@ -334,10 +337,43 @@ export class Orchestrator {
       .all() as { agent_id: string; since: number }[];
     const runSince = new Map(runs.map((r) => [r.agent_id, r.since]));
 
+    // 助手绑定的 Skills（agent_skills 关联表）
+    const skillRows = this.db.raw
+      .prepare('SELECT as2.agent_id, s.name FROM agent_skills as2 JOIN skills s ON s.id = as2.skill_id WHERE s.enabled = 1')
+      .all() as { agent_id: string; name: string }[];
+    const skillsByAgent = new Map<string, string[]>();
+    for (const r of skillRows) {
+      if (!skillsByAgent.has(r.agent_id)) skillsByAgent.set(r.agent_id, []);
+      skillsByAgent.get(r.agent_id)!.push(r.name);
+    }
+
+    // MCP 服务器（scope='global' 对所有助手可见，scope=agentId 为专属）
+    const mcpRows = this.db.raw
+      .prepare('SELECT id, name, scope FROM mcp_servers WHERE enabled = 1')
+      .all() as { id: string; name: string; scope: string }[];
+    const globalMcp = mcpRows.filter((m) => m.scope === 'global').map((m) => m.name);
+
+    // 助手模型解析：provider_id + model_override → 实际模型名
+    const agentProviderRows = this.db.raw
+      .prepare('SELECT id, provider_id, model_override FROM agents WHERE archived = 0')
+      .all() as { id: string; provider_id: string | null; model_override: string | null }[];
+    const providerRows = this.db.raw
+      .prepare('SELECT id, model, is_default FROM providers')
+      .all() as { id: string; model: string; is_default: number }[];
+    const defaultProvider = providerRows.find((p) => p.is_default === 1);
+    const providerModelMap = new Map(providerRows.map((p) => [p.id, p.model]));
+    const modelByAgent = new Map<string, string>();
+    for (const ar of agentProviderRows) {
+      if (ar.model_override) { modelByAgent.set(ar.id, ar.model_override); }
+      else if (ar.provider_id && providerModelMap.has(ar.provider_id)) { modelByAgent.set(ar.id, providerModelMap.get(ar.provider_id)!); }
+      else if (defaultProvider) { modelByAgent.set(ar.id, defaultProvider.model); }
+    }
+
     return agents.map((agent) => {
       const task = taskByAgent.get(agent.id) ?? null;
       const derived = this.deriveStatus(agent, task);
       const since = runSince.get(agent.id);
+      const agentMcp = mcpRows.filter((m) => m.scope === agent.id).map((m) => m.name);
       return {
         agent,
         derivedStatus: derived,
@@ -347,7 +383,10 @@ export class Orchestrator {
         uptimeText: since ? formatDuration(Date.now() - since) : '',
         channels: [...(channelsByAgent.get(agent.id) ?? [])] as AgentCardView['channels'],
         engineName: engineNames.get(agent.engineId) ?? '未配置引擎',
-        needsAttention: derived === 'error' || task?.status === 'WAITING_APPROVAL'
+        modelName: modelByAgent.get(agent.id) ?? '',
+        needsAttention: derived === 'error' || task?.status === 'WAITING_APPROVAL',
+        skills: skillsByAgent.get(agent.id) ?? [],
+        mcpServers: [...globalMcp, ...agentMcp]
       };
     });
   }
@@ -396,7 +435,7 @@ export class Orchestrator {
 
   createAgent(input: CreateAgentInput): Agent {
     if (input.name.length < 2 || input.name.length > 30) throw new Error('名称需为 2—30 字');
-    if (input.role.length < 20 || input.role.length > 500) throw new Error('职责描述需为 20—500 字');
+    if (input.role.length < 2 || input.role.length > 500) throw new Error('职责描述需为 2—500 字');
     const engine = this.db.raw.prepare("SELECT status FROM engines WHERE id = ?").get(input.engineId) as { status: string } | undefined;
     if (!engine || !['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(engine.status)) {
       throw new Error('只能选择已安装或待配置的引擎（未就绪引擎将以演示模式执行）');
@@ -405,6 +444,13 @@ export class Orchestrator {
     const id = randomUUID();
     const colors = ['#4d6bfe', '#22c1a3', '#8a5cf6', '#f59e0b', '#3aa7ff', '#ef6a6a'];
     const color = colors[Math.floor(Math.random() * colors.length)];
+    // 独立工作区：未指定时自动创建 userData/aibox-data/workspaces/{name}/
+    let workspace = input.workspace;
+    if (!workspace) {
+      const safeName = input.name.replace(/[<>:"/\\|?*]/g, '_').slice(0, 30);
+      workspace = join(app.getPath('userData'), 'aibox-data', 'workspaces', safeName);
+      mkdirSync(workspace, { recursive: true });
+    }
     this.db.transaction(() => {
       this.db.raw.prepare(
         `INSERT INTO agents(id, name, role, system_prompt, soul_md, agents_md, user_md, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at)

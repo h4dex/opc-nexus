@@ -10,6 +10,7 @@ import { Console } from './pages/Console';
 import { Chat } from './pages/Chat';
 import { Market } from './pages/Market';
 import { Teams } from './pages/Teams';
+import { Workflows } from './pages/Workflows';
 import { Usage } from './pages/Usage';
 import { Engines } from './pages/Engines';
 import { Channels } from './pages/Channels';
@@ -18,7 +19,7 @@ import { Settings } from './pages/Settings';
 import { CreateAgentWizard } from './wizard/CreateAgentWizard';
 import { todayText } from './components/common';
 import {
-  IconChip, IconClock, IconCoffee, IconHome, IconMonitor, IconMoon, IconPlug, IconPlus,
+  IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconMonitor, IconMoon, IconPlug, IconPlus,
   IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser
 } from './components/icons';
 
@@ -28,6 +29,7 @@ const NAV: { key: RouteKey; label: string; icon: React.ReactNode }[] = [
   { key: 'agents', label: '数字员工', icon: <IconUser size={17} /> },
   { key: 'tasks', label: '任务中心', icon: <IconTask size={17} /> },
   { key: 'schedules', label: '定时任务', icon: <IconClock size={17} /> },
+  { key: 'workflows', label: '工作流', icon: <IconFlow size={17} /> },
   { key: 'console', label: '执行监控', icon: <IconPlay size={17} /> },
   { key: 'chat', label: '对话', icon: <IconMessage size={17} /> },
   { key: 'market', label: '员工市场', icon: <IconUser size={17} /> },
@@ -100,6 +102,7 @@ export function App() {
           {route === 'agents' && <Agents />}
           {route === 'tasks' && <Tasks />}
           {route === 'schedules' && <Schedules />}
+          {route === 'workflows' && <Workflows />}
           {route === 'console' && <Console />}
           {route === 'chat' && <Chat />}
           {route === 'market' && <Market />}

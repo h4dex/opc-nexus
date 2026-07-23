@@ -56,3 +56,4 @@ export const IconFolder = svg('M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 
 export const IconDb = svg('M12 8c4.4 0 8-1.3 8-3s-3.6-3-8-3-8 1.3-8 3 3.6 3 8 3z', 'M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3');
 export const IconMessage = svg('M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z');
 export const IconThermo = svg('M10 13.6V4a2 2 0 1 1 4 0v9.6a4.5 4.5 0 1 1-4 0z');
+export const IconFlow = svg('M5 5h4v4H5zM15 15h4v4h-4zM15 5h4v4h-4z', 'M9 7h6M7 9v6a2 2 0 0 0 2 2h6M17 13v-2');

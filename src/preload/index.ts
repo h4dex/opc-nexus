@@ -6,7 +6,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
-  ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem
+  ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
+  WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -87,12 +88,20 @@ const api = {
   cloneAgent: (id: string, newName: string): Promise<Agent> => ipcRenderer.invoke('aibox:cloneAgent', id, newName),
   exportAgent: (id: string): Promise<string> => ipcRenderer.invoke('aibox:exportAgent', id),
 
-  // 任务 DAG 工作流
-  listWorkflows: (): Promise<{ id: string; name: string; steps: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[]; status: string; createdAt: number; lastRunAt: number | null }[]> => ipcRenderer.invoke('aibox:listWorkflows'),
-  createWorkflow: (input: { name: string; steps: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[] }): Promise<unknown> => ipcRenderer.invoke('aibox:createWorkflow', input),
-  updateWorkflow: (id: string, patch: { name?: string; steps?: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[] }): Promise<void> => ipcRenderer.invoke('aibox:updateWorkflow', id, patch),
+  // 可视化工作流引擎
+  listWorkflows: (): Promise<WorkflowDef[]> => ipcRenderer.invoke('aibox:listWorkflows'),
+  createWorkflow: (input: { name: string; description?: string; nodes: WfNode[]; edges: WfEdge[] }): Promise<WorkflowDef> => ipcRenderer.invoke('aibox:createWorkflow', input),
+  updateWorkflow: (id: string, patch: { name?: string; description?: string; nodes?: WfNode[]; edges?: WfEdge[] }): Promise<void> => ipcRenderer.invoke('aibox:updateWorkflow', id, patch),
   removeWorkflow: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeWorkflow', id),
-  triggerWorkflow: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:triggerWorkflow', id),
+  triggerWorkflow: (id: string, inputs?: Record<string, string>): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:triggerWorkflow', id, inputs),
+  getWorkflowRunState: (id: string): Promise<{ nodeId: string; status: string }[] | null> => ipcRenderer.invoke('aibox:getWorkflowRunState', id),
+  publishWorkflowAsSkill: (id: string): Promise<{ ok: boolean; message: string; skillId?: string }> => ipcRenderer.invoke('aibox:publishWorkflowAsSkill', id),
+  unpublishWorkflowSkill: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:unpublishWorkflowSkill', id),
+  // 外部工作流平台（Coze / Dify）
+  listWfPlatforms: (): Promise<WfPlatformConfig[]> => ipcRenderer.invoke('aibox:listWfPlatforms'),
+  saveWfPlatform: (input: { id?: string; name: string; baseUrl: string; token?: string }): Promise<WfPlatformConfig> => ipcRenderer.invoke('aibox:saveWfPlatform', input),
+  removeWfPlatform: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeWfPlatform', id),
+  testWfPlatform: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:testWfPlatform', id),
 
   // 专家团
   listTeams: (): Promise<{ id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; createdAt: number }[]> => ipcRenderer.invoke('aibox:listTeams'),
@@ -120,6 +129,11 @@ const api = {
   installEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:installEngine', id),
   detectEngines: (): Promise<Engine[]> => ipcRenderer.invoke('aibox:detectEngines'),
   getInstallGuide: (id: string): Promise<EngineInstallGuide | null> => ipcRenderer.invoke('aibox:getInstallGuide', id),
+  updateEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:updateEngine', id),
+  uninstallEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:uninstallEngine', id),
+  getEngineLatestVersion: (id: string): Promise<string | null> => ipcRenderer.invoke('aibox:getEngineLatestVersion', id),
+  checkRuntime: (): Promise<{ name: string; installed: boolean; version: string | null; path: string | null }[]> => ipcRenderer.invoke('aibox:checkRuntime'),
+  installRuntime: (name: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:installRuntime', name),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('aibox:openExternal', url),
   authEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:authEngine', id),
   setDefaultEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:setDefaultEngine', id),
@@ -174,6 +188,12 @@ const api = {
     const handler = (_: unknown, p: { taskId: string; chunk: string }) => fn(p);
     ipcRenderer.on('aibox:taskOutput', handler);
     return () => ipcRenderer.removeListener('aibox:taskOutput', handler);
+  },
+  /** 工作流节点执行事件（实时变色） */
+  onWfNodeEvent: (fn: (e: WfNodeEvent) => void): (() => void) => {
+    const handler = (_: unknown, e: WfNodeEvent) => fn(e);
+    ipcRenderer.on('aibox:wfNodeEvent', handler);
+    return () => ipcRenderer.removeListener('aibox:wfNodeEvent', handler);
   },
 };
 

@@ -84,8 +84,10 @@ src/
 | `npm run start` | 预览生产构建 |
 | `npm run pack:win` | 构建 + 打包 Windows x64 安装程序 |
 | `npm run pack:linux` | 构建 + 打包 Linux x64 |
+| `npm test` | 运行单元测试（vitest） |
+| `npm run test:watch` | 监听模式运行测试 |
 
-> 当前无测试框架，无 `npm test`。验证以 `typecheck` 为准。
+> 测试框架为 vitest，测试文件位于 `tests/` 目录。验证以 `typecheck` + `test` 为准。
 
 ## 禁止操作
 
@@ -96,7 +98,7 @@ src/
 5. **禁止**修改 `contextIsolation`、`nodeIntegration`、`sandbox` 安全配置
 6. **禁止**在状态机之外直接修改 Agent/Task/Engine/Channel 状态字段
 7. **禁止**引入新的 IPC channel 而不在 ipc.ts 白名单中注册
-8. **禁止**使用 `npm test`（不存在），验证必须用 `npm run typecheck`
+8. **禁止**跳过 `npm test` 验证，状态机变更必须有对应测试覆盖
 
 ## 验证路由
 
@@ -106,10 +108,13 @@ src/
 # 1. 类型检查（必须通过）
 npm run typecheck
 
-# 2. 构建验证（涉及构建配置或依赖变更时）
+# 2. 单元测试（必须通过）
+npm test
+
+# 3. 构建验证（涉及构建配置或依赖变更时）
 npm run build
 
-# 3. 运行时验证（涉及 UI/交互/状态逻辑时）
+# 4. 运行时验证（涉及 UI/交互/状态逻辑时）
 npm run dev
 ```
 

@@ -275,7 +275,13 @@ export interface AgentCardView {
   uptimeText: string;
   channels: ChannelType[];
   engineName: string;
+  /** 该助手当前使用的模型名称（provider 解析后） */
+  modelName: string;
   needsAttention: boolean;
+  /** 该助手绑定的 Skills 名称列表 */
+  skills: string[];
+  /** 该助手可用的 MCP 服务器名称列表（含 global + 专属） */
+  mcpServers: string[];
 }
 
 export interface CreateAgentInput {
@@ -332,5 +338,86 @@ export interface ExecutionEvent {
   runId: string;
   taskId: string;
   payload: Record<string, unknown>;
+  timestamp: number;
+}
+
+// ---------- 可视化工作流引擎 ----------
+
+/** 工作流节点类型 */
+export type WfNodeType = 'ai' | 'cli' | 'python' | 'http' | 'coze' | 'dify' | 'start' | 'end';
+
+/** 工作流节点配置（按类型不同字段不同） */
+export interface WfNodeConfig {
+  // AI 节点
+  prompt?: string;
+  model?: string;
+  temperature?: number;
+  // CLI 节点
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  // Python 节点
+  script?: string;
+  scriptPath?: string;
+  pythonArgs?: string[];
+  // HTTP 节点
+  url?: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  headers?: Record<string, string>;
+  body?: string;
+  // Coze 工作流节点
+  cozeWorkflowId?: string;
+  cozeInputs?: Record<string, string>;
+  // Dify 工作流节点
+  difyWorkflowId?: string;
+  difyInputs?: Record<string, string>;
+  // 通用
+  platformRef?: string;
+  outputVar?: string;
+  timeout?: number;
+}
+
+/** 外部工作流平台凭据配置（存 settings 表，Token 走 safeStorage） */
+export interface WfPlatformConfig {
+  id: string;
+  name: string;
+  baseUrl: string;
+  hasToken: boolean;
+}
+
+export interface WfNode {
+  id: string;
+  type: WfNodeType;
+  label: string;
+  position: { x: number; y: number };
+  config: WfNodeConfig;
+}
+
+export interface WfEdge {
+  id: string;
+  source: string;
+  target: string;
+}
+
+export interface WorkflowDef {
+  id: string;
+  name: string;
+  description: string;
+  nodes: WfNode[];
+  edges: WfEdge[];
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  publishedAsSkill: boolean;
+  skillId: string | null;
+  createdAt: number;
+  lastRunAt: number | null;
+}
+
+/** 工作流节点执行事件（实时推送到前端） */
+export interface WfNodeEvent {
+  workflowId: string;
+  nodeId: string;
+  status: 'running' | 'completed' | 'failed';
+  output?: string;
+  error?: string;
   timestamp: number;
 }

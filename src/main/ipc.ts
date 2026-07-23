@@ -18,11 +18,12 @@ import type { McpManager } from './services/mcpManager.js';
 import type { SkillManager } from './services/skillManager.js';
 import type { ProviderManager } from './services/providerManager.js';
 import type { WorkflowEngine } from './services/workflowEngine.js';
+import type { WfPlatformManager } from './services/wfPlatformManager.js';
 import type { TeamEngine } from './services/teamEngine.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
-import type { AppConfig, CreateAgentInput, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch } from '../shared/types.js';
+import type { AppConfig, CreateAgentInput, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { app } from 'electron';
@@ -44,11 +45,12 @@ export interface IpcDeps {
   providers: ProviderManager;
   workflows: WorkflowEngine;
   teams: TeamEngine;
+  wfPlatforms: WfPlatformManager;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, wfPlatforms, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -183,16 +185,33 @@ export function registerIpc(deps: IpcDeps) {
     return JSON.stringify(exportable, null, 2);
   });
 
-  // ---------- 任务 DAG 工作流 ----------
+  // ---------- 可视化工作流引擎 ----------
+  workflows.onBroadcast(broadcast);
   ipcMain.handle('aibox:listWorkflows', () => workflows.list());
-  ipcMain.handle('aibox:createWorkflow', (_e, input: { name: string; steps: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[] }) => workflows.create(input));
-  ipcMain.handle('aibox:updateWorkflow', (_e, id: string, patch: { name?: string; steps?: { id: string; title: string; agentId: string; instructions: string; dependsOn: string[] }[] }) => workflows.update(id, patch));
+  ipcMain.handle('aibox:createWorkflow', (_e, input: { name: string; description?: string; nodes: WfNode[]; edges: WfEdge[] }) => workflows.create(input));
+  ipcMain.handle('aibox:updateWorkflow', (_e, id: string, patch: { name?: string; description?: string; nodes?: WfNode[]; edges?: WfEdge[] }) => workflows.update(id, patch));
   ipcMain.handle('aibox:removeWorkflow', (_e, id: string) => workflows.remove(id));
-  ipcMain.handle('aibox:triggerWorkflow', (_e, id: string) => {
-    const r = workflows.trigger(id);
+  ipcMain.handle('aibox:triggerWorkflow', (_e, id: string, inputs?: Record<string, string>) => {
+    const r = workflows.trigger(id, inputs);
     pushSnapshot();
     return r;
   });
+  ipcMain.handle('aibox:getWorkflowRunState', (_e, id: string) => workflows.getRunState(id));
+  ipcMain.handle('aibox:publishWorkflowAsSkill', (_e, id: string) => {
+    const r = workflows.publishAsSkill(id);
+    pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:unpublishWorkflowSkill', (_e, id: string) => {
+    const r = workflows.unpublishSkill(id);
+    pushSnapshot();
+    return r;
+  });
+  // ---------- 外部工作流平台（Coze / Dify） ----------
+  ipcMain.handle('aibox:listWfPlatforms', () => wfPlatforms.list());
+  ipcMain.handle('aibox:saveWfPlatform', (_e, input: { id?: string; name: string; baseUrl: string; token?: string }) => wfPlatforms.save(input));
+  ipcMain.handle('aibox:removeWfPlatform', (_e, id: string) => wfPlatforms.remove(id));
+  ipcMain.handle('aibox:testWfPlatform', (_e, id: string) => wfPlatforms.test(id));
 
   // ---------- 专家团 ----------
   ipcMain.handle('aibox:listTeams', () => teams.list());
@@ -231,6 +250,23 @@ export function registerIpc(deps: IpcDeps) {
     return list;
   });
   ipcMain.handle('aibox:getInstallGuide', (_e, id: string) => engines.installGuide(id));
+  ipcMain.handle('aibox:updateEngine', async (_e, id: string) => {
+    const r = await engines.update(id);
+    pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:uninstallEngine', async (_e, id: string) => {
+    const r = await engines.uninstall(id);
+    pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:getEngineLatestVersion', (_e, id: string) => engines.latestVersion(id));
+  ipcMain.handle('aibox:checkRuntime', () => engines.checkRuntime());
+  ipcMain.handle('aibox:installRuntime', async (_e, name: string) => {
+    const r = await engines.installRuntime(name);
+    pushSnapshot();
+    return r;
+  });
   ipcMain.handle('aibox:openExternal', (_e, url: string) => {
     if (/^https:\/\//.test(url)) void shell.openExternal(url); // 外链一律系统浏览器，仅放行 https
   });

@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS agents (
   concurrency_limit INTEGER NOT NULL DEFAULT 1,
   archived INTEGER NOT NULL DEFAULT 0,
   avatar_color TEXT NOT NULL DEFAULT '#4d6bfe',
+  provider_id TEXT,
+  model_override TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -162,6 +164,86 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  title TEXT NOT NULL DEFAULT '',
+  last_message_at INTEGER NOT NULL,
+  message_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  command TEXT NOT NULL,
+  args TEXT NOT NULL DEFAULT '[]',
+  env TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  scope TEXT NOT NULL DEFAULT 'global'
+);
+
+CREATE TABLE IF NOT EXISTS skills (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_skills (
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  skill_id TEXT NOT NULL REFERENCES skills(id),
+  PRIMARY KEY (agent_id, skill_id)
+);
+
+CREATE TABLE IF NOT EXISTS usage_records (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  agent_id TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS providers (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  api_key_ref TEXT NOT NULL DEFAULT '',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS prompt_templates (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT 'general',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workflows (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  steps_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'idle',
+  created_at INTEGER NOT NULL,
+  last_run_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS teams (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  coordinator_id TEXT NOT NULL,
+  member_ids TEXT NOT NULL DEFAULT '[]',
+  mode TEXT NOT NULL DEFAULT 'coordinate',
+  created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
@@ -254,19 +336,22 @@ export class Database {
     this.inner.exec('BEGIN');
     try {
       this.inner.exec(DDL);
+      // 辅助：安全添加列（已存在则跳过，避免 DDL 与 ALTER 冲突）
+      const addCol = (table: string, col: string, type: string) => {
+        const cols = this.inner.exec(`PRAGMA table_info(${table})`);
+        const exists = cols.length > 0 && cols[0].values.some((row) => row[1] === col);
+        if (!exists) this.inner.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+      };
       if (prev < 2) {
-        // v2：任务产物列（新建库随 DDL 后补充；旧库增量 ALTER）
-        this.inner.exec('ALTER TABLE tasks ADD COLUMN result TEXT');
+        addCol('tasks', 'result', 'TEXT');
       }
       if (prev < 3) {
-        // v3：会话锚点（CLI resume / LLM 上下文）；task_messages / schedules 随 DDL 创建
-        this.inner.exec('ALTER TABLE tasks ADD COLUMN session_id TEXT');
+        addCol('tasks', 'session_id', 'TEXT');
       }
       if (prev < 4) {
-        // v4：人设三文件 + 会话 + MCP + Skills + 通知设置
-        this.inner.exec('ALTER TABLE agents ADD COLUMN soul_md TEXT NOT NULL DEFAULT \'\'');
-        this.inner.exec('ALTER TABLE agents ADD COLUMN agents_md TEXT NOT NULL DEFAULT \'\'');
-        this.inner.exec('ALTER TABLE agents ADD COLUMN user_md TEXT NOT NULL DEFAULT \'\'');
+        addCol('agents', 'soul_md', "TEXT NOT NULL DEFAULT ''");
+        addCol('agents', 'agents_md', "TEXT NOT NULL DEFAULT ''");
+        addCol('agents', 'user_md', "TEXT NOT NULL DEFAULT ''");
         this.inner.exec(`CREATE TABLE IF NOT EXISTS conversations (
           id TEXT PRIMARY KEY,
           agent_id TEXT NOT NULL REFERENCES agents(id),
@@ -308,7 +393,7 @@ export class Database {
         )`);
       }
       if (prev < 5) {
-        // v5：多供应商 + 助手模型覆写 + Prompt 模板
+        // v5：多供应商 + 助手模型覆写 + Prompt 模板 + 工作流 + 专家团
         this.inner.exec(`CREATE TABLE IF NOT EXISTS providers (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -318,8 +403,8 @@ export class Database {
           is_default INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL
         )`);
-        this.inner.exec('ALTER TABLE agents ADD COLUMN provider_id TEXT');
-        this.inner.exec('ALTER TABLE agents ADD COLUMN model_override TEXT');
+        addCol('agents', 'provider_id', 'TEXT');
+        addCol('agents', 'model_override', 'TEXT');
         this.inner.exec(`CREATE TABLE IF NOT EXISTS prompt_templates (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
@@ -343,6 +428,14 @@ export class Database {
           mode TEXT NOT NULL DEFAULT 'coordinate',
           created_at INTEGER NOT NULL
         )`);
+      }
+      if (prev < 6) {
+        // v6：可视化工作流引擎（节点/边/发布为 Skill/外部平台）
+        addCol('workflows', 'description', "TEXT NOT NULL DEFAULT ''");
+        addCol('workflows', 'nodes_json', "TEXT NOT NULL DEFAULT '[]'");
+        addCol('workflows', 'edges_json', "TEXT NOT NULL DEFAULT '[]'");
+        addCol('workflows', 'published_as_skill', 'INTEGER NOT NULL DEFAULT 0');
+        addCol('workflows', 'skill_id', 'TEXT');
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

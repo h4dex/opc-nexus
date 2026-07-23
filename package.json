@@ -2,6 +2,7 @@
   "name": "aibox-control-center",
   "version": "1.0.0",
   "description": "数字员工 AI Box 控制中心 - 本地优先的桌面 Agent 管理器",
+  "homepage": "https://github.com/senke/aibox-control-center",
   "main": "out/main/index.js",
   "author": "Senke",
   "license": "UNLICENSED",
@@ -12,12 +13,17 @@
     "build": "electron-vite build",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "pack:win": "npm run build && electron-builder --win --x64",
     "pack:linux": "npm run build && electron-builder --linux --x64"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
     "@types/sql.js": "^1.4.11",
+    "@xyflow/react": "^12.11.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
     "marked": "^18.0.7",
     "sql.js": "^1.14.1",
     "systeminformation": "^5.25.11",
@@ -25,6 +31,8 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
@@ -36,6 +44,7 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "typescript": "^5.8.3",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "vitest": "^3.2.7"
   }
 }

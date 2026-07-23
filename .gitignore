@@ -1,6 +1,8 @@
 node_modules/
 out/
 dist/
+release/
+.qoder/
 *.log
 .DS_Store
 Thumbs.db

@@ -1,0 +1,529 @@
+/**
+ * 测试辅助：模拟 Database 层
+ * 使用内存 Map 模拟 sql.js 的 prepare/get/all/run 接口，
+ * 仅覆盖 Orchestrator 所需的核心查询。
+ */
+// @ts-nocheck
+/* eslint-disable */
+
+export interface MockDb {
+  raw: {
+    prepare: (sql: string) => {
+      get: (...args: unknown[]) => unknown;
+      all: (...args: unknown[]) => unknown[];
+      run: (...args: unknown[]) => { changes: number };
+    };
+  };
+  transaction: (fn: () => void) => void;
+  audit: (entry: unknown) => void;
+  getSetting: <T>(key: string, fallback: T) => T;
+}
+
+interface Tables {
+  agents: Map<string, Record<string, unknown>>;
+  tasks: Map<string, Record<string, unknown>>;
+  agent_runs: Map<string, Record<string, unknown>>;
+  task_events: Map<string, Record<string, unknown>>;
+  approvals: Map<string, Record<string, unknown>>;
+  engines: Map<string, Record<string, unknown>>;
+  channels: Map<string, Record<string, unknown>>;
+  channel_routes: Map<string, Record<string, unknown>>;
+  conversations: Map<string, Record<string, unknown>>;
+  usage_records: Map<string, Record<string, unknown>>;
+  settings: Map<string, unknown>;
+}
+
+export function createMockDb(): MockDb & { tables: Tables } {
+  const tables: Tables = {
+    agents: new Map(),
+    tasks: new Map(),
+    agent_runs: new Map(),
+    task_events: new Map(),
+    approvals: new Map(),
+    engines: new Map(),
+    channels: new Map(),
+    channel_routes: new Map(),
+    conversations: new Map(),
+    usage_records: new Map(),
+    settings: new Map()
+  };
+
+  const audit = vi.fn();
+  const getSetting = <T>(key: string, fallback: T): T => {
+    return tables.settings.has(key) ? (tables.settings.get(key) as T) : fallback;
+  };
+
+  const raw = {
+    prepare: (sql: string) => ({
+      get: (...args: unknown[]): unknown => {
+        return executeQuery(tables, sql, args, 'get');
+      },
+      all: (...args: unknown[]): unknown[] => {
+        return executeQuery(tables, sql, args, 'all') as unknown[];
+      },
+      run: (...args: unknown[]) => {
+        return executeRun(tables, sql, args);
+      }
+    })
+  };
+
+  return {
+    raw,
+    transaction: (fn: () => void) => fn(),
+    audit,
+    getSetting,
+    tables
+  };
+}
+
+/** 简化的 SQL 路由：根据 SQL 语句匹配表和操作 */
+function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' | 'all'): unknown | unknown[] {
+  const table = detectTable(sql);
+  if (!table) return mode === 'get' ? undefined : [];
+  const rows = [...tables[table].values()];
+
+  // SELECT * FROM agents WHERE archived = 0
+  if (/SELECT \* FROM agents WHERE archived = 0/.test(sql)) {
+    const result = rows.filter(r => (r.archived as number) === 0);
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT * FROM agents WHERE id = ?
+  if (/SELECT \* FROM agents WHERE id = \?/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  // SELECT id FROM agents WHERE name = ? AND archived = 0 AND lifecycle = 'READY'
+  if (/SELECT id FROM agents WHERE name = \?/.test(sql)) {
+    const found = rows.find(r => r.name === args[0] && r.archived === 0 && r.lifecycle === 'READY');
+    return mode === 'get' ? (found ? { id: found.id } : undefined) : found ? [{ id: found.id }] : [];
+  }
+
+  // SELECT * FROM tasks WHERE id = ?
+  if (/SELECT \* FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  // SELECT * FROM tasks WHERE status = 'RUNNING' ...
+  if (/SELECT \* FROM tasks WHERE status = 'RUNNING'/.test(sql)) {
+    const result = rows.filter(r => r.status === 'RUNNING');
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT id FROM tasks WHERE status IN ('RUNNING','WAITING_APPROVAL','PAUSED')
+  if (/SELECT id FROM tasks WHERE status IN/.test(sql)) {
+    const statuses = ['RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
+    const result = [...tables.tasks.values()].filter(r => statuses.includes(r.status as string));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT * FROM tasks WHERE status IN (...) ORDER BY created_at DESC
+  if (/SELECT \* FROM tasks WHERE status IN \('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED'\)/.test(sql)) {
+    const statuses = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
+    const result = [...tables.tasks.values()].filter(r => statuses.includes(r.status as string));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT * FROM tasks ORDER BY created_at DESC LIMIT 200
+  if (/SELECT \* FROM tasks ORDER BY created_at DESC/.test(sql)) {
+    const result = [...tables.tasks.values()].sort((a, b) => (b.created_at as number) - (a.created_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT * FROM tasks WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at LIMIT 1
+  if (/SELECT \* FROM tasks WHERE agent_id = \? AND status = 'QUEUED'/.test(sql)) {
+    const result = [...tables.tasks.values()]
+      .filter(r => r.agent_id === args[0] && r.status === 'QUEUED')
+      .sort((a, b) => (a.created_at as number) - (b.created_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT id FROM tasks WHERE agent_id = ? AND status IN (...)
+  if (/SELECT id FROM tasks WHERE agent_id = \? AND status IN/.test(sql)) {
+    const statuses = ['RUNNING', 'QUEUED', 'PAUSED', 'WAITING_APPROVAL'];
+    const result = [...tables.tasks.values()].filter(r => r.agent_id === args[0] && statuses.includes(r.status as string));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN (...)
+  if (/SELECT COUNT\(\*\) c FROM tasks WHERE agent_id = \? AND status IN/.test(sql)) {
+    const statuses = ['RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
+    const count = [...tables.tasks.values()].filter(r => r.agent_id === args[0] && statuses.includes(r.status as string)).length;
+    return { c: count };
+  }
+
+  // SELECT COUNT(*) c FROM tasks WHERE status IN (...)
+  if (/SELECT COUNT\(\*\) c FROM tasks WHERE status IN/.test(sql)) {
+    const statuses = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
+    const count = [...tables.tasks.values()].filter(r => statuses.includes(r.status as string)).length;
+    return { c: count };
+  }
+
+  // SELECT COUNT(*) c FROM tasks WHERE status = 'COMPLETED' AND ended_at >= ?
+  if (/SELECT COUNT\(\*\) c FROM tasks WHERE status = 'COMPLETED'/.test(sql)) {
+    const count = [...tables.tasks.values()].filter(r => r.status === 'COMPLETED' && (r.ended_at as number) >= (args[0] as number)).length;
+    return { c: count };
+  }
+
+  // SELECT COUNT(*) c FROM approvals WHERE status = 'pending'
+  if (/SELECT COUNT\(\*\) c FROM approvals/.test(sql)) {
+    const count = [...tables.approvals.values()].filter(r => r.status === 'pending').length;
+    return { c: count };
+  }
+
+  // SELECT agent_id FROM tasks WHERE id = ?
+  if (/SELECT agent_id FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    return mode === 'get' ? (row ? { agent_id: row.agent_id } : undefined) : [];
+  }
+
+  // SELECT parent_id FROM tasks WHERE id = ?
+  if (/SELECT parent_id FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    return mode === 'get' ? (row ? { parent_id: row.parent_id } : undefined) : [];
+  }
+
+  // SELECT title FROM tasks WHERE id = ?
+  if (/SELECT title FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    return mode === 'get' ? (row ? { title: row.title } : undefined) : [];
+  }
+
+  // SELECT result FROM tasks WHERE id = ?
+  if (/SELECT result FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    return mode === 'get' ? (row ? { result: row.result } : undefined) : [];
+  }
+
+  // SELECT status FROM engines WHERE id = ?
+  if (/SELECT status FROM engines WHERE id = \?/.test(sql)) {
+    const row = tables.engines.get(args[0] as string);
+    return mode === 'get' ? (row ? { status: row.status } : undefined) : [];
+  }
+
+  // SELECT id, name FROM engines
+  if (/SELECT id, name FROM engines/.test(sql)) {
+    return [...tables.engines.values()].map(e => ({ id: e.id, name: e.name }));
+  }
+
+  // SELECT * FROM approvals WHERE status = 'pending'
+  if (/SELECT \* FROM approvals WHERE status = 'pending'/.test(sql)) {
+    return [...tables.approvals.values()].filter(r => r.status === 'pending');
+  }
+
+  // SELECT * FROM approvals WHERE id = ?
+  if (/SELECT \* FROM approvals WHERE id = \?/.test(sql)) {
+    const row = tables.approvals.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  // SELECT * FROM task_events WHERE task_id = ?
+  if (/SELECT \* FROM task_events WHERE task_id = \?/.test(sql)) {
+    return [...tables.task_events.values()].filter(r => r.task_id === args[0]);
+  }
+
+  // SELECT * FROM channels WHERE status IN (...)
+  if (/SELECT \* FROM channels WHERE status IN/.test(sql)) {
+    return [...tables.channels.values()].filter(r => ['ERROR', 'AUTH_EXPIRED'].includes(r.status as string));
+  }
+
+  // SELECT name FROM agents WHERE id = ?
+  if (/SELECT name FROM agents WHERE id = \?/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    return mode === 'get' ? (row ? { name: row.name } : undefined) : [];
+  }
+
+  // SELECT agent_id, MIN(started_at) AS since FROM agent_runs ...
+  if (/SELECT agent_id, MIN\(started_at\) AS since FROM agent_runs/.test(sql)) {
+    return [];
+  }
+
+  // SELECT c.type, cr.agent_id FROM channel_routes ...
+  if (/SELECT c\.type, cr\.agent_id FROM channel_routes/.test(sql)) {
+    return [];
+  }
+
+  // Fallback
+  return mode === 'get' ? undefined : [];
+}
+
+function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: number } {
+  // INSERT INTO agents
+  if (/INSERT INTO agents/.test(sql)) {
+    const [id, name, role, systemPrompt, soulMd, agentsMd, userMd, engineId, workspace, permissionMode, concurrencyLimit, color, now, now2] = args;
+    tables.agents.set(id as string, {
+      id, name, role, system_prompt: systemPrompt, soul_md: soulMd, agents_md: agentsMd, user_md: userMd,
+      lifecycle: 'READY', engine_id: engineId, workspace, permission_mode: permissionMode,
+      concurrency_limit: concurrencyLimit, archived: 0, avatar_color: color, created_at: now, updated_at: now2
+    });
+    return { changes: 1 };
+  }
+
+  // INSERT INTO tasks
+  if (/INSERT INTO tasks/.test(sql)) {
+    const [id, agentId, title, source, parentId, status, stage, sessionId, now, startedAt] = args;
+    tables.tasks.set(id as string, {
+      id, agent_id: agentId, title, source, parent_id: parentId, status,
+      priority: 0, progress: 0, stage, error: null, session_id: sessionId,
+      created_at: now, started_at: startedAt, ended_at: null, result: null
+    });
+    return { changes: 1 };
+  }
+
+  // INSERT INTO agent_runs
+  if (/INSERT INTO agent_runs/.test(sql)) {
+    const [id, agentId, taskId, pid, sessionId, status, startedAt] = args;
+    tables.agent_runs.set(id as string, {
+      id, agent_id: agentId, task_id: taskId, pid, session_id: sessionId, status, started_at: startedAt, ended_at: null
+    });
+    return { changes: 1 };
+  }
+
+  // INSERT INTO task_events
+  if (/INSERT INTO task_events/.test(sql)) {
+    const [id, taskId, eventType, payload, createdAt] = args;
+    tables.task_events.set(id as string, {
+      id, task_id: taskId, event_type: eventType, payload, created_at: createdAt
+    });
+    return { changes: 1 };
+  }
+
+  // INSERT INTO channel_routes
+  if (/INSERT INTO channel_routes/.test(sql)) {
+    const [id, channelId, convKey, agentId, policy] = args;
+    tables.channel_routes.set(id as string, {
+      id, channel_id: channelId, conversation_key: convKey, agent_id: agentId, policy
+    });
+    return { changes: 1 };
+  }
+
+  // INSERT INTO conversations
+  if (/INSERT INTO conversations/.test(sql)) {
+    const [id, agentId, title, lastMsgAt, msgCount] = args;
+    tables.conversations.set(id as string, {
+      id, agent_id: agentId, title, last_message_at: lastMsgAt, message_count: msgCount
+    });
+    return { changes: 1 };
+  }
+
+  // UPDATE agents SET lifecycle = 'READY'
+  if (/UPDATE agents SET lifecycle = 'READY'/.test(sql)) {
+    const [now, id] = args;
+    const agent = tables.agents.get(id as string);
+    if (agent) { agent.lifecycle = 'READY'; agent.updated_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE agents SET lifecycle = 'DISABLED'
+  if (/UPDATE agents SET lifecycle = 'DISABLED'/.test(sql)) {
+    const [now, id] = args;
+    const agent = tables.agents.get(id as string);
+    if (agent) { agent.lifecycle = 'DISABLED'; agent.updated_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE agents SET ... (generic persona update)
+  if (/UPDATE agents SET .+ WHERE id = \?/.test(sql)) {
+    const id = args[args.length - 1] as string;
+    const agent = tables.agents.get(id);
+    if (agent) {
+      // Parse field assignments from SQL
+      const setClause = sql.match(/SET (.+) WHERE/)?.[1] ?? '';
+      const fields = setClause.split(',').map(f => f.trim().split(' = ')[0]);
+      for (let i = 0; i < fields.length; i++) {
+        (agent as Record<string, unknown>)[fields[i]] = args[i];
+      }
+      return { changes: 1 };
+    }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'COMPLETED'
+  if (/UPDATE tasks SET status = 'COMPLETED'/.test(sql)) {
+    const [result, now, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task) { task.status = 'COMPLETED'; task.progress = 100; task.stage = '完成'; task.result = result; task.ended_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = ?, error = ?, ended_at = ?
+  if (/UPDATE tasks SET status = \?, error = \?, ended_at = \?/.test(sql)) {
+    const [status, error, now, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task) { task.status = status; task.error = error; task.ended_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'CANCELLED'
+  if (/UPDATE tasks SET status = 'CANCELLED'/.test(sql)) {
+    const [now, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task) { task.status = 'CANCELLED'; task.ended_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'PAUSED' WHERE id = ? AND status = 'RUNNING'
+  if (/UPDATE tasks SET status = 'PAUSED' WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
+    const [id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'RUNNING') { task.status = 'PAUSED'; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'RUNNING' WHERE id = ? AND status = 'PAUSED'
+  if (/UPDATE tasks SET status = 'RUNNING' WHERE id = \? AND status = 'PAUSED'/.test(sql)) {
+    const [id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'PAUSED') { task.status = 'RUNNING'; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'RUNNING', stage = ?, started_at = ?
+  if (/UPDATE tasks SET status = 'RUNNING', stage = \?, started_at = \?/.test(sql)) {
+    const [stage, now, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task) { task.status = 'RUNNING'; task.stage = stage; task.started_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'RUNNING' WHERE id = ? AND status = 'WAITING_APPROVAL'
+  if (/UPDATE tasks SET status = 'RUNNING' WHERE id = \? AND status = 'WAITING_APPROVAL'/.test(sql)) {
+    const [id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'WAITING_APPROVAL') { task.status = 'RUNNING'; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'FAILED' ... WHERE id = ? AND status = 'WAITING_APPROVAL'
+  if (/UPDATE tasks SET status = 'FAILED'.+WHERE id = \? AND status = 'WAITING_APPROVAL'/.test(sql)) {
+    const [now, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'WAITING_APPROVAL') { task.status = 'FAILED'; task.ended_at = now; task.error = '审批被拒绝'; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET stage = ? WHERE id = ? AND status = 'RUNNING'
+  if (/UPDATE tasks SET stage = \? WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
+    const [stage, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'RUNNING') { task.stage = stage; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET progress = ? WHERE id = ? AND status = 'RUNNING'
+  if (/UPDATE tasks SET progress = \? WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
+    const [progress, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'RUNNING') { task.progress = progress; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET session_id = ?
+  if (/UPDATE tasks SET session_id = \?/.test(sql)) {
+    const [sessionId, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.session_id === null) { task.session_id = sessionId; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'INTERRUPTED'
+  if (/UPDATE tasks SET status = 'INTERRUPTED'/.test(sql)) {
+    const [now, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task) { task.status = 'INTERRUPTED'; task.ended_at = now; task.error = '客户端异常退出，任务中断'; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE agent_runs SET ended_at = ?
+  if (/UPDATE agent_runs SET ended_at = \?/.test(sql)) {
+    const [now, status, taskId] = args;
+    for (const run of tables.agent_runs.values()) {
+      if (run.task_id === taskId && run.ended_at === null) {
+        run.ended_at = now;
+        run.status = status;
+        return { changes: 1 };
+      }
+    }
+    return { changes: 0 };
+  }
+
+  // UPDATE approvals SET status = ?
+  if (/UPDATE approvals SET status = \?/.test(sql)) {
+    const [status, now, id] = args;
+    const ap = tables.approvals.get(id as string);
+    if (ap) { ap.status = status; ap.decided_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE engines SET status = 'AUTH_REQUIRED'
+  if (/UPDATE engines SET status = 'AUTH_REQUIRED'/.test(sql)) {
+    const [id] = args;
+    const engine = tables.engines.get(id as string);
+    if (engine) { engine.status = 'AUTH_REQUIRED'; engine.auth_status = 'required'; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE conversations
+  if (/UPDATE conversations SET/.test(sql)) {
+    return { changes: 1 };
+  }
+
+  return { changes: 0 };
+}
+
+function detectTable(sql: string): keyof Tables | null {
+  if (/\bagents\b/.test(sql) && !/agent_runs/.test(sql)) return 'agents';
+  if (/\bagent_runs\b/.test(sql)) return 'agent_runs';
+  if (/\btasks\b/.test(sql) && !/task_events/.test(sql)) return 'tasks';
+  if (/\btask_events\b/.test(sql)) return 'task_events';
+  if (/\bapprovals\b/.test(sql)) return 'approvals';
+  if (/\bengines\b/.test(sql)) return 'engines';
+  if (/\bchannels\b/.test(sql) && !/channel_routes/.test(sql)) return 'channels';
+  if (/\bchannel_routes\b/.test(sql)) return 'channel_routes';
+  if (/\bconversations\b/.test(sql)) return 'conversations';
+  if (/\busage_records\b/.test(sql)) return 'usage_records';
+  return null;
+}
+
+// ---------- 工厂方法 ----------
+
+export function seedAgent(db: ReturnType<typeof createMockDb>, overrides: Partial<Record<string, unknown>> = {}): string {
+  const id = `agent-${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.tables.agents.set(id, {
+    id,
+    name: `测试员工-${id.slice(6)}`,
+    role: '负责测试任务执行的数字员工，验证状态机转换逻辑',
+    system_prompt: '',
+    soul_md: '',
+    agents_md: '',
+    user_md: '',
+    lifecycle: 'READY',
+    engine_id: 'engine-sim',
+    workspace: '',
+    permission_mode: 'standard',
+    concurrency_limit: 1,
+    archived: 0,
+    avatar_color: '#4d6bfe',
+    created_at: now,
+    updated_at: now,
+    ...overrides
+  });
+  return id;
+}
+
+export function seedEngine(db: ReturnType<typeof createMockDb>, id = 'engine-sim'): void {
+  db.tables.engines.set(id, {
+    id,
+    type: 'hermes',
+    name: 'Hermes (内置)',
+    version: '1.0.0',
+    path: null,
+    status: 'HEALTHY',
+    auth_status: 'authed',
+    is_default: 1,
+    data_boundary: '本地'
+  });
+}

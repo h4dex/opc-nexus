@@ -212,7 +212,7 @@ export class EngineManager {
     }
     if (this.installing.has(id)) return { ok: false, message: '该引擎正在安装中' };
 
-    const registry = sanitizeRegistry(loadConfig().npmRegistry) ?? 'https://registry.npmjs.org';
+    const registry = sanitizeRegistry(loadConfig().npmRegistry) ?? 'https://registry.npmmirror.com';
     this.installing.add(id);
     this.db.raw.prepare("UPDATE engines SET status = 'INSTALLING' WHERE id = ?").run(id);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.install.start', target: `${npmPackage} @ ${registry}`, result: 'ok' });
@@ -249,15 +249,134 @@ export class EngineManager {
     });
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.setDefault', target: id, result: 'ok' });
   }
+
+  /** 引擎更新：npm update -g <pkg> */
+  async update(id: string): Promise<EngineInstallResult> {
+    const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (!entry) return { ok: false, message: '未知引擎' };
+    const { npmPackage } = effective(entry);
+    if (!npmPackage) return { ok: false, message: `${entry.name} 不支持自动更新` };
+    const registry = sanitizeRegistry(loadConfig().npmRegistry) ?? 'https://registry.npmmirror.com';
+    const r = await npmCommand(['update', '-g', npmPackage, '--registry', registry]);
+    if (!r.ok) return { ok: false, message: `更新失败：${r.message}` };
+    await this.detect();
+    return { ok: true, message: `${entry.name} 已更新到最新版本` };
+  }
+
+  /** 引擎卸载：npm uninstall -g <pkg> */
+  async uninstall(id: string): Promise<EngineInstallResult> {
+    const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (!entry) return { ok: false, message: '未知引擎' };
+    const { npmPackage } = effective(entry);
+    if (!npmPackage) return { ok: false, message: `${entry.name} 不支持自动卸载` };
+    const r = await npmCommand(['uninstall', '-g', npmPackage]);
+    if (!r.ok) return { ok: false, message: `卸载失败：${r.message}` };
+    this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(id);
+    return { ok: true, message: `${entry.name} 已卸载` };
+  }
+
+  /** 查询 npm registry 上的最新版本 */
+  async latestVersion(id: string): Promise<string | null> {
+    const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (!entry) return null;
+    const { npmPackage } = effective(entry);
+    if (!npmPackage) return null;
+    try {
+      const registry = sanitizeRegistry(loadConfig().npmRegistry) ?? 'https://registry.npmmirror.com';
+      const res = await fetch(`${registry}/${npmPackage}/latest`, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return null;
+      const data = await res.json() as { version?: string };
+      return data.version ?? null;
+    } catch { return null; }
+  }
+
+  /** 系统 Runtime 环境检测：Node.js / npm / Python */
+  async checkRuntime(): Promise<{ name: string; installed: boolean; version: string | null; path: string | null }[]> {
+    const runtimes = [
+      { name: 'Node.js', bin: 'node', args: ['--version'] },
+      { name: 'npm', bin: 'npm', args: ['--version'] },
+      { name: 'Python', bin: process.platform === 'win32' ? 'python' : 'python3', args: ['--version'] }
+    ];
+    const results: { name: string; installed: boolean; version: string | null; path: string | null }[] = [];
+    for (const rt of runtimes) {
+      const path = await locateBin(rt.bin);
+      if (!path) {
+        results.push({ name: rt.name, installed: false, version: null, path: null });
+        continue;
+      }
+      const version = await new Promise<string | null>((resolve) => {
+        execFile(path, rt.args, { shell: false, timeout: 8000 }, (_err, stdout, stderr) => {
+          const out = (stdout || stderr || '').trim().split(/\r?\n/)[0]?.replace(/^v/, '') ?? null;
+          resolve(out);
+        });
+      });
+      results.push({ name: rt.name, installed: true, version, path });
+    }
+    return results;
+  }
+
+  /** 一键安装 Runtime（Windows: winget，Ubuntu: apt + 国内镜像源） */
+  async installRuntime(name: string): Promise<{ ok: boolean; message: string }> {
+    const isWin = process.platform === 'win32';
+    const isLinux = process.platform === 'linux';
+    let cmd: string, args: string[];
+
+    if (name === 'Node.js') {
+      if (isWin) {
+        cmd = 'cmd.exe';
+        args = ['/d', '/s', '/c', 'winget', 'install', 'OpenJS.NodeJS.LTS', '--accept-package-agreements', '--accept-source-agreements'];
+      } else if (isLinux) {
+        // Ubuntu: 使用 npmmirror 的 NodeSource 脚本安装 LTS
+        cmd = '/bin/bash';
+        args = ['-c', 'curl -fsSL https://npmmirror.com/mirrors/node/latest-v20.x/SHASUMS256.txt -o /dev/null && curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt-get install -y nodejs'];
+      } else {
+        cmd = 'brew'; args = ['install', 'node'];
+      }
+    } else if (name === 'Python') {
+      if (isWin) {
+        cmd = 'cmd.exe';
+        args = ['/d', '/s', '/c', 'winget', 'install', 'Python.Python.3.12', '--accept-package-agreements', '--accept-source-agreements'];
+      } else if (isLinux) {
+        // Ubuntu: apt 安装 + 清华镜像源 pip
+        cmd = '/bin/bash';
+        args = ['-c', 'sudo apt-get update && sudo apt-get install -y python3 python3-pip && pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple'];
+      } else {
+        cmd = 'brew'; args = ['install', 'python@3.12'];
+      }
+    } else if (name === 'npm') {
+      return { ok: false, message: 'npm 随 Node.js 一起安装，请先安装 Node.js' };
+    } else {
+      return { ok: false, message: `不支持自动安装 ${name}` };
+    }
+
+    return new Promise((resolve) => {
+      try {
+        const child = spawn(cmd, args, { shell: false, windowsHide: true });
+        let stderr = '';
+        child.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
+        const timer = setTimeout(() => { child.kill(); resolve({ ok: false, message: '安装超时（5分钟）' }); }, 5 * 60_000);
+        child.on('close', (code) => {
+          clearTimeout(timer);
+          resolve(code === 0 ? { ok: true, message: `${name} 安装成功，请重新检测` } : { ok: false, message: `安装失败（退出码 ${code}）：${stderr.slice(0, 200)}` });
+        });
+        child.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, message: `无法启动安装程序：${err.message}` }); });
+      } catch (err) {
+        resolve({ ok: false, message: err instanceof Error ? err.message : String(err) });
+      }
+    });
+  }
 }
 
 /** npm 全局安装（Windows 下 npm 为 .cmd，须经 cmd.exe /c 拉起；参数均已白名单校验，无注入面） */
 function npmInstallGlobal(pkg: string, registry: string): Promise<{ ok: boolean; message: string }> {
+  return npmCommand(['install', '-g', pkg, '--registry', registry]);
+}
+
+/** 通用 npm 命令执行（install/update/uninstall） */
+function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }> {
   const isWin = process.platform === 'win32';
   const bin = isWin ? 'cmd.exe' : 'npm';
-  const args = isWin
-    ? ['/d', '/s', '/c', 'npm', 'install', '-g', pkg, '--registry', registry]
-    : ['install', '-g', pkg, '--registry', registry];
+  const args = isWin ? ['/d', '/s', '/c', 'npm', ...npmArgs] : npmArgs;
   return new Promise((resolve) => {
     let stderr = '';
     let settled = false;

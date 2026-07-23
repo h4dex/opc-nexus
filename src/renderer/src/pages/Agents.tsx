@@ -46,7 +46,8 @@ export function Agents() {
               <th style={{ padding: '10px 12px', textAlign: 'left' }}>职责</th>
               <th style={{ padding: '10px 12px', textAlign: 'center' }}>状态</th>
               <th style={{ padding: '10px 12px', textAlign: 'center' }}>权限</th>
-              <th style={{ padding: '10px 12px', textAlign: 'left' }}>引擎</th>
+              <th style={{ padding: '10px 12px', textAlign: 'left' }}>引擎 / 模型</th>
+              <th style={{ padding: '10px 12px', textAlign: 'left' }}>能力（Skills / MCP）</th>
               <th style={{ padding: '10px 12px', textAlign: 'center' }}>当前任务</th>
               <th style={{ padding: '10px 12px', textAlign: 'center' }}>操作</th>
             </tr>
@@ -78,7 +79,23 @@ export function Agents() {
                   <td style={{ padding: '12px', textAlign: 'center' }}>
                     <span style={{ fontSize: 11.5, color: perm.color, fontWeight: 600 }}>{perm.text}</span>
                   </td>
-                  <td style={{ padding: '12px', fontSize: 12, color: 'var(--text-2)' }}>{card.engineName}</td>
+                  <td style={{ padding: '12px', fontSize: 12, color: 'var(--text-2)' }}>
+                    <div>{card.engineName}</div>
+                    {card.modelName && <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>{card.modelName}</div>}
+                  </td>
+                  <td style={{ padding: '12px', maxWidth: 220 }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {card.skills.map((s) => (
+                        <span key={s} title={`Skill: ${s}`} style={{ fontSize: 10.5, padding: '1px 6px', borderRadius: 3, background: 'var(--accent-dim, rgba(77,107,254,.12))', color: 'var(--accent)', border: '1px solid var(--accent)', whiteSpace: 'nowrap' }}>{s}</span>
+                      ))}
+                      {card.mcpServers.map((m) => (
+                        <span key={m} title={`MCP: ${m}`} style={{ fontSize: 10.5, padding: '1px 6px', borderRadius: 3, background: 'rgba(16,185,129,.1)', color: 'var(--success)', border: '1px solid var(--success)', whiteSpace: 'nowrap' }}>{m}</span>
+                      ))}
+                      {card.skills.length === 0 && card.mcpServers.length === 0 && (
+                        <span style={{ fontSize: 11, color: 'var(--text-3)' }}>未配置</span>
+                      )}
+                    </div>
+                  </td>
                   <td style={{ padding: '12px', textAlign: 'center', fontSize: 12, color: card.currentTask ? 'var(--accent)' : 'var(--text-3)' }}>
                     {card.currentTask ? `${card.currentTask.progress}%` : '空闲'}
                   </td>

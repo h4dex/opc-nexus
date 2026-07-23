@@ -406,12 +406,17 @@ export class LlmApiExecutor implements ExecutorAdapter {
     if (agent.systemPrompt) parts.push(agent.systemPrompt);
     if (agent.agentsMd) parts.push(`# 行为指令\n${agent.agentsMd}`);
     if (agent.userMd) parts.push(`# 用户信息\n${agent.userMd}`);
-    // 绑定的 skills 注入
+    // 绑定的 skills 注入（区分普通 skill 和 workflow skill）
     const skills = this.db.raw.prepare(
-      'SELECT s.content FROM skills s JOIN agent_skills as2 ON s.id = as2.skill_id WHERE as2.agent_id = ? AND s.enabled = 1'
-    ).all(agent.id) as { content: string }[];
+      'SELECT s.name, s.description, s.content FROM skills s JOIN agent_skills as2 ON s.id = as2.skill_id WHERE as2.agent_id = ? AND s.enabled = 1'
+    ).all(agent.id) as { name: string; description: string; content: string }[];
     for (const sk of skills) {
-      if (sk.content) parts.push(`# 技能\n${sk.content}`);
+      if (sk.content.startsWith('workflow:')) {
+        // 工作流类型 skill：注入可调用描述（不注入原始 workflow:id 字符串）
+        parts.push(`# 可用工作流\n你可以请求执行工作流「${sk.name}」来完成相关任务。${sk.description ? `说明：${sk.description}` : ''}`);
+      } else if (sk.content) {
+        parts.push(`# 技能\n${sk.content}`);
+      }
     }
     return parts.join('\n\n') || '你是一个智能助手。';
   }

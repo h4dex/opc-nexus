@@ -22,7 +22,9 @@ import { McpManager } from './services/mcpManager.js';
 import { SkillManager } from './services/skillManager.js';
 import { ProviderManager } from './services/providerManager.js';
 import { WorkflowEngine } from './services/workflowEngine.js';
+import { WfPlatformManager } from './services/wfPlatformManager.js';
 import { TeamEngine } from './services/teamEngine.js';
+import { WebServer } from './services/webServer.js';
 import { registerIpc } from './ipc.js';
 
 // 单实例锁：防止多开导致 SQLite 争用与重复调度
@@ -127,7 +129,8 @@ app.whenReady().then(async () => {
   const scheduler = new Scheduler(db, orchestrator);
   const mcpManager = new McpManager(db);
   const skillManager = new SkillManager(db);
-  const workflowEngine = new WorkflowEngine(db, orchestrator);
+  const wfPlatformMgr = new WfPlatformManager(db);
+  const workflowEngine = new WorkflowEngine(db, providerManager, wfPlatformMgr);
   const teamEngine = new TeamEngine(db, orchestrator);
   const feishu = new FeishuChannel(db, orchestrator);
     const wecom = new WecomChannel(db, orchestrator, broker);
@@ -167,7 +170,11 @@ app.whenReady().then(async () => {
     if (reconnectable.includes(statusOf('ch-weixin'))) void weixin.connect();
   }
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, getMainWindow: () => mainWindow });
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, getMainWindow: () => mainWindow });
+
+  // 局域网 Web 管理服务器（工控机远程管理）
+  const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
+  webServer.start();
 
   createWindow();
   createTray();

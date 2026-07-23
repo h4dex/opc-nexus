@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import type { AppConfig } from '../../shared/types.js';
 
 const DEFAULTS: AppConfig = {
-  npmRegistry: 'https://registry.npmjs.org',
+  npmRegistry: 'https://registry.npmmirror.com',
   engines: {}
 };
 
