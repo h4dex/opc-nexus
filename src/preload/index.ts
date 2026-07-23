@@ -56,6 +56,8 @@ const api = {
   /** Token / 模型调用统计 */
   getUsageStats: (): Promise<{ total: { input: number; output: number; total: number }; byModel: { model: string; input: number; output: number; total: number; count: number }[]; recent: { id: string; agentId: string; model: string; input: number; output: number; total: number; createdAt: number }[] }> =>
     ipcRenderer.invoke('aibox:getUsageStats'),
+  getUsageStatsEnhanced: (since: number | null): Promise<{ total: { input: number; output: number; total: number }; byModel: { model: string; input: number; output: number; total: number; count: number }[]; byAgent: { agent_id: string; total: number; count: number }[]; trend: { date: string; total: number }[]; recent: { id: string; agentId: string; model: string; input: number; output: number; total: number; createdAt: number }[] }> =>
+    ipcRenderer.invoke('aibox:getUsageStatsEnhanced', since),
 
   // MCP 服务器管理
   listMcpServers: (): Promise<{ id: string; name: string; command: string; args: string[]; env: Record<string, string>; enabled: boolean; scope: string }[]> => ipcRenderer.invoke('aibox:listMcpServers'),

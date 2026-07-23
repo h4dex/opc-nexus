@@ -153,6 +153,27 @@ export function registerIpc(deps: IpcDeps) {
   });
   // 用量统计
   ipcMain.handle('aibox:getUsageStats', () => orchestrator.usageStats());
+  ipcMain.handle('aibox:getUsageStatsEnhanced', (_e, since: number | null) => {
+    const where = since ? 'WHERE created_at >= ?' : '';
+    const params = since ? [since] : [];
+    const total = db.raw.prepare(`SELECT COALESCE(SUM(input_tokens),0) i, COALESCE(SUM(output_tokens),0) o, COALESCE(SUM(total_tokens),0) t FROM usage_records ${where}`).get(...params) as { i: number; o: number; t: number };
+    const byModel = (db.raw.prepare(`SELECT model, SUM(input_tokens) input, SUM(output_tokens) output, SUM(total_tokens) total, COUNT(*) count FROM usage_records ${where} GROUP BY model ORDER BY total DESC`).all(...params) as { model: string; input: number; output: number; total: number; count: number }[]);
+    const byAgent = (db.raw.prepare(`SELECT agent_id, SUM(total_tokens) total, COUNT(*) count FROM usage_records ${where} GROUP BY agent_id ORDER BY total DESC`).all(...params) as { agent_id: string; total: number; count: number }[]);
+    // 最近 7 天每日趋势
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+    const daily = (db.raw.prepare('SELECT created_at, total_tokens FROM usage_records WHERE created_at >= ? ORDER BY created_at').all(sevenDaysAgo) as { created_at: number; total_tokens: number }[]);
+    const trend: { date: string; total: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0); dayStart.setDate(dayStart.getDate() - i);
+      const dayEnd = dayStart.getTime() + 86400000;
+      const dayTotal = daily.filter((r) => r.created_at >= dayStart.getTime() && r.created_at < dayEnd).reduce((s, r) => s + r.total_tokens, 0);
+      trend.push({ date: `${dayStart.getMonth() + 1}/${dayStart.getDate()}`, total: dayTotal });
+    }
+    const recent = (db.raw.prepare(`SELECT * FROM usage_records ${where} ORDER BY created_at DESC LIMIT 50`).all(...params) as { id: string; agent_id: string; model: string; input_tokens: number; output_tokens: number; total_tokens: number; created_at: number }[]).map((r) => ({
+      id: r.id, agentId: r.agent_id, model: r.model, input: r.input_tokens, output: r.output_tokens, total: r.total_tokens, createdAt: r.created_at
+    }));
+    return { total: { input: total.i, output: total.o, total: total.t }, byModel, byAgent, trend, recent };
+  });
 
   // ---------- MCP 服务器管理 ----------
   ipcMain.handle('aibox:listMcpServers', () => mcp.list());
