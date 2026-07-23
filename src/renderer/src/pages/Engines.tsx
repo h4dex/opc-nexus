@@ -150,6 +150,9 @@ export function Engines() {
       {logsEngine && <EngineLogsPanel engine={logsEngine} onClose={() => setLogsEngine(null)} />}
       {/* 自定义引擎注册 */}
       {showRegister && <RegisterEngineModal onClose={() => setShowRegister(false)} />}
+
+      {/* 引擎路由规则 */}
+      <RoutingRules engines={engines} />
     </>
   );
 }
@@ -310,6 +313,57 @@ function RegisterEngineModal({ onClose }: { onClose: () => void }) {
         <button className="btn primary" disabled={busy || !name.trim() || !command.trim()} onClick={() => void register()}>
           {busy ? '注册中…' : '注册引擎'}
         </button>
+      </div>
+    </div>
+  );
+}
+
+/** 引擎路由规则（基础版）：按任务来源指定优先引擎 */
+const TASK_SOURCES = [
+  { key: 'desktop', label: '桌面派发' },
+  { key: 'channel', label: '消息渠道' },
+  { key: 'schedule', label: '定时任务' },
+  { key: 'team', label: '专家团' }
+];
+
+function RoutingRules({ engines }: { engines: Engine[] }) {
+  const [rules, setRules] = useState<Record<string, string> | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  if (!rules) {
+    void window.aibox.getEngineRouting().then(setRules);
+    return null;
+  }
+
+  const healthyEngines = engines.filter((e) => ['HEALTHY', 'SETUP_REQUIRED'].includes(e.status));
+
+  const save = async () => {
+    await window.aibox.saveEngineRouting(rules);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      <div className="card-title">引擎路由规则<span className="sub">按任务来源指定优先引擎（留空则用默认引擎）</span></div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10 }}>
+        {TASK_SOURCES.map((src) => (
+          <div key={src.key} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 12.5, minWidth: 70, color: 'var(--text-2)' }}>{src.label}</span>
+            <select
+              value={rules[src.key] ?? ''}
+              onChange={(e) => setRules((prev) => ({ ...prev, [src.key]: e.target.value }))}
+              style={{ flex: 1, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12 }}
+            >
+              <option value="">默认引擎</option>
+              {healthyEngines.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12 }}>
+        <button className="btn primary" onClick={() => void save()}>保存路由规则</button>
+        {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
       </div>
     </div>
   );

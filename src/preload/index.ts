@@ -168,6 +168,8 @@ const api = {
   getEngineLogs: (id: string): Promise<{ id: string; engineId: string; level: string; message: string; timestamp: number }[]> => ipcRenderer.invoke('aibox:getEngineLogs', id),
   getEngineMetrics: (id: string): Promise<{ avgLatencyMs: number; successRate: number; totalRuns: number }> => ipcRenderer.invoke('aibox:getEngineMetrics', id),
   registerCustomEngine: (input: { name: string; command: string; args?: string; dataBoundary?: string }): Promise<{ ok: boolean; message: string; id?: string }> => ipcRenderer.invoke('aibox:registerCustomEngine', input),
+  getEngineRouting: (): Promise<Record<string, string>> => ipcRenderer.invoke('aibox:getEngineRouting'),
+  saveEngineRouting: (rules: Record<string, string>): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveEngineRouting', rules),
 
   // 模型供应商（脱敏视图；密钥仅上行，不回传明文）
   getProviderConfig: (): Promise<ProviderConfig> => ipcRenderer.invoke('aibox:getProviderConfig'),

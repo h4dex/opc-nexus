@@ -388,6 +388,14 @@ export function registerIpc(deps: IpcDeps) {
     if (r.ok) pushSnapshot();
     return r;
   });
+  ipcMain.handle('aibox:getEngineRouting', () => {
+    const raw = db.raw.prepare("SELECT value FROM settings WHERE key = 'engine_routing'").get() as { value?: string } | undefined;
+    try { return raw?.value ? JSON.parse(raw.value) : {}; } catch { return {}; }
+  });
+  ipcMain.handle('aibox:saveEngineRouting', (_e, rules: Record<string, string>) => {
+    db.raw.prepare("INSERT INTO settings(key, value) VALUES('engine_routing', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(rules));
+    return { ok: true };
+  });
 
   // ---------- 模型供应商（Hermes；密钥仅存 safeStorage，Renderer 只见脱敏视图） ----------
   ipcMain.handle('aibox:getProviderConfig', () => getProviderConfig(db));
