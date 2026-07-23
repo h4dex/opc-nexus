@@ -287,6 +287,13 @@ export function registerIpc(deps: IpcDeps) {
     return r;
   });
   ipcMain.handle('aibox:getTeamRuns', (_e, teamId: string) => teams.listRuns(assertId(teamId, 'teamId')));
+  ipcMain.handle('aibox:getTeamConfig', (_e, teamId: string) => teams.getConfig(teamId));
+  ipcMain.handle('aibox:saveTeamConfig', (_e, teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }) => {
+    teams.saveConfig(teamId, config);
+    return { ok: true };
+  });
+  ipcMain.handle('aibox:getTeamStats', (_e, teamId: string) => teams.getStats(teamId));
+  ipcMain.handle('aibox:getSubtaskOutput', (_e, taskId: string) => teams.getSubtaskOutput(taskId));
 
   // ---------- 任务 ----------
   ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string) => orchestrator.createTask(assertId(agentId, 'agentId'), assertString(title, 'title', 1, 500)));

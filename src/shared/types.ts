@@ -576,6 +576,7 @@ export interface TeamRunSubtask {
   subtask: string;
   taskId: string | null;
   status: TeamRunSubtaskStatus;
+  output?: string;        // 子任务执行输出
 }
 
 export interface TeamRun {
@@ -590,4 +591,12 @@ export interface TeamRun {
   error: string | null;
   createdAt: number;
   endedAt: number | null;
+  durationMs: number | null;
+}
+
+/** 团队配置 */
+export interface TeamConfig {
+  timeout: number;        // 单步超时（秒）
+  maxRetries: number;     // 失败重试次数
+  concurrency: number;    // 并行执行数
 }

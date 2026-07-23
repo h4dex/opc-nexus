@@ -123,6 +123,10 @@ const api = {
   removeTeam: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeam', id),
   triggerTeam: (id: string, task: string): Promise<{ ok: boolean; message: string; runId?: string }> => ipcRenderer.invoke('aibox:triggerTeam', id, task),
   getTeamRuns: (teamId: string): Promise<TeamRun[]> => ipcRenderer.invoke('aibox:getTeamRuns', teamId),
+  getTeamConfig: (teamId: string): Promise<{ timeout: number; maxRetries: number; concurrency: number }> => ipcRenderer.invoke('aibox:getTeamConfig', teamId),
+  saveTeamConfig: (teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveTeamConfig', teamId, config),
+  getTeamStats: (teamId: string): Promise<{ totalRuns: number; avgDurationMs: number; successRate: number }> => ipcRenderer.invoke('aibox:getTeamStats', teamId),
+  getSubtaskOutput: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getSubtaskOutput', taskId),
 
   // 任务
   createTask: (agentId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title),

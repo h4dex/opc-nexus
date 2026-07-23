@@ -399,7 +399,41 @@ _生成时间：${new Date().toLocaleString()}_
       id: r.id, teamId: r.team_id, taskText: r.task_text,
       phase: r.phase as TeamRunPhase, currentStep: r.current_step, totalSteps: r.total_steps,
       subtasks, finalResult: r.final_result, error: r.error,
-      createdAt: r.created_at, endedAt: r.ended_at
+      createdAt: r.created_at, endedAt: r.ended_at,
+      durationMs: r.ended_at ? r.ended_at - r.created_at : null
     };
+  }
+
+  // ---------- 团队配置 / 统计 ----------
+
+  /** 获取团队配置 */
+  getConfig(teamId: string): { timeout: number; maxRetries: number; concurrency: number } {
+    const row = this.db.raw.prepare('SELECT config_json FROM teams WHERE id = ?').get(teamId) as { config_json?: string } | undefined;
+    if (!row?.config_json) return { timeout: 600, maxRetries: 1, concurrency: 1 };
+    try { return JSON.parse(row.config_json); } catch { return { timeout: 600, maxRetries: 1, concurrency: 1 }; }
+  }
+
+  /** 保存团队配置 */
+  saveConfig(teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }) {
+    this.db.raw.prepare('UPDATE teams SET config_json = ? WHERE id = ?').run(JSON.stringify(config), teamId);
+  }
+
+  /** 获取团队统计（累计执行次数/平均耗时/成功率） */
+  getStats(teamId: string): { totalRuns: number; avgDurationMs: number; successRate: number } {
+    const runs = this.db.raw.prepare('SELECT phase, created_at, ended_at FROM team_runs WHERE team_id = ? AND ended_at IS NOT NULL').all(teamId) as { phase: string; created_at: number; ended_at: number }[];
+    if (runs.length === 0) return { totalRuns: 0, avgDurationMs: 0, successRate: 0 };
+    const totalMs = runs.reduce((sum, r) => sum + (r.ended_at - r.created_at), 0);
+    const done = runs.filter((r) => r.phase === 'done').length;
+    return {
+      totalRuns: runs.length,
+      avgDurationMs: Math.round(totalMs / runs.length),
+      successRate: Math.round((done / runs.length) * 100)
+    };
+  }
+
+  /** 获取子任务输出（通过 taskId 查询任务结果） */
+  getSubtaskOutput(taskId: string): string | null {
+    const row = this.db.raw.prepare('SELECT result FROM tasks WHERE id = ?').get(taskId) as { result?: string } | undefined;
+    return row?.result ?? null;
   }
 }
