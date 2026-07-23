@@ -2,6 +2,7 @@
  * 虚拟办公室 —— 2D 卡通游戏风格
  * 参考 Qclaw / Marvis 办公室：拟人化角色 + 电脑工位 + 状态动画
  */
+import { useState } from 'react';
 import { useApp } from '../store';
 import type { AgentCardView } from '@shared/types';
 
@@ -53,14 +54,15 @@ function shadeColor(color: string, percent: number): string {
 }
 
 /* ---------- 单个工位组件 ---------- */
-function Workstation({ card }: { card: AgentCardView }) {
+function Workstation({ card, onHover, onLeave, onClick }: { card: AgentCardView; onHover: (card: AgentCardView, e: React.MouseEvent) => void; onLeave: () => void; onClick: (card: AgentCardView) => void }) {
   const { action, bubble, tooltip, label } = getOfficeAction(card);
   const { hair, shirt } = palette(card.agent.avatarColor);
   const isWorking = action === 'working';
   const isError = action === 'error';
 
   return (
-    <div className={`ws ${isError ? 'ws-error' : ''}`}>
+    <div className={`ws ${isError ? 'ws-error' : ''}`} style={{ cursor: 'pointer' }}
+      onMouseEnter={(e) => onHover(card, e)} onMouseLeave={onLeave} onClick={() => onClick(card)}>
       {/* 对话气泡 */}
       {bubble && (
         <div className={`ws-bubble ${isWorking ? 'ws-bubble-work' : ''}`} title={tooltip}>
@@ -135,6 +137,8 @@ function Workstation({ card }: { card: AgentCardView }) {
 /* ---------- 办公室主页面 ---------- */
 export function Office() {
   const { snapshot } = useApp();
+  const [hoverCard, setHoverCard] = useState<{ card: AgentCardView; x: number; y: number } | null>(null);
+  const [clickCard, setClickCard] = useState<AgentCardView | null>(null);
   if (!snapshot) return null;
   const { agentCards } = snapshot;
   const workingCount = agentCards.filter((c) => c.derivedStatus === 'running').length;
@@ -167,7 +171,10 @@ export function Office() {
         {/* 工位区 */}
         <div className="office-grid">
           {agentCards.map((card) => (
-            <Workstation key={card.agent.id} card={card} />
+            <Workstation key={card.agent.id} card={card}
+              onHover={(c, e) => setHoverCard({ card: c, x: e.clientX, y: e.clientY })}
+              onLeave={() => setHoverCard(null)}
+              onClick={(c) => setClickCard(c)} />
           ))}
         </div>
 
@@ -180,8 +187,96 @@ export function Office() {
         )}
       </div>
 
+      {/* 悬浮绩效卡片 */}
+      {hoverCard && <AgentHoverCard card={hoverCard.card} x={hoverCard.x} y={hoverCard.y} />}
+      {/* 点击详情弹窗 */}
+      {clickCard && <AgentOfficeModal card={clickCard} onClose={() => setClickCard(null)} />}
+
       <style>{officeCss}</style>
     </>
+  );
+}
+
+/* ---------- 悬浮绩效卡片 ---------- */
+function AgentHoverCard({ card, x, y }: { card: AgentCardView; x: number; y: number }) {
+  const statusLabel = card.derivedStatus === 'running' ? '执行中' : card.derivedStatus === 'error' ? '故障' : card.derivedStatus === 'paused' ? '暂停' : '空闲';
+  const statusColor = card.derivedStatus === 'running' ? 'var(--accent)' : card.derivedStatus === 'error' ? 'var(--danger)' : 'var(--success)';
+  return (
+    <div style={{ position: 'fixed', left: Math.min(x + 12, window.innerWidth - 260), top: Math.min(y + 12, window.innerHeight - 180), zIndex: 2000, width: 240, padding: '12px 14px', borderRadius: 10, background: 'var(--card-bg)', border: '1px solid var(--border)', boxShadow: '0 8px 24px rgba(0,0,0,.4)', pointerEvents: 'none' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <div style={{ width: 28, height: 28, borderRadius: 7, background: `${card.agent.avatarColor}22`, color: card.agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12 }}>{card.agent.name.slice(0, 1)}</div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 650, fontSize: 13 }}>{card.agent.name}</div>
+          <div style={{ fontSize: 10.5, color: 'var(--text-3)' }}>{card.agent.role.slice(0, 20)}</div>
+        </div>
+        <span style={{ fontSize: 10.5, color: statusColor, fontWeight: 650 }}>{statusLabel}</span>
+      </div>
+      <div style={{ fontSize: 11.5, color: 'var(--text-2)', lineHeight: 1.8 }}>
+        <div>引擎：{card.engineName} {card.modelName ? `· ${card.modelName}` : ''}</div>
+        {card.currentTask && <div>当前任务：{card.currentTask.title.slice(0, 25)}{card.currentTask.progress > 0 ? ` (${card.currentTask.progress}%)` : ''}</div>}
+        {!card.currentTask && <div>当前状态：等待任务派发</div>}
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>点击查看详细历史任务</div>
+    </div>
+  );
+}
+
+/* ---------- 点击详情弹窗 ---------- */
+function AgentOfficeModal({ card, onClose }: { card: AgentCardView; onClose: () => void }) {
+  const [detail, setDetail] = useState<{
+    tasks: { id: string; title: string; status: string; progress: number; createdAt: number }[];
+    usage: { totalTokens: number; inputTokens: number; outputTokens: number; calls: number };
+  } | null>(null);
+
+  if (!detail) {
+    void window.aibox.getAgentDetail(card.agent.id).then(setDetail);
+    return null;
+  }
+
+  const statusLabel = (s: string) => ({ QUEUED: '排队', RUNNING: '执行中', COMPLETED: '完成', FAILED: '失败', CANCELLED: '取消', PAUSED: '暂停' }[s] ?? s);
+  const statusColor = (s: string) => s === 'COMPLETED' ? 'var(--success)' : s === 'FAILED' ? 'var(--danger)' : s === 'RUNNING' ? 'var(--accent)' : 'var(--text-3)';
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3000 }} onClick={onClose}>
+      <div style={{ width: 500, maxHeight: '70vh', overflowY: 'auto', background: 'var(--card-bg)', borderRadius: 14, padding: 20, border: '1px solid var(--border)' }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+          <div style={{ width: 44, height: 44, borderRadius: 12, background: `${card.agent.avatarColor}22`, color: card.agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 18 }}>{card.agent.name.slice(0, 1)}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 16 }}>{card.agent.name}</div>
+            <div style={{ fontSize: 12, color: 'var(--text-3)' }}>{card.agent.role} · {card.engineName}</div>
+          </div>
+          <button className="btn small" onClick={onClose}>×</button>
+        </div>
+
+        {/* Token 统计 */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 16 }}>
+          <div style={{ textAlign: 'center', padding: '8px', borderRadius: 8, background: 'var(--input-bg)' }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{detail.usage.totalTokens.toLocaleString()}</div>
+            <div style={{ fontSize: 10.5, color: 'var(--text-3)' }}>总 Token</div>
+          </div>
+          <div style={{ textAlign: 'center', padding: '8px', borderRadius: 8, background: 'var(--input-bg)' }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--success)' }}>{detail.usage.calls}</div>
+            <div style={{ fontSize: 10.5, color: 'var(--text-3)' }}>调用次数</div>
+          </div>
+          <div style={{ textAlign: 'center', padding: '8px', borderRadius: 8, background: 'var(--input-bg)' }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--warning)' }}>{detail.usage.outputTokens.toLocaleString()}</div>
+            <div style={{ fontSize: 10.5, color: 'var(--text-3)' }}>输出 Token</div>
+          </div>
+        </div>
+
+        {/* 最近任务 */}
+        <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>最近任务</div>
+        {detail.tasks.length === 0 && <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 12 }}>暂无任务记录</div>}
+        {detail.tasks.map((t) => (
+          <div key={t.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 6, background: 'var(--input-bg)', marginBottom: 4, fontSize: 12 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', background: statusColor(t.status), flexShrink: 0 }} />
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.title.slice(0, 35)}</span>
+            <span style={{ color: statusColor(t.status), fontWeight: 600, fontSize: 11 }}>{statusLabel(t.status)}</span>
+            <span style={{ color: 'var(--text-3)', fontSize: 10.5 }}>{new Date(t.createdAt).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

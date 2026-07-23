@@ -41,6 +41,7 @@ export function Settings() {
       <div className="dash-grid">
         <ProviderCard />
         <RegistryCard />
+        <BridgeCard />
 
         <div className="card">
           <div className="card-title">外观</div>
@@ -132,6 +133,8 @@ function ProviderCard() {
   const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({});
   const [saved, setSaved] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
 
   const load = () => { void window.aibox.listProviders().then(setProviders); };
   useEffect(() => { load(); }, []);
@@ -207,8 +210,11 @@ function ProviderCard() {
             </div>
             <div>
               <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>模型</label>
-              <input style={inputStyle} value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" list="model-presets" />
-              <datalist id="model-presets">{MODEL_PRESETS.map((m) => <option key={m} value={m} />)}</datalist>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input style={{ ...inputStyle, flex: 1 }} value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" list="model-presets" />
+                {editId && <button className="btn small" disabled={fetchingModels} onClick={() => { setFetchingModels(true); void window.aibox.fetchProviderModels(editId).then((r) => { if (r.ok) setFetchedModels(r.models); setFetchingModels(false); }); }}>{fetchingModels ? '获取中' : '获取模型'}</button>}
+              </div>
+              <datalist id="model-presets">{(fetchedModels.length > 0 ? fetchedModels : MODEL_PRESETS).map((m) => <option key={m} value={m} />)}</datalist>
             </div>
           </div>
           <div style={{ marginBottom: 10 }}>
@@ -269,6 +275,73 @@ function RegistryCard() {
         {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已写入配置文件</span>}
         {error && <span style={{ fontSize: 12, color: 'var(--danger)' }}>{error}</span>}
       </div>
+    </div>
+  );
+}
+
+/** API Bridge 反向代理卡片 */
+function BridgeCard() {
+  const [status, setStatus] = useState<{ running: boolean; port: number; bridgeKey: string; enabled: boolean } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => { void window.aibox.getBridgeStatus().then(setStatus); }, []);
+
+  const toggle = async (enabled: boolean) => {
+    const s = await window.aibox.toggleBridge(enabled);
+    setStatus(s);
+  };
+
+  const regen = async () => {
+    const s = await window.aibox.regenerateBridgeKey();
+    setStatus(s);
+  };
+
+  const copyKey = () => {
+    if (!status) return;
+    void navigator.clipboard.writeText(status.bridgeKey);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  if (!status) return null;
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">API Bridge（本地反向代理）<span className="sub">让 Claude Code / Codex / OpenCode 等引擎通过本地端点调用模型</span></div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+          <input type="checkbox" checked={status.enabled} onChange={(e) => void toggle(e.target.checked)} style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
+          启用 API Bridge
+        </label>
+        <span style={{ fontSize: 12, padding: '2px 8px', borderRadius: 4, background: status.running ? 'var(--success-soft, rgba(34,197,94,.1))' : 'var(--input-bg)', color: status.running ? 'var(--success)' : 'var(--text-3)' }}>
+          {status.running ? `运行中 :${status.port}` : '已停止'}
+        </span>
+      </div>
+
+      {status.enabled && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
+            <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>本地端点 (Base URL)</div>
+              <code style={{ fontSize: 13, color: 'var(--accent)', fontWeight: 650 }}>http://127.0.0.1:{status.port}/v1</code>
+            </div>
+            <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Bridge API Key</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{status.bridgeKey.slice(0, 20)}...</code>
+                <button className="btn small" onClick={copyKey}>{copied ? '✓ 已复制' : '复制'}</button>
+                <button className="btn small" onClick={() => void regen()}>重新生成</button>
+              </div>
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
+            <b>使用方法：</b>在 Claude Code / Codex / OpenCode 等工具中配置：<br />
+            <code style={{ fontSize: 11.5 }}>OPENAI_BASE_URL=http://127.0.0.1:{status.port}/v1</code><br />
+            <code style={{ fontSize: 11.5 }}>OPENAI_API_KEY={status.bridgeKey.slice(0, 16)}...</code><br />
+            请求将自动转发到系统内配置的模型供应商（按 model 名路由）。
+          </div>
+        </>
+      )}
     </div>
   );
 }

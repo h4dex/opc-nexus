@@ -287,6 +287,7 @@ export class Orchestrator {
     }
     if (patch.tags !== undefined) { fields.push('tags_json = ?'); values.push(JSON.stringify(patch.tags)); }
     if (patch.modelOverrides !== undefined) { fields.push('model_overrides_json = ?'); values.push(JSON.stringify(patch.modelOverrides)); }
+    if (patch.engineId !== undefined) { fields.push('engine_id = ?'); values.push(patch.engineId); }
     if (fields.length === 0) return agent;
     fields.push('updated_at = ?'); values.push(Date.now());
     values.push(id);

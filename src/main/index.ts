@@ -26,6 +26,7 @@ import { WfPlatformManager } from './services/wfPlatformManager.js';
 import { TeamEngine } from './services/teamEngine.js';
 import { CollabManager } from './services/collabManager.js';
 import { WebServer } from './services/webServer.js';
+import { ApiBridge } from './services/apiBridge.js';
 import { registerIpc } from './ipc.js';
 
 // 单实例锁：防止多开导致 SQLite 争用与重复调度
@@ -178,7 +179,11 @@ app.whenReady().then(async () => {
     if (reconnectable.includes(statusOf('ch-weixin'))) void weixin.connect();
   }
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, getMainWindow: () => mainWindow });
+  // 本地 API Bridge（反向代理，供 Claude Code/Codex 等引擎使用）
+  const apiBridge = new ApiBridge(db, providerManager);
+  if (db.getSetting<string>('bridge_enabled', 'false') === 'true') apiBridge.start();
+
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, apiBridge, getMainWindow: () => mainWindow });
 
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });

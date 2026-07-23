@@ -87,6 +87,11 @@ const api = {
   updateProvider: (id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }): Promise<void> => ipcRenderer.invoke('aibox:updateProvider', id, patch),
   removeProvider: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeProvider', id),
   testProviderById: (id: string): Promise<{ ok: boolean; latencyMs: number; error: string | null }> => ipcRenderer.invoke('aibox:testProviderById', id),
+  fetchProviderModels: (id: string): Promise<{ ok: boolean; models: string[]; error?: string }> => ipcRenderer.invoke('aibox:fetchProviderModels', id),
+  // API Bridge
+  getBridgeStatus: (): Promise<{ running: boolean; port: number; bridgeKey: string; enabled: boolean }> => ipcRenderer.invoke('aibox:getBridgeStatus'),
+  toggleBridge: (enabled: boolean): Promise<{ running: boolean; port: number; bridgeKey: string; enabled: boolean }> => ipcRenderer.invoke('aibox:toggleBridge', enabled),
+  regenerateBridgeKey: (): Promise<{ running: boolean; port: number; bridgeKey: string; enabled: boolean }> => ipcRenderer.invoke('aibox:regenerateBridgeKey'),
 
   // Prompt 模板
   listTemplates: (): Promise<{ id: string; name: string; content: string; category: string }[]> => ipcRenderer.invoke('aibox:listTemplates'),

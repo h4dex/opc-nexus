@@ -350,6 +350,8 @@ export interface AgentPersonaPatch {
   tags?: string[];
   /** 模型参数覆盖 */
   modelOverrides?: { temperature?: number; topP?: number; maxTokens?: number };
+  /** 执行引擎 ID */
+  engineId?: string;
 }
 
 /** 会话（每个助手可持续多轮对话，上下文跨任务保持） */

@@ -59,6 +59,7 @@ export interface IpcDeps {
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
+  apiBridge: import('./services/apiBridge.js').ApiBridge;
   getMainWindow: () => BrowserWindow | null;
 }
 
@@ -204,6 +205,11 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:updateProvider', (_e, id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }) => providers.update(id, patch));
   ipcMain.handle('aibox:removeProvider', (_e, id: string) => providers.remove(id));
   ipcMain.handle('aibox:testProviderById', (_e, id: string) => providers.testById(id));
+  ipcMain.handle('aibox:fetchProviderModels', (_e, id: string) => providers.fetchModels(id));
+  // ---------- API Bridge ----------
+  ipcMain.handle('aibox:getBridgeStatus', () => deps.apiBridge.getStatus());
+  ipcMain.handle('aibox:toggleBridge', (_e, enabled: boolean) => { deps.apiBridge.toggle(enabled); return deps.apiBridge.getStatus(); });
+  ipcMain.handle('aibox:regenerateBridgeKey', () => { deps.apiBridge.regenerateKey(); return deps.apiBridge.getStatus(); });
 
   // ---------- Prompt 模板 ----------
   ipcMain.handle('aibox:listTemplates', () => (db.raw.prepare('SELECT * FROM prompt_templates ORDER BY created_at DESC').all() as unknown as { id: string; name: string; content: string; category: string; created_at: number }[]).map((r) => ({ id: r.id, name: r.name, content: r.content, category: r.category, createdAt: r.created_at })));

@@ -1,5 +1,6 @@
-/** 助手编辑弹窗：权限快捷切换 + 能力开关 + 人设配置（soul.md / agents.md / user.md）+ 预设模板 + 组合预览 */
+/** 助手编辑弹窗：权限快捷切换 + 能力开关 + 人设配置 + 引擎/模型选择 + 预设模板 + 组合预览 */
 import { useState } from 'react';
+import { useApp } from '../store';
 import { Modal } from '../components/common';
 import type { Agent, AgentCapabilities, PermissionMode } from '@shared/types';
 
@@ -32,6 +33,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
   const [tags, setTags] = useState<string[]>(agent.tags ?? []);
   const [tagInput, setTagInput] = useState('');
   const [modelOverrides, setModelOverrides] = useState<{ temperature?: number; topP?: number; maxTokens?: number }>(agent.modelOverrides ?? {});
+  const [engineId, setEngineId] = useState(agent.engineId);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
@@ -41,7 +43,8 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     setSaved(false);
     await window.aibox.updateAgentPersona(agent.id, {
       role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps,
-      tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined
+      tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
+      engineId
     });
     setBusy(false);
     setSaved(true);
@@ -156,6 +159,13 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
             <label>职责描述</label>
             <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="例如：全栈开发助手" />
           </div>
+
+          {/* 引擎选择 */}
+          <div className="field">
+            <label>执行引擎（该员工执行任务时使用的引擎）</label>
+            <EngineSelect value={engineId} onChange={setEngineId} />
+          </div>
+
           <div className="field">
             <label>基础 System Prompt（补充指令，与人设文件组合生效）</label>
             <textarea style={{ ...textareaStyle, minHeight: 100 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)}
@@ -246,5 +256,17 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
         </>
       )}
     </Modal>
+  );
+}
+
+/** 引擎选择下拉：从 snapshot.engines 中筛选可用引擎 */
+function EngineSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { snapshot } = useApp();
+  const engines = (snapshot?.engines ?? []).filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status));
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13 }}>
+      {engines.map((e) => <option key={e.id} value={e.id}>{e.name}{e.isDefault ? ' (默认)' : ''}{e.status === 'SETUP_REQUIRED' ? ' [演示模式]' : ''}</option>)}
+      {engines.length === 0 && <option value="">无可用引擎</option>}
+    </select>
   );
 }

@@ -118,4 +118,35 @@ export class ProviderManager {
       return { ok: false, latencyMs: Date.now() - started, error: err instanceof Error ? err.message : String(err) };
     }
   }
+
+  /** 获取指定供应商的可用模型列表 */
+  async fetchModels(id: string): Promise<{ ok: boolean; models: string[]; error?: string }> {
+    const row = this.db.raw.prepare('SELECT * FROM providers WHERE id = ?').get(id) as { base_url: string; api_key_ref: string } | undefined;
+    if (!row) return { ok: false, models: [], error: '供应商不存在' };
+    const key = row.api_key_ref ? this.decryptKey(row.api_key_ref) : '';
+    if (!key) return { ok: false, models: [], error: '未配置 API Key' };
+    const baseUrl = row.base_url.replace(/\/+$/, '');
+    try {
+      const res = await fetch(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) return { ok: false, models: [], error: `HTTP ${res.status}` };
+      const data = await res.json() as { data?: { id: string }[] };
+      const models = (data.data ?? []).map((m) => m.id).sort();
+      return { ok: true, models };
+    } catch (err) {
+      return { ok: false, models: [], error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** 按模型名查找对应供应商（用于 API Bridge 路由） */
+  resolveByModel(model: string): ResolvedProvider | null {
+    const providers = this.db.raw.prepare('SELECT * FROM providers').all() as { id: string; base_url: string; model: string; api_key_ref: string }[];
+    // 精确匹配模型名
+    const match = providers.find((p) => p.model === model);
+    if (match) {
+      const key = match.api_key_ref ? this.decryptKey(match.api_key_ref) : '';
+      return { baseUrl: match.base_url, model: match.model, key };
+    }
+    // 未匹配则用默认供应商
+    return this.resolveForAgent(null, model);
+  }
 }
