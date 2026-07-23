@@ -275,6 +275,13 @@ function AgentOfficeModal({ card, onClose }: { card: AgentCardView; onClose: () 
             <span style={{ color: 'var(--text-3)', fontSize: 10.5 }}>{new Date(t.createdAt).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })}</span>
           </div>
         ))}
+
+        {/* 快捷操作 */}
+        <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
+          <button className="btn small primary" onClick={() => { void window.aibox.createTask(card.agent.id, '手动派发任务'); onClose(); }}>派发任务</button>
+          <button className="btn small" onClick={() => { void window.aibox.openAgentWorkspace(card.agent.id); }}>打开工作目录</button>
+          <button className="btn small" onClick={onClose}>关闭</button>
+        </div>
       </div>
     </div>
   );

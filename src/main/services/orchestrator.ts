@@ -201,6 +201,7 @@ export class Orchestrator {
       engineId: r.engine_id as string, workspace: r.workspace as string,
       permissionMode: r.permission_mode as Agent['permissionMode'],
       capabilities, tags, modelOverrides,
+      modelOverride: (r.model_override as string) || undefined,
       concurrencyLimit: r.concurrency_limit as number, archived: (r.archived as number) === 1,
       avatarColor: r.avatar_color as string, createdAt: r.created_at as number, updatedAt: r.updated_at as number
     };
@@ -288,6 +289,7 @@ export class Orchestrator {
     if (patch.tags !== undefined) { fields.push('tags_json = ?'); values.push(JSON.stringify(patch.tags)); }
     if (patch.modelOverrides !== undefined) { fields.push('model_overrides_json = ?'); values.push(JSON.stringify(patch.modelOverrides)); }
     if (patch.engineId !== undefined) { fields.push('engine_id = ?'); values.push(patch.engineId); }
+    if (patch.modelOverride !== undefined) { fields.push('model_override = ?'); values.push(patch.modelOverride || ''); }
     if (fields.length === 0) return agent;
     fields.push('updated_at = ?'); values.push(Date.now());
     values.push(id);

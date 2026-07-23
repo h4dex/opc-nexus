@@ -34,6 +34,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
   const [tagInput, setTagInput] = useState('');
   const [modelOverrides, setModelOverrides] = useState<{ temperature?: number; topP?: number; maxTokens?: number }>(agent.modelOverrides ?? {});
   const [engineId, setEngineId] = useState(agent.engineId);
+  const [modelOverride, setModelOverride] = useState(agent.modelOverride ?? '');
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
@@ -44,7 +45,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     await window.aibox.updateAgentPersona(agent.id, {
       role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps,
       tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
-      engineId
+      engineId, modelOverride: modelOverride || undefined
     });
     setBusy(false);
     setSaved(true);
@@ -166,6 +167,12 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
             <EngineSelect value={engineId} onChange={setEngineId} />
           </div>
 
+          {/* 模型选择 */}
+          <div className="field">
+            <label>模型（留空则用供应商默认模型）</label>
+            <ModelSelect value={modelOverride} onChange={setModelOverride} />
+          </div>
+
           <div className="field">
             <label>基础 System Prompt（补充指令，与人设文件组合生效）</label>
             <textarea style={{ ...textareaStyle, minHeight: 100 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)}
@@ -268,5 +275,32 @@ function EngineSelect({ value, onChange }: { value: string; onChange: (v: string
       {engines.map((e) => <option key={e.id} value={e.id}>{e.name}{e.isDefault ? ' (默认)' : ''}{e.status === 'SETUP_REQUIRED' ? ' [演示模式]' : ''}</option>)}
       {engines.length === 0 && <option value="">无可用引擎</option>}
     </select>
+  );
+}
+
+/** 模型选择下拉：从默认供应商获取模型列表 + 允许手动输入 */
+function ModelSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { snapshot } = useApp();
+  const [models, setModels] = useState<string[]>([]);
+  const [fetched, setFetched] = useState(false);
+
+  // 尝试从默认供应商获取模型列表
+  if (!fetched) {
+    setFetched(true);
+    void window.aibox.listProviders().then((providers) => {
+      const def = providers.find((p) => p.isDefault) ?? providers[0];
+      if (def) void window.aibox.fetchProviderModels(def.id).then((r) => { if (r.ok) setModels(r.models); });
+    });
+  }
+
+  return (
+    <div style={{ display: 'flex', gap: 6 }}>
+      <input value={value} onChange={(e) => onChange(e.target.value)} placeholder="默认模型（留空跟随供应商）" list="agent-model-presets"
+        style={{ flex: 1, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13 }} />
+      <datalist id="agent-model-presets">
+        {models.map((m) => <option key={m} value={m} />)}
+        {models.length === 0 && <option value="deepseek-chat" />}
+      </datalist>
+    </div>
   );
 }

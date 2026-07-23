@@ -86,6 +86,8 @@ export interface Agent {
   tags: string[];
   /** 模型参数覆盖（每个员工可独立设置） */
   modelOverrides?: { temperature?: number; topP?: number; maxTokens?: number };
+  /** 模型名覆盖（留空则用供应商默认模型） */
+  modelOverride?: string;
   concurrencyLimit: number;
   archived: boolean;
   avatarColor: string;      // 卡片主题色
@@ -352,6 +354,8 @@ export interface AgentPersonaPatch {
   modelOverrides?: { temperature?: number; topP?: number; maxTokens?: number };
   /** 执行引擎 ID */
   engineId?: string;
+  /** 模型名覆盖 */
+  modelOverride?: string;
 }
 
 /** 会话（每个助手可持续多轮对话，上下文跨任务保持） */
