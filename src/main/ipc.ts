@@ -430,6 +430,11 @@ export function registerIpc(deps: IpcDeps) {
     scheduler.remove(id);
     pushSnapshot();
   });
+  ipcMain.handle('aibox:updateSchedule', (_e, id: string, patch: { title?: string; content?: string; cronKind?: string; cronValue?: string }) => {
+    scheduler.update(id, patch as { title?: string; content?: string; cronKind?: 'interval' | 'daily' | 'weekly' | 'monthly'; cronValue?: string });
+    pushSnapshot();
+  });
+  ipcMain.handle('aibox:getScheduleHistory', (_e, scheduleId: string) => scheduler.getHistory(scheduleId));
 
   // ---------- 渠道 ----------
   // 飞书真实接入（P3c）：保存凭据（secret 走 safeStorage）并建立长连接

@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconMoon, IconSun } from '../components/icons';
-import type { ProviderTestResult, SystemInfo } from '@shared/types';
+import type { SystemInfo } from '@shared/types';
 
 export function Settings() {
   const { theme, setTheme } = useApp();
@@ -115,69 +115,121 @@ export function Settings() {
   );
 }
 
-/** Hermes 模型供应商配置：密钥只上行到主进程 safeStorage，回显仅 hasKey 脱敏视图（15.1） */
+/** 多供应商管理：列表 + 添加/编辑/删除/测试/设为默认 */
+const MODEL_PRESETS = ['deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o', 'qwen-plus', 'qwen-turbo', 'moonshot-v1-8k', 'llama3.1'];
+
+interface ProviderItem { id: string; name: string; baseUrl: string; model: string; isDefault: boolean; hasKey: boolean }
+
 function ProviderCard() {
+  const [providers, setProviders] = useState<ProviderItem[]>([]);
+  const [showForm, setShowForm] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [apiKey, setApiKey] = useState('');
-  const [hasKey, setHasKey] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [test, setTest] = useState<ProviderTestResult | null>(null);
+  const [isDefault, setIsDefault] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({});
   const [saved, setSaved] = useState(false);
 
-  useEffect(() => {
-    void window.aibox.getProviderConfig().then((c) => {
-      setBaseUrl(c.baseUrl);
-      setModel(c.model);
-      setHasKey(c.hasKey);
-    });
-  }, []);
+  const load = () => { void window.aibox.listProviders().then(setProviders); };
+  useEffect(() => { load(); }, []);
+
+  const resetForm = () => { setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setIsDefault(false); setEditId(null); setShowForm(false); };
+
+  const startEdit = (p: ProviderItem) => {
+    setEditId(p.id); setName(p.name); setBaseUrl(p.baseUrl); setModel(p.model); setApiKey(''); setIsDefault(p.isDefault); setShowForm(true);
+  };
 
   const save = async () => {
-    const c = await window.aibox.saveProviderConfig({ baseUrl, model, apiKey: apiKey || undefined });
-    setHasKey(c.hasKey);
-    setApiKey('');
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2500);
+    if (!name.trim() || !baseUrl.trim()) return;
+    if (editId) {
+      await window.aibox.updateProvider(editId, { name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
+    } else {
+      await window.aibox.createProvider({ name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
+    }
+    setSaved(true); setTimeout(() => setSaved(false), 2000);
+    resetForm(); load();
   };
 
-  const doTest = async () => {
-    setTesting(true);
-    setTest(null);
+  const testConn = async (p: ProviderItem) => {
+    setTesting(p.id);
     try {
-      setTest(await window.aibox.testProvider({ baseUrl, apiKey: apiKey || undefined }));
-    } finally {
-      setTesting(false);
-    }
+      const r = await window.aibox.testProvider({ baseUrl: p.baseUrl });
+      setTestResult((prev) => ({ ...prev, [p.id]: { ok: r.ok, msg: r.ok ? `连接成功 (${r.latencyMs}ms)` : r.error ?? '失败' } }));
+    } finally { setTesting(null); }
   };
+
+  const removeP = async (id: string) => { await window.aibox.removeProvider(id); load(); };
+  const setDefault = async (id: string) => { await window.aibox.updateProvider(id, { isDefault: true }); load(); };
+
+  const inputStyle: React.CSSProperties = { width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5, outline: 'none' };
 
   return (
-    <div className="card">
-      <div className="card-title">模型供应商（Hermes 引擎）<span className="sub">配置完成后 Hermes 转为真实执行</span></div>
-      <div className="field">
-        <label>Base URL（OpenAI 兼容接口）</label>
-        <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">模型供应商管理<span className="sub">支持多供应商同时接入，员工可独立选择</span>
+        <button className="btn small primary" style={{ marginLeft: 'auto' }} onClick={() => { resetForm(); setShowForm(true); }}>添加供应商</button>
       </div>
-      <div className="field">
-        <label>模型</label>
-        <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="gpt-4o-mini" />
+
+      {/* 供应商列表 */}
+      {providers.length === 0 && <div style={{ fontSize: 12.5, color: 'var(--text-3)', padding: '12px 0' }}>未配置任何供应商。点击「添加供应商」接入 DeepSeek/OpenAI/Ollama 等模型服务。</div>}
+      <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+        {providers.map((p) => (
+          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)', border: `1px solid ${p.isDefault ? 'var(--accent)' : 'var(--border)'}` }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontWeight: 650, fontSize: 13 }}>{p.name}</span>
+                {p.isDefault && <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 3, background: 'var(--accent-soft)', color: 'var(--accent)', fontWeight: 650 }}>默认</span>}
+                <span style={{ fontSize: 10.5, color: p.hasKey ? 'var(--success)' : 'var(--danger)' }}>{p.hasKey ? '已配置 Key' : '未配置 Key'}</span>
+              </div>
+              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {p.baseUrl} · {p.model}
+              </div>
+              {testResult[p.id] && <div style={{ fontSize: 11, marginTop: 2, color: testResult[p.id].ok ? 'var(--success)' : 'var(--danger)' }}>{testResult[p.id].msg}</div>}
+            </div>
+            <button className="btn small" disabled={testing === p.id} onClick={() => void testConn(p)}>{testing === p.id ? '测试中' : '测试'}</button>
+            {!p.isDefault && <button className="btn small" onClick={() => void setDefault(p.id)}>设为默认</button>}
+            <button className="btn small" onClick={() => startEdit(p)}>编辑</button>
+            <button className="btn small danger" onClick={() => void removeP(p.id)}>删除</button>
+          </div>
+        ))}
       </div>
-      <div className="field">
-        <label>API Key{hasKey ? '（已保存于系统密钥库，留空表示沿用）' : ' *'}</label>
-        <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-          placeholder={hasKey ? '••••••••（已保存）' : 'sk-...'} autoComplete="off" />
-        <div className="hint">密钥仅存入系统密钥库（safeStorage），不进入渲染进程 / localStorage。</div>
-      </div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-        <button className="btn" disabled={testing} onClick={() => void doTest()}>{testing ? '测试中…' : '测试连接'}</button>
-        <button className="btn primary" onClick={() => void save()}>保存配置</button>
-        {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
-        {test && (
-          <span style={{ fontSize: 12, color: test.ok ? 'var(--success)' : 'var(--danger)' }}>
-            {test.ok ? `✓ 连接成功（${test.latencyMs}ms）` : `✗ ${test.error}`}
-          </span>
-        )}
-      </div>
+
+      {/* 添加/编辑表单 */}
+      {showForm && (
+        <div style={{ borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+          <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 10 }}>{editId ? '编辑供应商' : '添加供应商'}</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>名称 *</label>
+              <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="DeepSeek / OpenAI / Ollama" />
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>模型</label>
+              <input style={inputStyle} value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" list="model-presets" />
+              <datalist id="model-presets">{MODEL_PRESETS.map((m) => <option key={m} value={m} />)}</datalist>
+            </div>
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>Base URL（OpenAI 兼容接口）*</label>
+            <input style={inputStyle} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.deepseek.com/v1" />
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>API Key{editId ? '（留空表示沿用已存）' : ''}</label>
+            <input style={inputStyle} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-..." autoComplete="off" />
+          </div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, cursor: 'pointer' }}>
+              <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
+              设为默认供应商
+            </label>
+            <button className="btn primary" disabled={!name.trim() || !baseUrl.trim()} onClick={() => void save()}>{editId ? '保存修改' : '添加'}</button>
+            <button className="btn" onClick={resetForm}>取消</button>
+            {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

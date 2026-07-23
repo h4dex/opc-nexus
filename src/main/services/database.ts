@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -560,6 +560,10 @@ export class Database {
           members_json TEXT NOT NULL DEFAULT '[]',
           created_at INTEGER NOT NULL
         )`);
+      }
+      if (prev < 15) {
+        // v15：定时任务增强（任务内容字段）
+        addCol('schedules', 'content', "TEXT NOT NULL DEFAULT ''");
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

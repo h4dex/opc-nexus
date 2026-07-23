@@ -146,6 +146,8 @@ const api = {
   createSchedule: (input: ScheduleInput): Promise<Schedule> => ipcRenderer.invoke('aibox:createSchedule', input),
   toggleSchedule: (id: string, enabled: boolean): Promise<void> => ipcRenderer.invoke('aibox:toggleSchedule', id, enabled),
   deleteSchedule: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteSchedule', id),
+  updateSchedule: (id: string, patch: { title?: string; content?: string; cronKind?: string; cronValue?: string }): Promise<void> => ipcRenderer.invoke('aibox:updateSchedule', id, patch),
+  getScheduleHistory: (scheduleId: string): Promise<{ id: string; title: string; status: string; createdAt: number }[]> => ipcRenderer.invoke('aibox:getScheduleHistory', scheduleId),
 
   // 引擎
   installEngine: (id: string): Promise<EngineInstallResult> => ipcRenderer.invoke('aibox:installEngine', id),

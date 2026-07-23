@@ -146,8 +146,10 @@ export interface Schedule {
   id: string;
   agentId: string;
   title: string;
-  cronKind: 'interval' | 'daily' | 'weekly';
-  /** interval: 小时数；daily: "HH:mm"；weekly: "星期(0-6)|HH:mm" */
+  /** 任务详细指令/prompt（作为任务内容派发） */
+  content: string;
+  cronKind: 'interval' | 'daily' | 'weekly' | 'monthly';
+  /** interval: 小时数；daily: "HH:mm"；weekly: "星期(0-6)|HH:mm"；monthly: "日(1-28)|HH:mm" */
   cronValue: string;
   enabled: boolean;
   lastRunAt: number | null;
@@ -157,6 +159,7 @@ export interface Schedule {
 export interface ScheduleInput {
   agentId: string;
   title: string;
+  content?: string;
   cronKind: Schedule['cronKind'];
   cronValue: string;
 }
