@@ -18,7 +18,7 @@ const SOUL_PRESETS: { name: string; content: string }[] = [
   { name: '自定义', content: '' }
 ];
 
-type TabKey = 'soul' | 'agents' | 'user' | 'basic';
+type TabKey = 'soul' | 'agents' | 'user' | 'basic' | 'model' | 'tags';
 
 export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => void }) {
   const [tab, setTab] = useState<TabKey>('soul');
@@ -29,6 +29,9 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
   const [role, setRole] = useState(agent.role);
   const [permMode, setPermMode] = useState<PermissionMode>(agent.permissionMode);
   const [caps, setCaps] = useState<AgentCapabilities>(agent.capabilities ?? { network: false, shell: false, install: false, browser: false, computer: false });
+  const [tags, setTags] = useState<string[]>(agent.tags ?? []);
+  const [tagInput, setTagInput] = useState('');
+  const [modelOverrides, setModelOverrides] = useState<{ temperature?: number; topP?: number; maxTokens?: number }>(agent.modelOverrides ?? {});
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
@@ -37,7 +40,8 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     setBusy(true);
     setSaved(false);
     await window.aibox.updateAgentPersona(agent.id, {
-      role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps
+      role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps,
+      tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined
     });
     setBusy(false);
     setSaved(true);
@@ -56,7 +60,9 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     { key: 'soul', label: 'soul.md' },
     { key: 'agents', label: 'agents.md' },
     { key: 'user', label: 'user.md' },
-    { key: 'basic', label: '基础 / 权限' }
+    { key: 'basic', label: '基础 / 权限' },
+    { key: 'model', label: '模型参数' },
+    { key: 'tags', label: '标签' }
   ];
 
   const textareaStyle: React.CSSProperties = {
@@ -186,6 +192,56 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
           <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
             权限模式已在顶部设置。当前：<b style={{ color: PERM_OPTIONS.find((p) => p.value === permMode)?.color }}>{PERM_OPTIONS.find((p) => p.value === permMode)?.label}</b>
             <br />能力开关独立于权限模式：即使权限为“完全自主”，未开启的能力对应工具也不会注册给模型。
+          </div>
+        </>
+      )}
+
+      {tab === 'model' && (
+        <>
+          <div className="field">
+            <label>模型参数覆盖（留空则用全局默认值）</label>
+            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginBottom: 12 }}>每个员工可独立设置模型参数，覆盖全局供应商配置。</div>
+          </div>
+          <div className="field">
+            <label>Temperature: {modelOverrides.temperature ?? '默认'}</label>
+            <input type="range" min="0" max="2" step="0.1" value={modelOverrides.temperature ?? 0.7}
+              onChange={(e) => setModelOverrides((m) => ({ ...m, temperature: Number(e.target.value) }))} style={{ width: '100%' }} />
+          </div>
+          <div className="field">
+            <label>Top P: {modelOverrides.topP ?? '默认'}</label>
+            <input type="range" min="0" max="1" step="0.05" value={modelOverrides.topP ?? 1}
+              onChange={(e) => setModelOverrides((m) => ({ ...m, topP: Number(e.target.value) }))} style={{ width: '100%' }} />
+          </div>
+          <div className="field">
+            <label>Max Tokens</label>
+            <input type="number" min={256} max={128000} step={256} value={modelOverrides.maxTokens ?? ''}
+              onChange={(e) => setModelOverrides((m) => ({ ...m, maxTokens: e.target.value ? Number(e.target.value) : undefined }))}
+              placeholder="默认 4096" />
+          </div>
+          <button className="btn small" onClick={() => setModelOverrides({})} style={{ marginTop: 8 }}>清除覆盖（用全局默认）</button>
+        </>
+      )}
+
+      {tab === 'tags' && (
+        <>
+          <div className="field">
+            <label>标签分组（用于筛选和分组管理）</label>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+              {tags.map((t) => (
+                <span key={t} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, background: 'var(--accent-soft)', color: 'var(--accent)', fontSize: 12.5, fontWeight: 600 }}>
+                  {t}
+                  <button onClick={() => setTags((prev) => prev.filter((x) => x !== t))} style={{ border: 'none', background: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 14, padding: 0, lineHeight: 1 }}>×</button>
+                </span>
+              ))}
+              {tags.length === 0 && <span style={{ fontSize: 12, color: 'var(--text-3)' }}>未添加标签</span>}
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input value={tagInput} onChange={(e) => setTagInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && tagInput.trim()) { setTags((prev) => prev.includes(tagInput.trim()) ? prev : [...prev, tagInput.trim()]); setTagInput(''); } }}
+                placeholder="输入标签名，Enter 添加" style={{ flex: 1 }} />
+              <button className="btn small" onClick={() => { if (tagInput.trim()) { setTags((prev) => prev.includes(tagInput.trim()) ? prev : [...prev, tagInput.trim()]); setTagInput(''); } }}>添加</button>
+            </div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 8 }}>例如：“前端组”、“运营组”、“数据分析”</div>
           </div>
         </>
       )}

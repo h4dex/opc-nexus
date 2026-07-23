@@ -189,6 +189,10 @@ export class Orchestrator {
       const raw = r.capabilities_json as string | undefined;
       if (raw) capabilities = { ...capabilities, ...(JSON.parse(raw) as Partial<typeof capabilities>) };
     } catch { /* 解析失败用默认值 */ }
+    let tags: string[] = [];
+    try { const raw = r.tags_json as string | undefined; if (raw) tags = JSON.parse(raw) as string[]; } catch { /* empty */ }
+    let modelOverrides: { temperature?: number; topP?: number; maxTokens?: number } | undefined;
+    try { const raw = r.model_overrides_json as string | undefined; if (raw) modelOverrides = JSON.parse(raw); } catch { /* empty */ }
     return {
       id: r.id as string, name: r.name as string, role: r.role as string,
       systemPrompt: r.system_prompt as string,
@@ -196,7 +200,7 @@ export class Orchestrator {
       lifecycle: r.lifecycle as Agent['lifecycle'],
       engineId: r.engine_id as string, workspace: r.workspace as string,
       permissionMode: r.permission_mode as Agent['permissionMode'],
-      capabilities,
+      capabilities, tags, modelOverrides,
       concurrencyLimit: r.concurrency_limit as number, archived: (r.archived as number) === 1,
       avatarColor: r.avatar_color as string, createdAt: r.created_at as number, updatedAt: r.updated_at as number
     };
@@ -258,6 +262,12 @@ export class Orchestrator {
     return (this.db.raw.prepare('SELECT * FROM agents WHERE archived = 0 ORDER BY created_at').all() as Row[]).map((r) => this.mapAgent(r));
   }
 
+  /** 归档（软删除）助手 */
+  archiveAgent(id: string) {
+    this.db.raw.prepare('UPDATE agents SET archived = 1, updated_at = ? WHERE id = ?').run(Date.now(), id);
+    this.emit();
+  }
+
   /** 更新助手人设（soul.md / agents.md / user.md / 基础 prompt / 权限模式） */
   updateAgentPersona(id: string, patch: import('../../shared/types.js').AgentPersonaPatch): Agent {
     const agent = this.getAgent(id);
@@ -275,6 +285,8 @@ export class Orchestrator {
       const merged = { ...agent.capabilities, ...patch.capabilities };
       fields.push('capabilities_json = ?'); values.push(JSON.stringify(merged));
     }
+    if (patch.tags !== undefined) { fields.push('tags_json = ?'); values.push(JSON.stringify(patch.tags)); }
+    if (patch.modelOverrides !== undefined) { fields.push('model_overrides_json = ?'); values.push(JSON.stringify(patch.modelOverrides)); }
     if (fields.length === 0) return agent;
     fields.push('updated_at = ?'); values.push(Date.now());
     values.push(id);

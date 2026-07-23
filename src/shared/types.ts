@@ -82,6 +82,10 @@ export interface Agent {
   permissionMode: PermissionMode;
   /** 能力开关（网络/命令/安装），未配置时默认全关 */
   capabilities: AgentCapabilities;
+  /** 标签分组（如"前端组"/"运营组"） */
+  tags: string[];
+  /** 模型参数覆盖（每个员工可独立设置） */
+  modelOverrides?: { temperature?: number; topP?: number; maxTokens?: number };
   concurrencyLimit: number;
   archived: boolean;
   avatarColor: string;      // 卡片主题色
@@ -326,6 +330,10 @@ export interface AgentPersonaPatch {
   permissionMode?: PermissionMode;
   /** 能力开关（网络/命令/安装） */
   capabilities?: Partial<AgentCapabilities>;
+  /** 标签分组 */
+  tags?: string[];
+  /** 模型参数覆盖 */
+  modelOverrides?: { temperature?: number; topP?: number; maxTokens?: number };
 }
 
 /** 会话（每个助手可持续多轮对话，上下文跨任务保持） */

@@ -90,9 +90,11 @@ const api = {
   createTemplate: (input: { name: string; content: string; category?: string }): Promise<unknown> => ipcRenderer.invoke('aibox:createTemplate', input),
   removeTemplate: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTemplate', id),
 
-  // Agent 克隆/导出
+  // Agent 克隆/导出/导入/批量
   cloneAgent: (id: string, newName: string): Promise<Agent> => ipcRenderer.invoke('aibox:cloneAgent', id, newName),
   exportAgent: (id: string): Promise<string> => ipcRenderer.invoke('aibox:exportAgent', id),
+  importAgent: (json: string): Promise<{ ok: boolean; message: string; agent?: Agent }> => ipcRenderer.invoke('aibox:importAgent', json),
+  batchAgentAction: (ids: string[], action: 'start' | 'stop' | 'delete'): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:batchAgentAction', ids, action),
 
   // 可视化工作流引擎
   listWorkflows: (): Promise<WorkflowDef[]> => ipcRenderer.invoke('aibox:listWorkflows'),

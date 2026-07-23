@@ -209,6 +209,35 @@ export function registerIpc(deps: IpcDeps) {
     const { id: _id, lifecycle: _l, archived: _a, createdAt: _c, updatedAt: _u, avatarColor: _av, ...exportable } = agent;
     return JSON.stringify(exportable, null, 2);
   });
+  ipcMain.handle('aibox:importAgent', (_e, json: string) => {
+    try {
+      const data = JSON.parse(json) as { name?: string; role?: string; systemPrompt?: string; soulMd?: string; agentsMd?: string; userMd?: string; engineId?: string; workspace?: string; permissionMode?: string; concurrencyLimit?: number };
+      if (!data.name) return { ok: false, message: '文件缺少 name 字段' };
+      const agent = orchestrator.createAgent({
+        name: data.name, role: data.role ?? '', systemPrompt: data.systemPrompt ?? '',
+        soulMd: data.soulMd ?? '', agentsMd: data.agentsMd ?? '', userMd: data.userMd ?? '',
+        engineId: data.engineId ?? 'eng-hermes', workspace: data.workspace ?? '',
+        permissionMode: (data.permissionMode as 'readonly' | 'standard' | 'trusted' | 'autonomous') ?? 'standard',
+        concurrencyLimit: data.concurrencyLimit ?? 1, channelIds: []
+      });
+      pushSnapshot();
+      return { ok: true, message: `已导入员工「${agent.name}」`, agent };
+    } catch (e) {
+      return { ok: false, message: `JSON 解析失败: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  });
+  ipcMain.handle('aibox:batchAgentAction', (_e, ids: string[], action: 'start' | 'stop' | 'delete') => {
+    let count = 0;
+    for (const id of ids) {
+      try {
+        if (action === 'start') { orchestrator.startAgent(id); count++; }
+        else if (action === 'stop') { orchestrator.stopAgent(id); count++; }
+        else if (action === 'delete') { orchestrator.archiveAgent(id); count++; }
+      } catch { /* 跳过失败的 */ }
+    }
+    pushSnapshot();
+    return { ok: true, message: `已对 ${count} 位员工执行「${action === 'start' ? '启用' : action === 'stop' ? '停用' : '删除'}」操作` };
+  });
 
   // ---------- 可视化工作流引擎 ----------
   workflows.onBroadcast(broadcast);
