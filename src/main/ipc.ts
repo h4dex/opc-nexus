@@ -360,6 +360,18 @@ export function registerIpc(deps: IpcDeps) {
     engines.setDefault(id);
     pushSnapshot();
   });
+  ipcMain.handle('aibox:getEngineConfig', (_e, id: string) => engines.getConfig(id));
+  ipcMain.handle('aibox:saveEngineConfig', (_e, id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }) => {
+    engines.saveConfig(id, config);
+    return { ok: true };
+  });
+  ipcMain.handle('aibox:getEngineLogs', (_e, id: string) => engines.getLogs(id));
+  ipcMain.handle('aibox:getEngineMetrics', (_e, id: string) => engines.getMetrics(id));
+  ipcMain.handle('aibox:registerCustomEngine', (_e, input: { name: string; command: string; args?: string; dataBoundary?: string }) => {
+    const r = engines.registerCustom(input);
+    if (r.ok) pushSnapshot();
+    return r;
+  });
 
   // ---------- 模型供应商（Hermes；密钥仅存 safeStorage，Renderer 只见脱敏视图） ----------
   ipcMain.handle('aibox:getProviderConfig', () => getProviderConfig(db));

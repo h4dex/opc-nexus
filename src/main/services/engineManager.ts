@@ -410,6 +410,67 @@ export class EngineManager {
       }
     });
   }
+
+  // ---------- 配置 / 日志 / 指标 / 自定义注册 ----------
+
+  /** 保存引擎运行配置 */
+  saveConfig(id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }) {
+    this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(config), id);
+    this.addLog(id, 'info', `配置已更新: ${JSON.stringify(config).slice(0, 100)}`);
+  }
+
+  /** 获取引擎配置 */
+  getConfig(id: string): { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null {
+    const row = this.db.raw.prepare('SELECT config_json FROM engines WHERE id = ?').get(id) as { config_json?: string } | undefined;
+    if (!row?.config_json) return null;
+    try { return JSON.parse(row.config_json); } catch { return null; }
+  }
+
+  /** 添加引擎日志 */
+  addLog(engineId: string, level: 'info' | 'warn' | 'error', message: string) {
+    const id = `elog-${randomUUID().slice(0, 8)}`;
+    this.db.raw.prepare('INSERT INTO engine_logs(id, engine_id, level, message, timestamp) VALUES(?,?,?,?,?)')
+      .run(id, engineId, level, message, Date.now());
+    // 保留最近 200 条
+    this.db.raw.prepare('DELETE FROM engine_logs WHERE engine_id = ? AND id NOT IN (SELECT id FROM engine_logs WHERE engine_id = ? ORDER BY timestamp DESC LIMIT 200)')
+      .run(engineId, engineId);
+  }
+
+  /** 获取引擎日志（最近 100 条） */
+  getLogs(engineId: string): { id: string; engineId: string; level: string; message: string; timestamp: number }[] {
+    return (this.db.raw.prepare('SELECT * FROM engine_logs WHERE engine_id = ? ORDER BY timestamp DESC LIMIT 100').all(engineId) as unknown as {
+      id: string; engine_id: string; level: string; message: string; timestamp: number;
+    }[]).map((r) => ({ id: r.id, engineId: r.engine_id, level: r.level, message: r.message, timestamp: r.timestamp }));
+  }
+
+  /** 获取引擎性能指标（从 agent_runs 统计） */
+  getMetrics(engineId: string): { avgLatencyMs: number; successRate: number; totalRuns: number } {
+    const runs = this.db.raw.prepare(
+      `SELECT ar.started_at, ar.ended_at, t.status FROM agent_runs ar JOIN tasks t ON ar.task_id = t.id JOIN agents a ON ar.agent_id = a.id WHERE a.engine_id = ? AND ar.ended_at IS NOT NULL ORDER BY ar.ended_at DESC LIMIT 200`
+    ).all(engineId) as { started_at: number; ended_at: number; status: string }[];
+    if (runs.length === 0) return { avgLatencyMs: 0, successRate: 0, totalRuns: 0 };
+    const totalMs = runs.reduce((sum, r) => sum + (r.ended_at - r.started_at), 0);
+    const completed = runs.filter((r) => r.status === 'COMPLETED').length;
+    return {
+      avgLatencyMs: Math.round(totalMs / runs.length),
+      successRate: Math.round((completed / runs.length) * 100),
+      totalRuns: runs.length
+    };
+  }
+
+  /** 注册自定义引擎 */
+  registerCustom(input: { name: string; command: string; args?: string; dataBoundary?: string }): { ok: boolean; message: string; id?: string } {
+    if (!input.name.trim() || !input.command.trim()) return { ok: false, message: '名称和命令不能为空' };
+    const id = `eng-custom-${randomUUID().slice(0, 6)}`;
+    this.db.raw.prepare(
+      `INSERT INTO engines(id, type, name, version, path, status, auth_status, is_default, data_boundary) VALUES(?, 'external', ?, NULL, ?, 'NOT_INSTALLED', 'unknown', 0, ?)`
+    ).run(id, input.name.trim(), input.command.trim(), input.dataBoundary || '自定义引擎；数据发送目标取决于配置');
+    // 保存命令配置
+    const config = { runArgs: input.args ? input.args.split(' ').filter(Boolean) : [] };
+    this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(config), id);
+    this.addLog(id, 'info', `自定义引擎「${input.name}」已注册，命令: ${input.command}`);
+    return { ok: true, message: `已注册自定义引擎「${input.name}」`, id };
+  }
 }
 
 /** npm 全局安装（Windows 下 npm 为 .cmd，须经 cmd.exe /c 拉起；参数均已白名单校验，无注入面） */

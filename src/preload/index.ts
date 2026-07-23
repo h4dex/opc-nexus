@@ -155,6 +155,11 @@ const api = {
   openAgentWorkspace: (agentId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openAgentWorkspace', agentId),
   authEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:authEngine', id),
   setDefaultEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:setDefaultEngine', id),
+  getEngineConfig: (id: string): Promise<{ runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null> => ipcRenderer.invoke('aibox:getEngineConfig', id),
+  saveEngineConfig: (id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveEngineConfig', id, config),
+  getEngineLogs: (id: string): Promise<{ id: string; engineId: string; level: string; message: string; timestamp: number }[]> => ipcRenderer.invoke('aibox:getEngineLogs', id),
+  getEngineMetrics: (id: string): Promise<{ avgLatencyMs: number; successRate: number; totalRuns: number }> => ipcRenderer.invoke('aibox:getEngineMetrics', id),
+  registerCustomEngine: (input: { name: string; command: string; args?: string; dataBoundary?: string }): Promise<{ ok: boolean; message: string; id?: string }> => ipcRenderer.invoke('aibox:registerCustomEngine', input),
 
   // 模型供应商（脱敏视图；密钥仅上行，不回传明文）
   getProviderConfig: (): Promise<ProviderConfig> => ipcRenderer.invoke('aibox:getProviderConfig'),

@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -534,6 +534,17 @@ export class Database {
         // v11：数字员工增强（标签 + 模型参数覆盖）
         addCol('agents', 'tags_json', "TEXT NOT NULL DEFAULT '[]'");
         addCol('agents', 'model_overrides_json', 'TEXT');
+      }
+      if (prev < 12) {
+        // v12：引擎中心增强（配置 + 日志）
+        addCol('engines', 'config_json', 'TEXT');
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS engine_logs (
+          id TEXT PRIMARY KEY,
+          engine_id TEXT NOT NULL,
+          level TEXT NOT NULL DEFAULT 'info',
+          message TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        )`);
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

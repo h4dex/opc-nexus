@@ -105,6 +105,19 @@ export interface Engine {
   runningInstances: number;
   dataBoundary: string;     // 数据发送目标（15.1：外部引擎必须展示数据发送方）
   installable: boolean;     // 是否支持客户端内自动安装（存在可用 npm 包）
+  /** 引擎运行配置 */
+  config?: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number };
+  /** 引擎性能指标 */
+  metrics?: { avgLatencyMs?: number; successRate?: number; totalRuns?: number };
+}
+
+/** 引擎日志条目 */
+export interface EngineLogEntry {
+  id: string;
+  engineId: string;
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  timestamp: number;
 }
 
 /** 引擎自动安装结果 */
