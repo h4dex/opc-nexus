@@ -4,6 +4,7 @@ import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
 import { TEAM_TEMPLATES, type TeamTemplate } from '../data/teamTemplates';
+import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
 import type { TeamRun } from '../../../shared/types';
 
 interface TeamData {
@@ -256,21 +257,24 @@ function RunProgress({ run }: { run: TeamRun }) {
   );
 }
 
-/** 创建团队弹窗 */
+/** 组建团队弹窗：从员工市场选择专家，创建后自动实例化为现有员工 */
 function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreated: (t: TeamData) => void }) {
   const { snapshot } = useApp();
   const [name, setName] = useState('');
-  const [coordinatorId, setCoordinatorId] = useState('');
-  const [memberIds, setMemberIds] = useState<string[]>([]);
   const [mode, setMode] = useState<'coordinate' | 'roundtable'>('coordinate');
   const [workspace, setWorkspace] = useState('');
+  const [dept, setDept] = useState<string>('全部');
+  const [coordRole, setCoordRole] = useState<MarketRole | null>(null);
+  const [memberRoles, setMemberRoles] = useState<MarketRole[]>([]);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
 
   if (!snapshot) return null;
-  const agents = snapshot.agentCards.filter((c) => c.agent.lifecycle === 'READY');
 
-  const toggleMember = (id: string) => {
-    setMemberIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+  const filteredRoles = MARKET_ROLES.filter((r) => dept === '全部' || r.department === dept);
+
+  const toggleMember = (role: MarketRole) => {
+    setMemberRoles((prev) => prev.some((r) => r.id === role.id) ? prev.filter((r) => r.id !== role.id) : [...prev, role]);
   };
 
   const pickDir = async () => {
@@ -279,19 +283,43 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
   };
 
   const create = async () => {
-    if (!name.trim() || !coordinatorId) return;
-    setBusy(true);
+    if (!name.trim() || !coordRole) return;
+    if (memberRoles.length === 0) { setError('请至少选择一位专家成员'); return; }
+    setBusy(true); setError('');
     try {
-      const t = await window.aibox.createTeam({ name: name.trim(), coordinatorId, memberIds: memberIds.filter((id) => id !== coordinatorId), mode, workspace: workspace.trim() || undefined });
+      // 从员工市场实例化专家：已存在同名员工则复用，否则创建
+      const existingNames = new Set(snapshot.agentCards.map((c) => c.agent.name));
+      const engineId = snapshot.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? 'eng-hermes';
+      const allRoles = [coordRole, ...memberRoles.filter((r) => r.id !== coordRole.id)];
+      const nameToId = new Map<string, string>();
+
+      for (const role of allRoles) {
+        if (existingNames.has(role.name)) {
+          const found = snapshot.agentCards.find((c) => c.agent.name === role.name);
+          if (found) nameToId.set(role.name, found.agent.id);
+        } else {
+          const created = await window.aibox.createAgent({
+            name: role.name, role: role.role, systemPrompt: '', soulMd: role.soulMd, agentsMd: role.agentsMd, userMd: '',
+            engineId, workspace: '', permissionMode: role.permissionMode, concurrencyLimit: 1, channelIds: []
+          });
+          nameToId.set(role.name, created.id);
+        }
+      }
+
+      const coordinatorId = nameToId.get(coordRole.name)!;
+      const memberIds = allRoles.filter((r) => r.id !== coordRole.id).map((r) => nameToId.get(r.name)!).filter(Boolean);
+      const t = await window.aibox.createTeam({ name: name.trim(), coordinatorId, memberIds, mode, workspace: workspace.trim() || undefined });
       onCreated(t as TeamData);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <Modal title="组建专家团" onClose={onClose} width={560}
-      footer={<><button className="btn" onClick={onClose}>取消</button><button className="btn primary" disabled={busy || !name.trim() || !coordinatorId} onClick={() => void create()}>{busy ? '创建中…' : '创建团队'}</button></>}>
+    <Modal title="组建专家团（从员工市场选择专家）" onClose={onClose} width={620}
+      footer={<><button className="btn" onClick={onClose}>取消</button><button className="btn primary" disabled={busy || !name.trim() || !coordRole} onClick={() => void create()}>{busy ? '创建中…' : '创建团队'}</button></>}>
       <div className="field">
         <label>团队名称</label>
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：产品评审团、技术攻关组" />
@@ -300,57 +328,67 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
       <div className="field">
         <label>协作模式</label>
         <div style={{ display: 'flex', gap: 10 }}>
-          <button onClick={() => setMode('coordinate')} style={{
-            flex: 1, padding: '10px 14px', borderRadius: 8, cursor: 'pointer', textAlign: 'left',
-            border: `1.5px solid ${mode === 'coordinate' ? 'var(--accent)' : 'var(--border)'}`,
-            background: mode === 'coordinate' ? 'var(--accent-soft)' : 'transparent'
-          }}>
+          <button onClick={() => setMode('coordinate')} style={{ flex: 1, padding: '10px 14px', borderRadius: 8, cursor: 'pointer', textAlign: 'left', border: `1.5px solid ${mode === 'coordinate' ? 'var(--accent)' : 'var(--border)'}`, background: mode === 'coordinate' ? 'var(--accent-soft)' : 'transparent' }}>
             <div style={{ fontWeight: 650, fontSize: 13 }}>🎯 主Agent协调</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3 }}>协调者拆解任务→分派专家→综合结论</div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3 }}>澄清Spec→拆解→分派→验收</div>
           </button>
-          <button onClick={() => setMode('roundtable')} style={{
-            flex: 1, padding: '10px 14px', borderRadius: 8, cursor: 'pointer', textAlign: 'left',
-            border: `1.5px solid ${mode === 'roundtable' ? 'var(--accent)' : 'var(--border)'}`,
-            background: mode === 'roundtable' ? 'var(--accent-soft)' : 'transparent'
-          }}>
+          <button onClick={() => setMode('roundtable')} style={{ flex: 1, padding: '10px 14px', borderRadius: 8, cursor: 'pointer', textAlign: 'left', border: `1.5px solid ${mode === 'roundtable' ? 'var(--accent)' : 'var(--border)'}`, background: mode === 'roundtable' ? 'var(--accent-soft)' : 'transparent' }}>
             <div style={{ fontWeight: 650, fontSize: 13 }}>🔄 专家圆桌</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3 }}>各专家发表观点→协调者总结</div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3 }}>多专家 PK 观点→总结</div>
           </button>
         </div>
       </div>
 
+      {/* 部门筛选 */}
       <div className="field">
-        <label>主 Agent（协调者）— 负责分析、拆解、综合</label>
-        <select value={coordinatorId} onChange={(e) => setCoordinatorId(e.target.value)}>
-          <option value="">选择协调者…</option>
-          {agents.map((c) => <option key={c.agent.id} value={c.agent.id}>{c.agent.name}（{c.agent.role}）</option>)}
-        </select>
+        <label>选择专家（从员工市场，创建后自动录用为现有员工）</label>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+          {DEPARTMENTS.map((d) => (
+            <button key={d} onClick={() => setDept(d)} style={{ padding: '4px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 11.5, fontWeight: 600, background: dept === d ? 'var(--accent)' : 'var(--input-bg)', color: dept === d ? '#fff' : 'var(--text-2)' }}>{d}</button>
+          ))}
+        </div>
+
+        {/* 协调者选择 */}
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginBottom: 4 }}>主 Agent（协调者）— 点击选择：</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            {filteredRoles.map((r) => (
+              <button key={r.id} onClick={() => setCoordRole(r)} style={{ padding: '4px 10px', borderRadius: 6, fontSize: 11.5, fontWeight: 600, cursor: 'pointer', border: `1px solid ${coordRole?.id === r.id ? 'var(--accent)' : 'var(--border)'}`, background: coordRole?.id === r.id ? 'var(--accent-soft)' : 'transparent', color: coordRole?.id === r.id ? 'var(--accent)' : 'var(--text-2)' }}>
+                👑 {r.name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 成员多选 */}
+        <div>
+          <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginBottom: 4 }}>专家成员（可多选）：</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5, maxHeight: 160, overflowY: 'auto' }}>
+            {filteredRoles.filter((r) => r.id !== coordRole?.id).map((r) => {
+              const checked = memberRoles.some((m) => m.id === r.id);
+              return (
+                <label key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderRadius: 6, cursor: 'pointer', border: `1px solid ${checked ? 'var(--accent)' : 'var(--border)'}`, background: checked ? 'var(--accent-soft)' : 'transparent', fontSize: 12 }}>
+                  <input type="checkbox" checked={checked} onChange={() => toggleMember(r)} style={{ accentColor: 'var(--accent)', width: 14, height: 14 }} />
+                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</span>
+                  <span style={{ fontSize: 10, color: 'var(--text-3)' }}>{r.department}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
       </div>
 
       <div className="field">
-        <label>共享工作目录（可选，留空自动创建）— 团队成员共享，通过 MD 文件交接</label>
+        <label>共享工作目录（可选，留空自动创建）</label>
         <div style={{ display: 'flex', gap: 8 }}>
           <input value={workspace} onChange={(e) => setWorkspace(e.target.value)} placeholder="默认：userData/workspaces/team-{id}" style={{ flex: 1 }} />
           <button className="btn small" onClick={() => void pickDir()}>选择</button>
         </div>
       </div>
 
-      <div className="field">
-        <label>专家成员（可多选）</label>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, maxHeight: 180, overflowY: 'auto' }}>
-          {agents.filter((c) => c.agent.id !== coordinatorId).map((c) => (
-            <label key={c.agent.id} style={{
-              display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 6, cursor: 'pointer',
-              border: `1px solid ${memberIds.includes(c.agent.id) ? 'var(--accent)' : 'var(--border)'}`,
-              background: memberIds.includes(c.agent.id) ? 'var(--accent-soft)' : 'transparent', fontSize: 12.5,
-              color: 'var(--text-1)'
-            }}>
-              <input type="checkbox" checked={memberIds.includes(c.agent.id)} onChange={() => toggleMember(c.agent.id)} style={{ accentColor: 'var(--accent)', width: 15, height: 15 }} />
-              {c.agent.name}
-            </label>
-          ))}
-        </div>
-        {agents.length <= 1 && <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 6 }}>至少需要 2 个就绪助手才能组建团队（可到员工市场录用）</div>}
+      {error && <div style={{ fontSize: 12.5, color: 'var(--danger)', marginBottom: 8 }}>{error}</div>}
+      <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.7, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
+        选中的专家来自员工市场岗位模板。创建团队时，尚未录用的专家将自动创建为数字员工（含完整人设），已录用的直接复用。
       </div>
     </Modal>
   );
