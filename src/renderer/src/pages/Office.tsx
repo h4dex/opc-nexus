@@ -227,6 +227,7 @@ function AgentOfficeModal({ card, onClose }: { card: AgentCardView; onClose: () 
     tasks: { id: string; title: string; status: string; progress: number; createdAt: number }[];
     usage: { totalTokens: number; inputTokens: number; outputTokens: number; calls: number };
   } | null>(null);
+  const [taskInput, setTaskInput] = useState('');
 
   if (!detail) {
     void window.aibox.getAgentDetail(card.agent.id).then(setDetail);
@@ -276,9 +277,33 @@ function AgentOfficeModal({ card, onClose }: { card: AgentCardView; onClose: () 
           </div>
         ))}
 
+        {/* 派发任务 */}
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 6 }}>派发任务</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input value={taskInput} onChange={(e) => setTaskInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && taskInput.trim()) { void window.aibox.createTask(card.agent.id, taskInput.trim()); setTaskInput(''); onClose(); } }}
+              placeholder="输入任务内容，Enter 派发…"
+              style={{ flex: 1, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5 }} />
+            <button className="btn small primary" disabled={!taskInput.trim()} onClick={() => { void window.aibox.createTask(card.agent.id, taskInput.trim()); setTaskInput(''); onClose(); }}>派发</button>
+          </div>
+        </div>
+
+        {/* 当前任务控制 */}
+        {card.currentTask && (
+          <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 8, background: 'var(--accent-soft)', border: '1px solid var(--accent)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <span style={{ fontSize: 12, fontWeight: 650, color: 'var(--accent)', flex: 1 }}>当前任务：{card.currentTask.title.slice(0, 30)} ({card.currentTask.progress}%)</span>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn small" onClick={() => { void window.aibox.pauseTask(card.currentTask!.id); onClose(); }}>暂停</button>
+              <button className="btn small danger" onClick={() => { void window.aibox.cancelTask(card.currentTask!.id); onClose(); }}>终止任务</button>
+            </div>
+          </div>
+        )}
+
         {/* 快捷操作 */}
         <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-          <button className="btn small primary" onClick={() => { void window.aibox.createTask(card.agent.id, '手动派发任务'); onClose(); }}>派发任务</button>
           <button className="btn small" onClick={() => { void window.aibox.openAgentWorkspace(card.agent.id); }}>打开工作目录</button>
           <button className="btn small" onClick={onClose}>关闭</button>
         </div>
