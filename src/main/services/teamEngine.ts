@@ -1,9 +1,11 @@
 /**
- * 专家团执行引擎（流水线版）：
- * - coordinate（主专家协调）：主专家拆解任务 → 逐步分派子任务给不同成员 → 验收综合
- * - roundtable（专家圆桌）：各专家依次对同一问题发表观点 → 协调者总结
+ * 专家团执行引擎（主Agent调度循环版）：
+ * - coordinate（主专家协调）：主Agent拆解任务 → 并行分派给各成员 → 监控收集结果 → 决策（追加/重试/完成）→ 循环直到完成
+ * - roundtable（专家圆桌）：各专家并行对同一问题发表观点 → 协调者总结
+ * - 各成员经自己的 engineId 路由到对应引擎执行（支持多引擎混合分工）
  * - 团队共享工作空间 + MD 交接协议（_aibox/OUTLINE.md + handoffs/ + PROGRESS.md），消除信息孤岛
  * - 流水线状态持久化到 team_runs 表，UI 可轮询进度
+ * - 失败重试：主Agent自动决策重试（受 maxRetries 配置约束）+ UI 手动点击重试
  */
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -51,6 +53,9 @@ interface RunRow {
 const STEP_TIMEOUT_MS = 10 * 60_000;
 
 export class TeamEngine {
+  /** 正在手动重试中的 run（防并发） */
+  private retryingRuns = new Set<string>();
+
   constructor(private db: Database, private orchestrator: Orchestrator) {}
 
   // ---------- CRUD ----------
@@ -165,55 +170,15 @@ export class TeamEngine {
 
       this.writeOutline(ws, team, coordinator, task, subtasks);
       this.updateRun(runId, { phase: 'execute', total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks) });
-      this.appendProgress(ws, `拆解完成，共 ${subtasks.length} 个子任务，开始逐步执行`);
+      this.appendProgress(ws, `拆解完成，共 ${subtasks.length} 个子任务，进入主Agent调度循环（并行分派+持续监控）`);
 
-      // Phase 2：逐步执行（顺序，前一个完成后才派发下一个）
-      const handoffNames: string[] = [];
-      for (let i = 0; i < subtasks.length; i++) {
-        const st = subtasks[i];
-        st.status = 'running';
-        this.updateRun(runId, { current_step: i + 1, subtasks_json: JSON.stringify(subtasks) });
-        this.appendProgress(ws, `[${i + 1}/${subtasks.length}] ${st.agent} 开始执行：${st.subtask.slice(0, 80)}`);
+      // Phase 2：主Agent调度循环（并行分派 → 监控收集 → 协调者决策 → 追加/重试/完成）
+      const config = this.getConfig(team.id);
+      const maxRounds = Math.max(2, (config.maxRetries ?? 1) + 3);
+      const conclusion = await this.executeRounds(runId, team, coordinator, members, task, ws, subtasks, config, maxRounds);
 
-        const member = members.find((m) => m.id === st.agentId);
-        if (!member) {
-          st.status = 'failed';
-          this.appendProgress(ws, `[${i + 1}/${subtasks.length}] 成员不存在，跳过`);
-          continue;
-        }
-
-        const prompt = this.buildMemberPrompt(team, task, st.subtask, ws, handoffNames, i);
-        // title 即执行器 prompt（cliExecutor/llmApiExecutor 直接读取 task.title），
-        // 必须在创建时传入完整上下文，不能事后更新（dispatch 同步读取存在竞态）
-        const subTask = this.orchestrator.createTask(member.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
-        st.taskId = subTask.id;
-        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
-
-        const done = await this.orchestrator.waitForTask(subTask.id, STEP_TIMEOUT_MS);
-        const ok = done?.status === 'COMPLETED';
-        st.status = ok ? 'done' : 'failed';
-
-        const result = ok ? (this.orchestrator.taskResult(subTask.id) ?? '（无产出）') : `执行失败：${done?.error ?? '超时'}`;
-        const handoffName = this.writeHandoff(ws, i + 1, member.name, st.subtask, result, ok);
-        handoffNames.push(handoffName);
-        this.appendProgress(ws, `[${i + 1}/${subtasks.length}] ${st.agent} ${ok ? '完成' : '失败'}，交接文档：${handoffName}`);
-        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
-      }
-
-      // Phase 3：验收综合
-      this.updateRun(runId, { phase: 'review' });
-      this.appendProgress(ws, '全部子任务结束，协调者开始验收综合');
-
-      const reviewPrompt = this.buildReviewPrompt(team, task, ws, handoffNames);
-      const reviewTask = this.orchestrator.createTask(coordinator.id, reviewPrompt.slice(0, 2000), 'team', { workspaceOverride: ws });
-
-      const reviewDone = await this.orchestrator.waitForTask(reviewTask.id, STEP_TIMEOUT_MS);
-      const finalResult = reviewDone?.status === 'COMPLETED'
-        ? (this.orchestrator.taskResult(reviewTask.id) ?? '（无结论）')
-        : `验收任务失败：${reviewDone?.error ?? '超时'}`;
-
-      this.appendProgress(ws, `流水线完成｜最终结论已产出`);
-      this.updateRun(runId, { phase: 'done', final_result: finalResult, ended_at: Date.now() });
+      this.appendProgress(ws, '流水线完成｜最终结论已产出');
+      this.updateRun(runId, { phase: 'done', final_result: conclusion, ended_at: Date.now() });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.appendProgress(ws, `流水线异常：${message}`);
@@ -310,18 +275,18 @@ ${specCtx}
     }
   }
 
-  /** Phase 2：成员提示词 = 原始任务 + 你的子任务 + 大纲 + 前序交接摘要 */
+  /** Phase 2：成员提示词 = 原始任务 + 你的子任务 + 大纲 + 已完成成员的交接摘要 */
   private buildMemberPrompt(team: Team, task: string, subtask: string, ws: string, prevHandoffs: string[], step: number): string {
     const outline = this.readSafe(join(ws, '_aibox', 'OUTLINE.md'));
     const handoffCtx = prevHandoffs.length > 0
-      ? `\n\n## 前序成员交接内容\n${prevHandoffs.map((n) => this.readSafe(join(ws, '_aibox', 'handoffs', n))).join('\n\n---\n\n')}`
+      ? `\n\n## 其他成员已完成的交接内容\n${prevHandoffs.map((n) => this.readSafe(join(ws, '_aibox', 'handoffs', n))).filter(Boolean).join('\n\n---\n\n')}`
       : '';
     return `你正在参与团队「${team.name}」的协作任务，工作目录已切换到团队共享空间，_aibox/ 目录下有大纲与交接文档可供参考。
 
 ## 团队总任务
 ${task}
 
-## 你的子任务（第 ${step + 1} 步）
+## 你的子任务
 ${subtask}
 
 ## 团队大纲
@@ -331,17 +296,200 @@ ${handoffCtx}
 请完成你的子任务，产出写入工作目录，并在结果中说明：做了什么、产出文件、遗留问题。`;
   }
 
-  /** Phase 3：验收提示词 = 原始任务 + 全部交接文档 */
-  private buildReviewPrompt(team: Team, task: string, ws: string, handoffNames: string[]): string {
-    const handoffs = handoffNames.map((n) => this.readSafe(join(ws, '_aibox', 'handoffs', n))).join('\n\n---\n\n');
-    return `你是团队「${team.name}」的主专家（协调者）。各成员已完成各自的子任务，以下是他们的交接文档：
+  // ---------- 主Agent调度循环（并行分派 + 监控 + 决策） ----------
 
-${handoffs || '（无交接内容）'}
+  /**
+   * 调度循环核心：
+   * 1. 将当前所有 pending 子任务并行分派给各成员（各成员使用自己的引擎）
+   * 2. 等待本轮全部完成，收集产出
+   * 3. 向主Agent汇报全部结果，由主Agent决策：完成（输出结论）/ 继续（追加新任务或重试失败项）
+   * 4. 循环直到主Agent判定完成或达到最大轮次
+   */
+  private async executeRounds(
+    runId: string, team: Team, coordinator: Agent, members: Agent[],
+    task: string, ws: string, subtasks: TeamRunSubtask[],
+    config: { timeout: number; maxRetries: number }, maxRounds: number
+  ): Promise<string> {
+    let round = 0;
+
+    while (round < maxRounds) {
+      round++;
+      const pending = subtasks.filter((s) => s.status === 'pending');
+      if (pending.length === 0) break;
+
+      // ① 并行分派本轮所有待执行子任务
+      for (const st of pending) {
+        st.status = 'running';
+        st.round = round;
+      }
+      this.updateRun(runId, { current_step: round, total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks) });
+      this.appendProgress(ws, `══ 第 ${round} 轮调度 ══ 并行分派 ${pending.length} 个子任务：${pending.map((s) => s.agent).join('、')}`);
+
+      const stepTimeout = Math.max(60_000, (config.timeout || 600) * 1000);
+      await Promise.all(pending.map(async (st) => {
+        const idx = subtasks.indexOf(st);
+        const member = members.find((m) => m.id === st.agentId);
+        if (!member) {
+          st.status = 'failed';
+          st.output = '成员不存在';
+          this.appendProgress(ws, `${st.agent} 成员不存在，标记失败`);
+          return;
+        }
+        // 上下文 = 大纲 + 所有已完成成员的交接文档
+        const doneHandoffs = subtasks.filter((s) => s.status === 'done').map((s) => this.handoffNameFor(subtasks.indexOf(s), s.agent));
+        const prompt = this.buildMemberPrompt(team, task, st.subtask, ws, doneHandoffs, idx);
+        // title 即执行器 prompt，各成员经自己的 engineId 路由到对应引擎执行
+        const subTask = this.orchestrator.createTask(member.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
+        st.taskId = subTask.id;
+        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+
+        const done = await this.orchestrator.waitForTask(subTask.id, stepTimeout);
+        const ok = done?.status === 'COMPLETED';
+        st.status = ok ? 'done' : 'failed';
+        st.output = ok
+          ? (this.orchestrator.taskResult(subTask.id) ?? '（无产出）')
+          : `执行失败：${done?.error ?? done?.status ?? '超时'}`;
+
+        this.writeHandoff(ws, idx + 1, member.name, st.subtask, st.output, ok);
+        this.appendProgress(ws, `${st.agent} ${ok ? '✓ 完成' : '✗ 失败'}（第 ${round} 轮）`);
+        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+      }));
+
+      // ② 本轮全部结束，向主Agent汇报并请求决策
+      this.appendProgress(ws, `第 ${round} 轮执行结束，向主Agent汇报结果并请求调度决策…`);
+      const decision = await this.coordinatorDecide(runId, team, coordinator, members, task, ws, subtasks, round, maxRounds, config.maxRetries ?? 1);
+
+      if (decision.action === 'finish') {
+        return decision.conclusion ?? this.buildFallbackSummary(subtasks);
+      }
+
+      // ③ 主Agent决策继续：追加新任务 / 重试失败项
+      if (decision.newTasks.length > 0) {
+        for (const nt of decision.newTasks) {
+          subtasks.push(nt);
+        }
+        this.appendProgress(ws, `主Agent追加 ${decision.newTasks.length} 个新子任务：${decision.newTasks.map((s) => `${s.agent}→${s.subtask.slice(0, 30)}`).join('；')}`);
+      }
+      const retried = subtasks.filter((s) => s.status === 'pending' && (s.retryCount ?? 0) > 0).length;
+      if (retried > 0) this.appendProgress(ws, `主Agent决定重试 ${retried} 个失败子任务`);
+      this.updateRun(runId, { total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks) });
+    }
+
+    // 达到最大轮次，降级汇总
+    this.appendProgress(ws, `已达最大调度轮次（${maxRounds}），直接汇总产出`);
+    return this.buildFallbackSummary(subtasks);
+  }
+
+  /** 向主Agent汇报全部子任务结果，由主Agent决策下一步调度 */
+  private async coordinatorDecide(
+    runId: string, team: Team, coordinator: Agent, members: Agent[],
+    task: string, ws: string, subtasks: TeamRunSubtask[],
+    round: number, maxRounds: number, maxRetries: number
+  ): Promise<{ action: 'finish' | 'continue'; conclusion?: string; newTasks: TeamRunSubtask[] }> {
+    const memberDesc = members.map((m) => `${m.name}（${m.role || '通用'}）`).join('、');
+    const report = this.buildRoundReport(subtasks);
+    const isLastRound = round >= maxRounds;
+
+    const prompt = `你是团队「${team.name}」的主Agent（总调度者），持续监控所有成员的任务执行情况。团队成员：${memberDesc}。
 
 ## 团队总任务
 ${task}
 
-请验收各成员的产出：检查是否覆盖任务要求、指出不足与风险，然后给出最终综合结论。`;
+## 当前全部子任务执行状态（第 ${round}/${maxRounds} 轮）
+${report}
+
+## 你的调度决策
+请评估当前进度，做出决策。仅输出 JSON，不要其他内容：
+
+情况A - 任务已全部完成（或已足够完整），输出：
+{"action":"finish","conclusion":"最终综合结论（验收各成员产出、指出不足与风险、给出总结）"}
+
+情况B - 仍需继续（有失败需重试、或需追加新子任务），输出：
+{"action":"continue","newTasks":[{"agent":"成员名","subtask":"新子任务描述（重试任务请注明是重试）"}]}
+
+规则：
+- 失败的子任务最多重试 ${maxRetries} 次（已重试次数见状态），超过则跳过并在结论中说明
+- 已完成的子任务不要重复分派
+- ${isLastRound ? '这是最后一轮，必须输出 finish' : '如果所有子任务都已完成，直接输出 finish'}`;
+
+    const decideTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
+    const done = await this.orchestrator.waitForTask(decideTask.id, STEP_TIMEOUT_MS);
+
+    if (done?.status === 'COMPLETED') {
+      const result = this.orchestrator.taskResult(decideTask.id) ?? '';
+      const parsed = this.parseDecision(result, members, subtasks, maxRetries);
+      if (parsed) return parsed;
+      this.appendProgress(ws, '主Agent决策解析失败，视为完成');
+    } else {
+      this.appendProgress(ws, `主Agent决策任务未完成（${done?.status ?? '超时'}），视为完成`);
+    }
+    return { action: 'finish', newTasks: [] };
+  }
+
+  /** 构建全部子任务状态报告（供主Agent决策） */
+  private buildRoundReport(subtasks: TeamRunSubtask[]): string {
+    return subtasks.map((st, i) => {
+      const statusText = st.status === 'done' ? '✓完成' : st.status === 'failed' ? '✗失败' : st.status === 'running' ? '执行中' : '待执行';
+      const retryInfo = (st.retryCount ?? 0) > 0 ? `（已重试${st.retryCount}次）` : '';
+      const output = st.status === 'done'
+        ? `产出摘要：${(st.output ?? '').slice(0, 300)}`
+        : st.status === 'failed'
+          ? `失败原因：${(st.output ?? '未知').slice(0, 200)}`
+          : '';
+      return `${i + 1}. [${statusText}]${retryInfo} ${st.agent}：${st.subtask.slice(0, 120)}${output ? `\n   ${output}` : ''}`;
+    }).join('\n');
+  }
+
+  /** 解析主Agent的调度决策 JSON */
+  private parseDecision(
+    result: string, members: Agent[], subtasks: TeamRunSubtask[], maxRetries: number
+  ): { action: 'finish' | 'continue'; conclusion?: string; newTasks: TeamRunSubtask[] } | null {
+    const match = result.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      const obj = JSON.parse(match[0]) as { action?: string; conclusion?: string; newTasks?: { agent?: string; subtask?: string }[] };
+      if (obj.action === 'finish') {
+        return { action: 'finish', conclusion: obj.conclusion || undefined, newTasks: [] };
+      }
+      if (obj.action === 'continue' && Array.isArray(obj.newTasks)) {
+        const newTasks: TeamRunSubtask[] = [];
+        for (const nt of obj.newTasks) {
+          if (!nt.subtask) continue;
+          const subtaskText = String(nt.subtask);
+          const member = members.find((m) => m.name === nt.agent) ?? members[newTasks.length % members.length];
+          // 检查是否为重试任务：同名成员+相似子任务已失败且未超过重试上限
+          const existingFailed = subtasks.find((s) => s.agentId === member.id && s.status === 'failed' && (s.retryCount ?? 0) < maxRetries
+            && (subtaskText.includes('重试') || s.subtask.slice(0, 40) === subtaskText.slice(0, 40)));
+          if (existingFailed) {
+            existingFailed.status = 'pending';
+            existingFailed.retryCount = (existingFailed.retryCount ?? 0) + 1;
+            existingFailed.subtask = subtaskText;
+          } else {
+            newTasks.push({ agent: member.name, agentId: member.id, subtask: subtaskText, taskId: null, status: 'pending' });
+          }
+        }
+        return { action: 'continue', newTasks };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 交接文档文件名（与 writeHandoff 命名规则一致） */
+  private handoffNameFor(index: number, agentName: string): string {
+    const safeName = agentName.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 20);
+    return `${String(index + 1).padStart(2, '0')}-${safeName}.md`;
+  }
+
+  /** 降级汇总（主Agent决策失败或达到轮次上限时） */
+  private buildFallbackSummary(subtasks: TeamRunSubtask[]): string {
+    const done = subtasks.filter((s) => s.status === 'done');
+    const failed = subtasks.filter((s) => s.status === 'failed');
+    let summary = `## 团队执行汇总（自动降级）\n\n完成 ${done.length} 项，失败 ${failed.length} 项\n`;
+    for (const s of done) summary += `\n### ${s.agent}（完成）\n${(s.output ?? '').slice(0, 800)}\n`;
+    for (const s of failed) summary += `\n### ${s.agent}（失败）\n${(s.output ?? '').slice(0, 200)}\n`;
+    return summary;
   }
 
   // ---------- MD 交接协议 ----------
@@ -361,7 +509,7 @@ ${task}
 ## 协调者
 ${coordinator.name}
 
-## 分工（按执行顺序）
+## 分工（主Agent统一调度，并行执行）
 ${subtasks.map((s, i) => `${i + 1}. **${s.agent}**：${s.subtask}`).join('\n')}
 
 ## 协作规范
@@ -445,6 +593,106 @@ _生成时间：${new Date().toLocaleString()}_
       createdAt: r.created_at, endedAt: r.ended_at,
       durationMs: r.ended_at ? r.ended_at - r.created_at : null
     };
+  }
+
+  // ---------- 手动重试失败子任务 ----------
+
+  /**
+   * 手动重试指定 run 中某个失败的子任务（UI 点击「重试」触发）。
+   * 立即返回，异步执行；重试成功后自动重新验收综合。
+   */
+  retrySubtask(runId: string, subtaskIndex: number): { ok: boolean; message: string } {
+    const row = this.db.raw.prepare('SELECT * FROM team_runs WHERE id = ?').get(runId) as RunRow | undefined;
+    if (!row) return { ok: false, message: '执行记录不存在' };
+    if (['clarify', 'decompose', 'execute', 'review'].includes(row.phase)) {
+      return { ok: false, message: '流水线仍在执行中，请等待完成后再重试' };
+    }
+    if (this.retryingRuns.has(runId)) return { ok: false, message: '该记录已有子任务正在重试中' };
+
+    let subtasks: TeamRunSubtask[] = [];
+    try { subtasks = JSON.parse(row.subtasks_json) as TeamRunSubtask[]; } catch { /* ignore */ }
+    const st = subtasks[subtaskIndex];
+    if (!st) return { ok: false, message: '子任务不存在' };
+    if (st.status !== 'failed') return { ok: false, message: '只能重试失败的子任务' };
+
+    const team = this.list().find((t) => t.id === row.team_id);
+    if (!team) return { ok: false, message: '团队不存在' };
+    const agents = this.orchestrator.listAgents();
+    const coordinator = agents.find((a) => a.id === team.coordinatorId);
+    if (!coordinator) return { ok: false, message: '协调者助手不存在' };
+    const member = agents.find((a) => a.id === st.agentId);
+    if (!member) return { ok: false, message: `成员「${st.agent}」不存在` };
+
+    // 标记为重试中（UI 轮询可感知）
+    st.status = 'retrying';
+    this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks), phase: 'execute', current_step: subtaskIndex + 1, error: '' });
+    this.retryingRuns.add(runId);
+    void this.doRetrySubtask(runId, row, team, coordinator, member, subtasks, subtaskIndex)
+      .finally(() => this.retryingRuns.delete(runId));
+
+    return { ok: true, message: `正在重试「${st.agent}」的子任务…` };
+  }
+
+  private async doRetrySubtask(runId: string, row: RunRow, team: Team, coordinator: Agent, member: Agent, subtasks: TeamRunSubtask[], index: number) {
+    const ws = this.ensureWorkspace(team);
+    const st = subtasks[index];
+    this.appendProgress(ws, `手动重试｜${st.agent}：${st.subtask.slice(0, 60)}`);
+
+    try {
+      // 重建已完成成员的交接文档列表（作为上下文）
+      const doneHandoffs = subtasks
+        .filter((s, j) => j !== index && s.status === 'done')
+        .map((s) => this.handoffNameFor(subtasks.indexOf(s), s.agent));
+
+      const prompt = this.buildMemberPrompt(team, row.task_text, st.subtask, ws, doneHandoffs, index);
+      const task = this.orchestrator.createTask(member.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
+      st.taskId = task.id;
+      this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+
+      const done = await this.orchestrator.waitForTask(task.id, STEP_TIMEOUT_MS);
+      const ok = done?.status === 'COMPLETED';
+      st.status = ok ? 'done' : 'failed';
+      st.retryCount = (st.retryCount ?? 0) + 1;
+
+      const result = ok ? (this.orchestrator.taskResult(task.id) ?? '（无产出）') : `重试失败：${done?.error ?? '超时'}`;
+      this.writeHandoff(ws, index + 1, member.name, st.subtask, result, ok);
+      this.appendProgress(ws, `手动重试${ok ? '成功' : '失败'}｜${st.agent}`);
+      this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+
+      if (!ok) {
+        // 重试仍失败，恢复终态
+        const anyFailed = subtasks.some((s) => s.status === 'failed');
+        this.updateRun(runId, { phase: anyFailed ? 'failed' : 'done', error: anyFailed ? '部分子任务失败' : '', ended_at: Date.now() });
+        return;
+      }
+
+      // 重试成功 → 主Agent重新验收综合
+      this.updateRun(runId, { phase: 'review' });
+      this.appendProgress(ws, '重试成功，主Agent重新验收综合');
+
+      const report = this.buildRoundReport(subtasks);
+      const reviewPrompt = `你是团队「${team.name}」的主Agent（总调度者）。以下是全部子任务的最新执行状态：
+
+${report}
+
+## 团队总任务
+${row.task_text}
+
+请验收各成员的产出：检查是否覆盖任务要求、指出不足与风险，然后给出最终综合结论。`;
+      const reviewTask = this.orchestrator.createTask(coordinator.id, reviewPrompt.slice(0, 2000), 'team', { workspaceOverride: ws });
+      const reviewDone = await this.orchestrator.waitForTask(reviewTask.id, STEP_TIMEOUT_MS);
+      const finalResult = reviewDone?.status === 'COMPLETED'
+        ? (this.orchestrator.taskResult(reviewTask.id) ?? '（无结论）')
+        : `验收任务失败：${reviewDone?.error ?? '超时'}`;
+
+      this.appendProgress(ws, '重新验收完成，最终结论已更新');
+      this.updateRun(runId, { phase: 'done', final_result: finalResult, error: '', ended_at: Date.now() });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      st.status = 'failed';
+      this.appendProgress(ws, `重试异常：${message}`);
+      this.updateRun(runId, { phase: 'failed', error: `重试异常：${message}`, subtasks_json: JSON.stringify(subtasks), ended_at: Date.now() });
+    }
   }
 
   // ---------- 团队配置 / 统计 ----------

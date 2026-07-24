@@ -1,4 +1,4 @@
-/** 应用骨架：侧边导航 + 顶栏 + 页面路由 + FAB */
+/** 应用骨架：侧边导航（分组）+ 顶栏 + 页面路由 + FAB + 全局Toast */
 import { useEffect } from 'react';
 import { useApp, type RouteKey } from './store';
 import { Dashboard } from './pages/Dashboard';
@@ -20,35 +20,49 @@ import { Skills } from './pages/Skills';
 import { System } from './pages/System';
 import { Settings } from './pages/Settings';
 import { CreateAgentWizard } from './wizard/CreateAgentWizard';
+import { ToastContainer } from './components/Toast';
 import { todayText } from './components/common';
 import {
   IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconMonitor, IconMoon, IconPlug, IconPlus,
   IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser
 } from './components/icons';
 
-const NAV: { key: RouteKey; label: string; icon: React.ReactNode }[] = [
-  { key: 'dashboard', label: 'AI Box 工作台', icon: <IconHome size={17} /> },
-  { key: 'office', label: '办公室', icon: <IconCoffee size={17} /> },
-  { key: 'agents', label: '数字员工', icon: <IconUser size={17} /> },
-  { key: 'tasks', label: '任务中心', icon: <IconTask size={17} /> },
-  { key: 'schedules', label: '定时任务', icon: <IconClock size={17} /> },
-  { key: 'workflows', label: '工作流', icon: <IconFlow size={17} /> },
-  { key: 'console', label: '执行监控', icon: <IconPlay size={17} /> },
-  { key: 'chat', label: '对话', icon: <IconMessage size={17} /> },
-  { key: 'market', label: '员工市场', icon: <IconUser size={17} /> },
-  { key: 'teams', label: '专家团', icon: <IconUser size={17} /> },
-  { key: 'collab', label: '多机协同', icon: <IconFlow size={17} /> },
-  { key: 'engines', label: '引擎中心', icon: <IconChip size={17} /> },
-  { key: 'mcp', label: 'MCP 管理', icon: <IconPlug size={17} /> },
-  { key: 'skills', label: '技能管理', icon: <IconTask size={17} /> },
-  { key: 'channels', label: '连接中心', icon: <IconPlug size={17} /> },
-  { key: 'usage', label: '用量统计', icon: <IconMonitor size={17} /> },
-  { key: 'system', label: '系统状态', icon: <IconMonitor size={17} /> },
-  { key: 'settings', label: '设置', icon: <IconSettings size={17} /> }
+const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: React.ReactNode }[] }[] = [
+  { group: '工作', items: [
+    { key: 'dashboard', label: 'AI Box 工作台', icon: <IconHome size={17} /> },
+    { key: 'office', label: '办公室', icon: <IconCoffee size={17} /> },
+    { key: 'tasks', label: '任务中心', icon: <IconTask size={17} /> },
+    { key: 'schedules', label: '定时任务', icon: <IconClock size={17} /> },
+  ]},
+  { group: '协作', items: [
+    { key: 'teams', label: '专家团', icon: <IconUser size={17} /> },
+    { key: 'chat', label: '对话', icon: <IconMessage size={17} /> },
+    { key: 'workflows', label: '工作流', icon: <IconFlow size={17} /> },
+    { key: 'collab', label: '多机协同', icon: <IconFlow size={17} /> },
+  ]},
+  { group: '配置', items: [
+    { key: 'agents', label: '数字员工', icon: <IconUser size={17} /> },
+    { key: 'market', label: '员工市场', icon: <IconUser size={17} /> },
+    { key: 'engines', label: '引擎中心', icon: <IconChip size={17} /> },
+    { key: 'mcp', label: 'MCP 管理', icon: <IconPlug size={17} /> },
+    { key: 'skills', label: '技能管理', icon: <IconTask size={17} /> },
+    { key: 'channels', label: '连接中心', icon: <IconPlug size={17} /> },
+  ]},
+  { group: '系统', items: [
+    { key: 'console', label: '执行监控', icon: <IconPlay size={17} /> },
+    { key: 'usage', label: '用量统计', icon: <IconMonitor size={17} /> },
+    { key: 'system', label: '系统状态', icon: <IconMonitor size={17} /> },
+    { key: 'settings', label: '设置', icon: <IconSettings size={17} /> },
+  ]}
 ];
 
+const ALL_NAV = NAV_GROUPS.flatMap((g) => g.items);
+
+/** 保活页面：切换后不销毁状态（对话/任务/专家团） */
+const KEEP_ALIVE: RouteKey[] = ['chat', 'tasks', 'teams'];
+
 export function App() {
-  const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, init } = useApp();
+  const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, appVersion, init } = useApp();
 
   useEffect(() => {
     void init();
@@ -60,6 +74,30 @@ export function App() {
 
   const todos = snapshot?.stats.pendingTodos ?? 0;
 
+  /** 页面渲染器：保活页面用 display 切换，其余条件渲染 */
+  const renderPage = (key: RouteKey) => {
+    switch (key) {
+      case 'dashboard': return <Dashboard />;
+      case 'office': return <Office />;
+      case 'agents': return <Agents />;
+      case 'tasks': return <Tasks />;
+      case 'schedules': return <Schedules />;
+      case 'workflows': return <Workflows />;
+      case 'console': return <Console />;
+      case 'chat': return <Chat />;
+      case 'market': return <Market />;
+      case 'teams': return <Teams />;
+      case 'collab': return <Collab />;
+      case 'engines': return <Engines />;
+      case 'mcp': return <Mcp />;
+      case 'skills': return <Skills />;
+      case 'channels': return <Channels />;
+      case 'usage': return <Usage />;
+      case 'system': return <System />;
+      case 'settings': return <Settings />;
+    }
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -67,15 +105,22 @@ export function App() {
           <div className="brand-logo">AI</div>
           <div>
             <div className="brand-name">数字员工 AI Box</div>
-            <div className="brand-sub">控制中心 v1.0</div>
+            <div className="brand-sub">控制中心 v{appVersion}</div>
           </div>
         </div>
-        {NAV.map((n) => (
-          <button key={n.key} className={`nav-item ${route === n.key ? 'active' : ''}`} onClick={() => setRoute(n.key)}>
-            {n.icon}{n.label}
-            {n.key === 'tasks' && todos > 0 && <span className="badge">{todos}</span>}
-          </button>
-        ))}
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          {NAV_GROUPS.map((g) => (
+            <div key={g.group}>
+              <div className="nav-group-label">{g.group}</div>
+              {g.items.map((n) => (
+                <button key={n.key} className={`nav-item ${route === n.key ? 'active' : ''}`} onClick={() => setRoute(n.key)}>
+                  {n.icon}{n.label}
+                  {n.key === 'tasks' && todos > 0 && <span className="badge">{todos}</span>}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
         <div className="sidebar-footer">
           <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.7 }}>
             本地优先 · 数据不出设备<br />Windows / Ubuntu
@@ -85,7 +130,7 @@ export function App() {
 
       <div className="main-area">
         <header className="topbar">
-          <span className="topbar-title">{NAV.find((n) => n.key === route)?.label}</span>
+          <span className="topbar-title">{ALL_NAV.find((n) => n.key === route)?.label}</span>
           <span className="status-pill"><span className={`dot ${online ? 'green' : 'red'}`} />{online ? '在线' : '离线'}</span>
           <span className="status-pill">{deviceName}</span>
           <div className="topbar-right">
@@ -103,24 +148,14 @@ export function App() {
         </header>
 
         <main className="content">
-          {route === 'dashboard' && <Dashboard />}
-          {route === 'office' && <Office />}
-          {route === 'agents' && <Agents />}
-          {route === 'tasks' && <Tasks />}
-          {route === 'schedules' && <Schedules />}
-          {route === 'workflows' && <Workflows />}
-          {route === 'console' && <Console />}
-          {route === 'chat' && <Chat />}
-          {route === 'market' && <Market />}
-          {route === 'teams' && <Teams />}
-          {route === 'collab' && <Collab />}
-          {route === 'engines' && <Engines />}
-          {route === 'mcp' && <Mcp />}
-          {route === 'skills' && <Skills />}
-          {route === 'channels' && <Channels />}
-          {route === 'usage' && <Usage />}
-          {route === 'system' && <System />}
-          {route === 'settings' && <Settings />}
+          {/* 保活页面：display 切换保留状态 */}
+          {KEEP_ALIVE.map((key) => (
+            <div key={key} style={{ display: route === key ? 'contents' : 'none', height: '100%' }}>
+              {renderPage(key)}
+            </div>
+          ))}
+          {/* 普通页面：条件渲染 */}
+          {!KEEP_ALIVE.includes(route) && renderPage(route)}
         </main>
       </div>
 
@@ -129,6 +164,7 @@ export function App() {
       </button>
 
       {wizardOpen && <CreateAgentWizard onClose={() => setWizardOpen(false)} />}
+      <ToastContainer />
     </div>
   );
 }

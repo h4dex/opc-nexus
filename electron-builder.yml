@@ -9,6 +9,7 @@ directories:
 files:
   - out/**
   - package.json
+  - build/icon.png
   - node_modules/sql.js/**
   - node_modules/systeminformation/**
   - node_modules/express/**

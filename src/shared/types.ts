@@ -573,8 +573,8 @@ export interface CollabConnectInfo {
 
 // ---------- 专家团流水线 ----------
 
-/** 团队执行子任务状态 */
-export type TeamRunSubtaskStatus = 'pending' | 'running' | 'done' | 'failed';
+/** 团队执行子任务状态（retrying = 手动/调度重试中） */
+export type TeamRunSubtaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'retrying';
 
 /** 团队执行流水线阶段 */
 export type TeamRunPhase = 'clarify' | 'decompose' | 'execute' | 'review' | 'done' | 'failed';
@@ -586,6 +586,8 @@ export interface TeamRunSubtask {
   taskId: string | null;
   status: TeamRunSubtaskStatus;
   output?: string;        // 子任务执行输出
+  round?: number;         // 调度轮次（主Agent第几轮分派）
+  retryCount?: number;    // 已重试次数
 }
 
 export interface TeamRun {

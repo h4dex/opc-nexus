@@ -13,6 +13,8 @@ import type {
 } from '../shared/types.js';
 
 export interface Snapshot {
+  /** 单调递增版本号，供渲染层判断快照新旧 / 跳过冗余渲染 */
+  version: number;
   stats: DashboardStats;
   agentCards: AgentCardView[];
   tasks: Task[];
@@ -33,6 +35,7 @@ export interface ResourcePayload {
 const api = {
   // 查询
   getSnapshot: (): Promise<Snapshot> => ipcRenderer.invoke('aibox:getSnapshot'),
+  getAppVersion: (): Promise<string> => ipcRenderer.invoke('aibox:getAppVersion'),
   getResourceHistory: (): Promise<ResourcePayload> => ipcRenderer.invoke('aibox:getResourceHistory'),
   getSystemInfo: (): Promise<SystemInfo> => ipcRenderer.invoke('aibox:getSystemInfo'),
 
@@ -136,6 +139,7 @@ const api = {
   saveTeamConfig: (teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveTeamConfig', teamId, config),
   getTeamStats: (teamId: string): Promise<{ totalRuns: number; avgDurationMs: number; successRate: number }> => ipcRenderer.invoke('aibox:getTeamStats', teamId),
   getSubtaskOutput: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getSubtaskOutput', taskId),
+  retryTeamSubtask: (runId: string, subtaskIndex: number): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:retryTeamSubtask', runId, subtaskIndex),
   saveTeamAsTemplate: (teamId: string, name?: string): Promise<{ ok: boolean; message: string; id?: string }> => ipcRenderer.invoke('aibox:saveTeamAsTemplate', teamId, name),
   listTeamTemplates: (): Promise<{ id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[]> => ipcRenderer.invoke('aibox:listTeamTemplates'),
   removeTeamTemplate: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeamTemplate', id),
@@ -216,6 +220,8 @@ const api = {
   toggleFullscreen: (): Promise<boolean> => ipcRenderer.invoke('aibox:toggleFullscreen'),
   isFullscreen: (): Promise<boolean> => ipcRenderer.invoke('aibox:isFullscreen'),
   pickDirectory: (): Promise<string | null> => ipcRenderer.invoke('aibox:pickDirectory'),
+  exportData: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:exportData'),
+  reportError: (payload: { message: string; stack?: string; componentStack?: string }): Promise<void> => ipcRenderer.invoke('aibox:reportError', payload),
   storeSecret: (ref: string, secret: string): Promise<void> => ipcRenderer.invoke('aibox:storeSecret', ref, secret),
   hasSecret: (ref: string): Promise<boolean> => ipcRenderer.invoke('aibox:hasSecret', ref),
 

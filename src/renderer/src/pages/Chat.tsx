@@ -1,6 +1,7 @@
 /** 对话聊天（Cherry Studio 风格）：左侧助手+会话列表，右侧消息流 + 输入框，流式输出 + Markdown 渲染 */
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { useApp } from '../store';
 import type { Conversation, TaskEvent } from '@shared/types';
 
@@ -18,9 +19,10 @@ function normalizeTables(md: string): string {
   return out.join('\n');
 }
 
-/** 轻量 Markdown 渲染（同步解析，输出 HTML） */
+/** 轻量 Markdown 渲染（同步解析 + DOMPurify 消毒，防止 LLM 产出注入脚本） */
 function Md({ text }: { text: string }) {
-  const html = marked.parse(normalizeTables(text), { async: false, gfm: true, breaks: true }) as string;
+  const raw = marked.parse(normalizeTables(text), { async: false, gfm: true, breaks: true }) as string;
+  const html = DOMPurify.sanitize(raw, { ADD_ATTR: ['target'] });
   return <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 

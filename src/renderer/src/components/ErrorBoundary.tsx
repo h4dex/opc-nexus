@@ -13,13 +13,16 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     this.setState({ errorInfo });
-    // 结构化日志输出（主进程可通过 IPC 收集）
+    // 结构化日志输出 + 上报主进程写入审计日志
     console.error('[ErrorBoundary]', {
       message: error.message,
       stack: error.stack,
       componentStack: errorInfo.componentStack,
       timestamp: Date.now()
     });
+    try {
+      void window.aibox.reportError({ message: error.message, stack: error.stack, componentStack: errorInfo.componentStack ?? undefined });
+    } catch { /* 上报失败不阻塞 */ }
   }
 
   private reset = () => {

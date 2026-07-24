@@ -33,7 +33,10 @@ export function Teams() {
   }, [snapshot?.tasks.length]);
 
   /** 轮询活跃流水线进度（2s，有未完成 run 时） */
-  const hasActiveRun = Object.values(runs).some((r) => r && ['clarify', 'decompose', 'execute', 'review'].includes(r.phase));
+  const hasActiveRun = Object.values(runs).some((r) => r && (
+    ['clarify', 'decompose', 'execute', 'review'].includes(r.phase)
+    || r.subtasks.some((s) => s.status === 'retrying')
+  ));
   const pollRuns = useCallback(() => {
     for (const t of teams) {
       void window.aibox.getTeamRuns(t.id).then((list) => {
@@ -201,7 +204,13 @@ export function Teams() {
             </div>
 
             {/* 流水线进度面板 */}
-            {runs[team.id] && <RunProgress run={runs[team.id]!} />}
+            {runs[team.id] && <RunProgress run={runs[team.id]!} onRetry={async (runId, idx) => {
+              const r = await window.aibox.retryTeamSubtask(runId, idx);
+              setTriggerMsg((m) => ({ ...m, [team.id]: r.message }));
+              setTimeout(() => setTriggerMsg((m) => ({ ...m, [team.id]: '' })), 4000);
+              // 立即拉取更新
+              void window.aibox.getTeamRuns(team.id).then((list) => setRuns((prev) => ({ ...prev, [team.id]: list[0] ?? null })));
+            }} />}
           </div>
         ))}
       </div>
@@ -214,11 +223,22 @@ export function Teams() {
   );
 }
 
-/** 流水线进度面板：阶段指示器 + 子任务状态 + 最终结论 */
-function RunProgress({ run }: { run: TeamRun }) {
+/** 流水线进度面板：阶段指示器 + 子任务状态（并行调度视图）+ 手动重试 + 耗时 + 最终结论 */
+function RunProgress({ run, onRetry }: { run: TeamRun; onRetry: (runId: string, subtaskIndex: number) => void }) {
   const active = ['clarify', 'decompose', 'execute', 'review'].includes(run.phase);
-  const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : s === 'running' ? 'var(--accent)' : 'var(--text-3)';
-  const statusLabel = (s: string) => s === 'done' ? '完成' : s === 'failed' ? '失败' : s === 'running' ? '执行中' : '等待';
+  const terminal = ['done', 'failed'].includes(run.phase);
+  const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : (s === 'running' || s === 'retrying') ? 'var(--accent)' : 'var(--text-3)';
+  const statusLabel = (s: string) => s === 'done' ? '完成' : s === 'failed' ? '失败' : s === 'running' ? '执行中' : s === 'retrying' ? '重试中' : '等待';
+
+  // 耗时：活跃时每秒跳动，终态显示总耗时
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [active]);
+  const elapsedMs = (run.endedAt ?? now) - run.createdAt;
+  const elapsedText = elapsedMs < 60_000 ? `${Math.max(0, Math.round(elapsedMs / 1000))}s` : `${Math.floor(elapsedMs / 60_000)}m${Math.round((elapsedMs % 60_000) / 1000)}s`;
 
   return (
     <div style={{ marginTop: 12, padding: '12px 14px', borderRadius: 8, background: 'var(--input-bg)', border: '1px solid var(--card-border)' }}>
@@ -228,19 +248,27 @@ function RunProgress({ run }: { run: TeamRun }) {
           {run.phase === 'done' ? '✅' : run.phase === 'failed' ? '❌' : '⚙️'} {PHASE_LABEL[run.phase] ?? run.phase}
         </span>
         {run.phase === 'execute' && run.totalSteps > 0 && (
-          <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>子任务 {run.currentStep}/{run.totalSteps}</span>
+          <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>第 {run.currentStep} 轮调度 · 共 {run.totalSteps} 个子任务（并行执行）</span>
         )}
+        <span style={{ fontSize: 11, color: 'var(--text-3)', fontVariantNumeric: 'tabular-nums' }}>⏱ {elapsedText}</span>
         {active && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>· {run.taskText.slice(0, 40)}{run.taskText.length > 40 ? '…' : ''}</span>}
       </div>
 
-      {/* 子任务列表 */}
+      {/* 子任务列表（并行状态） */}
       {run.subtasks.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           {run.subtasks.map((st, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 12 }}>
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
               <span style={{ color: statusColor(st.status), fontWeight: 650, flexShrink: 0 }}>● {statusLabel(st.status)}</span>
               <span style={{ color: 'var(--text-1)', fontWeight: 550, flexShrink: 0 }}>{st.agent}</span>
-              <span style={{ color: 'var(--text-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{st.subtask}</span>
+              {st.round != null && st.round > 1 && <span style={{ fontSize: 10, color: 'var(--text-3)', flexShrink: 0 }}>R{st.round}</span>}
+              {(st.retryCount ?? 0) > 0 && <span style={{ fontSize: 10, color: 'var(--warning, #fbbf24)', flexShrink: 0 }}>重试{st.retryCount}次</span>}
+              <span style={{ color: 'var(--text-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{st.subtask}</span>
+              {/* 手动重试按钮：仅终态 run 中的失败子任务可重试 */}
+              {terminal && st.status === 'failed' && (
+                <button className="btn small" style={{ padding: '1px 8px', fontSize: 11, flexShrink: 0, color: 'var(--accent)' }}
+                  onClick={() => onRetry(run.id, i)}>↻ 重试</button>
+              )}
             </div>
           ))}
         </div>
@@ -397,11 +425,11 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
 /** 团队统计（异步加载） */
 function TeamStats({ teamId }: { teamId: string }) {
   const [stats, setStats] = useState<{ totalRuns: number; avgDurationMs: number; successRate: number } | null>(null);
-  const [loaded, setLoaded] = useState(false);
-  if (!loaded) {
-    void window.aibox.getTeamStats(teamId).then((s) => { setStats(s); setLoaded(true); });
-    return null;
-  }
+  useEffect(() => {
+    let cancelled = false;
+    void window.aibox.getTeamStats(teamId).then((s) => { if (!cancelled) setStats(s); });
+    return () => { cancelled = true; };
+  }, [teamId]);
   if (!stats || stats.totalRuns === 0) return null;
   return (
     <div style={{ display: 'flex', gap: 14, fontSize: 11.5, color: 'var(--text-2)', marginBottom: 12, padding: '6px 10px', background: 'var(--input-bg)', borderRadius: 6 }}>
@@ -474,10 +502,11 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
   const [runs, setRuns] = useState<TeamRun[] | null>(null);
   const [expandedOutput, setExpandedOutput] = useState<Record<string, string>>({});
 
-  if (!runs) {
+  useEffect(() => {
     void window.aibox.getTeamRuns(team.id).then(setRuns);
-    return null;
-  }
+  }, [team.id]);
+
+  if (!runs) return null;
 
   const loadOutput = async (taskId: string) => {
     if (expandedOutput[taskId]) return;
@@ -507,11 +536,16 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
             {/* 子任务列表 */}
             {run.subtasks.map((st, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, padding: '3px 0' }}>
-                <span style={{ color: st.status === 'done' ? 'var(--success)' : st.status === 'failed' ? 'var(--danger)' : st.status === 'running' ? 'var(--accent)' : 'var(--text-3)', fontWeight: 650 }}>●</span>
+                <span style={{ color: st.status === 'done' ? 'var(--success)' : st.status === 'failed' ? 'var(--danger)' : (st.status === 'running' || st.status === 'retrying') ? 'var(--accent)' : 'var(--text-3)', fontWeight: 650 }}>●</span>
                 <span style={{ fontWeight: 550 }}>{st.agent}</span>
+                {(st.retryCount ?? 0) > 0 && <span style={{ fontSize: 10, color: 'var(--warning, #fbbf24)' }}>重试{st.retryCount}次</span>}
                 <span style={{ color: 'var(--text-2)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{st.subtask}</span>
                 {st.taskId && (
                   <button className="btn small" style={{ padding: '1px 6px', fontSize: 10 }} onClick={() => void loadOutput(st.taskId!)}>查看输出</button>
+                )}
+                {['done', 'failed'].includes(run.phase) && st.status === 'failed' && (
+                  <button className="btn small" style={{ padding: '1px 6px', fontSize: 10, color: 'var(--accent)' }}
+                    onClick={() => void window.aibox.retryTeamSubtask(run.id, i).then(() => window.aibox.getTeamRuns(team.id).then(setRuns))}>↻ 重试</button>
                 )}
               </div>
             ))}
@@ -542,13 +576,14 @@ function TeamConfigModal({ team, onClose }: { team: TeamData; onClose: () => voi
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
-  if (!loaded) {
+  useEffect(() => {
     void window.aibox.getTeamConfig(team.id).then((c) => {
       setTimeout_(c.timeout); setMaxRetries(c.maxRetries); setConcurrency(c.concurrency);
       setLoaded(true);
     });
-    return null;
-  }
+  }, [team.id]);
+
+  if (!loaded) return null;
 
   const save = async () => {
     await window.aibox.saveTeamConfig(team.id, { timeout, maxRetries, concurrency });
@@ -588,11 +623,11 @@ function TeamConfigModal({ team, onClose }: { team: TeamData; onClose: () => voi
 function CustomTemplates() {
   const [templates, setTemplates] = useState<{ id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[] | null>(null);
 
-  if (!templates) {
+  useEffect(() => {
     void window.aibox.listTeamTemplates().then(setTemplates);
-    return null;
-  }
-  if (templates.length === 0) return null;
+  }, []);
+
+  if (!templates || templates.length === 0) return null;
 
   return (
     <div style={{ marginBottom: 20 }}>

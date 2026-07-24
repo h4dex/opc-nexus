@@ -622,8 +622,8 @@ const officeCss = `
 
 /* ===== 内容布局 ===== */
 .office-content { position: relative; z-index: 2; display: flex; gap: 14px; padding: 12px 16px 10px; align-items: flex-start; }
-.office-main { flex: 0 0 auto; width: 340px; }
-.office-rooms { flex: 1; min-width: 0; }
+.office-main { flex: 1.2; min-width: 0; }
+.office-rooms { flex: 1; min-width: 300px; }
 .section-label { font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.45); margin-bottom: 8px; letter-spacing: 0.5px; }
 .area-empty { font-size: 12px; color: rgba(255,255,255,0.25); padding: 24px; text-align: center; }
 
@@ -631,7 +631,7 @@ const officeCss = `
 .office-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px 10px; }
 
 /* ===== 房间 ===== */
-.rooms-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.rooms-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 .room-panel { background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; padding: 10px 12px; position: relative; overflow: hidden; min-height: 120px; }
 .room-header { font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.65); margin-bottom: 5px; display: flex; align-items: center; gap: 5px; }
 .room-icon { font-size: 13px; }

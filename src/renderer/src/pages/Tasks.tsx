@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { TASK_STATUS_META, Modal, ProgressBar, ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconCheck, IconPause, IconPlay, IconStop, IconX } from '../components/icons';
+import { toast } from '../components/Toast';
 import type { Task, TaskEvent } from '@shared/types';
 
 type TabKey = 'active' | 'approval' | 'done';
@@ -14,6 +15,8 @@ export function Tasks() {
   const [tab, setTab] = useState<TabKey>('active');
   const [detailId, setDetailId] = useState<string | null>(null);
   const [ctx, setCtx] = useState<CtxState | null>(null);
+  const [followUpTask, setFollowUpTask] = useState<Task | null>(null);
+  const [followUpText, setFollowUpText] = useState('');
   if (!snapshot) return null;
 
   const { tasks, approvals, agentCards } = snapshot;
@@ -32,7 +35,7 @@ export function Tasks() {
       { label: '打开产物目录', onClick: () => void window.aibox.openTaskWorkspace(t.id) },
     ];
     if (['COMPLETED', 'FAILED'].includes(t.status)) {
-      items.push({ label: '追问 / 续跑', onClick: () => setDetailId(t.id) });
+      items.push({ label: '追问 / 续跑', onClick: () => { setFollowUpTask(t); setFollowUpText(''); } });
     }
     if (t.status === 'RUNNING') items.push({ label: '暂停', onClick: () => void window.aibox.pauseTask(t.id) });
     if (t.status === 'PAUSED') items.push({ label: '继续', onClick: () => void window.aibox.resumeTask(t.id) });
@@ -139,6 +142,26 @@ export function Tasks() {
       })()}
 
       {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.task)} onClose={() => setCtx(null)} />}
+
+      {/* 追问 / 续跑弹窗：基于原任务会话锚点创建新任务 */}
+      {followUpTask && (
+        <Modal title={`追问 / 续跑 · ${followUpTask.title.slice(0, 30)}`} onClose={() => setFollowUpTask(null)}
+          footer={<>
+            <button className="btn" onClick={() => setFollowUpTask(null)}>取消</button>
+            <button className="btn primary" disabled={!followUpText.trim()} onClick={() => {
+              void window.aibox.createFollowUpTask(followUpTask.id, followUpText.trim())
+                .then(() => { toast.ok('续跑任务已创建，继承原会话上下文'); setFollowUpTask(null); })
+                .catch((e) => toast.err(`创建失败：${e instanceof Error ? e.message : String(e)}`));
+            }}>提交续跑</button>
+          </>}>
+          <div className="field">
+            <label>追问 / 续跑指令（将继承原任务的会话上下文）</label>
+            <textarea className="input" rows={4} value={followUpText} onChange={(e) => setFollowUpText(e.target.value)}
+              style={{ width: '100%', resize: 'vertical' }}
+              placeholder="例如：继续上次未完成的部分 / 在上次结果基础上优化…" />
+          </div>
+        </Modal>
+      )}
     </>
   );
 }

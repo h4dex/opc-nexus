@@ -61,6 +61,10 @@ function createWindow() {
     minHeight: 720,
     title: '数字员工 AI Box',
     backgroundColor: '#0f1218',
+    ...((): { icon?: string } => {
+      const p = join(app.getAppPath(), 'build', 'icon.png');
+      return { icon: p };
+    })(),
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -102,10 +106,17 @@ function createWindow() {
 }
 
 function createTray() {
-  // 16×16 单色占位图标，避免依赖外部资源
-  const icon = nativeImage.createFromDataURL(
+  // 优先加载品牌图标（build/icon.png，随包分发），加载失败降级为内置占位图
+  const placeholder = nativeImage.createFromDataURL(
     'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWElEQVR4nGNgGAWDHjAyMDAw/P//nxGXAkZGxn9oEhAbGWm0CJqGhoaGhvg3UHSMIUaNoBmRkZERXBQ0DY2MjIyM4m+gihtDjBpBMyIjIyO4KGgaGkODAAYGAPJpAh9rDsGxAAAAAElFTkSuQmCC'
   );
+  let icon = placeholder;
+  for (const candidate of [join(app.getAppPath(), 'build', 'icon.png'), join(import.meta.dirname, '../../build/icon.png')]) {
+    const img = nativeImage.createFromPath(candidate);
+    if (!img.isEmpty()) { icon = img; break; }
+  }
+  // 托盘使用 16x16（Windows）/ 22x22（Linux）
+  icon = icon.resize({ width: 16, height: 16 });
   tray = new Tray(icon);
   tray.setToolTip('数字员工 AI Box');
   tray.setContextMenu(

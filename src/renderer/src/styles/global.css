@@ -163,6 +163,22 @@ select option:hover, select option:checked {
 .brand-name { font-size: 15px; font-weight: 650; }
 .brand-sub { font-size: 11px; color: var(--text-2); }
 
+/* 侧边栏分组标签 */
+.nav-group-label {
+  padding: 12px 12px 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  color: var(--text-3);
+  text-transform: uppercase;
+}
+
+/* Toast 滑入动画 */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
 /* Cherry Studio 侧边栏激活态：着色底 + 细描边 + 左侧辉光条 */
 .nav-item {
   position: relative;

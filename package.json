@@ -20,9 +20,11 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
+    "@types/dompurify": "^3.0.5",
     "@types/sql.js": "^1.4.11",
     "@xyflow/react": "^12.11.2",
     "cors": "^2.8.6",
+    "dompurify": "^3.4.12",
     "express": "^5.2.1",
     "marked": "^18.0.7",
     "playwright-core": "^1.61.1",

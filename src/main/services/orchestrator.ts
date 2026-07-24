@@ -580,17 +580,19 @@ export class Orchestrator {
     return task;
   }
 
-  /** 等待任务到达终态（供团队流水线等编排逻辑轮询；超时返回 null） */
+  /** 等待任务到达终态（供团队流水线等编排逻辑轮询；超时返回 null）。轮询间隔指数退避 500ms→4s，降低并行任务时的 DB 压力 */
   waitForTask(taskId: string, timeoutMs: number): Promise<Task | null> {
     return new Promise((resolve) => {
       const started = Date.now();
+      let delay = 500;
       const check = () => {
         const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
         if (!row) return resolve(null);
         const t = this.mapTask(row);
         if (['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(t.status)) return resolve(t);
         if (Date.now() - started >= timeoutMs) return resolve(null);
-        setTimeout(check, 2000);
+        delay = Math.min(delay * 1.5, 4000);
+        setTimeout(check, delay);
       };
       check();
     });

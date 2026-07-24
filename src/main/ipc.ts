@@ -27,6 +27,8 @@ import { loadConfig, saveConfig } from './services/config.js';
 import type { AppConfig, CreateAgentInput, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { copyFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { app } from 'electron';
 
 /** 轻量级运行时参数校验（防御异常/恶意输入穿透） */
@@ -71,7 +73,17 @@ export function registerIpc(deps: IpcDeps) {
       if (!win.isDestroyed()) win.webContents.send(channel, payload);
     }
   };
-  const pushSnapshot = () => broadcast('aibox:snapshot', buildSnapshot(deps));
+  // 快照推送节流（trailing）：任务高频状态变化时最多 ~400ms 推一次，降低 IPC 序列化开销
+  let snapTimer: NodeJS.Timeout | null = null;
+  let snapPending = false;
+  const pushSnapshot = () => {
+    if (snapTimer) { snapPending = true; return; }
+    broadcast('aibox:snapshot', buildSnapshot(deps));
+    snapTimer = setTimeout(() => {
+      snapTimer = null;
+      if (snapPending) { snapPending = false; pushSnapshot(); }
+    }, 400);
+  };
 
   // 编排器状态变化 → 推送全量快照（本地事件到 UI ≤ 2 秒）；审批挂起即时可见
   orchestrator.onChange(pushSnapshot);
@@ -90,6 +102,7 @@ export function registerIpc(deps: IpcDeps) {
 
   // ---------- 查询 ----------
   ipcMain.handle('aibox:getSnapshot', () => buildSnapshot(deps));
+  ipcMain.handle('aibox:getAppVersion', () => app.getVersion());
   ipcMain.handle('aibox:getResourceHistory', () => ({ history: monitor.getHistory(), health: monitor.getHealth() }));
   ipcMain.handle('aibox:getSystemInfo', (): SystemInfo => ({
     platform: process.platform,
@@ -328,6 +341,7 @@ export function registerIpc(deps: IpcDeps) {
   });
   ipcMain.handle('aibox:getTeamStats', (_e, teamId: string) => teams.getStats(teamId));
   ipcMain.handle('aibox:getSubtaskOutput', (_e, taskId: string) => teams.getSubtaskOutput(taskId));
+  ipcMain.handle('aibox:retryTeamSubtask', (_e, runId: string, subtaskIndex: number) => teams.retrySubtask(assertId(runId, 'runId'), subtaskIndex));
   ipcMain.handle('aibox:saveTeamAsTemplate', (_e, teamId: string, name?: string) => teams.saveAsTemplate(teamId, name));
   ipcMain.handle('aibox:listTeamTemplates', () => teams.listTemplates());
   ipcMain.handle('aibox:removeTeamTemplate', (_e, id: string) => teams.removeTemplate(id));
@@ -527,6 +541,27 @@ export function registerIpc(deps: IpcDeps) {
     return r.canceled ? null : r.filePaths[0];
   });
 
+  // ---------- 数据备份导出（本地优先：用户可备份 SQLite 数据库） ----------
+  ipcMain.handle('aibox:exportData', async () => {
+    const win = getMainWindow();
+    if (!win) return { ok: false, message: '窗口不存在' };
+    const stamp = new Date().toISOString().slice(0, 10);
+    const r = await dialog.showSaveDialog(win, {
+      title: '导出数据库备份',
+      defaultPath: `aibox-backup-${stamp}.db`,
+      filters: [{ name: 'SQLite 数据库', extensions: ['db'] }]
+    });
+    if (r.canceled || !r.filePath) return { ok: false, message: '已取消' };
+    try {
+      db.flush(); // 先落盘再复制，保证备份完整
+      copyFileSync(join(app.getPath('userData'), 'aibox-data', 'aibox.db'), r.filePath);
+      db.audit({ id: randomUUID(), actor: 'admin', action: 'data.export', target: r.filePath, result: 'ok' });
+      return { ok: true, message: `备份已导出：${r.filePath}` };
+    } catch (err) {
+      return { ok: false, message: `导出失败：${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
+
   // ---------- 凭据（15.1：密钥不进入 Renderer/localStorage，仅存系统密钥库） ----------
   ipcMain.handle('aibox:storeSecret', (_e, ref: string, secret: string) => {
     if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用');
@@ -535,6 +570,16 @@ export function registerIpc(deps: IpcDeps) {
     db.audit({ id: randomUUID(), actor: 'admin', action: 'secret.store', target: ref, result: 'ok' });
   });
   ipcMain.handle('aibox:hasSecret', (_e, ref: string) => db.getSetting<string | null>(`secret:${ref}`, null) !== null);
+
+  // ---------- 前端异常上报（ErrorBoundary 捕获的渲染异常写入审计日志） ----------
+  ipcMain.handle('aibox:reportError', (_e, payload: { message: string; stack?: string; componentStack?: string }) => {
+    db.audit({
+      id: randomUUID(), actor: 'renderer', action: 'ui.error',
+      target: (payload?.message ?? 'unknown').slice(0, 200),
+      result: 'error',
+      source: (payload?.stack ?? '').slice(0, 300) || 'renderer'
+    });
+  });
 
   // ---------- 多机协同 ----------
   ipcMain.handle('aibox:collab:checkGit', async () => {
@@ -566,6 +611,8 @@ export function registerIpc(deps: IpcDeps) {
   });
 }
 
+let snapshotVersion = 0;
+
 function buildSnapshot(deps: IpcDeps) {
   const todos = deps.orchestrator.todos();
   // 系统级待办：无可用执行器提醒 + 资源告警（遗留修复）
@@ -582,6 +629,7 @@ function buildSnapshot(deps: IpcDeps) {
     systemTodos.push({ id: `sys-alert-${i}`, title: msg, owner: '系统监控', dueText: '资源告警', severity: 'high', kind: 'system' });
   }
   return {
+    version: ++snapshotVersion,
     stats: deps.orchestrator.stats(),
     agentCards: deps.orchestrator.agentCards(),
     tasks: deps.orchestrator.listTasks(),

@@ -1,5 +1,5 @@
 /** AI Box 工作台首页（PRD 6.x，按基准 UI 还原） */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { RingGauge, Sparkline } from '../components/charts';
 import {
@@ -22,9 +22,21 @@ const PERM_META: Record<PermissionMode, { label: string; color: string }> = {
 
 function PermBadge({ mode, onChange }: { mode: PermissionMode; onChange: (m: PermissionMode) => void }) {
   const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
   const meta = PERM_META[mode];
+
+  // 点击外部自动关闭
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
   return (
-    <div style={{ position: 'relative', display: 'inline-block' }}>
+    <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>
       <button onClick={() => setOpen(!open)} style={{
         display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 10px', borderRadius: 6,
         border: `1px solid ${meta.color}`, background: 'transparent', color: meta.color,

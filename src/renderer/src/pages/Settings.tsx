@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconMoon, IconSun } from '../components/icons';
+import { toast } from '../components/Toast';
 import type { SystemInfo } from '@shared/types';
 
 export function Settings() {
@@ -96,6 +97,14 @@ export function Settings() {
             <div>· 渲染进程：contextIsolation 开启、nodeIntegration 关闭，IPC 白名单</div>
             <div>· 资源明细保留 7 天；任务日志保留 90 天；审计索引保留 1 年</div>
             <div>· 高风险操作必须审批；渠道不可静默批准安装 / 提权 / 目录外写入</div>
+          </div>
+          <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <button className="btn small" onClick={() => {
+              void window.aibox.exportData().then((r) => {
+                if (r.ok) toast.ok(r.message); else if (r.message !== '已取消') toast.err(r.message);
+              });
+            }}>📦 导出数据库备份</button>
+            <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>本地优先：数据全量存于本机，可随时备份迁移</span>
           </div>
         </div>
 

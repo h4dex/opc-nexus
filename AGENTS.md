@@ -1,8 +1,8 @@
-# AGENTS.md — 数字员工 AI Box 控制中心
+# AGENTS.md — OPC-Nexus · 单人公司的智能枢纽
 
 ## 项目简介
 
-本地优先的桌面 Agent 管理器（Electron + React），为"数字员工"提供统一控制中心。
+OPC-Nexus（One Person Company Nexus）— 本地优先的桌面 Agent 管理器（Electron + React），为单人公司提供 AI 数字员工统一智能枢纽。
 管理 AI Agent 的生命周期、任务编排、引擎接入、消息渠道和系统资源监控。
 
 - **技术栈**: Electron 37 + electron-vite + React 19 + Zustand + sql.js + TypeScript (strict)
