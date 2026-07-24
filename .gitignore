@@ -3,6 +3,7 @@ out/
 dist/
 release/
 .qoder/
+.superpowers/
 *.log
 .DS_Store
 Thumbs.db

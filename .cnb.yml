@@ -1,0 +1,27 @@
+# OPC-Nexus CI/CD 配置
+# 文档: https://docs.cnb.cool/zh/build/configuration.html
+
+master:
+  push:
+    - name: typecheck-and-test
+      docker:
+        image: node:22
+      stages:
+        - name: install
+          script: npm ci --registry=https://registry.npmmirror.com
+        - name: typecheck
+          script: npm run typecheck
+        - name: test
+          script: npm test
+
+  pull_request:
+    - name: pr-check
+      docker:
+        image: node:22
+      stages:
+        - name: install
+          script: npm ci --registry=https://registry.npmmirror.com
+        - name: typecheck
+          script: npm run typecheck
+        - name: test
+          script: npm test
