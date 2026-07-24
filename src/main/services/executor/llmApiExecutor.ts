@@ -44,6 +44,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
   private running = new Map<string, RunningRun>();
   private host: ToolHost | null = null;
   private browserMgr: import('../browserManager.js').BrowserManager | null = null;
+  private ocrService: import('../ocrService.js').OcrService | null = null;
 
   constructor(private db: Database, private broker: ApprovalBroker, private providerMgr?: ProviderManager) {}
 
@@ -53,6 +54,10 @@ export class LlmApiExecutor implements ExecutorAdapter {
 
   setBrowserManager(mgr: import('../browserManager.js').BrowserManager) {
     this.browserMgr = mgr;
+  }
+
+  setOcrService(svc: import('../ocrService.js').OcrService) {
+    this.ocrService = svc;
   }
 
   private config(): ProviderSettings {
@@ -298,7 +303,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
     }
 
     try {
-      const ctx: ToolContext = { workspace: task.workspaceOverride || agent.workspace, agentId: agent.id, taskId: task.id, host: this.host, browserMgr: this.browserMgr };
+      const ctx: ToolContext = { workspace: task.workspaceOverride || agent.workspace, agentId: agent.id, taskId: task.id, host: this.host, browserMgr: this.browserMgr, ocrService: this.ocrService };
       const result = await tool.execute(args, ctx);
       record('tool_result', { name: call.name, result: result.slice(0, 2000) });
       cb.onOutput(task.id, `\n[工具 ${call.name}] ${result.slice(0, 400)}\n`);

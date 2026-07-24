@@ -1,0 +1,33 @@
+{
+  "GET /api/users": {
+    "status": 200,
+    "body": {
+      "users": [
+        { "id": 1, "name": "张三", "role": "admin" },
+        { "id": 2, "name": "李四", "role": "editor" }
+      ],
+      "total": 2
+    }
+  },
+  "POST /api/users": {
+    "status": 201,
+    "body": { "id": 3, "message": "创建成功" }
+  },
+  "GET /api/health": {
+    "status": 200,
+    "body": { "status": "ok", "uptime": 12345 }
+  },
+  "GET /api/slow": {
+    "status": 200,
+    "delay": 2,
+    "body": { "message": "这个接口延迟了 2 秒" }
+  },
+  "GET /api/error": {
+    "status": 500,
+    "body": { "error": "Internal Server Error", "code": "ERR_INTERNAL" }
+  },
+  "* /api/echo": {
+    "status": 200,
+    "body": { "message": "这是 echo 端点，会返回你的请求信息" }
+  }
+}

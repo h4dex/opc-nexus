@@ -1,0 +1,164 @@
+{
+  "version": "1.0.0",
+  "description": "AiBoxDash 本地 Python 工具集 - 供 LLM 调用和工作流节点使用",
+  "python": "python",
+  "pythonWindows": "python",
+  "pythonLinux": "python3",
+  "toolsDir": "local-tools",
+  "tools": [
+    {
+      "id": "http_tool",
+      "name": "网络请求",
+      "script": "http_tool.py",
+      "description": "发起 HTTP/HTTPS 请求，支持 GET/POST/PUT/DELETE、文件下载、表单提交。返回 JSON 结构化响应。",
+      "category": "network",
+      "dependencies": [],
+      "args": [
+        { "name": "--url", "required": true, "type": "string", "description": "请求 URL" },
+        { "name": "--method", "required": false, "type": "string", "default": "GET", "description": "HTTP 方法: GET/POST/PUT/DELETE/PATCH" },
+        { "name": "--headers", "required": false, "type": "string", "description": "请求头 JSON 字符串" },
+        { "name": "--body", "required": false, "type": "string", "description": "请求体" },
+        { "name": "--form", "required": false, "type": "string", "description": "表单数据 JSON" },
+        { "name": "--download", "required": false, "type": "string", "description": "下载文件保存路径" },
+        { "name": "--timeout", "required": false, "type": "int", "default": "30", "description": "超时秒数" },
+        { "name": "--insecure", "required": false, "type": "flag", "description": "跳过 SSL 验证（仅限内网）" }
+      ],
+      "examples": [
+        "python http_tool.py --url https://httpbin.org/get",
+        "python http_tool.py --url https://api.example.com/data --method POST --body '{\"key\":\"value\"}'",
+        "python http_tool.py --url https://example.com/file.zip --download ./downloads/file.zip"
+      ]
+    },
+    {
+      "id": "sysinfo_tool",
+      "name": "系统信息",
+      "script": "sysinfo_tool.py",
+      "description": "读取系统信息：CPU、内存、磁盘、网络、进程列表、环境变量。",
+      "category": "system",
+      "dependencies": [],
+      "args": [
+        { "name": "--action", "required": true, "type": "string", "description": "查询类型: overview/cpu/memory/disk/network/process/env" },
+        { "name": "--top", "required": false, "type": "int", "default": "10", "description": "进程列表数量" },
+        { "name": "--path", "required": false, "type": "string", "description": "磁盘查询路径" },
+        { "name": "--keys", "required": false, "type": "string", "description": "环境变量前缀过滤（逗号分隔）" }
+      ],
+      "examples": [
+        "python sysinfo_tool.py --action overview",
+        "python sysinfo_tool.py --action memory",
+        "python sysinfo_tool.py --action process --top 5",
+        "python sysinfo_tool.py --action disk --path D:\\"
+      ]
+    },
+    {
+      "id": "office_convert",
+      "name": "Office 文件转换",
+      "script": "office_convert.py",
+      "description": "文件格式转换：CSV↔Excel、Markdown→HTML、JSON↔CSV、PDF文本提取、合并CSV。",
+      "category": "office",
+      "dependencies": ["openpyxl", "PyPDF2", "fpdf2"],
+      "args": [
+        { "name": "--action", "required": true, "type": "string", "description": "操作: csv2xlsx/xlsx2csv/md2html/json2csv/csv2json/merge_csv/pdf2txt/txt2pdf" },
+        { "name": "--input", "required": true, "type": "string", "description": "输入文件/目录路径" },
+        { "name": "--output", "required": false, "type": "string", "description": "输出路径（默认自动推断）" },
+        { "name": "--sheet", "required": false, "type": "int", "default": "0", "description": "Excel 工作表索引" }
+      ],
+      "examples": [
+        "python office_convert.py --action csv2xlsx --input data.csv",
+        "python office_convert.py --action md2html --input README.md",
+        "python office_convert.py --action json2csv --input records.json --output table.csv"
+      ]
+    },
+    {
+      "id": "file_tool",
+      "name": "文件批处理",
+      "script": "file_tool.py",
+      "description": "文件批量操作：重命名、查找、目录树、统计、压缩/解压、哈希校验、重复文件检测。",
+      "category": "file",
+      "dependencies": [],
+      "args": [
+        { "name": "--action", "required": true, "type": "string", "description": "操作: rename/find/tree/stats/zip/unzip/hash/dedup" },
+        { "name": "--path", "required": true, "type": "string", "description": "目标路径" },
+        { "name": "--pattern", "required": false, "type": "string", "default": "*", "description": "匹配模式" },
+        { "name": "--output", "required": false, "type": "string", "description": "输出路径" },
+        { "name": "--execute", "required": false, "type": "flag", "description": "实际执行（重命名默认为预览）" },
+        { "name": "--depth", "required": false, "type": "int", "default": "3", "description": "目录树深度" },
+        { "name": "--algorithm", "required": false, "type": "string", "default": "sha256", "description": "哈希算法" }
+      ],
+      "examples": [
+        "python file_tool.py --action tree --path ./src --depth 2",
+        "python file_tool.py --action find --path ./docs --pattern *.md",
+        "python file_tool.py --action stats --path ./project",
+        "python file_tool.py --action zip --path ./output --output ./backup.zip"
+      ]
+    },
+    {
+      "id": "text_tool",
+      "name": "文本处理",
+      "script": "text_tool.py",
+      "description": "文本/数据处理：编码转换、JSON格式化查询、正则提取、文本统计、模板渲染、数据清洗。",
+      "category": "text",
+      "dependencies": [],
+      "args": [
+        { "name": "--action", "required": true, "type": "string", "description": "操作: encode/decode/json_fmt/json_query/regex/stats/template/clean/replace" },
+        { "name": "--text", "required": false, "type": "string", "description": "输入文本" },
+        { "name": "--file", "required": false, "type": "string", "description": "从文件读取" },
+        { "name": "--encoding", "required": false, "type": "string", "default": "base64", "description": "编码类型" },
+        { "name": "--path", "required": false, "type": "string", "description": "JSON 查询路径" },
+        { "name": "--pattern", "required": false, "type": "string", "description": "正则表达式" }
+      ],
+      "examples": [
+        "python text_tool.py --action encode --text \"Hello World\" --encoding base64",
+        "python text_tool.py --action json_query --file data.json --path users[0].name",
+        "python text_tool.py --action regex --text \"email: test@example.com\" --pattern \"[\\w.]+@[\\w.]+\"",
+        "python text_tool.py --action stats --file article.txt"
+      ]
+    },
+    {
+      "id": "image_tool",
+      "name": "图片处理",
+      "script": "image_tool.py",
+      "description": "图片处理：缩放、裁剪、格式转换、旋转、加水印、缩略图、批量处理。",
+      "category": "image",
+      "dependencies": ["Pillow"],
+      "args": [
+        { "name": "--action", "required": true, "type": "string", "description": "操作: info/resize/crop/convert/rotate/watermark/thumbnail/batch_resize" },
+        { "name": "--input", "required": true, "type": "string", "description": "输入文件/目录" },
+        { "name": "--output", "required": false, "type": "string", "description": "输出路径" },
+        { "name": "--width", "required": false, "type": "int", "description": "目标宽度" },
+        { "name": "--height", "required": false, "type": "int", "description": "目标高度" },
+        { "name": "--format", "required": false, "type": "string", "default": "png", "description": "目标格式" },
+        { "name": "--quality", "required": false, "type": "int", "default": "85", "description": "输出质量" }
+      ],
+      "examples": [
+        "python image_tool.py --action info --input photo.jpg",
+        "python image_tool.py --action resize --input photo.jpg --width 800",
+        "python image_tool.py --action convert --input logo.png --format webp",
+        "python image_tool.py --action watermark --input photo.jpg --text \"Confidential\""
+      ]
+    },
+    {
+      "id": "webserver_tool",
+      "name": "本地 Web Server",
+      "script": "webserver_tool.py",
+      "description": "本地 HTTP 服务：静态文件服务、Mock API、文件上传接收、反向代理。支持定时自动停止（工作流场景）。",
+      "category": "network",
+      "dependencies": [],
+      "args": [
+        { "name": "--action", "required": true, "type": "string", "description": "模式: static(静态文件)/mock(Mock API)/upload(文件上传)/proxy(反向代理)" },
+        { "name": "--port", "required": false, "type": "int", "default": "8080", "description": "监听端口" },
+        { "name": "--host", "required": false, "type": "string", "default": "127.0.0.1", "description": "监听地址（0.0.0.0 允许局域网访问）" },
+        { "name": "--dir", "required": false, "type": "string", "description": "服务目录（static/upload 模式）" },
+        { "name": "--routes", "required": false, "type": "string", "description": "Mock 路由配置 JSON 文件" },
+        { "name": "--target", "required": false, "type": "string", "description": "代理目标地址（proxy 模式）" },
+        { "name": "--duration", "required": false, "type": "int", "default": "0", "description": "自动停止秒数（0=手动停止）" }
+      ],
+      "examples": [
+        "python webserver_tool.py --action static --dir ./dist --port 3000",
+        "python webserver_tool.py --action mock --port 9090 --routes mock_routes.json",
+        "python webserver_tool.py --action upload --dir ./uploads --port 8081",
+        "python webserver_tool.py --action proxy --target http://127.0.0.1:5173 --port 8080",
+        "python webserver_tool.py --action static --dir ./public --port 8080 --duration 60"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# AiBoxDash 本地工具集 - 可选依赖
+# 基础工具（http_tool, sysinfo_tool, file_tool, text_tool）仅使用标准库，无需安装
+# 以下为增强功能的可选依赖：
+
+# Office 文件转换（Excel 读写）
+openpyxl>=3.1.0
+
+# PDF 操作
+PyPDF2>=3.0.0
+fpdf2>=2.7.0
+
+# 图片处理
+Pillow>=10.0.0

@@ -7,8 +7,10 @@ release/
 *.log
 .DS_Store
 Thumbs.db
-screenshots/
+/screenshots/
 *.png
+!docs/screenshots/
+!docs/screenshots/*.png
 !.npmrc
 d.ps1
 d2.ps1

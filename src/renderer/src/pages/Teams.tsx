@@ -5,7 +5,7 @@ import { Modal } from '../components/common';
 import { IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
 import { TEAM_TEMPLATES, type TeamTemplate } from '../data/teamTemplates';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
-import type { TeamRun } from '../../../shared/types';
+import type { TeamRun, TeamRunSubtask, TeamTimelineEvent } from '../../../shared/types';
 
 interface TeamData {
   id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; workspace: string; createdAt: number;
@@ -27,6 +27,7 @@ export function Teams() {
   const [editTeam, setEditTeam] = useState<TeamData | null>(null);
   const [historyTeam, setHistoryTeam] = useState<TeamData | null>(null);
   const [configTeam, setConfigTeam] = useState<TeamData | null>(null);
+  const [timelineTeamId, setTimelineTeamId] = useState<string | null>(null);
 
   useEffect(() => {
     void window.aibox.listTeams().then(setTeams);
@@ -198,6 +199,7 @@ export function Teams() {
             {/* 操作按钮 */}
             <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
               <button className="btn small" onClick={() => setEditTeam(team)}>编辑团队</button>
+              <button className="btn small" disabled={!runs[team.id]} onClick={() => setTimelineTeamId(team.id)}>⏱ 执行时间线</button>
               <button className="btn small" onClick={() => setHistoryTeam(team)}>执行历史</button>
               <button className="btn small" onClick={() => setConfigTeam(team)}>配置</button>
               <button className="btn small" onClick={() => void window.aibox.saveTeamAsTemplate(team.id).then((r) => { setDeployMsg(r.message); setTimeout(() => setDeployMsg(''), 3000); })}>保存为模板</button>
@@ -219,6 +221,19 @@ export function Teams() {
       {editTeam && <EditTeamModal team={editTeam} onClose={() => setEditTeam(null)} onSaved={(t) => { setTeams((prev) => prev.map((x) => x.id === t.id ? t : x)); setEditTeam(null); }} />}
       {historyTeam && <TeamHistoryModal team={historyTeam} onClose={() => setHistoryTeam(null)} />}
       {configTeam && <TeamConfigModal team={configTeam} onClose={() => setConfigTeam(null)} />}
+      {timelineTeamId && runs[timelineTeamId] && (
+        <TeamTimelineModal
+          run={runs[timelineTeamId]!}
+          teamName={teams.find((t) => t.id === timelineTeamId)?.name ?? ''}
+          onClose={() => setTimelineTeamId(null)}
+          onRetry={async (runId, idx) => {
+            const r = await window.aibox.retryTeamSubtask(runId, idx);
+            setTriggerMsg((m) => ({ ...m, [timelineTeamId]: r.message }));
+            setTimeout(() => setTriggerMsg((m) => ({ ...m, [timelineTeamId]: '' })), 4000);
+            void window.aibox.getTeamRuns(timelineTeamId).then((list) => setRuns((prev) => ({ ...prev, [timelineTeamId]: list[0] ?? null })));
+          }}
+        />
+      )}
     </>
   );
 }
@@ -281,6 +296,198 @@ function RunProgress({ run, onRetry }: { run: TeamRun; onRetry: (runId: string, 
           {run.finalResult}
         </div>
       )}
+    </div>
+  );
+}
+
+/** 执行时间线抽屉：决策脊柱 + 可展开轮次，实时/复盘两用 */
+interface TlRoundSubtask { agent: string; status: string; durationMs: number }
+interface TlNode {
+  kind: 'phase' | 'round' | 'decision';
+  phase?: string;
+  round?: number;
+  count?: number;
+  action?: string;
+  summary?: string;
+  ts: number;
+  subtasks: TlRoundSubtask[];
+}
+
+const TL_PHASE_LABEL: Record<string, string> = { clarify: '澄清需求 · 生成 Spec', decompose: '任务拆解', review: '验收综合' };
+
+function fmtDur(ms: number): string {
+  if (ms <= 0) return '—';
+  return ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+/** 从事件流构建时间线节点；旧记录无事件时从 subtasks 重建 */
+function buildTimeline(run: TeamRun): TlNode[] {
+  const nodes: TlNode[] = [];
+  if (run.events && run.events.length > 0) {
+    for (const ev of run.events) {
+      if (ev.type === 'phase') {
+        nodes.push({ kind: 'phase', phase: ev.phase, ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'round_start') {
+        nodes.push({ kind: 'round', round: ev.round, count: ev.count, ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'subtask_done') {
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          if (nodes[i].kind === 'round' && nodes[i].round === ev.round) {
+            nodes[i].subtasks.push({ agent: ev.agent, status: ev.status, durationMs: ev.durationMs });
+            break;
+          }
+        }
+      } else if (ev.type === 'decision') {
+        nodes.push({ kind: 'decision', round: ev.round, action: ev.action, summary: ev.summary, ts: ev.ts, subtasks: [] });
+      }
+    }
+    return nodes;
+  }
+  // 降级：旧记录无事件流，按 subtasks 的 round 重建
+  if (run.subtasks.length > 0) {
+    const byRound = new Map<number, TeamRunSubtask[]>();
+    for (const st of run.subtasks) {
+      const r = st.round ?? 1;
+      if (!byRound.has(r)) byRound.set(r, []);
+      byRound.get(r)!.push(st);
+    }
+    for (const [r, sts] of [...byRound.entries()].sort((a, b) => a[0] - b[0])) {
+      nodes.push({ kind: 'round', round: r, count: sts.length, ts: run.createdAt, subtasks: sts.map((s) => ({ agent: s.agent, status: s.status, durationMs: 0 })) });
+    }
+  }
+  return nodes;
+}
+
+function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
+  run: TeamRun; teamName: string; onClose: () => void;
+  onRetry: (runId: string, subtaskIndex: number) => void;
+}) {
+  const active = ['clarify', 'decompose', 'execute', 'review'].includes(run.phase);
+  const terminal = ['done', 'failed'].includes(run.phase);
+  const nodes = buildTimeline(run);
+  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  const toggleRound = (r: number) => setCollapsed((prev) => {
+    const next = new Set(prev);
+    if (next.has(r)) next.delete(r); else next.add(r);
+    return next;
+  });
+
+  const maxDur = Math.max(1, ...nodes.flatMap((n) => n.subtasks.map((s) => s.durationMs)));
+  const stColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : 'var(--accent)';
+  const stLabel = (s: string) => s === 'done' ? '✓' : s === 'failed' ? '✗' : '…';
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 1000, display: 'flex', justifyContent: 'flex-end' }} onClick={onClose}>
+      <div className="card" onClick={(e) => e.stopPropagation()} style={{
+        width: 540, height: '100%', borderRadius: 0, margin: 0, display: 'flex', flexDirection: 'column',
+        borderLeft: '1px solid var(--card-border)', animation: 'toast-in .2s ease-out'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '16px 20px', borderBottom: '1px solid var(--card-border)' }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>⏱ 执行时间线 · {teamName}</div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>
+              {run.taskText.slice(0, 44)}{run.taskText.length > 44 ? '…' : ''} · 总耗时 {fmtDur((run.endedAt ?? Date.now()) - run.createdAt)}
+            </div>
+          </div>
+          <button className="btn small" onClick={onClose}><IconX size={13} />关闭</button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
+          {nodes.length === 0 && <div style={{ color: 'var(--text-3)', fontSize: 12.5, textAlign: 'center', padding: 40 }}>暂无时间线数据</div>}
+
+          <div style={{ borderLeft: '2px solid var(--accent)', marginLeft: 10, paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {nodes.map((n, i) => {
+              if (n.kind === 'phase') {
+                return (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, position: 'relative' }}>
+                    <span style={{ position: 'absolute', left: -27, width: 12, height: 12, borderRadius: '50%', background: 'var(--accent)', border: '2px solid var(--bg)' }} />
+                    <span style={{ fontSize: 12.5, fontWeight: 650, color: 'var(--text-1)' }}>{TL_PHASE_LABEL[n.phase ?? ''] ?? n.phase}</span>
+                    <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{new Date(n.ts).toLocaleTimeString('zh-CN', { hour12: false })}</span>
+                  </div>
+                );
+              }
+              if (n.kind === 'decision') {
+                const isFinish = n.action === 'finish';
+                return (
+                  <div key={i} style={{ position: 'relative', background: 'var(--input-bg)', border: `1px solid ${isFinish ? 'var(--success)' : 'var(--warning)'}`, borderRadius: 8, padding: '10px 12px' }}>
+                    <span style={{ position: 'absolute', left: -27, top: 12, width: 10, height: 10, transform: 'rotate(45deg)', background: isFinish ? 'var(--success)' : 'var(--warning)', border: '2px solid var(--bg)' }} />
+                    <div style={{ fontSize: 12, fontWeight: 700, color: isFinish ? 'var(--success)' : 'var(--warning)' }}>
+                      ◆ 主Agent决策{isFinish ? '：完成' : '：继续调度'}
+                    </div>
+                    {n.summary && <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3 }}>{n.summary}</div>}
+                  </div>
+                );
+              }
+              const isCollapsed = collapsed.has(n.round ?? 0);
+              const doneCount = n.subtasks.filter((s) => s.status === 'done').length;
+              const failCount = n.subtasks.filter((s) => s.status === 'failed').length;
+              return (
+                <div key={i} style={{ position: 'relative', background: 'var(--input-bg)', border: '1px solid var(--card-border)', borderRadius: 8, overflow: 'hidden' }}>
+                  <span style={{ position: 'absolute', left: -27, top: 14, width: 12, height: 12, borderRadius: '50%', background: 'var(--accent)', border: '2px solid var(--bg)' }} />
+                  <button onClick={() => toggleRound(n.round ?? 0)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px', border: 'none', background: 'transparent', cursor: 'pointer', textAlign: 'left' }}>
+                    <span style={{ fontSize: 11, color: 'var(--text-3)', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
+                    <span style={{ fontSize: 12.5, fontWeight: 700, color: 'var(--accent)', flexShrink: 0 }}>第 {n.round} 轮调度</span>
+                    <span style={{ fontSize: 11, color: 'var(--text-3)', flexShrink: 0 }}>{n.count} 并行</span>
+                    <span style={{ fontSize: 11, marginLeft: 'auto', flexShrink: 0 }}>
+                      {doneCount > 0 && <span style={{ color: 'var(--success)' }}>{doneCount} 成 </span>}
+                      {failCount > 0 && <span style={{ color: 'var(--danger)' }}>{failCount} 败</span>}
+                    </span>
+                  </button>
+                  {!isCollapsed && (
+                    <div style={{ padding: '0 12px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {n.subtasks.map((s, j) => (
+                        <div key={j} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                          <span style={{ color: stColor(s.status), fontWeight: 700, width: 14, flexShrink: 0 }}>{stLabel(s.status)}</span>
+                          <span style={{ color: 'var(--text-1)', fontWeight: 550, flexShrink: 0, maxWidth: 110, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.agent}</span>
+                          <div style={{ flex: 1, height: 6, borderRadius: 3, background: 'var(--bg-2, #1a1d24)', overflow: 'hidden' }}>
+                            <div style={{ width: `${Math.max(4, (s.durationMs / maxDur) * 100)}%`, height: '100%', background: stColor(s.status), borderRadius: 3 }} />
+                          </div>
+                          <span style={{ fontSize: 10.5, color: 'var(--text-3)', flexShrink: 0, fontVariantNumeric: 'tabular-nums', minWidth: 34, textAlign: 'right' }}>{fmtDur(s.durationMs)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {active && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, position: 'relative' }}>
+                <span style={{ position: 'absolute', left: -27, width: 12, height: 12, borderRadius: '50%', background: 'var(--accent)', animation: 'toast-in 1s ease-in-out infinite alternate' }} />
+                <span style={{ fontSize: 12, color: 'var(--accent)', fontWeight: 600 }}>执行中…</span>
+              </div>
+            )}
+            {terminal && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, position: 'relative' }}>
+                <span style={{ position: 'absolute', left: -27, width: 12, height: 12, borderRadius: '50%', background: run.phase === 'done' ? 'var(--success)' : 'var(--danger)', border: '2px solid var(--bg)' }} />
+                <span style={{ fontSize: 12.5, fontWeight: 700, color: run.phase === 'done' ? 'var(--success)' : 'var(--danger)' }}>
+                  {run.phase === 'done' ? '✅ 流水线完成' : '❌ 流水线失败'}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {run.phase === 'done' && run.finalResult && (
+            <div style={{ marginTop: 16, padding: '10px 12px', background: 'var(--input-bg)', border: '1px solid var(--card-border)', borderRadius: 8 }}>
+              <div style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--text-2)', marginBottom: 6 }}>最终结论</div>
+              <div style={{ fontSize: 12, color: 'var(--text-1)', whiteSpace: 'pre-wrap', lineHeight: 1.6, maxHeight: 200, overflowY: 'auto' }}>{run.finalResult}</div>
+            </div>
+          )}
+          {run.error && <div style={{ marginTop: 12, fontSize: 12, color: 'var(--danger)' }}>{run.error}</div>}
+
+          {terminal && run.subtasks.some((s) => s.status === 'failed') && (
+            <div style={{ marginTop: 16, padding: '10px 12px', background: 'var(--input-bg)', border: '1px solid var(--danger)', borderRadius: 8 }}>
+              <div style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--danger)', marginBottom: 8 }}>失败子任务（可重试）</div>
+              {run.subtasks.map((st, idx) => st.status === 'failed' ? (
+                <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, padding: '4px 0' }}>
+                  <span style={{ color: 'var(--text-1)', fontWeight: 550 }}>{st.agent}</span>
+                  <span style={{ color: 'var(--text-3)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{st.subtask.slice(0, 40)}</span>
+                  <button className="btn small" style={{ padding: '1px 8px', fontSize: 11, color: 'var(--accent)' }} onClick={() => onRetry(run.id, idx)}>↻ 重试</button>
+                </div>
+              ) : null)}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

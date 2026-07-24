@@ -44,6 +44,11 @@ export class ExecutorRegistry {
     this.llm.setBrowserManager(mgr);
   }
 
+  /** 注入 OCR 服务（PaddleOCR WASM 工具使用） */
+  setOcrService(svc: import('../ocrService.js').OcrService) {
+    this.llm.setOcrService(svc);
+  }
+
   private engineType(engineId: string): string {
     const row = this.db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as { type: string } | undefined;
     return row?.type ?? 'hermes';

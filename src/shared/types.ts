@@ -598,12 +598,21 @@ export interface TeamRun {
   currentStep: number;
   totalSteps: number;
   subtasks: TeamRunSubtask[];
+  /** 时间线事件流（阶段/轮次/子任务完成/主Agent决策），供执行时间线可视化 */
+  events: TeamTimelineEvent[];
   finalResult: string | null;
   error: string | null;
   createdAt: number;
   endedAt: number | null;
   durationMs: number | null;
 }
+
+/** 专家团执行时间线事件（主Agent调度循环的每个关键节点） */
+export type TeamTimelineEvent =
+  | { type: 'phase'; phase: 'clarify' | 'decompose' | 'review'; ts: number }
+  | { type: 'round_start'; round: number; count: number; ts: number }
+  | { type: 'subtask_done'; round: number; agent: string; agentId: string; status: 'done' | 'failed'; durationMs: number; ts: number }
+  | { type: 'decision'; round: number; action: 'finish' | 'continue'; summary: string; ts: number };
 
 /** 团队配置 */
 export interface TeamConfig {

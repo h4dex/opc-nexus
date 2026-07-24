@@ -61,12 +61,13 @@ export interface IpcDeps {
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
+  ocr: import('./services/ocrService.js').OcrService;
   apiBridge: import('./services/apiBridge.js').ApiBridge;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, wfPlatforms, collab, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, wfPlatforms, collab, ocr, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -522,6 +523,12 @@ export function registerIpc(deps: IpcDeps) {
   // ---------- 设置 ----------
   ipcMain.handle('aibox:getSetting', (_e, key: string) => db.getSetting(key, null));
   ipcMain.handle('aibox:setSetting', (_e, key: string, value: unknown) => db.setSetting(key, value));
+
+  // ---------- OCR 文字识别服务 ----------
+  ipcMain.handle('aibox:getOcrStatus', () => ocr.getStatus());
+  ipcMain.handle('aibox:toggleOcr', (_e, enabled: boolean) => { ocr.setEnabled(enabled); return ocr.getStatus(); });
+  ipcMain.handle('aibox:downloadOcrModels', () => ocr.downloadModels());
+  ipcMain.handle('aibox:ocrRecognize', (_e, imagePath: string) => ocr.recognize(imagePath));
   // 数据库维护：完整性检查 + 手动清理
   ipcMain.handle('aibox:integrityCheck', () => db.integrityCheck());
   ipcMain.handle('aibox:manualCleanup', () => { db.cleanupRetention(); return { ok: true, message: '数据清理完成' }; });

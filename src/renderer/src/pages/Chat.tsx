@@ -45,10 +45,6 @@ export function Chat() {
   convIdRef.current = convId;
   activeTaskRef.current = activeTaskId;
 
-  if (!snapshot) return null;
-  const { agentCards } = snapshot;
-  const agents = agentCards.filter((c) => c.agent.lifecycle === 'READY');
-
   // 选中助手后加载会话列表
   useEffect(() => {
     if (!agentId) return;
@@ -87,6 +83,11 @@ export function Chat() {
   }, []);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
+
+  // 所有 hooks 必须在早退之前调用（保活页面在 snapshot 加载前即挂载，早退后置 hooks 会触发 hooks 数量不一致）
+  if (!snapshot) return null;
+  const { agentCards } = snapshot;
+  const agents = agentCards.filter((c) => c.agent.lifecycle === 'READY');
 
   const send = async () => {
     const text = input.trim();

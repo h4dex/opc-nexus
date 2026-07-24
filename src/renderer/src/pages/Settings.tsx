@@ -108,6 +108,8 @@ export function Settings() {
           </div>
         </div>
 
+        <OcrCard />
+
         <div className="card">
           <div className="card-title">关于</div>
           <table className="table">
@@ -351,6 +353,64 @@ function BridgeCard() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/** OCR 文字识别服务卡片（PaddleOCR WASM） */
+function OcrCard() {
+  const [status, setStatus] = useState<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string } | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState('');
+
+  const load = () => { void window.aibox.getOcrStatus().then(setStatus); };
+  useEffect(() => { load(); }, []);
+
+  const toggle = async (enabled: boolean) => {
+    const s = await window.aibox.toggleOcr(enabled);
+    setStatus(s);
+    if (enabled) toast.ok('OCR 服务已开启');
+  };
+
+  const download = async () => {
+    setDownloading(true);
+    setDownloadMsg('正在下载模型文件…');
+    try {
+      const r = await window.aibox.downloadOcrModels();
+      setDownloadMsg(r.message);
+      if (r.ok) toast.ok('模型下载完成');
+      else toast.err(r.message);
+      load();
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  if (!status) return null;
+
+  return (
+    <div className="card">
+      <div className="card-title">OCR 文字识别（{status.version}）</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer' }}>
+          <input type="checkbox" checked={status.enabled} onChange={(e) => void toggle(e.target.checked)} />
+          启用内置 OCR 服务（离线识别图片中的中英文文字）
+        </label>
+        <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8 }}>
+          <div>· 引擎：PaddleOCR PP-OCRv4 ONNX（WASM CPU 推理，无需 GPU）</div>
+          <div>· 模型状态：{status.modelsExist ? `✅ 已就绪（${status.modelSize}）` : '⚠️ 未下载'}</div>
+          <div>· 支持格式：PNG / JPG / BMP / WEBP</div>
+          <div>· 用途：数字员工可通过 ocr_recognize 工具识别图片/截图/扫描件中的文字</div>
+        </div>
+        {!status.modelsExist && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <button className="btn primary small" disabled={downloading} onClick={() => void download()}>
+              {downloading ? '下载中…' : '⬇️ 下载 OCR 模型（约 15MB）'}
+            </button>
+            {downloadMsg && <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{downloadMsg}</span>}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

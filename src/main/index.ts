@@ -157,6 +157,10 @@ app.whenReady().then(async () => {
   const { BrowserManager } = await import('./services/browserManager.js');
   const browserMgr = new BrowserManager();
   executors.setBrowserManager(browserMgr);
+  // OCR 服务（PaddleOCR WASM）注入
+  const { OcrService } = await import('./services/ocrService.js');
+  const ocrService = new OcrService(db);
+  executors.setOcrService(ocrService);
   orchestrator.setDispatchGuard(() => monitor.getGuardReason());
   // 阈值来自设置页（settings.thresholds）；新告警边沿推系统通知
   monitor.setThresholdProvider(() => {
@@ -196,7 +200,7 @@ app.whenReady().then(async () => {
   const apiBridge = new ApiBridge(db, providerManager);
   if (db.getSetting<string>('bridge_enabled', 'false') === 'true') apiBridge.start();
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, apiBridge, getMainWindow: () => mainWindow });
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, apiBridge, getMainWindow: () => mainWindow });
 
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });

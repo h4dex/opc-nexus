@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -264,6 +264,7 @@ CREATE TABLE IF NOT EXISTS team_runs (
   current_step INTEGER NOT NULL DEFAULT 0,
   total_steps INTEGER NOT NULL DEFAULT 0,
   subtasks_json TEXT NOT NULL DEFAULT '[]',
+  events_json TEXT NOT NULL DEFAULT '[]',
   final_result TEXT,
   error TEXT,
   created_at INTEGER NOT NULL,
@@ -564,6 +565,10 @@ export class Database {
       if (prev < 15) {
         // v15：定时任务增强（任务内容字段）
         addCol('schedules', 'content', "TEXT NOT NULL DEFAULT ''");
+      }
+      if (prev < 16) {
+        // v16：专家团执行时间线（事件流持久化，供可视化）
+        addCol('team_runs', 'events_json', "TEXT NOT NULL DEFAULT '[]'");
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

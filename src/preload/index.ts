@@ -213,6 +213,12 @@ const api = {
   // 设置 / 目录 / 凭据
   getSetting: (key: string): Promise<unknown> => ipcRenderer.invoke('aibox:getSetting', key),
   setSetting: (key: string, value: unknown): Promise<void> => ipcRenderer.invoke('aibox:setSetting', key, value),
+
+  // OCR 文字识别服务
+  getOcrStatus: (): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:getOcrStatus'),
+  toggleOcr: (enabled: boolean): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:toggleOcr', enabled),
+  downloadOcrModels: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:downloadOcrModels'),
+  ocrRecognize: (imagePath: string): Promise<{ ok: boolean; text: string; boxes: { box: [number, number][]; text: string; confidence: number }[]; elapsed: number; error?: string }> => ipcRenderer.invoke('aibox:ocrRecognize', imagePath),
   /** 数据库完整性检查 */
   integrityCheck: (): Promise<{ ok: boolean; message: string; repaired: number }> => ipcRenderer.invoke('aibox:integrityCheck'),
   /** 手动数据清理 */

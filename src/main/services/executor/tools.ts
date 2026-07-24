@@ -21,6 +21,8 @@ export interface ToolContext {
   host: ToolHost | null;
   /** 浏览器管理器（browser 能力工具使用，由执行器注入） */
   browserMgr?: import('../browserManager.js').BrowserManager | null;
+  /** OCR 服务（由执行器注入，未启用时为 null） */
+  ocrService?: import('../ocrService.js').OcrService | null;
 }
 
 /** 编排器能力注入（委托创建/等待子任务），由 main 装配 */
@@ -372,6 +374,66 @@ export const TOOLS: ToolDef[] = [
       });
     }
   },
+  // ---------- 本地 Python 工具集 ----------
+  {
+    name: 'run_python_tool',
+    description: '调用本地 Python 工具集（local-tools/）。可用工具: http_tool(网络请求/下载), sysinfo_tool(系统信息), office_convert(文件格式转换), file_tool(文件批处理), text_tool(文本处理), image_tool(图片处理), webserver_tool(本地Web服务)。返回 JSON 结构化结果。',
+    risk: 'write',
+    requiresCapability: 'shell',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tool: {
+          type: 'string',
+          enum: ['http_tool', 'sysinfo_tool', 'office_convert', 'file_tool', 'text_tool', 'image_tool', 'webserver_tool'],
+          description: '工具名称'
+        },
+        args: {
+          type: 'string',
+          description: '命令行参数（如 --action overview --top 5）'
+        }
+      },
+      required: ['tool', 'args']
+    },
+    async execute(args, ctx) {
+      const tool = String(args.tool ?? '');
+      const toolArgs = String(args.args ?? '').trim();
+      const allowed = ['http_tool', 'sysinfo_tool', 'office_convert', 'file_tool', 'text_tool', 'image_tool', 'webserver_tool'];
+      if (!allowed.includes(tool)) throw new Error(`未知工具: ${tool}（可用: ${allowed.join(', ')}）`);
+      if (!toolArgs) throw new Error('请提供工具参数（如 --action overview）');
+
+      // 定位 local-tools 目录（项目根目录下）
+      const { join: pJoin, dirname: pDirname } = await import('node:path');
+      const { existsSync } = await import('node:fs');
+      // 开发模式: app.getAppPath() 为项目根；生产模式: 取 resources 路径
+      const { app: electronApp } = await import('electron');
+      const appRoot = electronApp.getAppPath();
+      const toolsDir = pJoin(appRoot, 'local-tools');
+      const scriptPath = pJoin(toolsDir, `${tool}.py`);
+      if (!existsSync(scriptPath)) throw new Error(`工具脚本不存在: ${scriptPath}`);
+
+      const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+      // 解析参数为数组（简单按空格拆分，引号内不拆分）
+      const argArray = toolArgs.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((a) => a.replace(/^"|"$/g, '')) ?? [];
+
+      return new Promise<string>((resolveP, rejectP) => {
+        execFile(pythonBin, [scriptPath, ...argArray], {
+          cwd: ctx.workspace,
+          timeout: 3 * 60_000,
+          maxBuffer: 2 * 1024 * 1024,
+          shell: false
+        }, (err, stdout, stderr) => {
+          const out = (stdout || '').trim();
+          if (err && !out) {
+            rejectP(new Error(`Python 工具执行失败: ${err.message}\n${(stderr || '').slice(0, 1000)}`));
+          } else {
+            const result = out || (stderr || '').slice(0, 4000) || '（无输出）';
+            resolveP(result.length > 16_000 ? `${result.slice(0, 16_000)}\n…（已截断）` : result);
+          }
+        });
+      });
+    }
+  },
   // ---------- 浏览器自动化（Playwright / CDP） ----------
   {
     name: 'browser_navigate',
@@ -469,6 +531,31 @@ export const TOOLS: ToolDef[] = [
     async execute(_args, ctx) {
       if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
       return ctx.browserMgr.getContent(ctx.agentId);
+    }
+  },
+  // ---------- OCR 文字识别（PaddleOCR WASM） ----------
+  {
+    name: 'ocr_recognize',
+    description: '识别图片中的文字（支持中英文）。传入工作目录内的图片路径，返回识别到的文本内容及位置。支持 PNG/JPG/BMP/WEBP。',
+    risk: 'safe',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '相对工作目录的图片文件路径' },
+        detail: { type: 'boolean', description: '是否返回详细位置信息（默认 false，仅返回纯文本）' }
+      },
+      required: ['path']
+    },
+    async execute(args, ctx) {
+      if (!ctx.ocrService) throw new Error('OCR 服务未启用，请在设置中开启「OCR 文字识别」');
+      const full = resolveInWorkspace(ctx.workspace, args.path);
+      const result = await ctx.ocrService.recognize(full);
+      if (!result.ok) throw new Error(result.error ?? 'OCR 识别失败');
+      if (args.detail) {
+        const lines = result.boxes.map((b) => `[置信度 ${(b.confidence * 100).toFixed(0)}%] ${b.text}`);
+        return `识别完成（${result.elapsed}ms，${result.boxes.length} 个文本区域）：\n${lines.join('\n')}`;
+      }
+      return result.text || '（未检测到文字）';
     }
   },
   // ---------- Computer Use（桌面操控） ----------

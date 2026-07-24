@@ -13,7 +13,7 @@ import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs'
 import { app } from 'electron';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
-import type { Agent, TeamRun, TeamRunPhase, TeamRunSubtask } from '../../shared/types.js';
+import type { Agent, TeamRun, TeamRunPhase, TeamRunSubtask, TeamTimelineEvent } from '../../shared/types.js';
 
 export interface Team {
   id: string;
@@ -43,6 +43,7 @@ interface RunRow {
   current_step: number;
   total_steps: number;
   subtasks_json: string;
+  events_json: string;
   final_result: string | null;
   error: string | null;
   created_at: number;
@@ -150,13 +151,17 @@ export class TeamEngine {
   private async runPipeline(runId: string, team: Team, coordinator: Agent, members: Agent[], task: string) {
     const ws = this.ensureWorkspace(team);
     this.appendProgress(ws, `流水线启动｜任务：${task}`);
+    const events: TeamTimelineEvent[] = [];
 
     try {
       // Phase 0：问题澄清 + 生成 Spec（主Agent 内部 AI 先澄清问题，输出结构化规格说明）
+      events.push({ type: 'phase', phase: 'clarify', ts: Date.now() });
+      this.persistEvents(runId, events);
       const spec = await this.clarify(runId, team, coordinator, task, ws);
 
       // Phase 1：拆解（圆桌模式为固定视角分配，无需 LLM 拆解）
-      this.updateRun(runId, { phase: 'decompose' });
+      events.push({ type: 'phase', phase: 'decompose', ts: Date.now() });
+      this.updateRun(runId, { phase: 'decompose', events_json: JSON.stringify(events) });
       let subtasks: TeamRunSubtask[];
       if (team.mode === 'roundtable') {
         subtasks = members.map((m) => ({
@@ -175,7 +180,7 @@ export class TeamEngine {
       // Phase 2：主Agent调度循环（并行分派 → 监控收集 → 协调者决策 → 追加/重试/完成）
       const config = this.getConfig(team.id);
       const maxRounds = Math.max(2, (config.maxRetries ?? 1) + 3);
-      const conclusion = await this.executeRounds(runId, team, coordinator, members, task, ws, subtasks, config, maxRounds);
+      const conclusion = await this.executeRounds(runId, team, coordinator, members, task, ws, subtasks, config, maxRounds, events);
 
       this.appendProgress(ws, '流水线完成｜最终结论已产出');
       this.updateRun(runId, { phase: 'done', final_result: conclusion, ended_at: Date.now() });
@@ -184,6 +189,11 @@ export class TeamEngine {
       this.appendProgress(ws, `流水线异常：${message}`);
       this.updateRun(runId, { phase: 'failed', error: message, ended_at: Date.now() });
     }
+  }
+
+  /** 持久化时间线事件流（供 UI 执行时间线可视化） */
+  private persistEvents(runId: string, events: TeamTimelineEvent[]) {
+    this.updateRun(runId, { events_json: JSON.stringify(events) });
   }
 
   /** Phase 0：问题澄清 + 生成 Spec（主Agent 内部 AI 先澄清问题边界、目标、约束，输出结构化规格说明） */
@@ -308,7 +318,8 @@ ${handoffCtx}
   private async executeRounds(
     runId: string, team: Team, coordinator: Agent, members: Agent[],
     task: string, ws: string, subtasks: TeamRunSubtask[],
-    config: { timeout: number; maxRetries: number }, maxRounds: number
+    config: { timeout: number; maxRetries: number }, maxRounds: number,
+    events: TeamTimelineEvent[]
   ): Promise<string> {
     let round = 0;
 
@@ -322,7 +333,8 @@ ${handoffCtx}
         st.status = 'running';
         st.round = round;
       }
-      this.updateRun(runId, { current_step: round, total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks) });
+      events.push({ type: 'round_start', round, count: pending.length, ts: Date.now() });
+      this.updateRun(runId, { current_step: round, total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks), events_json: JSON.stringify(events) });
       this.appendProgress(ws, `══ 第 ${round} 轮调度 ══ 并行分派 ${pending.length} 个子任务：${pending.map((s) => s.agent).join('、')}`);
 
       const stepTimeout = Math.max(60_000, (config.timeout || 600) * 1000);
@@ -332,6 +344,7 @@ ${handoffCtx}
         if (!member) {
           st.status = 'failed';
           st.output = '成员不存在';
+          events.push({ type: 'subtask_done', round, agent: st.agent, agentId: st.agentId, status: 'failed', durationMs: 0, ts: Date.now() });
           this.appendProgress(ws, `${st.agent} 成员不存在，标记失败`);
           return;
         }
@@ -339,6 +352,7 @@ ${handoffCtx}
         const doneHandoffs = subtasks.filter((s) => s.status === 'done').map((s) => this.handoffNameFor(subtasks.indexOf(s), s.agent));
         const prompt = this.buildMemberPrompt(team, task, st.subtask, ws, doneHandoffs, idx);
         // title 即执行器 prompt，各成员经自己的 engineId 路由到对应引擎执行
+        const startedAt = Date.now();
         const subTask = this.orchestrator.createTask(member.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
         st.taskId = subTask.id;
         this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
@@ -350,14 +364,22 @@ ${handoffCtx}
           ? (this.orchestrator.taskResult(subTask.id) ?? '（无产出）')
           : `执行失败：${done?.error ?? done?.status ?? '超时'}`;
 
+        events.push({ type: 'subtask_done', round, agent: st.agent, agentId: st.agentId, status: st.status, durationMs: Date.now() - startedAt, ts: Date.now() });
         this.writeHandoff(ws, idx + 1, member.name, st.subtask, st.output, ok);
         this.appendProgress(ws, `${st.agent} ${ok ? '✓ 完成' : '✗ 失败'}（第 ${round} 轮）`);
-        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks), events_json: JSON.stringify(events) });
       }));
 
       // ② 本轮全部结束，向主Agent汇报并请求决策
       this.appendProgress(ws, `第 ${round} 轮执行结束，向主Agent汇报结果并请求调度决策…`);
       const decision = await this.coordinatorDecide(runId, team, coordinator, members, task, ws, subtasks, round, maxRounds, config.maxRetries ?? 1);
+
+      // 记录主Agent决策节点
+      const decisionSummary = decision.action === 'finish'
+        ? '任务完成，输出最终结论'
+        : `继续调度：${decision.newTasks.length > 0 ? `追加 ${decision.newTasks.length} 个新子任务` : ''}${subtasks.some((s) => s.status === 'pending' && (s.retryCount ?? 0) > 0) ? '重试失败子任务' : ''}`;
+      events.push({ type: 'decision', round, action: decision.action, summary: decisionSummary, ts: Date.now() });
+      this.persistEvents(runId, events);
 
       if (decision.action === 'finish') {
         return decision.conclusion ?? this.buildFallbackSummary(subtasks);
@@ -559,13 +581,14 @@ _生成时间：${new Date().toLocaleString()}_
 
   // ---------- 内部工具 ----------
 
-  private updateRun(runId: string, patch: { phase?: TeamRunPhase; current_step?: number; total_steps?: number; subtasks_json?: string; final_result?: string; error?: string; ended_at?: number }) {
+  private updateRun(runId: string, patch: { phase?: TeamRunPhase; current_step?: number; total_steps?: number; subtasks_json?: string; events_json?: string; final_result?: string; error?: string; ended_at?: number }) {
     const fields: string[] = [];
     const values: (string | number)[] = [];
     if (patch.phase !== undefined) { fields.push('phase = ?'); values.push(patch.phase); }
     if (patch.current_step !== undefined) { fields.push('current_step = ?'); values.push(patch.current_step); }
     if (patch.total_steps !== undefined) { fields.push('total_steps = ?'); values.push(patch.total_steps); }
     if (patch.subtasks_json !== undefined) { fields.push('subtasks_json = ?'); values.push(patch.subtasks_json); }
+    if (patch.events_json !== undefined) { fields.push('events_json = ?'); values.push(patch.events_json); }
     if (patch.final_result !== undefined) { fields.push('final_result = ?'); values.push(patch.final_result); }
     if (patch.error !== undefined) { fields.push('error = ?'); values.push(patch.error); }
     if (patch.ended_at !== undefined) { fields.push('ended_at = ?'); values.push(patch.ended_at); }
@@ -586,10 +609,12 @@ _生成时间：${new Date().toLocaleString()}_
   private mapRun(r: RunRow): TeamRun {
     let subtasks: TeamRunSubtask[] = [];
     try { subtasks = JSON.parse(r.subtasks_json) as TeamRunSubtask[]; } catch { /* ignore */ }
+    let events: TeamTimelineEvent[] = [];
+    try { events = JSON.parse(r.events_json ?? '[]') as TeamTimelineEvent[]; } catch { /* ignore */ }
     return {
       id: r.id, teamId: r.team_id, taskText: r.task_text,
       phase: r.phase as TeamRunPhase, currentStep: r.current_step, totalSteps: r.total_steps,
-      subtasks, finalResult: r.final_result, error: r.error,
+      subtasks, events, finalResult: r.final_result, error: r.error,
       createdAt: r.created_at, endedAt: r.ended_at,
       durationMs: r.ended_at ? r.ended_at - r.created_at : null
     };

@@ -5,8 +5,7 @@
   "homepage": "https://github.com/senke/aibox-control-center",
   "main": "out/main/index.js",
   "author": "Senke",
-  "license": "UNLICENSED",
-  "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "electron-vite dev",
@@ -27,7 +26,9 @@
     "dompurify": "^3.4.12",
     "express": "^5.2.1",
     "marked": "^18.0.7",
+    "onnxruntime-node": "^1.27.0",
     "playwright-core": "^1.61.1",
+    "sharp": "^0.35.3",
     "sql.js": "^1.14.1",
     "systeminformation": "^5.25.11",
     "ws": "^8.21.1",
@@ -49,5 +50,8 @@
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
     "vitest": "^3.2.7"
+  },
+  "allowScripts": {
+    "onnxruntime-node@1.27.0": true
   }
 }
