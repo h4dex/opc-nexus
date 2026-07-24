@@ -15,6 +15,8 @@ import { Workflows } from './pages/Workflows';
 import { Usage } from './pages/Usage';
 import { Engines } from './pages/Engines';
 import { Channels } from './pages/Channels';
+import { Mcp } from './pages/Mcp';
+import { Skills } from './pages/Skills';
 import { System } from './pages/System';
 import { Settings } from './pages/Settings';
 import { CreateAgentWizard } from './wizard/CreateAgentWizard';
@@ -37,6 +39,8 @@ const NAV: { key: RouteKey; label: string; icon: React.ReactNode }[] = [
   { key: 'teams', label: '专家团', icon: <IconUser size={17} /> },
   { key: 'collab', label: '多机协同', icon: <IconFlow size={17} /> },
   { key: 'engines', label: '引擎中心', icon: <IconChip size={17} /> },
+  { key: 'mcp', label: 'MCP 管理', icon: <IconPlug size={17} /> },
+  { key: 'skills', label: '技能管理', icon: <IconTask size={17} /> },
   { key: 'channels', label: '连接中心', icon: <IconPlug size={17} /> },
   { key: 'usage', label: '用量统计', icon: <IconMonitor size={17} /> },
   { key: 'system', label: '系统状态', icon: <IconMonitor size={17} /> },
@@ -111,6 +115,8 @@ export function App() {
           {route === 'teams' && <Teams />}
           {route === 'collab' && <Collab />}
           {route === 'engines' && <Engines />}
+          {route === 'mcp' && <Mcp />}
+          {route === 'skills' && <Skills />}
           {route === 'channels' && <Channels />}
           {route === 'usage' && <Usage />}
           {route === 'system' && <System />}

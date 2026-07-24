@@ -11,7 +11,7 @@ interface TeamData {
 }
 
 const PHASE_LABEL: Record<string, string> = {
-  decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败'
+  clarify: '澄清/Spec', decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败'
 };
 
 export function Teams() {
@@ -32,7 +32,7 @@ export function Teams() {
   }, [snapshot?.tasks.length]);
 
   /** 轮询活跃流水线进度（2s，有未完成 run 时） */
-  const hasActiveRun = Object.values(runs).some((r) => r && ['decompose', 'execute', 'review'].includes(r.phase));
+  const hasActiveRun = Object.values(runs).some((r) => r && ['clarify', 'decompose', 'execute', 'review'].includes(r.phase));
   const pollRuns = useCallback(() => {
     for (const t of teams) {
       void window.aibox.getTeamRuns(t.id).then((list) => {
@@ -215,7 +215,7 @@ export function Teams() {
 
 /** 流水线进度面板：阶段指示器 + 子任务状态 + 最终结论 */
 function RunProgress({ run }: { run: TeamRun }) {
-  const active = ['decompose', 'execute', 'review'].includes(run.phase);
+  const active = ['clarify', 'decompose', 'execute', 'review'].includes(run.phase);
   const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : s === 'running' ? 'var(--accent)' : 'var(--text-3)';
   const statusLabel = (s: string) => s === 'done' ? '完成' : s === 'failed' ? '失败' : s === 'running' ? '执行中' : '等待';
 
@@ -447,7 +447,7 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
     setExpandedOutput((prev) => ({ ...prev, [taskId]: output ?? '(无输出)' }));
   };
 
-  const phaseLabel = (p: string) => ({ decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败' }[p] ?? p);
+  const phaseLabel = (p: string) => ({ clarify: '澄清/Spec', decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败' }[p] ?? p);
   const phaseColor = (p: string) => p === 'done' ? 'var(--success)' : p === 'failed' ? 'var(--danger)' : 'var(--accent)';
 
   return (

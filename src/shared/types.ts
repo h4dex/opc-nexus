@@ -577,7 +577,7 @@ export interface CollabConnectInfo {
 export type TeamRunSubtaskStatus = 'pending' | 'running' | 'done' | 'failed';
 
 /** 团队执行流水线阶段 */
-export type TeamRunPhase = 'decompose' | 'execute' | 'review' | 'done' | 'failed';
+export type TeamRunPhase = 'clarify' | 'decompose' | 'execute' | 'review' | 'done' | 'failed';
 
 export interface TeamRunSubtask {
   agent: string;          // 成员名

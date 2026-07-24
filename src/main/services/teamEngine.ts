@@ -94,7 +94,7 @@ export class TeamEngine {
 
   /** 崩溃恢复：启动时把未完成的流水线标记为 failed */
   recoverRuns() {
-    const active = this.db.raw.prepare("SELECT id FROM team_runs WHERE phase IN ('decompose','execute','review')").all() as { id: string }[];
+    const active = this.db.raw.prepare("SELECT id FROM team_runs WHERE phase IN ('clarify','decompose','execute','review')").all() as { id: string }[];
     if (active.length === 0) return;
     const now = Date.now();
     for (const r of active) {
@@ -126,7 +126,7 @@ export class TeamEngine {
     const now = Date.now();
     this.db.raw.prepare(
       "INSERT INTO team_runs(id, team_id, task_text, phase, current_step, total_steps, subtasks_json, created_at) VALUES(?,?,?,?,0,0,'[]',?)"
-    ).run(runId, teamId, task, 'decompose', now);
+    ).run(runId, teamId, task, 'clarify', now);
 
     // 异步启动流水线（不阻塞 IPC 返回）
     void this.runPipeline(runId, team, coordinator, members, task);
@@ -134,8 +134,8 @@ export class TeamEngine {
     return {
       ok: true,
       message: team.mode === 'roundtable'
-        ? `圆桌讨论已启动：${members.length} 位专家依次发言，${coordinator.name} 最后总结`
-        : `团队「${team.name}」已启动：${coordinator.name} 正在拆解任务`,
+        ? `圆桌讨论已启动：主Agent 正在澄清问题并生成 Spec，随后 ${members.length} 位专家依次发言`
+        : `团队「${team.name}」已启动：${coordinator.name} 正在澄清问题并生成 Spec`,
       runId
     };
   }
@@ -147,7 +147,11 @@ export class TeamEngine {
     this.appendProgress(ws, `流水线启动｜任务：${task}`);
 
     try {
+      // Phase 0：问题澄清 + 生成 Spec（主Agent 内部 AI 先澄清问题，输出结构化规格说明）
+      const spec = await this.clarify(runId, team, coordinator, task, ws);
+
       // Phase 1：拆解（圆桌模式为固定视角分配，无需 LLM 拆解）
+      this.updateRun(runId, { phase: 'decompose' });
       let subtasks: TeamRunSubtask[];
       if (team.mode === 'roundtable') {
         subtasks = members.map((m) => ({
@@ -156,7 +160,7 @@ export class TeamEngine {
           taskId: null, status: 'pending' as const
         }));
       } else {
-        subtasks = await this.decompose(runId, team, coordinator, members, task, ws);
+        subtasks = await this.decompose(runId, team, coordinator, members, task, ws, spec);
       }
 
       this.writeOutline(ws, team, coordinator, task, subtasks);
@@ -217,13 +221,52 @@ export class TeamEngine {
     }
   }
 
-  /** Phase 1：协调者真实拆解（LLM 输出 JSON；解析失败则按成员均分降级） */
-  private async decompose(runId: string, team: Team, coordinator: Agent, members: Agent[], task: string, ws: string): Promise<TeamRunSubtask[]> {
-    const memberDesc = members.map((m) => `${m.name}（${m.role || '通用职责'}）`).join('、');
-    const prompt = `你是团队「${team.name}」的主专家（协调者）。你的团队成员有：${memberDesc}。
-请分析以下任务，拆解为 ${members.length} 个互不重叠的子任务，每个子任务分配给最合适的一位成员，确保覆盖完整且无遗漏。
-仅输出 JSON 数组，不要其他内容：[{"agent":"成员名","subtask":"具体子任务描述（含验收标准）"}]
+  /** Phase 0：问题澄清 + 生成 Spec（主Agent 内部 AI 先澄清问题边界、目标、约束，输出结构化规格说明） */
+  private async clarify(runId: string, team: Team, coordinator: Agent, task: string, ws: string): Promise<string> {
+    this.appendProgress(ws, '主Agent 开始问题澄清，生成执行规格说明 (Spec)');
 
+    const prompt = `你是团队「${team.name}」的主专家（协调者）。在开始分工之前，请先对以下任务进行问题澄清，输出一份结构化的执行规格说明（Spec）。
+
+要求：
+1. 明确任务的核心目标和预期产出
+2. 澄清关键假设和约束条件
+3. 定义验收标准（什么样算完成）
+4. 识别潜在风险和注意事项
+
+输出格式（Markdown）：
+# 执行规格说明 (Spec)
+## 核心目标
+## 预期产出
+## 关键假设与约束
+## 验收标准
+## 风险与注意事项
+
+任务：${task}`;
+
+    const clarifyTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
+    const done = await this.orchestrator.waitForTask(clarifyTask.id, STEP_TIMEOUT_MS);
+
+    let spec = '';
+    if (done?.status === 'COMPLETED') {
+      spec = this.orchestrator.taskResult(clarifyTask.id) ?? '';
+      // 写入 SPEC.md 到共享工作空间
+      try { writeFileSync(join(ws, '_aibox', 'SPEC.md'), spec, 'utf8'); } catch { /* ignore */ }
+      this.appendProgress(ws, 'Spec 已生成（_aibox/SPEC.md），开始任务拆解');
+    } else {
+      spec = `（澄清阶段未完成，直接基于原始任务执行）\n任务：${task}`;
+      this.appendProgress(ws, `澄清任务未完成（${done?.status ?? '超时'}），跳过 Spec 直接拆解`);
+    }
+    return spec;
+  }
+
+  /** Phase 1：协调者真实拆解（LLM 输出 JSON；解析失败则按成员均分降级） */
+  private async decompose(runId: string, team: Team, coordinator: Agent, members: Agent[], task: string, ws: string, spec: string): Promise<TeamRunSubtask[]> {
+    const memberDesc = members.map((m) => `${m.name}（${m.role || '通用职责'}）`).join('、');
+    const specCtx = spec && !spec.startsWith('（澄清阶段未完成') ? `\n\n## 已生成的执行规格说明 (Spec)\n${spec.slice(0, 800)}` : '';
+    const prompt = `你是团队「${team.name}」的主专家（协调者）。你的团队成员有：${memberDesc}。
+请基于以下任务和 Spec，拆解为 ${members.length} 个互不重叠的子任务，每个子任务分配给最合适的一位成员，确保覆盖完整且无遗漏。
+仅输出 JSON 数组，不要其他内容：[{"agent":"成员名","subtask":"具体子任务描述（含验收标准）"}]
+${specCtx}
 任务：${task}`;
 
     const decompTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws });
