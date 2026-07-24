@@ -16,7 +16,7 @@ import { WeixinChannel } from './services/channels/wechatChannel.js';
 import { ResourceMonitor } from './services/resourceMonitor.js';
 import { Scheduler } from './services/scheduler.js';
 import { notify } from './services/notifier.js';
-import { seedIfEmpty } from './services/seed.js';
+import { seedIfEmpty, seedMcpServers, seedSkills } from './services/seed.js';
 import { importCredentialsBootstrap } from './services/bootstrap.js';
 import { McpManager } from './services/mcpManager.js';
 import { SkillManager } from './services/skillManager.js';
@@ -160,6 +160,8 @@ app.whenReady().then(async () => {
   orchestrator.recoverAfterRestart();
   teamEngine.recoverRuns();
   seedIfEmpty(db);
+  seedMcpServers(db);
+  seedSkills(db);
   // 凭据引导文件自动导入（credentials.bootstrap.json → safeStorage，导入后重命名）
   importCredentialsBootstrap(db);
   // 数据保留策略：启动 + 每 24h 清理（任务 90 天 / 资源 7 天 / 审计 1 年）

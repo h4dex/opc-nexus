@@ -491,6 +491,20 @@ export class Orchestrator {
     if (!engine || !['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(engine.status)) {
       throw new Error('只能选择已安装或待配置的引擎（未就绪引擎将以演示模式执行）');
     }
+    // 同名员工已存在（含已归档）：复用而非重复插入（agents.name 有 UNIQUE 约束）
+    const existing = this.db.raw.prepare('SELECT id, archived FROM agents WHERE name = ?').get(input.name) as { id: string; archived: number } | undefined;
+    if (existing) {
+      if (existing.archived === 1) {
+        // 已归档的同名员工：重新激活并更新配置
+        this.db.raw.prepare(
+          `UPDATE agents SET archived = 0, role = ?, system_prompt = ?, soul_md = ?, agents_md = ?, user_md = ?, engine_id = ?, permission_mode = ?, lifecycle = 'READY', updated_at = ? WHERE id = ?`
+        ).run(input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '', input.engineId, input.permissionMode, Date.now(), existing.id);
+        this.emit();
+        return this.listAgents().find((a) => a.id === existing.id)!;
+      }
+      // 未归档的同名员工：直接返回已有的
+      return this.listAgents().find((a) => a.id === existing.id)!;
+    }
     const now = Date.now();
     const id = randomUUID();
     const colors = ['#4d6bfe', '#22c1a3', '#8a5cf6', '#f59e0b', '#3aa7ff', '#ef6a6a'];
