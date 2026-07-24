@@ -291,7 +291,7 @@ export function Workflows() {
               >
                 <Background gap={16} size={1} />
                 <Controls />
-                <MiniMap style={{ background: 'var(--card-bg)' }} />
+                <MiniMap style={{ background: 'var(--card)' }} />
               </ReactFlow>
             </div>
           </div>

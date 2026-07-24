@@ -345,7 +345,7 @@ function AgentDetailDrawer({ agent, onClose, onEdit }: { agent: Agent; onClose: 
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.4)', zIndex: 900 }} onClick={onClose}>
-      <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: 420, background: 'var(--card-bg)', borderLeft: '1px solid var(--border)', padding: 20, overflowY: 'auto', boxShadow: '-4px 0 24px rgba(0,0,0,.3)' }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: 420, background: 'var(--card)', borderLeft: '1px solid var(--border)', padding: 20, overflowY: 'auto', boxShadow: '-4px 0 24px rgba(0,0,0,.3)' }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
             <div style={{ width: 40, height: 40, borderRadius: 10, background: `${agent.avatarColor}22`, color: agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 16 }}>{agent.name.slice(0, 1)}</div>

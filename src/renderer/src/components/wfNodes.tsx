@@ -20,7 +20,7 @@ function NodeShell({ color, icon, title, subtitle, data, hasInput = true, hasOut
     <div style={{
       minWidth: 160, padding: '10px 14px', borderRadius: 10,
       border: `2px solid ${status !== 'pending' ? STATUS_COLOR[status] : color}`,
-      background: 'var(--card-bg, #1a1e26)', boxShadow: '0 2px 8px rgba(0,0,0,.25)',
+      background: 'var(--card, #1a1e26)', boxShadow: '0 2px 8px rgba(0,0,0,.25)',
       fontSize: 12, position: 'relative'
     }}>
       {hasInput && <Handle type="target" position={Position.Left} style={{ background: color }} />}
@@ -73,7 +73,7 @@ export function ConditionWfNode({ data }: NodeProps) {
     <div style={{
       minWidth: 160, padding: '10px 14px', borderRadius: 10,
       border: `2px solid ${(d.runStatus && d.runStatus !== 'pending') ? STATUS_COLOR[d.runStatus] : '#f97316'}`,
-      background: 'var(--card-bg, #1a1e26)', boxShadow: '0 2px 8px rgba(0,0,0,.25)',
+      background: 'var(--card, #1a1e26)', boxShadow: '0 2px 8px rgba(0,0,0,.25)',
       fontSize: 12, position: 'relative', transform: 'rotate(0deg)'
     }}>
       <Handle type="target" position={Position.Left} style={{ background: '#f97316' }} />
@@ -113,7 +113,7 @@ export function StartWfNode({ data }: NodeProps) {
   return (
     <div style={{
       width: 56, height: 56, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--success)', color: '#fff', fontWeight: 700, fontSize: 11, border: '3px solid var(--card-bg, #1a1e26)'
+      background: 'var(--success)', color: '#fff', fontWeight: 700, fontSize: 11, border: '3px solid var(--card, #1a1e26)'
     }}>
       {d.label || '开始'}
       <Handle type="source" position={Position.Right} style={{ background: 'var(--success)' }} />
@@ -126,7 +126,7 @@ export function EndWfNode({ data }: NodeProps) {
   return (
     <div style={{
       width: 56, height: 56, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--danger)', color: '#fff', fontWeight: 700, fontSize: 11, border: '3px solid var(--card-bg, #1a1e26)'
+      background: 'var(--danger)', color: '#fff', fontWeight: 700, fontSize: 11, border: '3px solid var(--card, #1a1e26)'
     }}>
       <Handle type="target" position={Position.Left} style={{ background: 'var(--danger)' }} />
       {d.label || '结束'}

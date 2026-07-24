@@ -479,13 +479,13 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
             ))}
             {/* 展开的子任务输出 */}
             {run.subtasks.filter((st) => st.taskId && expandedOutput[st.taskId]).map((st) => (
-              <pre key={st.taskId} style={{ marginTop: 6, padding: '8px 10px', background: 'var(--card-bg)', borderRadius: 6, fontSize: 11, lineHeight: 1.6, maxHeight: 120, overflowY: 'auto', whiteSpace: 'pre-wrap' }}>
+              <pre key={st.taskId} style={{ marginTop: 6, padding: '8px 10px', background: 'var(--card)', borderRadius: 6, fontSize: 11, lineHeight: 1.6, maxHeight: 120, overflowY: 'auto', whiteSpace: 'pre-wrap' }}>
                 {expandedOutput[st.taskId!]}
               </pre>
             ))}
             {run.error && <div style={{ marginTop: 6, fontSize: 12, color: 'var(--danger)' }}>{run.error}</div>}
             {run.finalResult && (
-              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-1)', background: 'var(--card-bg)', padding: '8px 10px', borderRadius: 6, maxHeight: 100, overflowY: 'auto', whiteSpace: 'pre-wrap' }}>
+              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-1)', background: 'var(--card)', padding: '8px 10px', borderRadius: 6, maxHeight: 100, overflowY: 'auto', whiteSpace: 'pre-wrap' }}>
                 {run.finalResult}
               </div>
             )}

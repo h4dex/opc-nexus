@@ -202,7 +202,7 @@ function AgentHoverCard({ card, x, y }: { card: AgentCardView; x: number; y: num
   const statusLabel = card.derivedStatus === 'running' ? '执行中' : card.derivedStatus === 'error' ? '故障' : card.derivedStatus === 'paused' ? '暂停' : '空闲';
   const statusColor = card.derivedStatus === 'running' ? 'var(--accent)' : card.derivedStatus === 'error' ? 'var(--danger)' : 'var(--success)';
   return (
-    <div style={{ position: 'fixed', left: Math.min(x + 12, window.innerWidth - 260), top: Math.min(y + 12, window.innerHeight - 180), zIndex: 2000, width: 240, padding: '12px 14px', borderRadius: 10, background: 'var(--card-bg)', border: '1px solid var(--border)', boxShadow: '0 8px 24px rgba(0,0,0,.4)', pointerEvents: 'none' }}>
+    <div style={{ position: 'fixed', left: Math.min(x + 12, window.innerWidth - 260), top: Math.min(y + 12, window.innerHeight - 180), zIndex: 2000, width: 240, padding: '12px 14px', borderRadius: 10, background: 'var(--card)', border: '1px solid var(--border)', boxShadow: '0 8px 24px rgba(0,0,0,.4)', pointerEvents: 'none' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
         <div style={{ width: 28, height: 28, borderRadius: 7, background: `${card.agent.avatarColor}22`, color: card.agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12 }}>{card.agent.name.slice(0, 1)}</div>
         <div style={{ flex: 1 }}>
@@ -238,7 +238,7 @@ function AgentOfficeModal({ card, onClose }: { card: AgentCardView; onClose: () 
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3000 }} onClick={onClose}>
-      <div style={{ width: 500, maxHeight: '70vh', overflowY: 'auto', background: 'var(--card-bg)', borderRadius: 14, padding: 20, border: '1px solid var(--border)' }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ width: 500, maxHeight: '70vh', overflowY: 'auto', background: 'var(--card)', borderRadius: 14, padding: 20, border: '1px solid var(--border)' }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
           <div style={{ width: 44, height: 44, borderRadius: 12, background: `${card.agent.avatarColor}22`, color: card.agent.avatarColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 18 }}>{card.agent.name.slice(0, 1)}</div>
           <div style={{ flex: 1 }}>
