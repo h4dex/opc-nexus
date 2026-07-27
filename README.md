@@ -262,6 +262,7 @@ opc-nexus/
 | 文档 | 说明 |
 |------|------|
 | [用户使用手册](./docs/USER-GUIDE.md) | 界面说明、操作指南、常见问题 |
+| [更新日志](./CHANGELOG.md) | 版本历史与变更记录 |
 | [架构设计](./src/docs/architecture.md) | 系统架构、分层模型、安全基线 |
 | [功能文档](./src/docs/features.md) | 全部功能模块开发文档 |
 | [API 参考](./src/docs/api-reference.md) | IPC 接口与 Preload API 参考 |

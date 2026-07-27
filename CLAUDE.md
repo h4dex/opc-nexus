@@ -17,6 +17,11 @@ OPC-Nexus(package 名 `aibox-control-center`)— 本地优先的桌面 AI Agent 
 - Git 身份:`liyingjie <y@senke.com>`(已配置)
 - CNB 相关操作(API、CI、Release)使用 `.claude/skills/cnb` skill
 
+## 版本发布约定
+
+- 每次功能发布须同步:① `package.json` 的 `version` 按语义化版本递增(新功能 minor,修复 patch);② 在 `CHANGELOG.md` 顶部追加该版本的变更记录(新增/修复/变更 分节)
+- CHANGELOG 是版本历史的唯一权威文档,README 仅链接不重复内容
+
 ## 常用命令
 
 | 命令 | 用途 |
