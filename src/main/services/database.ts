@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 22;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -329,6 +329,36 @@ CREATE TABLE IF NOT EXISTS deliverable_reviews (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_entries (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  source_type TEXT NOT NULL DEFAULT 'manual',
+  source_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'other',
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  pinned INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  last_used_at INTEGER,
+  source_updated_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(source_type, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_versions (
+  id TEXT PRIMARY KEY,
+  knowledge_id TEXT NOT NULL REFERENCES knowledge_entries(id),
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  change_note TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'manual',
+  created_by TEXT NOT NULL DEFAULT 'admin',
+  created_at INTEGER NOT NULL,
+  UNIQUE(knowledge_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS collab_workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -377,6 +407,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_deliverables_project ON deliverables(project_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_deliverable_versions_parent ON deliverable_versions(deliverable_id, version);
 CREATE INDEX IF NOT EXISTS idx_deliverable_reviews_parent ON deliverable_reviews(deliverable_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_entries(project_id, status, pinned, updated_at);
+CREATE INDEX IF NOT EXISTS idx_knowledge_versions_parent ON knowledge_versions(knowledge_id, version);
 `;
 
 type Row = Record<string, SqlValue>;
@@ -708,6 +740,11 @@ export class Database {
             AND EXISTS (SELECT 1 FROM projects WHERE id = 'project-demo-quality')
             AND EXISTS (SELECT 1 FROM projects WHERE id = 'project-demo-customer');
         `);
+      }
+      if (prev < 22) {
+        // v22：项目知识库、不可变知识版本与成果来源追溯。
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_entries(project_id, status, pinned, updated_at)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_knowledge_versions_parent ON knowledge_versions(knowledge_id, version)');
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

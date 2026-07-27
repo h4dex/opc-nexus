@@ -36,6 +36,8 @@ interface Tables {
   deliverables: Map<string, Record<string, unknown>>;
   deliverable_versions: Map<string, Record<string, unknown>>;
   deliverable_reviews: Map<string, Record<string, unknown>>;
+  knowledge_entries: Map<string, Record<string, unknown>>;
+  knowledge_versions: Map<string, Record<string, unknown>>;
   settings: Map<string, unknown>;
 }
 
@@ -57,6 +59,8 @@ export function createMockDb(): MockDb & { tables: Tables } {
     deliverables: new Map(),
     deliverable_versions: new Map(),
     deliverable_reviews: new Map(),
+    knowledge_entries: new Map(),
+    knowledge_versions: new Map(),
     settings: new Map()
   };
 
@@ -365,6 +369,35 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
+  // ---------- 项目知识库 ----------
+  if (/SELECT \* FROM knowledge_entries ORDER BY pinned DESC, updated_at DESC/.test(sql)) {
+    const result = [...tables.knowledge_entries.values()].sort((a, b) =>
+      Number(b.pinned) - Number(a.pinned) || (b.updated_at as number) - (a.updated_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM knowledge_entries WHERE source_type = \? AND source_id = \?/.test(sql)) {
+    const row = [...tables.knowledge_entries.values()].find(r => r.source_type === args[0] && r.source_id === args[1]);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  if (/SELECT \* FROM knowledge_entries WHERE id = \?/.test(sql)) {
+    const row = tables.knowledge_entries.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  if (/SELECT \* FROM knowledge_versions ORDER BY knowledge_id, version DESC/.test(sql)) {
+    const result = [...tables.knowledge_versions.values()].sort((a, b) =>
+      String(a.knowledge_id).localeCompare(String(b.knowledge_id)) || (b.version as number) - (a.version as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM knowledge_versions WHERE knowledge_id = \? ORDER BY version DESC/.test(sql)) {
+    const result = [...tables.knowledge_versions.values()].filter(r => r.knowledge_id === args[0])
+      .sort((a, b) => (b.version as number) - (a.version as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
   // Fallback
   return mode === 'get' ? undefined : [];
 }
@@ -465,6 +498,49 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
       if (rawValue === '?') deliverable[field] = args[argIndex++];
       else if (/^'.*'$/.test(rawValue)) deliverable[field] = rawValue.slice(1, -1);
       else if (/^NULL$/i.test(rawValue)) deliverable[field] = null;
+    }
+    return { changes: 1 };
+  }
+
+  // ---------- 项目知识库 ----------
+  if (/INSERT INTO knowledge_entries/.test(sql)) {
+    const [id, projectId, sourceType, sourceId, title, category, tagsJson, pinned, status,
+      sourceUpdatedAt, createdAt, updatedAt] = args;
+    tables.knowledge_entries.set(id as string, {
+      id, project_id: projectId, source_type: sourceType, source_id: sourceId, title, category,
+      tags_json: tagsJson, pinned, status, usage_count: 0, last_used_at: null,
+      source_updated_at: sourceUpdatedAt, created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO knowledge_versions/.test(sql)) {
+    const [id, knowledgeId, version, content, changeNote, origin, createdBy, createdAt] = args;
+    tables.knowledge_versions.set(id as string, {
+      id, knowledge_id: knowledgeId, version, content, change_note: changeNote,
+      origin, created_by: createdBy, created_at: createdAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/UPDATE knowledge_entries SET usage_count = usage_count \+ 1, last_used_at = \? WHERE id = \?/.test(sql)) {
+    const [lastUsedAt, id] = args;
+    const entry = tables.knowledge_entries.get(id as string);
+    if (!entry) return { changes: 0 };
+    entry.usage_count = Number(entry.usage_count) + 1;
+    entry.last_used_at = lastUsedAt;
+    return { changes: 1 };
+  }
+
+  if (/UPDATE knowledge_entries SET .+ WHERE id = \?/.test(sql)) {
+    const id = args[args.length - 1] as string;
+    const entry = tables.knowledge_entries.get(id);
+    if (!entry) return { changes: 0 };
+    const setClause = sql.match(/SET (.+) WHERE/)?.[1] ?? '';
+    let argIndex = 0;
+    for (const assignment of setClause.split(',').map(value => value.trim())) {
+      const [field, rawValue] = assignment.split(' = ').map(value => value.trim());
+      if (rawValue === '?') entry[field] = args[argIndex++];
     }
     return { changes: 1 };
   }
@@ -709,6 +785,8 @@ function detectTable(sql: string): keyof Tables | null {
   if (/\bdeliverable_versions\b/.test(sql)) return 'deliverable_versions';
   if (/\bdeliverable_reviews\b/.test(sql)) return 'deliverable_reviews';
   if (/\bdeliverables\b/.test(sql)) return 'deliverables';
+  if (/\bknowledge_versions\b/.test(sql)) return 'knowledge_versions';
+  if (/\bknowledge_entries\b/.test(sql)) return 'knowledge_entries';
   return null;
 }
 

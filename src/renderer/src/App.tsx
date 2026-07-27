@@ -6,6 +6,7 @@ import { Office } from './pages/Office';
 import { Inbox } from './pages/Inbox';
 import { Projects } from './pages/Projects';
 import { Deliverables } from './pages/Deliverables';
+import { Knowledge } from './pages/Knowledge';
 import { Agents } from './pages/Agents';
 import { Schedules } from './pages/Schedules';
 import { Tasks } from './pages/Tasks';
@@ -28,7 +29,7 @@ import { GlobalSearch } from './components/GlobalSearch';
 import { todayText } from './components/common';
 import {
   IconAlert, IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconLayers, IconMonitor, IconMoon, IconPlug, IconPlus,
-  IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser, IconFolder
+  IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser, IconFolder, IconBook
 } from './components/icons';
 
 const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: React.ReactNode }[] }[] = [
@@ -39,6 +40,7 @@ const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: 
     { key: 'office', label: '办公室', icon: <IconCoffee size={17} /> },
     { key: 'tasks', label: '任务中心', icon: <IconTask size={17} /> },
     { key: 'deliverables', label: '成果库', icon: <IconLayers size={17} /> },
+    { key: 'knowledge', label: '项目知识库', icon: <IconBook size={17} /> },
     { key: 'schedules', label: '定时任务', icon: <IconClock size={17} /> },
   ]},
   { group: '协作', items: [
@@ -99,6 +101,7 @@ export function App() {
       case 'agents': return <Agents />;
       case 'tasks': return <Tasks />;
       case 'deliverables': return <Deliverables />;
+      case 'knowledge': return <Knowledge />;
       case 'schedules': return <Schedules />;
       case 'workflows': return <Workflows />;
       case 'console': return <Console />;

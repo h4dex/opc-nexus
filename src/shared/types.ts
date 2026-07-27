@@ -381,6 +381,86 @@ export interface ProjectDeliverablePackage {
   deliverables: Array<DeliverableSummary & { latestContent: string }>;
 }
 
+// ---------- 项目知识库 ----------
+
+export type KnowledgeSourceType = 'manual' | 'deliverable';
+export type KnowledgeCategory = 'decision' | 'playbook' | 'research' | 'reference' | 'lesson' | 'other';
+export type KnowledgeStatus = 'active' | 'archived';
+export type KnowledgeVersionOrigin = 'manual' | 'deliverable';
+
+export interface KnowledgeSummary {
+  id: string;
+  projectId: string;
+  projectName: string;
+  sourceType: KnowledgeSourceType;
+  sourceId: string;
+  title: string;
+  category: KnowledgeCategory;
+  tags: string[];
+  pinned: boolean;
+  status: KnowledgeStatus;
+  latestVersion: number;
+  versionCount: number;
+  preview: string;
+  usageCount: number;
+  lastUsedAt: number | null;
+  sourceUpdatedAt: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface KnowledgeVersion {
+  id: string;
+  knowledgeId: string;
+  version: number;
+  content: string;
+  changeNote: string;
+  origin: KnowledgeVersionOrigin;
+  createdBy: string;
+  createdAt: number;
+}
+
+export interface KnowledgeTrace {
+  project: { id: string; name: string; status: ProjectStatus };
+  source: { type: KnowledgeSourceType; id: string; title: string; deliverableId: string | null };
+}
+
+export interface KnowledgeDetail extends KnowledgeSummary {
+  latestContent: string;
+  versions: KnowledgeVersion[];
+  trace: KnowledgeTrace;
+}
+
+export interface KnowledgeInput {
+  projectId: string;
+  title: string;
+  content: string;
+  category?: KnowledgeCategory;
+  tags?: string[];
+  pinned?: boolean;
+}
+
+export interface KnowledgePatch {
+  title?: string;
+  category?: KnowledgeCategory;
+  tags?: string[];
+  pinned?: boolean;
+  status?: KnowledgeStatus;
+}
+
+export interface KnowledgeVersionInput {
+  content: string;
+  changeNote: string;
+}
+
+export interface KnowledgeQuery {
+  projectId?: string;
+  category?: KnowledgeCategory;
+  sourceType?: KnowledgeSourceType;
+  status?: KnowledgeStatus | 'all';
+  search?: string;
+}
+
 /** 任务执行事件（13.2 审计可追溯；详情页时间线） */
 export interface TaskEvent {
   id: string;

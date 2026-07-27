@@ -13,6 +13,7 @@ import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs'
 import { app } from 'electron';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
+import type { KnowledgeManager } from './knowledgeManager.js';
 import type {
   Agent, DeliverableReviewStatus, TeamCollaborationOverview, TeamMemberContribution,
   TeamRun, TeamRunPhase, TeamRunSubtask, TeamRunTrace, TeamTimelineEvent
@@ -85,7 +86,7 @@ export class TeamEngine {
   /** 运行控制注册表：runId → 控制信号（流水线内存态，无需持久化） */
   private controls = new Map<string, RunControl>();
 
-  constructor(private db: Database, private orchestrator: Orchestrator) {}
+  constructor(private db: Database, private orchestrator: Orchestrator, private knowledge?: KnowledgeManager) {}
 
   /** 获取或创建 run 的控制信号（公开以供测试检验控制状态） */
   control(runId: string): RunControl {
@@ -275,6 +276,7 @@ export class TeamEngine {
     }
 
     // 执行/验收阶段：从持久化子任务状态续跑
+    this.prepareKnowledgeContext(runId, ws, row.task_text);
     this.appendProgress(ws, `检测到中断的流水线（${row.phase} 阶段，第 ${row.current_step} 轮），开始续跑`);
     let subtasks: TeamRunSubtask[] = [];
     try { subtasks = JSON.parse(row.subtasks_json) as TeamRunSubtask[]; } catch { subtasks = []; }
@@ -425,6 +427,7 @@ export class TeamEngine {
 
   private async runPipeline(runId: string, team: Team, coordinator: Agent, members: Agent[], task: string) {
     const ws = this.ensureWorkspace(team);
+    this.prepareKnowledgeContext(runId, ws, task);
     this.appendProgress(ws, `流水线启动｜任务：${task}`);
     const events: TeamTimelineEvent[] = [];
 
@@ -500,6 +503,10 @@ export class TeamEngine {
   /** Phase 0：问题澄清 + 生成 Spec（主Agent 内部 AI 先澄清问题边界、目标、约束，输出结构化规格说明） */
   private async clarify(runId: string, team: Team, coordinator: Agent, task: string, ws: string): Promise<string> {
     this.appendProgress(ws, '主Agent 开始问题澄清，生成执行规格说明 (Spec)');
+    const knowledgeContext = this.readSafe(join(ws, '_aibox', 'KNOWLEDGE.md'));
+    const knowledgeBlock = knowledgeContext
+      ? `\n\n## 本项目既有知识（完整内容见 _aibox/KNOWLEDGE.md）\n${knowledgeContext.slice(0, 700)}`
+      : '';
 
     const prompt = `你是团队「${team.name}」的主专家（协调者）。在开始分工之前，请先对以下任务进行问题澄清，输出一份结构化的执行规格说明（Spec）。
 
@@ -517,7 +524,7 @@ export class TeamEngine {
 ## 验收标准
 ## 风险与注意事项
 
-任务：${task}`;
+任务：${task}${knowledgeBlock}`;
 
     const clarifyTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws, projectId: this.projectIdForRun(runId) });
     const done = await this.orchestrator.waitForTask(clarifyTask.id, STEP_TIMEOUT_MS);
@@ -589,6 +596,10 @@ ${specCtx}
   /** Phase 2：成员提示词 = 原始任务 + 你的子任务 + 大纲 + 已完成成员的交接摘要 */
   private buildMemberPrompt(team: Team, task: string, subtask: string, ws: string, prevHandoffs: string[], step: number): string {
     const outline = this.readSafe(join(ws, '_aibox', 'OUTLINE.md'));
+    const knowledge = this.readSafe(join(ws, '_aibox', 'KNOWLEDGE.md'));
+    const knowledgeCtx = knowledge
+      ? `\n\n## 项目知识库（完整内容见 _aibox/KNOWLEDGE.md）\n${knowledge.slice(0, 650)}`
+      : '';
     const handoffCtx = prevHandoffs.length > 0
       ? `\n\n## 其他成员已完成的交接内容\n${prevHandoffs.map((n) => this.readSafe(join(ws, '_aibox', 'handoffs', n))).filter(Boolean).join('\n\n---\n\n')}`
       : '';
@@ -599,6 +610,7 @@ ${task}
 
 ## 你的子任务
 ${subtask}
+${knowledgeCtx}
 
 ## 团队大纲
 ${outline || '（无）'}
@@ -879,6 +891,18 @@ ${report}${guidanceBlock}
     const ws = team.workspace || join(app.getPath('userData'), 'workspaces', team.id);
     mkdirSync(join(ws, '_aibox', 'handoffs'), { recursive: true });
     return ws;
+  }
+
+  private prepareKnowledgeContext(runId: string, ws: string, task: string) {
+    const projectId = this.projectIdForRun(runId);
+    if (!projectId || !this.knowledge) return;
+    try {
+      const content = this.knowledge.buildProjectContext(projectId, task);
+      writeFileSync(join(ws, '_aibox', 'KNOWLEDGE.md'), content, 'utf8');
+      this.appendProgress(ws, '已加载项目知识库上下文（_aibox/KNOWLEDGE.md）');
+    } catch (error) {
+      this.appendProgress(ws, `项目知识加载失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private writeOutline(ws: string, team: Team, coordinator: Agent, task: string, subtasks: TeamRunSubtask[]) {

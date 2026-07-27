@@ -20,6 +20,7 @@ vi.mock('node:fs', () => ({
 }));
 
 import { TeamEngine } from '../src/main/services/teamEngine.js';
+import { writeFileSync } from 'node:fs';
 
 /** 最小化 Orchestrator mock：控制流仅用到 cancelTask */
 function createMockOrchestrator() {
@@ -233,6 +234,36 @@ describe('TeamEngine 执行干预控制流', () => {
       const id = seedTeamRun(db, { phase: 'done' });
       expect(engine.injectGuidance(id, '指导').ok).toBe(false);
     });
+  });
+});
+
+describe('TeamEngine 项目知识注入', () => {
+  it('绑定项目时生成共享知识文件并登记上下文使用', () => {
+    const db = createMockDb();
+    const projectId = seedProject(db, { id: 'project-knowledge', name: '知识复用项目' });
+    const runId = seedTeamRun(db, { project_id: projectId });
+    const knowledge = { buildProjectContext: vi.fn().mockReturnValue('# 项目知识上下文\n\n既有执行手册') };
+    const engine = new TeamEngine(db as never, createMockOrchestrator() as never, knowledge as never);
+
+    engine.prepareKnowledgeContext(runId, '/tmp/team-workspace', '制定执行方案');
+
+    expect(knowledge.buildProjectContext).toHaveBeenCalledWith(projectId, '制定执行方案');
+    expect(writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('_aibox\\KNOWLEDGE.md'),
+      '# 项目知识上下文\n\n既有执行手册',
+      'utf8'
+    );
+  });
+
+  it('未绑定项目时不读取或写入知识上下文', () => {
+    const db = createMockDb();
+    const runId = seedTeamRun(db, { project_id: null });
+    const knowledge = { buildProjectContext: vi.fn() };
+    const engine = new TeamEngine(db as never, createMockOrchestrator() as never, knowledge as never);
+
+    engine.prepareKnowledgeContext(runId, '/tmp/team-workspace', '通用讨论');
+
+    expect(knowledge.buildProjectContext).not.toHaveBeenCalled();
   });
 });
 

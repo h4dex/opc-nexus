@@ -22,12 +22,14 @@ import type { WfPlatformManager } from './services/wfPlatformManager.js';
 import type { TeamEngine } from './services/teamEngine.js';
 import type { ProjectManager } from './services/projectManager.js';
 import type { DeliverableManager } from './services/deliverableManager.js';
+import type { KnowledgeManager } from './services/knowledgeManager.js';
 import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
 import type {
   AppConfig, CreateAgentInput, DeliverableMetaPatch, DeliverableReviewInput, DeliverableVersionInput,
+  KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeVersionInput,
   ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge
 } from '../shared/types.js';
 import { hostname, release } from 'node:os';
@@ -70,6 +72,7 @@ export interface IpcDeps {
   workflows: WorkflowEngine;
   projects: ProjectManager;
   deliverables: DeliverableManager;
+  knowledge: KnowledgeManager;
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
@@ -80,7 +83,7 @@ export interface IpcDeps {
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -172,11 +175,22 @@ export function registerIpc(deps: IpcDeps) {
     }
     const result = deliverables.review(deliverableId, input, reworkRef);
     if (!result) throw new Error('成果不存在');
+    if (result.deliverable.reviewStatus === 'accepted') knowledge.ingestDeliverable(result.deliverable);
     pushSnapshot();
     return { ...result, reworkRef, reworkMessage };
   });
   ipcMain.handle('aibox:getProjectDeliverablePackage', (_e, projectId: string) =>
     deliverables.packageForProject(assertId(projectId, 'projectId')));
+
+  // ---------- 项目知识库 ----------
+  ipcMain.handle('aibox:listKnowledge', (_e, query?: KnowledgeQuery) => knowledge.list(query ?? {}));
+  ipcMain.handle('aibox:getKnowledge', (_e, id: string) => knowledge.get(assertId(id, 'knowledgeId')));
+  ipcMain.handle('aibox:createKnowledge', (_e, input: KnowledgeInput) =>
+    knowledge.create(input));
+  ipcMain.handle('aibox:updateKnowledge', (_e, id: string, patch: KnowledgePatch) =>
+    knowledge.update(assertId(id, 'knowledgeId'), patch));
+  ipcMain.handle('aibox:addKnowledgeVersion', (_e, id: string, input: KnowledgeVersionInput) =>
+    knowledge.addVersion(assertId(id, 'knowledgeId'), input));
   ipcMain.handle('aibox:exportDeliverable', async (_e, id: string, format: 'markdown' | 'json') => {
     const detail = deliverables.get(assertId(id, 'deliverableId'));
     if (!detail) throw new Error('成果不存在');

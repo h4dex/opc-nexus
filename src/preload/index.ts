@@ -7,6 +7,7 @@ import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
+  KnowledgeDetail, KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeSummary, KnowledgeVersionInput,
   Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
@@ -56,6 +57,13 @@ const api = {
   getProjectDeliverablePackage: (projectId: string): Promise<ProjectDeliverablePackage> => ipcRenderer.invoke('aibox:getProjectDeliverablePackage', projectId),
   exportDeliverable: (id: string, format: 'markdown' | 'json'): Promise<{ ok: boolean; canceled: boolean; message: string; path?: string }> => ipcRenderer.invoke('aibox:exportDeliverable', id, format),
   exportProjectDeliverablePackage: (projectId: string): Promise<{ ok: boolean; canceled: boolean; message: string; path?: string }> => ipcRenderer.invoke('aibox:exportProjectDeliverablePackage', projectId),
+
+  // 项目知识库
+  listKnowledge: (query?: KnowledgeQuery): Promise<KnowledgeSummary[]> => ipcRenderer.invoke('aibox:listKnowledge', query),
+  getKnowledge: (id: string): Promise<KnowledgeDetail | null> => ipcRenderer.invoke('aibox:getKnowledge', id),
+  createKnowledge: (input: KnowledgeInput): Promise<KnowledgeDetail> => ipcRenderer.invoke('aibox:createKnowledge', input),
+  updateKnowledge: (id: string, patch: KnowledgePatch): Promise<KnowledgeDetail | null> => ipcRenderer.invoke('aibox:updateKnowledge', id, patch),
+  addKnowledgeVersion: (id: string, input: KnowledgeVersionInput): Promise<KnowledgeDetail | null> => ipcRenderer.invoke('aibox:addKnowledgeVersion', id, input),
 
   // 数字员工
   createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', input),
