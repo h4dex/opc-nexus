@@ -4,6 +4,8 @@ dist/
 release/
 .qoder/
 .superpowers/
+# 用户本地配置(含凭据,严禁入库)
+user/
 *.log
 .DS_Store
 Thumbs.db

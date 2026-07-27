@@ -19,6 +19,7 @@ import { notify } from './services/notifier.js';
 import { seedIfEmpty, seedMcpServers, seedSkills } from './services/seed.js';
 import { importCredentialsBootstrap } from './services/bootstrap.js';
 import { migrateLegacyProvider } from './services/provider.js';
+import { loadUserConfig } from './services/userConfig.js';
 import { McpManager } from './services/mcpManager.js';
 import { SkillManager } from './services/skillManager.js';
 import { ProviderManager } from './services/providerManager.js';
@@ -208,6 +209,15 @@ app.whenReady().then(async () => {
   importCredentialsBootstrap(db);
   // 旧版供应商配置（settings provider:hermes）→ providers 表（P0：单一数据源）
   migrateLegacyProvider(db);
+  // 用户配置文件 user/config.yaml（不存在则生成模板）：企微凭据导入 safeStorage
+  const userCfg = loadUserConfig();
+  if (userCfg.wecom.botId && userCfg.wecom.secret) {
+    try {
+      wecom.saveCredentials(userCfg.wecom.botId, userCfg.wecom.secret);
+    } catch {
+      /* 密钥库不可用时跳过，渠道页可手动配置 */
+    }
+  }
   // 数据保留策略：启动 + 每 24h 清理（任务 90 天 / 资源 7 天 / 审计 1 年）
   db.cleanupRetention();
   setInterval(() => db.cleanupRetention(), 24 * 3_600_000);
@@ -224,7 +234,9 @@ app.whenReady().then(async () => {
     const statusOf = (id: string) =>
       (db.raw.prepare('SELECT status FROM channels WHERE id = ?').get(id) as { status: string } | undefined)?.status ?? '';
     if (reconnectable.includes(statusOf('ch-feishu'))) void feishu.connect();
-    if (reconnectable.includes(statusOf('ch-wecom'))) void wecom.connect();
+    // 企微：config.yaml 提供了凭据时首次也自动连（UNCONFIGURED → 直接建立长连接）
+    const wecomStatus = statusOf('ch-wecom');
+    if (reconnectable.includes(wecomStatus) || (userCfg.wecom.botId && userCfg.wecom.secret && wecomStatus !== 'DISABLED')) void wecom.connect();
     if (reconnectable.includes(statusOf('ch-weixin'))) void weixin.connect();
   }
 
