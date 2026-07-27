@@ -66,3 +66,4 @@ export const IconBook = svg('M4 4.5A2.5 2.5 0 0 1 6.5 2H11v18H6.5A2.5 2.5 0 0 0 
 export const IconPin = svg('M9 3h6l-1 5 3 3v2H7v-2l3-3z', 'M12 13v8');
 export const IconArchive = svg('M4 7h16v13H4zM3 3h18v4H3z', 'M9 11h6');
 export const IconTrash = svg('M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14', 'M10 11v6m4-6v6');
+export const IconEdit = svg('M4 20h4L19 9l-4-4L4 16z', 'M13.5 6.5l4 4M4 20h16');

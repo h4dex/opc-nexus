@@ -242,7 +242,9 @@ export interface AppConfig {
 /** 定时任务（P3a：到期自动创建 source='schedule' 的任务） */
 export interface Schedule {
   id: string;
-  agentId: string;
+  agentId: string | null;
+  projectId: string | null;
+  automationKind: AutomationScheduleKind;
   title: string;
   /** 任务详细指令/prompt（作为任务内容派发） */
   content: string;
@@ -255,11 +257,140 @@ export interface Schedule {
 }
 
 export interface ScheduleInput {
-  agentId: string;
+  agentId?: string;
+  projectId?: string;
+  automationKind?: AutomationScheduleKind;
   title: string;
   content?: string;
   cronKind: Schedule['cronKind'];
   cronValue: string;
+}
+
+// ---------- 经营自动化 ----------
+
+export type AutomationScheduleKind = 'task' | 'project_inspection' | 'weekly_report' | 'monthly_report';
+export type AutomationReportKind = Exclude<AutomationScheduleKind, 'task'>;
+export type AutomationFindingKind = 'overdue' | 'low_quality' | 'duplicate_work' | 'budget';
+
+export interface AutomationFinding {
+  id: string;
+  kind: AutomationFindingKind;
+  projectId: string;
+  projectName: string;
+  severity: 'high' | 'medium' | 'low';
+  title: string;
+  detail: string;
+  count: number;
+  detectedAt: number;
+}
+
+export interface AutomationReportMetrics {
+  taskTotal: number;
+  taskCompleted: number;
+  deliverableTotal: number;
+  acceptedDeliverables: number;
+  totalTokens: number;
+  estimatedCost: number;
+  runtimeMs: number;
+}
+
+export interface AutomationReport {
+  id: string;
+  scheduleId: string | null;
+  projectId: string;
+  projectName: string;
+  kind: AutomationReportKind;
+  title: string;
+  periodStart: number;
+  periodEnd: number;
+  metrics: AutomationReportMetrics;
+  findings: AutomationFinding[];
+  content: string;
+  trigger: 'manual' | 'scheduled';
+  createdAt: number;
+}
+
+export interface ProjectBudget {
+  projectId: string;
+  projectName: string;
+  tokenLimit: number;
+  costLimit: number;
+  warningPercent: number;
+  spentTokens: number;
+  spentCost: number;
+  runtimeMs: number;
+  usagePercent: number;
+  status: 'unset' | 'normal' | 'warning' | 'exceeded';
+  updatedAt: number | null;
+}
+
+export interface ProjectBudgetInput {
+  tokenLimit: number;
+  costLimit: number;
+  warningPercent: number;
+}
+
+export interface AssigneeRecommendation {
+  agentId: string;
+  agentName: string;
+  role: string;
+  score: number;
+  activeTasks: number;
+  completedTasks: number;
+  projectExperience: number;
+  successRate: number;
+  reason: string;
+}
+
+export type CustomerDeliveryStatus = 'draft' | 'delivered' | 'accepted';
+
+export interface CustomerDelivery {
+  id: string;
+  projectId: string;
+  projectName: string;
+  customerName: string;
+  title: string;
+  status: CustomerDeliveryStatus;
+  deliverableIds: string[];
+  note: string;
+  deliveredAt: number | null;
+  acceptedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CustomerDeliveryInput {
+  projectId: string;
+  customerName: string;
+  title: string;
+  deliverableIds: string[];
+  note?: string;
+}
+
+export interface AutomationAuditItem {
+  id: string;
+  actor: string;
+  action: string;
+  target: string;
+  result: string;
+  source: string;
+  createdAt: number;
+}
+
+export interface AutomationOverview {
+  generatedAt: number;
+  summary: {
+    activePlans: number;
+    highRiskFindings: number;
+    reportsThisMonth: number;
+    overBudgetProjects: number;
+    pendingDeliveries: number;
+  };
+  findings: AutomationFinding[];
+  reports: AutomationReport[];
+  budgets: ProjectBudget[];
+  deliveries: CustomerDelivery[];
+  auditLogs: AutomationAuditItem[];
 }
 
 export interface Task {

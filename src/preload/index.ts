@@ -9,6 +9,8 @@ import type {
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
   KnowledgeDetail, KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeSummary, KnowledgeVersionInput,
   ActionCenterOverview, GlobalSearchResult,
+  AssigneeRecommendation, AutomationOverview, AutomationReport, AutomationReportKind,
+  CustomerDelivery, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudget, ProjectBudgetInput,
   Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
@@ -51,6 +53,13 @@ const api = {
   updateProject: (id: string, patch: ProjectPatch): Promise<Project | null> => ipcRenderer.invoke('aibox:updateProject', id, patch),
   archiveProject: (id: string): Promise<Project | null> => ipcRenderer.invoke('aibox:archiveProject', id),
   getProjectOperations: (): Promise<ProjectOperationsOverview> => ipcRenderer.invoke('aibox:getProjectOperations'),
+
+  getAutomationOverview: (projectId?: string): Promise<AutomationOverview> => ipcRenderer.invoke('aibox:getAutomationOverview', projectId),
+  runAutomationReport: (kind: AutomationReportKind, projectId: string): Promise<AutomationReport> => ipcRenderer.invoke('aibox:runAutomationReport', kind, projectId),
+  setProjectBudget: (projectId: string, input: ProjectBudgetInput): Promise<ProjectBudget> => ipcRenderer.invoke('aibox:setProjectBudget', projectId, input),
+  recommendAssignees: (projectId: string, brief: string): Promise<AssigneeRecommendation[]> => ipcRenderer.invoke('aibox:recommendAssignees', projectId, brief),
+  createCustomerDelivery: (input: CustomerDeliveryInput): Promise<CustomerDelivery> => ipcRenderer.invoke('aibox:createCustomerDelivery', input),
+  updateCustomerDeliveryStatus: (id: string, status: CustomerDeliveryStatus): Promise<CustomerDelivery> => ipcRenderer.invoke('aibox:updateCustomerDeliveryStatus', id, status),
 
   // 成果验收
   listDeliverables: (): Promise<DeliverableSummary[]> => ipcRenderer.invoke('aibox:listDeliverables'),
@@ -197,7 +206,7 @@ const api = {
   createSchedule: (input: ScheduleInput): Promise<Schedule> => ipcRenderer.invoke('aibox:createSchedule', input),
   toggleSchedule: (id: string, enabled: boolean): Promise<void> => ipcRenderer.invoke('aibox:toggleSchedule', id, enabled),
   deleteSchedule: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteSchedule', id),
-  updateSchedule: (id: string, patch: { title?: string; content?: string; cronKind?: string; cronValue?: string }): Promise<void> => ipcRenderer.invoke('aibox:updateSchedule', id, patch),
+  updateSchedule: (id: string, patch: Partial<ScheduleInput>): Promise<void> => ipcRenderer.invoke('aibox:updateSchedule', id, patch),
   getScheduleHistory: (scheduleId: string): Promise<{ id: string; title: string; status: string; createdAt: number }[]> => ipcRenderer.invoke('aibox:getScheduleHistory', scheduleId),
 
   // 引擎
@@ -267,6 +276,8 @@ const api = {
   isFullscreen: (): Promise<boolean> => ipcRenderer.invoke('aibox:isFullscreen'),
   pickDirectory: (): Promise<string | null> => ipcRenderer.invoke('aibox:pickDirectory'),
   exportData: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:exportData'),
+  restoreData: (): Promise<{ ok: boolean; message: string; restartRequired: boolean }> => ipcRenderer.invoke('aibox:restoreData'),
+  restartApp: (): Promise<void> => ipcRenderer.invoke('aibox:restartApp'),
   reportError: (payload: { message: string; stack?: string; componentStack?: string }): Promise<void> => ipcRenderer.invoke('aibox:reportError', payload),
   storeSecret: (ref: string, secret: string): Promise<void> => ipcRenderer.invoke('aibox:storeSecret', ref, secret),
   hasSecret: (ref: string): Promise<boolean> => ipcRenderer.invoke('aibox:hasSecret', ref),

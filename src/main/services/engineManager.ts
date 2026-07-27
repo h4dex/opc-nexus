@@ -520,20 +520,24 @@ function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }
 function locateBin(bin: string): Promise<string | null> {
   const cmd = process.platform === 'win32' ? 'where' : 'which';
   return new Promise((resolve) => {
-    execFile(cmd, [bin], { shell: false, timeout: 10_000 }, (err, stdout) => {
-      if (err) return resolve(null);
-      const lines = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-      resolve(lines.find((l) => /\.exe$/i.test(l)) ?? lines[0] ?? null);
-    });
+    try {
+      execFile(cmd, [bin], { shell: false, timeout: 10_000 }, (err, stdout) => {
+        if (err) return resolve(null);
+        const lines = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+        resolve(lines.find((l) => /\.exe$/i.test(l)) ?? lines[0] ?? null);
+      });
+    } catch { resolve(null); }
   });
 }
 
 /** --version 探测（10s 超时；部分 CLI 把版本写到 stderr） */
 function binVersion(binPath: string): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile(binPath, ['--version'], { shell: false, timeout: 10_000 }, (_err, stdout, stderr) => {
-      const out = (stdout || stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80);
-      resolve(out || null);
-    });
+    try {
+      execFile(binPath, ['--version'], { shell: false, timeout: 10_000 }, (_err, stdout, stderr) => {
+        const out = (stdout || stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80);
+        resolve(out || null);
+      });
+    } catch { resolve(null); }
   });
 }

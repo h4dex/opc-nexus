@@ -1,263 +1,186 @@
-/** 定时任务管理：按员工分组展示 + 创建/编辑/启停/删除 + 执行历史 + 每月周期 + 任务内容模板 */
-import { useEffect, useState } from 'react';
+/** 自动计划：普通 Agent 任务与项目巡检/周报/月报共用调度管理。 */
+import { useEffect, useMemo, useState } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
-import { IconPlus, IconPlay, IconStop, IconX } from '../components/icons';
+import { IconClock, IconEdit, IconFile, IconPause, IconPlay, IconPlus, IconTrash } from '../components/icons';
+import { toast } from '../components/Toast';
+import type { AutomationScheduleKind, Schedule, ScheduleInput } from '../../../shared/types';
 
-interface ScheduleData {
-  id: string; agentId: string; title: string; content: string; cronKind: string; cronValue: string; enabled: boolean; lastRunAt: number | null; nextRunAt: number;
-}
+const KIND_META: Record<AutomationScheduleKind, { label: string; description: string }> = {
+  task: { label: '员工任务', description: '按计划派发指令给指定数字员工' },
+  project_inspection: { label: '项目巡检', description: '自动检查逾期、质量、重复工作与预算' },
+  weekly_report: { label: '项目周报', description: '汇总近七天任务、成果、消耗和风险' },
+  monthly_report: { label: '项目月报', description: '汇总本月经营进展、成本和交付情况' }
+};
 
-const KIND_LABEL: Record<string, string> = { interval: '每 N 小时', daily: '每天定时', weekly: '每周定时', monthly: '每月定时' };
+const CRON_LABEL: Record<Schedule['cronKind'], string> = {
+  interval: '每 N 小时', daily: '每天', weekly: '每周', monthly: '每月'
+};
 
-export function Schedules() {
+export function Schedules({ embedded = false, onChanged }: { embedded?: boolean; onChanged?: () => void }) {
   const { snapshot } = useApp();
-  const [schedules, setSchedules] = useState<ScheduleData[]>([]);
-  const [createOpen, setCreateOpen] = useState(false);
-  const [editTarget, setEditTarget] = useState<ScheduleData | null>(null);
-  const [historyTarget, setHistoryTarget] = useState<ScheduleData | null>(null);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [form, setForm] = useState<Schedule | 'create' | null>(null);
+  const [historyTarget, setHistoryTarget] = useState<Schedule | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Schedule | null>(null);
+  const [filter, setFilter] = useState<'all' | 'automation' | 'task'>('all');
 
-  useEffect(() => {
-    if (snapshot?.schedules) setSchedules(snapshot.schedules as unknown as ScheduleData[]);
-  }, [snapshot?.schedules]);
-
+  useEffect(() => setSchedules(snapshot?.schedules ?? []), [snapshot?.schedules]);
+  const visible = useMemo(() => schedules.filter((item) => filter === 'all'
+    || (filter === 'task' ? item.automationKind === 'task' : item.automationKind !== 'task')), [filter, schedules]);
   if (!snapshot) return null;
-  const agentName = (id: string) => snapshot.agentCards.find((c) => c.agent.id === id)?.agent.name ?? '未知';
-  const agentColor = (id: string) => snapshot.agentCards.find((c) => c.agent.id === id)?.agent.avatarColor ?? 'var(--accent)';
+  const agentNames = new Map(snapshot.agentCards.map((item) => [item.agent.id, item.agent.name]));
+  const projectNames = new Map(snapshot.projects.map((item) => [item.id, item.name]));
 
-  // 按员工分组
-  const grouped = new Map<string, ScheduleData[]>();
-  for (const s of schedules) {
-    const list = grouped.get(s.agentId) ?? [];
-    list.push(s);
-    grouped.set(s.agentId, list);
-  }
-
-  const toggle = async (id: string, enabled: boolean) => {
-    await window.aibox.toggleSchedule(id, enabled);
-    setSchedules((s) => s.map((x) => x.id === id ? { ...x, enabled } : x));
+  const toggle = async (schedule: Schedule) => {
+    try {
+      await window.aibox.toggleSchedule(schedule.id, !schedule.enabled);
+      setSchedules((items) => items.map((item) => item.id === schedule.id ? { ...item, enabled: !schedule.enabled } : item));
+      onChanged?.();
+    } catch (error) { toast.err(error instanceof Error ? error.message : '计划状态更新失败'); }
+  };
+  const remove = async () => {
+    if (!deleteTarget) return;
+    try {
+      await window.aibox.deleteSchedule(deleteTarget.id);
+      setSchedules((items) => items.filter((item) => item.id !== deleteTarget.id));
+      setDeleteTarget(null); onChanged?.(); toast.ok('自动计划已删除');
+    } catch (error) { toast.err(error instanceof Error ? error.message : '删除失败'); }
   };
 
-  const remove = async (id: string) => {
-    await window.aibox.deleteSchedule(id);
-    setSchedules((s) => s.filter((x) => x.id !== id));
-  };
-
-  const cronDesc = (s: ScheduleData) => {
-    if (s.cronKind === 'interval') return `每 ${s.cronValue} 小时`;
-    if (s.cronKind === 'daily') return `每天 ${s.cronValue}`;
-    if (s.cronKind === 'weekly') {
-      const [day, time] = s.cronValue.split('|');
-      const days = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-      return `每${days[Number(day)] ?? day} ${time ?? ''}`;
-    }
-    if (s.cronKind === 'monthly') {
-      const [date, time] = s.cronValue.split('|');
-      return `每月 ${date} 日 ${time ?? ''}`;
-    }
-    return s.cronValue;
-  };
-
-  const countdown = (nextRunAt: number) => {
-    const diff = nextRunAt - Date.now();
-    if (diff <= 0) return '即将执行';
-    const h = Math.floor(diff / 3600000);
-    const m = Math.floor((diff % 3600000) / 60000);
-    if (h > 24) return `${Math.floor(h / 24)} 天 ${h % 24} 小时后`;
-    if (h > 0) return `${h} 小时 ${m} 分钟后`;
-    return `${m} 分钟后`;
-  };
-
-  return (
-    <>
-      <div className="page-head">
-        <h2>定时任务</h2>
-        <span className="desc">{schedules.length} 个计划 · 按岗位分组 · 每个员工支持多个定时任务</span>
-        <div className="right">
-          <button className="btn small primary" onClick={() => setCreateOpen(true)}><IconPlus size={13} />新建计划</button>
-        </div>
+  return <section className="schedule-manager">
+    {!embedded && <div className="page-head"><h2>自动计划</h2><span className="desc">定时派发任务、巡检与经营报告</span></div>}
+    <div className="schedule-toolbar">
+      <div className="automation-segmented" aria-label="计划类型筛选">
+        {([['all', '全部'], ['automation', '经营计划'], ['task', '员工任务']] as const).map(([key, label]) =>
+          <button key={key} type="button" className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}</button>)}
       </div>
+      <span>{visible.length} 个计划</span>
+      <button className="btn small primary" type="button" onClick={() => setForm('create')}><IconPlus size={13} />新建计划</button>
+    </div>
 
-      {schedules.length === 0 && (
-        <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-3)' }}>
-          还没有定时任务。点击「新建计划」为助手设置自动执行。
-        </div>
-      )}
+    {visible.length === 0 ? <div className="automation-empty"><IconClock size={24} /><strong>暂无自动计划</strong><span>创建巡检、报告或员工任务计划。</span></div>
+      : <div className="automation-plan-table"><table className="table"><thead><tr>
+        <th>计划</th><th>对象</th><th>周期</th><th>最近 / 下次运行</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody>{visible.map((schedule) => <tr key={schedule.id}>
+        <td><div className="schedule-title"><span data-kind={schedule.automationKind}><IconClock size={14} /></span><div><strong>{schedule.title}</strong><small>{KIND_META[schedule.automationKind].label}</small></div></div></td>
+        <td>{schedule.automationKind === 'task'
+          ? <><strong>{schedule.agentId ? agentNames.get(schedule.agentId) ?? '已归档员工' : '未指定员工'}</strong>{schedule.projectId && <small>{projectNames.get(schedule.projectId) ?? '已归档项目'}</small>}</>
+          : <><strong>{schedule.projectId ? projectNames.get(schedule.projectId) ?? '已归档项目' : '未指定项目'}</strong><small>系统自动生成</small></>}</td>
+        <td>{cronDescription(schedule)}</td>
+        <td><div className="schedule-times"><span>{schedule.lastRunAt ? timeLabel(schedule.lastRunAt) : '尚未运行'}</span><small>{schedule.enabled ? countdown(schedule.nextRunAt) : '已暂停'}</small></div></td>
+        <td><span className={`automation-status ${schedule.enabled ? 'active' : ''}`}>{schedule.enabled ? '运行中' : '已暂停'}</span></td>
+        <td><div className="schedule-actions">
+          <button className="icon-btn" type="button" title={schedule.enabled ? '暂停计划' : '启用计划'} onClick={() => void toggle(schedule)}>{schedule.enabled ? <IconPause size={14} /> : <IconPlay size={14} />}</button>
+          <button className="icon-btn" type="button" title="执行历史" onClick={() => setHistoryTarget(schedule)}><IconFile size={14} /></button>
+          <button className="icon-btn" type="button" title="编辑计划" onClick={() => setForm(schedule)}><IconEdit size={14} /></button>
+          <button className="icon-btn danger" type="button" title="删除计划" onClick={() => setDeleteTarget(schedule)}><IconTrash size={14} /></button>
+        </div></td>
+      </tr>)}</tbody></table></div>}
 
-      {/* 按员工分组展示 */}
-      <div style={{ display: 'grid', gap: 16 }}>
-        {[...grouped.entries()].map(([agentId, list]) => (
-          <div key={agentId} className="card" style={{ padding: 0, overflow: 'hidden' }}>
-            {/* 分组头 */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 18px', background: 'var(--input-bg)', borderBottom: '1px solid var(--border)' }}>
-              <div style={{ width: 28, height: 28, borderRadius: 7, background: `${agentColor(agentId)}22`, color: agentColor(agentId), display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12 }}>
-                {agentName(agentId).slice(0, 1)}
-              </div>
-              <span style={{ fontWeight: 650, fontSize: 13.5, flex: 1 }}>{agentName(agentId)}</span>
-              <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{list.length} 个定时任务</span>
-            </div>
-            {/* 任务列表 */}
-            <div style={{ padding: '8px 18px' }}>
-              {list.map((s) => (
-                <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--border)', opacity: s.enabled ? 1 : 0.6 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 600, fontSize: 13 }}>{s.title}</div>
-                    <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 2 }}>
-                      {cronDesc(s)}
-                      {s.enabled && <span style={{ marginLeft: 10, color: 'var(--accent)' }}>下次：{countdown(s.nextRunAt)}</span>}
-                      {s.lastRunAt && <span style={{ marginLeft: 10, color: 'var(--text-3)' }}>上次：{new Date(s.lastRunAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>}
-                    </div>
-                    {s.content && <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.content.slice(0, 60)}</div>}
-                  </div>
-                  <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: s.enabled ? 'var(--success-soft, rgba(34,197,94,.1))' : 'var(--input-bg)', color: s.enabled ? 'var(--success)' : 'var(--text-3)', flexShrink: 0 }}>
-                    {s.enabled ? '运行中' : '已暂停'}
-                  </span>
-                  <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                    <button className="btn small" onClick={() => void toggle(s.id, !s.enabled)} title={s.enabled ? '暂停' : '启用'}>
-                      {s.enabled ? <IconStop size={12} /> : <IconPlay size={12} />}
-                    </button>
-                    <button className="btn small" onClick={() => setHistoryTarget(s)} title="执行历史" style={{ fontSize: 11, padding: '3px 8px' }}>历史</button>
-                    <button className="btn small" onClick={() => setEditTarget(s)} style={{ fontSize: 11, padding: '3px 8px' }}>编辑</button>
-                    <button className="btn small danger" onClick={() => void remove(s.id)} title="删除"><IconX size={12} /></button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {createOpen && <ScheduleFormModal mode="create" onClose={() => setCreateOpen(false)} onSaved={(s) => { setSchedules((prev) => [...prev, s]); setCreateOpen(false); }} />}
-      {editTarget && <ScheduleFormModal mode="edit" schedule={editTarget} onClose={() => setEditTarget(null)} onSaved={(s) => { setSchedules((prev) => prev.map((x) => x.id === s.id ? s : x)); setEditTarget(null); }} />}
-      {historyTarget && <ScheduleHistoryModal schedule={historyTarget} onClose={() => setHistoryTarget(null)} />}
-    </>
-  );
+    {form && <ScheduleForm schedule={form === 'create' ? undefined : form} onClose={() => setForm(null)} onSaved={(saved) => {
+      setSchedules((items) => form === 'create' ? [...items, saved] : items.map((item) => item.id === saved.id ? saved : item));
+      setForm(null); onChanged?.();
+    }} />}
+    {historyTarget && <ScheduleHistory schedule={historyTarget} onClose={() => setHistoryTarget(null)} />}
+    {deleteTarget && <Modal title="删除自动计划" onClose={() => setDeleteTarget(null)} footer={<>
+      <button className="btn" type="button" onClick={() => setDeleteTarget(null)}>取消</button>
+      <button className="btn danger" type="button" onClick={() => void remove()}><IconTrash size={13} />确认删除</button>
+    </>}><p>删除“{deleteTarget.title}”后不会再自动运行，已有任务和报告历史会继续保留。</p></Modal>}
+  </section>;
 }
 
-/** 创建/编辑定时任务弹窗 */
-function ScheduleFormModal({ mode, schedule, onClose, onSaved }: {
-  mode: 'create' | 'edit'; schedule?: ScheduleData; onClose: () => void; onSaved: (s: ScheduleData) => void;
-}) {
+function ScheduleForm({ schedule, onClose, onSaved }: { schedule?: Schedule; onClose: () => void; onSaved: (schedule: Schedule) => void }) {
   const { snapshot } = useApp();
+  const [kind, setKind] = useState<AutomationScheduleKind>(schedule?.automationKind ?? 'project_inspection');
   const [agentId, setAgentId] = useState(schedule?.agentId ?? '');
+  const [projectId, setProjectId] = useState(schedule?.projectId ?? '');
   const [title, setTitle] = useState(schedule?.title ?? '');
   const [content, setContent] = useState(schedule?.content ?? '');
-  const [cronKind, setCronKind] = useState<'interval' | 'daily' | 'weekly' | 'monthly'>((schedule?.cronKind as 'interval' | 'daily' | 'weekly' | 'monthly') ?? 'daily');
-  const [cronValue, setCronValue] = useState(schedule?.cronValue ?? '09:00');
+  const [cronKind, setCronKind] = useState<Schedule['cronKind']>(schedule?.cronKind ?? 'weekly');
+  const [cronValue, setCronValue] = useState(schedule?.cronValue ?? '1|09:00');
   const [busy, setBusy] = useState(false);
-
   if (!snapshot) return null;
-  const agents = snapshot.agentCards.filter((c) => c.agent.lifecycle === 'READY');
+  const agents = snapshot.agentCards.filter((item) => item.agent.lifecycle === 'READY');
+  const projects = snapshot.projects.filter((item) => item.status !== 'archived');
+  const valid = !!title.trim() && (kind === 'task' ? !!agentId : !!projectId);
 
+  const selectKind = (next: AutomationScheduleKind) => {
+    setKind(next);
+    if (!title.trim() || Object.values(KIND_META).some((item) => title === item.label)) setTitle(KIND_META[next].label);
+    if (next === 'weekly_report') { setCronKind('weekly'); setCronValue('5|17:00'); }
+    if (next === 'monthly_report') { setCronKind('monthly'); setCronValue('1|09:00'); }
+    if (next === 'project_inspection') { setCronKind('daily'); setCronValue('09:00'); }
+  };
   const save = async () => {
-    if (!title.trim() || (mode === 'create' && !agentId)) return;
+    if (!valid) return;
     setBusy(true);
+    const input: ScheduleInput = {
+      automationKind: kind, agentId: kind === 'task' ? agentId : undefined,
+      projectId: projectId || undefined, title: title.trim(), content: kind === 'task' ? content.trim() : '', cronKind, cronValue
+    };
     try {
-      if (mode === 'create') {
-        const s = await window.aibox.createSchedule({ agentId, title: title.trim(), content: content.trim(), cronKind, cronValue });
-        onSaved(s as unknown as ScheduleData);
-      } else if (schedule) {
-        await window.aibox.updateSchedule(schedule.id, { title: title.trim(), content: content.trim(), cronKind, cronValue });
-        onSaved({ ...schedule, title: title.trim(), content: content.trim(), cronKind, cronValue });
-      }
-    } finally { setBusy(false); }
+      if (schedule) {
+        await window.aibox.updateSchedule(schedule.id, { ...input, agentId: input.agentId ?? '', projectId: input.projectId ?? '' });
+        onSaved({ ...schedule, ...input, agentId: input.agentId ?? null, projectId: input.projectId ?? null, content: input.content ?? '' });
+      } else onSaved(await window.aibox.createSchedule(input));
+      toast.ok(schedule ? '自动计划已更新' : '自动计划已创建');
+    } catch (error) { toast.err(error instanceof Error ? error.message : '计划保存失败'); }
+    finally { setBusy(false); }
   };
 
-  return (
-    <Modal title={mode === 'create' ? '新建定时任务' : '编辑定时任务'} onClose={onClose} width={520}
-      footer={<><button className="btn" onClick={onClose}>取消</button><button className="btn primary" disabled={busy || !title.trim() || (mode === 'create' && !agentId)} onClick={() => void save()}>{busy ? '保存中…' : '保存'}</button></>}>
-      {mode === 'create' && (
-        <div className="field">
-          <label>执行助手（岗位）</label>
-          <select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
-            <option value="">选择助手…</option>
-            {agents.map((c) => <option key={c.agent.id} value={c.agent.id}>{c.agent.name}（{c.agent.role.slice(0, 15)}）</option>)}
-          </select>
-        </div>
-      )}
-      <div className="field">
-        <label>任务标题</label>
-        <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="例如：每日晨报汇总、每周数据巡检" />
-      </div>
-      <div className="field">
-        <label>任务详细指令（可选，作为 prompt 派发给助手）</label>
-        <textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="例如：请汇总今日所有渠道的客户咨询，按优先级分类整理为表格，并给出跟进建议。"
-          style={{ width: '100%', minHeight: 80, resize: 'vertical', fontFamily: 'inherit', fontSize: 12.5, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)' }} />
-      </div>
-      <div className="field">
-        <label>执行周期</label>
-        <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
-          {(['interval', 'daily', 'weekly', 'monthly'] as const).map((k) => (
-            <button key={k} onClick={() => { setCronKind(k); if (k === 'interval') setCronValue('4'); else if (k === 'daily') setCronValue('09:00'); else if (k === 'weekly') setCronValue('1|09:00'); else setCronValue('1|09:00'); }}
-              style={{ padding: '5px 12px', borderRadius: 6, border: `1px solid ${cronKind === k ? 'var(--accent)' : 'var(--border)'}`, background: cronKind === k ? 'var(--accent-soft)' : 'transparent', color: cronKind === k ? 'var(--accent)' : 'var(--text-2)', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-              {KIND_LABEL[k]}
-            </button>
-          ))}
-        </div>
-        {cronKind === 'interval' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>每</span>
-            <input type="number" min={1} max={168} value={cronValue} onChange={(e) => setCronValue(e.target.value)} style={{ width: 60, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', textAlign: 'center' }} />
-            <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>小时执行一次</span>
-          </div>
-        )}
-        {cronKind === 'daily' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>每天</span>
-            <input type="time" value={cronValue} onChange={(e) => setCronValue(e.target.value)} style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)' }} />
-            <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>执行</span>
-          </div>
-        )}
-        {cronKind === 'weekly' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <select value={cronValue.split('|')[0] ?? '1'} onChange={(e) => setCronValue(`${e.target.value}|${cronValue.split('|')[1] ?? '09:00'}`)} style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)' }}>
-              {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((d, i) => <option key={i} value={String(i + 1)}>{d}</option>)}
-            </select>
-            <input type="time" value={cronValue.split('|')[1] ?? '09:00'} onChange={(e) => setCronValue(`${cronValue.split('|')[0] ?? '1'}|${e.target.value}`)} style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)' }} />
-          </div>
-        )}
-        {cronKind === 'monthly' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>每月</span>
-            <input type="number" min={1} max={28} value={cronValue.split('|')[0] ?? '1'} onChange={(e) => setCronValue(`${e.target.value}|${cronValue.split('|')[1] ?? '09:00'}`)} style={{ width: 55, padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', textAlign: 'center' }} />
-            <span style={{ fontSize: 12.5, color: 'var(--text-2)' }}>日</span>
-            <input type="time" value={cronValue.split('|')[1] ?? '09:00'} onChange={(e) => setCronValue(`${cronValue.split('|')[0] ?? '1'}|${e.target.value}`)} style={{ padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)' }} />
-          </div>
-        )}
-      </div>
-    </Modal>
-  );
-}
-
-/** 执行历史弹窗 */
-function ScheduleHistoryModal({ schedule, onClose }: { schedule: ScheduleData; onClose: () => void }) {
-  const [history, setHistory] = useState<{ id: string; title: string; status: string; createdAt: number }[] | null>(null);
-
-  if (!history) {
-    void window.aibox.getScheduleHistory(schedule.id).then(setHistory);
-    return null;
-  }
-
-  const statusLabel = (s: string) => ({ QUEUED: '排队', RUNNING: '执行中', COMPLETED: '完成', FAILED: '失败', CANCELLED: '取消' }[s] ?? s);
-  const statusColor = (s: string) => s === 'COMPLETED' ? 'var(--success)' : s === 'FAILED' ? 'var(--danger)' : s === 'RUNNING' ? 'var(--accent)' : 'var(--text-3)';
-
-  return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={onClose}>
-      <div className="card" style={{ width: 520, maxHeight: '65vh', overflowY: 'auto', padding: 20 }} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <h3 style={{ margin: 0, fontSize: 15 }}>执行历史 · {schedule.title}</h3>
-          <button className="btn small" onClick={onClose}>关闭</button>
-        </div>
-        {history.length === 0 && <div style={{ color: 'var(--text-3)', fontSize: 12.5, padding: 20, textAlign: 'center' }}>暂无执行记录</div>}
-        {history.map((h) => (
-          <div key={h.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 6, background: 'var(--input-bg)', marginBottom: 4, fontSize: 12.5 }}>
-            <span style={{ width: 7, height: 7, borderRadius: '50%', background: statusColor(h.status), flexShrink: 0 }} />
-            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{h.title.slice(0, 40)}</span>
-            <span style={{ color: statusColor(h.status), fontWeight: 600, fontSize: 11.5 }}>{statusLabel(h.status)}</span>
-            <span style={{ color: 'var(--text-3)', fontSize: 11 }}>{new Date(h.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
-          </div>
-        ))}
-      </div>
+  return <Modal title={schedule ? '编辑自动计划' : '新建自动计划'} width={620} onClose={onClose} footer={<>
+    <button className="btn" type="button" onClick={onClose}>取消</button>
+    <button className="btn primary" type="button" disabled={busy || !valid} onClick={() => void save()}>{busy ? '保存中...' : '保存计划'}</button>
+  </>}>
+    <div className="field"><label>计划类型</label><div className="schedule-kind-grid">{(Object.keys(KIND_META) as AutomationScheduleKind[]).map((value) =>
+      <button key={value} type="button" className={kind === value ? 'active' : ''} onClick={() => selectKind(value)}><strong>{KIND_META[value].label}</strong><span>{KIND_META[value].description}</span></button>)}</div></div>
+    <div className="automation-form-grid">
+      {kind === 'task' && <div className="field"><label>数字员工</label><select value={agentId} onChange={(event) => setAgentId(event.target.value)}><option value="">选择员工</option>{agents.map((item) => <option value={item.agent.id} key={item.agent.id}>{item.agent.name} · {item.agent.role}</option>)}</select></div>}
+      <div className="field"><label>{kind === 'task' ? '归属项目（可选）' : '项目'}</label><select value={projectId} onChange={(event) => setProjectId(event.target.value)}><option value="">{kind === 'task' ? '不归属项目' : '选择项目'}</option>{projects.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></div>
     </div>
-  );
+    <div className="field"><label>计划标题</label><input value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)} placeholder="例如：客户交付项目周报" /></div>
+    {kind === 'task' && <div className="field"><label>任务指令</label><textarea rows={4} value={content} maxLength={4000} onChange={(event) => setContent(event.target.value)} placeholder="描述数字员工每次需要执行的具体工作" /></div>}
+    <CronEditor kind={cronKind} value={cronValue} onChange={(nextKind, nextValue) => { setCronKind(nextKind); setCronValue(nextValue); }} />
+  </Modal>;
 }
+
+function CronEditor({ kind, value, onChange }: { kind: Schedule['cronKind']; value: string; onChange: (kind: Schedule['cronKind'], value: string) => void }) {
+  const changeKind = (next: Schedule['cronKind']) => onChange(next, next === 'interval' ? '4' : next === 'daily' ? '09:00' : '1|09:00');
+  const [part, time = '09:00'] = value.split('|');
+  return <div className="field"><label>执行周期</label><div className="automation-segmented schedule-cron-tabs">{(Object.keys(CRON_LABEL) as Schedule['cronKind'][]).map((item) =>
+    <button className={kind === item ? 'active' : ''} type="button" key={item} onClick={() => changeKind(item)}>{CRON_LABEL[item]}</button>)}</div>
+    <div className="schedule-cron-value">
+      {kind === 'interval' && <><span>每</span><input aria-label="间隔小时" type="number" min={0.5} max={168} step={0.5} value={value} onChange={(event) => onChange(kind, event.target.value)} /><span>小时</span></>}
+      {kind === 'daily' && <><span>每天</span><input aria-label="每日时间" type="time" value={value} onChange={(event) => onChange(kind, event.target.value)} /></>}
+      {kind === 'weekly' && <><span>每周</span><select aria-label="星期" value={part} onChange={(event) => onChange(kind, `${event.target.value}|${time}`)}>{['周日', '周一', '周二', '周三', '周四', '周五', '周六'].map((label, index) => <option value={index} key={label}>{label}</option>)}</select><input aria-label="每周时间" type="time" value={time} onChange={(event) => onChange(kind, `${part}|${event.target.value}`)} /></>}
+      {kind === 'monthly' && <><span>每月</span><input aria-label="每月日期" type="number" min={1} max={28} value={part} onChange={(event) => onChange(kind, `${event.target.value}|${time}`)} /><span>日</span><input aria-label="每月时间" type="time" value={time} onChange={(event) => onChange(kind, `${part}|${event.target.value}`)} /></>}
+    </div>
+  </div>;
+}
+
+function ScheduleHistory({ schedule, onClose }: { schedule: Schedule; onClose: () => void }) {
+  const [history, setHistory] = useState<{ id: string; title: string; status: string; createdAt: number }[] | null>(null);
+  useEffect(() => { void window.aibox.getScheduleHistory(schedule.id).then(setHistory).catch(() => setHistory([])); }, [schedule.id]);
+  return <Modal title={`运行历史 · ${schedule.title}`} width={560} onClose={onClose} footer={<button className="btn" onClick={onClose}>关闭</button>}>
+    {!history ? <div className="automation-empty">正在读取历史...</div> : history.length === 0 ? <div className="automation-empty">尚无运行记录</div>
+      : <div className="schedule-history">{history.map((item) => <div key={item.id}><span data-status={item.status} /><strong>{item.title}</strong><small>{statusLabel(item.status)}</small><time>{timeLabel(item.createdAt)}</time></div>)}</div>}
+  </Modal>;
+}
+
+function cronDescription(schedule: Schedule): string {
+  if (schedule.cronKind === 'interval') return `每 ${schedule.cronValue} 小时`;
+  if (schedule.cronKind === 'daily') return `每天 ${schedule.cronValue}`;
+  const [part, time] = schedule.cronValue.split('|');
+  if (schedule.cronKind === 'monthly') return `每月 ${part} 日 ${time}`;
+  return `每${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][Number(part)] ?? part} ${time}`;
+}
+function countdown(timestamp: number): string {
+  const difference = timestamp - Date.now();
+  if (difference <= 0) return '即将运行';
+  const hours = Math.floor(difference / 3_600_000); const minutes = Math.floor(difference % 3_600_000 / 60_000);
+  if (hours >= 24) return `${Math.floor(hours / 24)} 天后运行`;
+  return hours > 0 ? `${hours} 小时 ${minutes} 分后运行` : `${Math.max(1, minutes)} 分钟后运行`;
+}
+function timeLabel(timestamp: number): string { return new Date(timestamp).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }); }
+function statusLabel(status: string): string { return ({ COMPLETED: '已完成', FAILED: '失败', RUNNING: '运行中', QUEUED: '排队', CANCELLED: '已取消' } as Record<string, string>)[status] ?? status; }

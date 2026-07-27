@@ -24,6 +24,7 @@ import type { ProjectManager } from './services/projectManager.js';
 import type { DeliverableManager } from './services/deliverableManager.js';
 import type { KnowledgeManager } from './services/knowledgeManager.js';
 import type { DiscoveryManager } from './services/discoveryManager.js';
+import type { AutomationManager } from './services/automationManager.js';
 import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
@@ -31,7 +32,8 @@ import { loadConfig, saveConfig } from './services/config.js';
 import type {
   AppConfig, CreateAgentInput, DeliverableMetaPatch, DeliverableReviewInput, DeliverableVersionInput,
   KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeVersionInput,
-  ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge
+  ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge,
+  AutomationReportKind, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudgetInput
 } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -74,6 +76,7 @@ export interface IpcDeps {
   projects: ProjectManager;
   deliverables: DeliverableManager;
   knowledge: KnowledgeManager;
+  automation: AutomationManager;
   discovery: DiscoveryManager;
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
@@ -85,7 +88,7 @@ export interface IpcDeps {
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, discovery, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -154,6 +157,32 @@ export function registerIpc(deps: IpcDeps) {
     return project;
   });
   ipcMain.handle('aibox:getProjectOperations', () => projects.operations(deliverables.list()));
+
+  // ---------- 项目经营自动化 ----------
+  ipcMain.handle('aibox:getAutomationOverview', (_e, projectId?: string) =>
+    automation.overview(projectId ? assertId(projectId, 'projectId') : undefined));
+  ipcMain.handle('aibox:runAutomationReport', (_e, kind: AutomationReportKind, projectId: string) => {
+    if (!['project_inspection', 'weekly_report', 'monthly_report'].includes(kind)) throw new Error('自动化报告类型无效');
+    return automation.run(kind, assertId(projectId, 'projectId'));
+  });
+  ipcMain.handle('aibox:setProjectBudget', (_e, projectId: string, input: ProjectBudgetInput) =>
+    automation.setBudget(assertId(projectId, 'projectId'), input));
+  ipcMain.handle('aibox:recommendAssignees', (_e, projectId: string, brief: string) =>
+    automation.recommendAssignees(assertId(projectId, 'projectId'), assertString(brief ?? '', 'brief', 0, 500)));
+  ipcMain.handle('aibox:createCustomerDelivery', (_e, input: CustomerDeliveryInput) => {
+    if (!input || !Array.isArray(input.deliverableIds) || input.deliverableIds.some((id) => typeof id !== 'string')) throw new Error('成果列表无效');
+    return automation.createDelivery({
+      projectId: assertId(input.projectId, 'projectId'),
+      customerName: assertString(input.customerName, 'customerName', 2, 100),
+      title: assertString(input.title, 'title', 2, 160),
+      deliverableIds: input.deliverableIds.map((id) => assertId(id, 'deliverableId')),
+      note: input.note ? assertString(input.note, 'note', 1, 1000) : undefined
+    });
+  });
+  ipcMain.handle('aibox:updateCustomerDeliveryStatus', (_e, id: string, status: CustomerDeliveryStatus) => {
+    if (!['draft', 'delivered', 'accepted'].includes(status)) throw new Error('交付状态无效');
+    return automation.updateDeliveryStatus(assertId(id, 'deliveryId'), status);
+  });
 
   // ---------- 成果验收 ----------
   ipcMain.handle('aibox:listDeliverables', () => deliverables.list());
@@ -628,8 +657,8 @@ export function registerIpc(deps: IpcDeps) {
     scheduler.remove(id);
     pushSnapshot();
   });
-  ipcMain.handle('aibox:updateSchedule', (_e, id: string, patch: { title?: string; content?: string; cronKind?: string; cronValue?: string }) => {
-    scheduler.update(id, patch as { title?: string; content?: string; cronKind?: 'interval' | 'daily' | 'weekly' | 'monthly'; cronValue?: string });
+  ipcMain.handle('aibox:updateSchedule', (_e, id: string, patch: Partial<ScheduleInput>) => {
+    scheduler.update(assertId(id, 'scheduleId'), patch);
     pushSnapshot();
   });
   ipcMain.handle('aibox:getScheduleHistory', (_e, scheduleId: string) => scheduler.getHistory(scheduleId));
@@ -725,6 +754,28 @@ export function registerIpc(deps: IpcDeps) {
     } catch (err) {
       return { ok: false, message: `导出失败：${err instanceof Error ? err.message : String(err)}` };
     }
+  });
+
+  ipcMain.handle('aibox:restoreData', async () => {
+    const win = getMainWindow();
+    if (!win) return { ok: false, message: '窗口不存在', restartRequired: false };
+    const r = await dialog.showOpenDialog(win, {
+      title: '选择 AI Box 数据库备份', properties: ['openFile'],
+      filters: [{ name: 'SQLite 数据库', extensions: ['db'] }]
+    });
+    if (r.canceled || !r.filePaths[0]) return { ok: false, message: '已取消', restartRequired: false };
+    try {
+      const result = await db.stageRestore(r.filePaths[0]);
+      return { ...result, restartRequired: result.ok };
+    } catch (error) {
+      db.audit({ id: randomUUID(), actor: 'admin', action: 'data.restore.stage', target: 'backup', result: 'invalid' });
+      return { ok: false, message: `恢复失败：${error instanceof Error ? error.message : String(error)}`, restartRequired: false };
+    }
+  });
+  ipcMain.handle('aibox:restartApp', () => {
+    db.flush();
+    app.relaunch();
+    app.exit(0);
   });
 
   // ---------- 凭据（15.1：密钥不进入 Renderer/localStorage，仅存系统密钥库） ----------

@@ -39,6 +39,11 @@ interface Tables {
   knowledge_entries: Map<string, Record<string, unknown>>;
   knowledge_versions: Map<string, Record<string, unknown>>;
   action_dismissals: Map<string, Record<string, unknown>>;
+  schedules: Map<string, Record<string, unknown>>;
+  project_budgets: Map<string, Record<string, unknown>>;
+  automation_reports: Map<string, Record<string, unknown>>;
+  customer_deliveries: Map<string, Record<string, unknown>>;
+  audit_logs: Map<string, Record<string, unknown>>;
   settings: Map<string, unknown>;
 }
 
@@ -63,6 +68,11 @@ export function createMockDb(): MockDb & { tables: Tables } {
     knowledge_entries: new Map(),
     knowledge_versions: new Map(),
     action_dismissals: new Map(),
+    schedules: new Map(),
+    project_budgets: new Map(),
+    automation_reports: new Map(),
+    customer_deliveries: new Map(),
+    audit_logs: new Map(),
     settings: new Map()
   };
 
@@ -152,6 +162,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   if (/SELECT \* FROM tasks WHERE status = 'RUNNING'/.test(sql)) {
     const result = rows.filter(r => r.status === 'RUNNING');
     return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT id FROM agents WHERE id = \? AND archived = 0/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    const result = row && row.archived === 0 ? { id: row.id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
   }
 
   if (/SELECT \* FROM tasks WHERE status = 'COMPLETED'/.test(sql)) {
@@ -420,11 +436,96 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
+  // ---------- 经营自动化 / 自动计划 ----------
+  if (/SELECT \* FROM schedules WHERE enabled = 1 AND next_run_at <= \?/.test(sql)) {
+    const result = [...tables.schedules.values()].filter(row => row.enabled === 1 && Number(row.next_run_at) <= Number(args[0]));
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM schedules ORDER BY next_run_at/.test(sql)) {
+    const result = [...tables.schedules.values()].sort((a, b) => Number(a.next_run_at) - Number(b.next_run_at));
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM schedules WHERE id = \?/.test(sql)) {
+    const row = tables.schedules.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+  if (/SELECT id, title, created_at FROM automation_reports WHERE schedule_id = \?/.test(sql)) {
+    const result = [...tables.automation_reports.values()].filter(row => row.schedule_id === args[0])
+      .sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, 20);
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM automation_reports ORDER BY created_at DESC LIMIT 100/.test(sql)) {
+    const result = [...tables.automation_reports.values()].sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, 100);
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM project_budgets/.test(sql)) {
+    const result = [...tables.project_budgets.values()];
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM customer_deliveries ORDER BY updated_at DESC/.test(sql)) {
+    const result = [...tables.customer_deliveries.values()].sort((a, b) => Number(b.updated_at) - Number(a.updated_at));
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM usage_records ORDER BY created_at DESC/.test(sql)) {
+    const result = [...tables.usage_records.values()].sort((a, b) => Number(b.created_at) - Number(a.created_at));
+    return mode === 'get' ? result[0] : result;
+  }
+  if (/SELECT \* FROM audit_logs ORDER BY created_at DESC LIMIT 100/.test(sql)) {
+    const result = [...tables.audit_logs.values()].sort((a, b) => Number(b.created_at) - Number(a.created_at)).slice(0, 100);
+    return mode === 'get' ? result[0] : result;
+  }
+
   // Fallback
   return mode === 'get' ? undefined : [];
 }
 
 function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: number } {
+  if (/INSERT INTO automation_reports/.test(sql)) {
+    const [id, scheduleId, projectId, kind, title, periodStart, periodEnd, metricsJson, findingsJson, content, trigger, createdAt] = args;
+    tables.automation_reports.set(id as string, { id, schedule_id: scheduleId, project_id: projectId, kind, title,
+      period_start: periodStart, period_end: periodEnd, metrics_json: metricsJson, findings_json: findingsJson, content, trigger, created_at: createdAt });
+    return { changes: 1 };
+  }
+  if (/INSERT INTO project_budgets/.test(sql)) {
+    const [projectId, tokenLimit, costLimit, warningPercent, updatedAt] = args;
+    tables.project_budgets.set(projectId as string, { project_id: projectId, token_limit: tokenLimit, cost_limit: costLimit, warning_percent: warningPercent, updated_at: updatedAt });
+    return { changes: 1 };
+  }
+  if (/INSERT INTO customer_deliveries/.test(sql)) {
+    const [id, projectId, customerName, title, deliverableIdsJson, note, createdAt, updatedAt] = args;
+    tables.customer_deliveries.set(id as string, { id, project_id: projectId, customer_name: customerName, title, status: 'draft',
+      deliverable_ids_json: deliverableIdsJson, note, delivered_at: null, accepted_at: null, created_at: createdAt, updated_at: updatedAt });
+    return { changes: 1 };
+  }
+  if (/UPDATE customer_deliveries SET status = \?/.test(sql)) {
+    const [status, deliveredAt, acceptedAt, updatedAt, id] = args;
+    const row = tables.customer_deliveries.get(id as string);
+    if (!row) return { changes: 0 };
+    Object.assign(row, { status, delivered_at: deliveredAt, accepted_at: acceptedAt, updated_at: updatedAt });
+    return { changes: 1 };
+  }
+  if (/INSERT INTO schedules/.test(sql)) {
+    const [id, agentId, projectId, automationKind, title, content, cronKind, cronValue, nextRunAt] = args;
+    tables.schedules.set(id as string, { id, agent_id: agentId, project_id: projectId, automation_kind: automationKind,
+      title, content, cron_kind: cronKind, cron_value: cronValue, enabled: 1, last_run_at: null, next_run_at: nextRunAt });
+    return { changes: 1 };
+  }
+  if (/UPDATE schedules SET last_run_at = \?, next_run_at = \? WHERE id = \?/.test(sql)) {
+    const [lastRunAt, nextRunAt, id] = args; const row = tables.schedules.get(id as string);
+    if (!row) return { changes: 0 }; row.last_run_at = lastRunAt; row.next_run_at = nextRunAt; return { changes: 1 };
+  }
+  if (/UPDATE schedules SET enabled = \?, next_run_at = \? WHERE id = \?/.test(sql)) {
+    const [enabled, nextRunAt, id] = args; const row = tables.schedules.get(id as string);
+    if (!row) return { changes: 0 }; row.enabled = enabled; row.next_run_at = nextRunAt; return { changes: 1 };
+  }
+  if (/UPDATE schedules SET .+ WHERE id = \?/.test(sql)) {
+    const id = args[args.length - 1] as string; const row = tables.schedules.get(id);
+    if (!row) return { changes: 0 };
+    const fields = (sql.match(/SET (.+) WHERE/)?.[1] ?? '').split(',').map(field => field.trim().split(' = ')[0]);
+    fields.forEach((field, index) => { row[field] = args[index]; }); return { changes: 1 };
+  }
+  if (/DELETE FROM schedules WHERE id = \?/.test(sql)) return { changes: tables.schedules.delete(args[0] as string) ? 1 : 0 };
+
   if (/INSERT INTO action_dismissals/.test(sql)) {
     const [actionKey, fingerprint, dismissedAt] = args;
     tables.action_dismissals.set(actionKey as string, {
@@ -836,6 +937,11 @@ function detectTable(sql: string): keyof Tables | null {
   if (/\bknowledge_versions\b/.test(sql)) return 'knowledge_versions';
   if (/\bknowledge_entries\b/.test(sql)) return 'knowledge_entries';
   if (/\baction_dismissals\b/.test(sql)) return 'action_dismissals';
+  if (/\bschedules\b/.test(sql)) return 'schedules';
+  if (/\bproject_budgets\b/.test(sql)) return 'project_budgets';
+  if (/\bautomation_reports\b/.test(sql)) return 'automation_reports';
+  if (/\bcustomer_deliveries\b/.test(sql)) return 'customer_deliveries';
+  if (/\baudit_logs\b/.test(sql)) return 'audit_logs';
   return null;
 }
 

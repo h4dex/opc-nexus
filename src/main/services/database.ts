@@ -6,15 +6,17 @@
  */
 import initSqlJs, { type Database as SqlJsDatabase, type SqlValue } from 'sql.js';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { app } from 'electron';
 import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { validateDatabaseBackup } from './backupValidator.js';
 
 const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 24;
+const SCHEMA_VERSION = 25;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -117,8 +119,11 @@ CREATE TABLE IF NOT EXISTS task_messages (
 
 CREATE TABLE IF NOT EXISTS schedules (
   id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT REFERENCES agents(id),
+  project_id TEXT REFERENCES projects(id),
+  automation_kind TEXT NOT NULL DEFAULT 'task',
   title TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
   cron_kind TEXT NOT NULL,
   cron_value TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -366,6 +371,43 @@ CREATE TABLE IF NOT EXISTS action_dismissals (
   dismissed_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_budgets (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id),
+  token_limit INTEGER NOT NULL DEFAULT 0,
+  cost_limit REAL NOT NULL DEFAULT 0,
+  warning_percent INTEGER NOT NULL DEFAULT 80,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS automation_reports (
+  id TEXT PRIMARY KEY,
+  schedule_id TEXT,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  period_start INTEGER NOT NULL,
+  period_end INTEGER NOT NULL,
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  findings_json TEXT NOT NULL DEFAULT '[]',
+  content TEXT NOT NULL,
+  trigger TEXT NOT NULL DEFAULT 'manual',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS customer_deliveries (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  customer_name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  deliverable_ids_json TEXT NOT NULL DEFAULT '[]',
+  note TEXT NOT NULL DEFAULT '',
+  delivered_at INTEGER,
+  accepted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS collab_workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -417,6 +459,8 @@ CREATE INDEX IF NOT EXISTS idx_deliverable_reviews_parent ON deliverable_reviews
 CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_entries(project_id, status, pinned, updated_at);
 CREATE INDEX IF NOT EXISTS idx_knowledge_versions_parent ON knowledge_versions(knowledge_id, version);
 CREATE INDEX IF NOT EXISTS idx_action_dismissed_at ON action_dismissals(dismissed_at);
+CREATE INDEX IF NOT EXISTS idx_automation_reports_project ON automation_reports(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_customer_deliveries_project ON customer_deliveries(project_id, updated_at);
 `;
 
 type Row = Record<string, SqlValue>;
@@ -488,10 +532,14 @@ export class Database {
       locateFile: () => wasmPath
     });
 
-    d.inner = existsSync(d.file)
-      ? new SQL.Database(new Uint8Array(readFileSync(d.file)))
+    const pendingRestore = join(dir, 'aibox.restore.pending.db');
+    const sourceFile = existsSync(pendingRestore) ? pendingRestore : d.file;
+    d.inner = existsSync(sourceFile)
+      ? new SQL.Database(new Uint8Array(readFileSync(sourceFile)))
       : new SQL.Database();
+    if (sourceFile === pendingRestore) d.dirty = true;
     d.migrate();
+    if (sourceFile === pendingRestore) rmSync(pendingRestore, { force: true });
     return d;
   }
 
@@ -762,6 +810,31 @@ export class Database {
         // v24：终态任务软删除，保留执行记录与成果来源追溯。
         addCol('tasks', 'deleted_at', 'INTEGER');
       }
+      if (prev < 25) {
+        // v25：项目经营自动化、成本预算、客户交付与周期报告。
+        this.inner.exec(`
+          CREATE TABLE schedules_v25 (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT REFERENCES agents(id),
+            project_id TEXT REFERENCES projects(id),
+            automation_kind TEXT NOT NULL DEFAULT 'task',
+            title TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            cron_kind TEXT NOT NULL,
+            cron_value TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_at INTEGER,
+            next_run_at INTEGER NOT NULL
+          );
+          INSERT INTO schedules_v25(id, agent_id, project_id, automation_kind, title, content, cron_kind, cron_value, enabled, last_run_at, next_run_at)
+          SELECT id, agent_id, NULL, 'task', title, content, cron_kind, cron_value, enabled, last_run_at, next_run_at FROM schedules;
+          DROP TABLE schedules;
+          ALTER TABLE schedules_v25 RENAME TO schedules;
+          CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(enabled, next_run_at);
+        `);
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_automation_reports_project ON automation_reports(project_id, created_at)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_customer_deliveries_project ON customer_deliveries(project_id, updated_at)');
+      }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');
     } catch (err) {
@@ -788,6 +861,15 @@ export class Database {
     mkdirSync(dirname(this.file), { recursive: true });
     writeFileSync(this.file, Buffer.from(data));
     this.dirty = false;
+  }
+
+  /** 校验外部备份并暂存；下次启动时先加载该文件，迁移成功后才覆盖当前数据库。 */
+  async stageRestore(sourcePath: string): Promise<{ ok: boolean; message: string }> {
+    const { data, schemaVersion } = await validateDatabaseBackup(sourcePath, SCHEMA_VERSION);
+    const pending = join(dirname(this.file), 'aibox.restore.pending.db');
+    writeFileSync(pending, data);
+    this.audit({ id: randomUUID(), actor: 'admin', action: 'data.restore.stage', target: `schema-v${schemaVersion}`, result: 'restart-required' });
+    return { ok: true, message: `备份校验通过（v${schemaVersion}），重启应用后恢复生效` };
   }
 
   getMeta(key: string): string | null {

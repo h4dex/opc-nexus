@@ -4,6 +4,7 @@ import type {
   ActionCenterItem, ActionCenterKind, ActionCenterOverview, DeliverableSummary, GlobalSearchResult,
   KnowledgeSummary, ProjectOperationsOverview, SearchEntityType, SearchRoute, TeamRun
 } from '../../shared/types.js';
+import type { AutomationFinding } from '../../shared/types.js';
 import type { Database } from './database.js';
 
 type Row = Record<string, unknown>;
@@ -13,6 +14,7 @@ interface DiscoveryDeps {
   deliverables: { list: () => DeliverableSummary[] };
   knowledge: { list: (query?: { status?: 'active' | 'archived' | 'all' }) => KnowledgeSummary[] };
   teams: { listAttentionRuns: (limit?: number) => (TeamRun & { teamName: string })[] };
+  automation?: { findings: (projectId?: string) => AutomationFinding[] };
 }
 
 interface Candidate extends GlobalSearchResult {
@@ -142,6 +144,15 @@ export class DiscoveryManager {
         suggestion: '查看执行时间线和失败子任务。', severity: 'warn', createdAt: run.endedAt ?? run.createdAt,
         target: { route: 'teams', entityType: 'team', entityId: run.teamId }, approvalId: null
       }, `${run.phase}:${run.error}:${run.endedAt}`);
+    }
+
+    for (const finding of (this.deps.automation?.findings() ?? []).filter((item) => ['duplicate_work', 'budget'].includes(item.kind))) {
+      add({
+        key: `automation_risk:${finding.id}`, kind: 'project_risk', title: finding.title, owner: finding.projectName,
+        reason: finding.detail, suggestion: '打开经营自动化工作台查看异常并安排处理。',
+        severity: finding.severity === 'high' ? 'danger' : finding.severity === 'medium' ? 'warn' : 'info', createdAt: finding.detectedAt,
+        target: { route: 'projects', entityType: 'project', entityId: finding.projectId }, approvalId: null
+      }, `${finding.kind}:${finding.severity}:${finding.detail}:${finding.count}`);
     }
 
     const severityRank = { danger: 0, warn: 1, info: 2 } as const;

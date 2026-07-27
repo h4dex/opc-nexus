@@ -8,7 +8,7 @@ import { Projects } from './pages/Projects';
 import { Deliverables } from './pages/Deliverables';
 import { Knowledge } from './pages/Knowledge';
 import { Agents } from './pages/Agents';
-import { Schedules } from './pages/Schedules';
+import { Automation } from './pages/Automation';
 import { Tasks } from './pages/Tasks';
 import { Console } from './pages/Console';
 import { Chat } from './pages/Chat';
@@ -41,7 +41,7 @@ const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: 
     { key: 'tasks', label: '任务中心', icon: <IconTask size={17} /> },
     { key: 'deliverables', label: '成果库', icon: <IconLayers size={17} /> },
     { key: 'knowledge', label: '项目知识库', icon: <IconBook size={17} /> },
-    { key: 'schedules', label: '定时任务', icon: <IconClock size={17} /> },
+    { key: 'schedules', label: '经营自动化', icon: <IconClock size={17} /> },
   ]},
   { group: '协作', items: [
     { key: 'teams', label: '专家团', icon: <IconUser size={17} /> },
@@ -105,7 +105,7 @@ export function App() {
       case 'tasks': return <Tasks />;
       case 'deliverables': return <Deliverables />;
       case 'knowledge': return <Knowledge />;
-      case 'schedules': return <Schedules />;
+      case 'schedules': return <Automation />;
       case 'workflows': return <Workflows />;
       case 'console': return <Console />;
       case 'chat': return <Chat />;
