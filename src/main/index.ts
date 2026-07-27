@@ -20,6 +20,7 @@ import { seedIfEmpty, seedMcpServers, seedSkills } from './services/seed.js';
 import { importCredentialsBootstrap } from './services/bootstrap.js';
 import { migrateLegacyProvider } from './services/provider.js';
 import { loadUserConfig } from './services/userConfig.js';
+import { WecomWebhookNotifier } from './services/wecomWebhook.js';
 import { McpManager } from './services/mcpManager.js';
 import { SkillManager } from './services/skillManager.js';
 import { ProviderManager } from './services/providerManager.js';
@@ -239,6 +240,14 @@ app.whenReady().then(async () => {
     if (reconnectable.includes(wecomStatus) || (userCfg.wecom.botId && userCfg.wecom.secret && wecomStatus !== 'DISABLED')) void wecom.connect();
     if (reconnectable.includes(statusOf('ch-weixin'))) void weixin.connect();
   }
+
+  // 企微 webhook 通知（config.yaml wecom.webhookUrl；仅推送任务完成结果）
+  const webhookNotifier = new WecomWebhookNotifier();
+  orchestrator.onTaskFinished((info) => {
+    if (info.status !== 'COMPLETED') return;
+    const agent = db.raw.prepare('SELECT name FROM agents WHERE id = ?').get(info.agentId) as { name: string } | undefined;
+    webhookNotifier.notifyTaskCompleted(info.title, agent?.name ?? '数字员工', info.result);
+  });
 
   // 本地 API Bridge（反向代理，供 Claude Code/Codex 等引擎使用）
   const apiBridge = new ApiBridge(db, providerManager);

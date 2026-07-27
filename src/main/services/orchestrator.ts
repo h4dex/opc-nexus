@@ -38,6 +38,8 @@ export class Orchestrator {
   private listeners = new Set<() => void>();
   /** 任务输出流式订阅（推送到渲染进程逐字显示） */
   private outputListeners = new Set<(taskId: string, chunk: string) => void>();
+  /** 任务终态订阅（webhook 通知等；status 仅 COMPLETED/FAILED/INTERRUPTED） */
+  private finishListeners = new Set<(info: { taskId: string; agentId: string; status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; title: string; result: string | null; error: string | null }) => void>();
   private schedulerTimer: NodeJS.Timeout | null = null;
   private lastEmit = 0;
   private emitTimer: NodeJS.Timeout | null = null;
@@ -95,6 +97,12 @@ export class Orchestrator {
   onOutput(fn: (taskId: string, chunk: string) => void): () => void {
     this.outputListeners.add(fn);
     return () => this.outputListeners.delete(fn);
+  }
+
+  /** 订阅任务终态（执行器回调驱动；用于对外通知渠道） */
+  onTaskFinished(fn: (info: { taskId: string; agentId: string; status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; title: string; result: string | null; error: string | null }) => void): () => void {
+    this.finishListeners.add(fn);
+    return () => this.finishListeners.delete(fn);
   }
 
   /** 快照推送节流（300ms）：执行器高频进度回调下避免全量快照洪泛，并保证尾随一次 */
@@ -696,6 +704,15 @@ export class Orchestrator {
         notify(this.db, '任务执行失败', `${t?.title ?? taskId}：${(info.error ?? '').slice(0, 120)}`);
       }
       if (authFailed) notify(this.db, '引擎需要重新登录', '执行引擎鉴权失败，已标记为待登录，请到引擎中心处理');
+      // 终态订阅（webhook 等对外通知）：查询落库后的最终数据,异常不影响主流程
+      {
+        const t = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(taskId) as { title: string } | undefined;
+        for (const fn of this.finishListeners) {
+          try {
+            fn({ taskId, agentId, status, title: t?.title ?? taskId, result: info.result ?? null, error: info.error ?? null });
+          } catch { /* 通知失败不影响调度 */ }
+        }
+      }
       this.emit();
       this.scheduleNext(agentId);
     };
