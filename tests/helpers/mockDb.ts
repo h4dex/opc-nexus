@@ -20,6 +20,7 @@ export interface MockDb {
 }
 
 interface Tables {
+  projects: Map<string, Record<string, unknown>>;
   agents: Map<string, Record<string, unknown>>;
   tasks: Map<string, Record<string, unknown>>;
   agent_runs: Map<string, Record<string, unknown>>;
@@ -30,11 +31,14 @@ interface Tables {
   channel_routes: Map<string, Record<string, unknown>>;
   conversations: Map<string, Record<string, unknown>>;
   usage_records: Map<string, Record<string, unknown>>;
+  teams: Map<string, Record<string, unknown>>;
+  team_runs: Map<string, Record<string, unknown>>;
   settings: Map<string, unknown>;
 }
 
 export function createMockDb(): MockDb & { tables: Tables } {
   const tables: Tables = {
+    projects: new Map(),
     agents: new Map(),
     tasks: new Map(),
     agent_runs: new Map(),
@@ -45,6 +49,8 @@ export function createMockDb(): MockDb & { tables: Tables } {
     channel_routes: new Map(),
     conversations: new Map(),
     usage_records: new Map(),
+    teams: new Map(),
+    team_runs: new Map(),
     settings: new Map()
   };
 
@@ -81,6 +87,25 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   const table = detectTable(sql);
   if (!table) return mode === 'get' ? undefined : [];
   const rows = [...tables[table].values()];
+
+  // SELECT * FROM projects ORDER BY updated_at DESC
+  if (/SELECT \* FROM projects ORDER BY updated_at DESC/.test(sql)) {
+    const result = [...tables.projects.values()].sort((a, b) => (b.updated_at as number) - (a.updated_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  // SELECT * FROM projects WHERE id = ?
+  if (/SELECT \* FROM projects WHERE id = \?/.test(sql)) {
+    const row = tables.projects.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  // SELECT id FROM projects WHERE id = ? AND status != 'archived'
+  if (/SELECT id FROM projects WHERE id = \?/.test(sql)) {
+    const row = tables.projects.get(args[0] as string);
+    const result = row && row.status !== 'archived' ? { id: row.id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
 
   // SELECT * FROM agents WHERE archived = 0
   if (/SELECT \* FROM agents WHERE archived = 0/.test(sql)) {
@@ -185,6 +210,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? (row ? { parent_id: row.parent_id } : undefined) : [];
   }
 
+  // SELECT project_id FROM tasks WHERE id = ?
+  if (/SELECT project_id FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    return mode === 'get' ? (row ? { project_id: row.project_id ?? null } : undefined) : [];
+  }
+
   // SELECT title FROM tasks WHERE id = ?
   if (/SELECT title FROM tasks WHERE id = \?/.test(sql)) {
     const row = tables.tasks.get(args[0] as string);
@@ -224,6 +255,29 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return [...tables.task_events.values()].filter(r => r.task_id === args[0]);
   }
 
+  // SELECT * FROM team_runs WHERE id = ?
+  if (/SELECT \* FROM team_runs WHERE id = \?/.test(sql)) {
+    const row = tables.team_runs.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  // SELECT project_id FROM team_runs WHERE id = ?
+  if (/SELECT project_id FROM team_runs WHERE id = \?/.test(sql)) {
+    const row = tables.team_runs.get(args[0] as string);
+    return mode === 'get' ? (row ? { project_id: row.project_id ?? null } : undefined) : [];
+  }
+
+  // SELECT id FROM team_runs WHERE phase IN ('clarify','decompose','execute','review')
+  if (/SELECT id FROM team_runs WHERE phase IN/.test(sql)) {
+    const phases = ['clarify', 'decompose', 'execute', 'review'];
+    return [...tables.team_runs.values()].filter(r => phases.includes(r.phase as string)).map(r => ({ id: r.id }));
+  }
+
+  // SELECT * FROM teams ORDER BY created_at DESC
+  if (/SELECT \* FROM teams ORDER BY created_at DESC/.test(sql)) {
+    return [...tables.teams.values()].sort((a, b) => (b.created_at as number) - (a.created_at as number));
+  }
+
   // SELECT * FROM channels WHERE status IN (...)
   if (/SELECT \* FROM channels WHERE status IN/.test(sql)) {
     return [...tables.channels.values()].filter(r => ['ERROR', 'AUTH_EXPIRED'].includes(r.status as string));
@@ -250,6 +304,27 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
 }
 
 function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: number } {
+  // INSERT INTO projects
+  if (/INSERT INTO projects/.test(sql)) {
+    const [id, name, objective, description, clientName, status, color, dueAt, createdAt, updatedAt] = args;
+    tables.projects.set(id as string, {
+      id, name, objective, description, client_name: clientName, status, color,
+      due_at: dueAt, created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  // UPDATE projects（通用字段更新）
+  if (/UPDATE projects SET .+ WHERE id = \?/.test(sql)) {
+    const id = args[args.length - 1] as string;
+    const project = tables.projects.get(id);
+    if (!project) return { changes: 0 };
+    const setClause = sql.match(/SET (.+) WHERE/)?.[1] ?? '';
+    const fields = setClause.split(',').map(f => f.trim().split(' = ')[0]);
+    for (let i = 0; i < fields.length; i++) project[fields[i]] = args[i];
+    return { changes: 1 };
+  }
+
   // INSERT INTO agents
   if (/INSERT INTO agents/.test(sql)) {
     const [id, name, role, systemPrompt, soulMd, agentsMd, userMd, engineId, workspace, permissionMode, concurrencyLimit, color, now, now2] = args;
@@ -263,11 +338,22 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
 
   // INSERT INTO tasks
   if (/INSERT INTO tasks/.test(sql)) {
-    const [id, agentId, title, source, parentId, status, stage, sessionId, now, startedAt] = args;
+    const [id, agentId, projectId, title, source, parentId, status, stage, sessionId, workspaceOverride, now, startedAt] = args;
     tables.tasks.set(id as string, {
-      id, agent_id: agentId, title, source, parent_id: parentId, status,
+      id, agent_id: agentId, project_id: projectId, title, source, parent_id: parentId, status,
       priority: 0, progress: 0, stage, error: null, session_id: sessionId,
-      created_at: now, started_at: startedAt, ended_at: null, result: null
+      workspace_override: workspaceOverride, created_at: now, started_at: startedAt, ended_at: null, result: null, quality: null
+    });
+    return { changes: 1 };
+  }
+
+  // INSERT INTO team_runs
+  if (/INSERT INTO team_runs/.test(sql)) {
+    const [id, teamId, projectId, taskText, phase, createdAt] = args;
+    tables.team_runs.set(id as string, {
+      id, team_id: teamId, project_id: projectId, task_text: taskText, phase,
+      current_step: 0, total_steps: 0, subtasks_json: '[]', events_json: '[]',
+      final_result: null, error: null, created_at: createdAt, ended_at: null
     });
     return { changes: 1 };
   }
@@ -470,10 +556,26 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 1 };
   }
 
+  // UPDATE team_runs SET ... WHERE id = ?（通用字段更新）
+  if (/UPDATE team_runs SET .+ WHERE id = \?/.test(sql)) {
+    const id = args[args.length - 1] as string;
+    const run = tables.team_runs.get(id);
+    if (run) {
+      const setClause = sql.match(/SET (.+) WHERE/)?.[1] ?? '';
+      const fields = setClause.split(',').map(f => f.trim().split(' = ')[0]);
+      for (let i = 0; i < fields.length; i++) {
+        (run as Record<string, unknown>)[fields[i]] = args[i];
+      }
+      return { changes: 1 };
+    }
+    return { changes: 0 };
+  }
+
   return { changes: 0 };
 }
 
 function detectTable(sql: string): keyof Tables | null {
+  if (/\bprojects\b/.test(sql)) return 'projects';
   if (/\bagents\b/.test(sql) && !/agent_runs/.test(sql)) return 'agents';
   if (/\bagent_runs\b/.test(sql)) return 'agent_runs';
   if (/\btasks\b/.test(sql) && !/task_events/.test(sql)) return 'tasks';
@@ -484,6 +586,8 @@ function detectTable(sql: string): keyof Tables | null {
   if (/\bchannel_routes\b/.test(sql)) return 'channel_routes';
   if (/\bconversations\b/.test(sql)) return 'conversations';
   if (/\busage_records\b/.test(sql)) return 'usage_records';
+  if (/\bteam_runs\b/.test(sql)) return 'team_runs';
+  if (/\bteams\b/.test(sql)) return 'teams';
   return null;
 }
 
@@ -526,4 +630,54 @@ export function seedEngine(db: ReturnType<typeof createMockDb>, id = 'engine-sim
     is_default: 1,
     data_boundary: '本地'
   });
+}
+
+/** 种子项目：默认进行中。 */
+export function seedProject(db: ReturnType<typeof createMockDb>, overrides: Partial<Record<string, unknown>> = {}): string {
+  const id = `project-${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.tables.projects.set(id, {
+    id, name: `测试项目-${id.slice(8)}`, objective: '验证项目归属闭环', description: '', client_name: '',
+    status: 'active', color: '#4d6bfe', due_at: null, created_at: now, updated_at: now,
+    ...overrides
+  });
+  return id;
+}
+
+/** 种子团队（teams） */
+export function seedTeam(db: ReturnType<typeof createMockDb>, overrides: Partial<Record<string, unknown>> = {}): string {
+  const id = (overrides.id as string) ?? `team-${Math.random().toString(36).slice(2, 8)}`;
+  db.tables.teams.set(id, {
+    id,
+    name: '测试团队',
+    coordinator_id: 'coord',
+    member_ids: JSON.stringify(['a1', 'a3']),
+    mode: 'coordinate',
+    workspace: '',
+    created_at: Date.now(),
+    ...overrides
+  });
+  return id;
+}
+
+/** 种子团队运行记录（team_runs）：phase/subtasks 可覆盖，默认处于 execute 活跃阶段 */
+export function seedTeamRun(db: ReturnType<typeof createMockDb>, overrides: Partial<Record<string, unknown>> = {}): string {
+  const id = `run-${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.tables.team_runs.set(id, {
+    id,
+    team_id: 'team-test',
+    task_text: '测试团队任务',
+    phase: 'execute',
+    current_step: 1,
+    total_steps: 2,
+    subtasks_json: '[]',
+    events_json: '[]',
+    final_result: null,
+    error: null,
+    created_at: now,
+    ended_at: null,
+    ...overrides
+  });
+  return id;
 }

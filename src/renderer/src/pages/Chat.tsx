@@ -19,11 +19,34 @@ function normalizeTables(md: string): string {
   return out.join('\n');
 }
 
-/** 轻量 Markdown 渲染（同步解析 + DOMPurify 消毒，防止 LLM 产出注入脚本） */
+/** 轻量 Markdown 渲染（同步解析 + DOMPurify 消毒 + 代码块复制按钮） */
 function Md({ text }: { text: string }) {
+  const ref = useRef<HTMLDivElement>(null);
   const raw = marked.parse(normalizeTables(text), { async: false, gfm: true, breaks: true }) as string;
   const html = DOMPurify.sanitize(raw, { ADD_ATTR: ['target'] });
-  return <div className="md-body" dangerouslySetInnerHTML={{ __html: html }} />;
+
+  // 为代码块注入复制按钮
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.querySelectorAll('pre').forEach((pre) => {
+      if (pre.querySelector('.code-copy-btn')) return;
+      pre.style.position = 'relative';
+      const btn = document.createElement('button');
+      btn.className = 'code-copy-btn';
+      btn.textContent = '复制';
+      btn.style.cssText = 'position:absolute;top:6px;right:6px;padding:2px 8px;font-size:11px;border:1px solid var(--border);background:var(--card);color:var(--text-2);border-radius:5px;cursor:pointer;opacity:.75';
+      btn.onclick = () => {
+        const code = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
+        void navigator.clipboard.writeText(code);
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = '复制'; }, 1500);
+      };
+      pre.appendChild(btn);
+    });
+  }, [html]);
+
+  return <div ref={ref} className="md-body" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 export function Chat() {
@@ -37,6 +60,7 @@ export function Chat() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState('');
+  const [lastUserMsg, setLastUserMsg] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const convIdRef = useRef<string | null>(null);
   const activeTaskRef = useRef<string | null>(null);
@@ -89,11 +113,12 @@ export function Chat() {
   const { agentCards } = snapshot;
   const agents = agentCards.filter((c) => c.agent.lifecycle === 'READY');
 
-  const send = async () => {
-    const text = input.trim();
+  const send = async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
     if (!text || !agentId || sending) return;
     setSending(true);
     setInput('');
+    setLastUserMsg(text);
     try {
       const r = await window.aibox.chatWithAgent(agentId, text, convId ?? undefined);
       setConvId(r.conversationId);
@@ -104,6 +129,11 @@ export function Chat() {
     } finally {
       setSending(false);
     }
+  };
+
+  /** 重新生成：重发最后一条用户消息 */
+  const regenerate = () => {
+    if (lastUserMsg && !sending) void send(lastUserMsg);
   };
 
   /** 停止生成：取消当前活跃任务 */
@@ -185,7 +215,15 @@ export function Chat() {
           {messages.map((e) => {
             if (e.eventType === 'output') {
               const text = String(e.payload.chunk ?? e.payload.text ?? '');
-              return <div key={e.id} style={{ marginBottom: 12, padding: '10px 14px', background: 'var(--input-bg)', borderRadius: 10, fontSize: 13, lineHeight: 1.8 }}><Md text={text} /></div>;
+              return (
+                <div key={e.id} className="chat-msg" style={{ position: 'relative', marginBottom: 12, padding: '10px 14px', background: 'var(--input-bg)', borderRadius: 10, fontSize: 13, lineHeight: 1.8 }}>
+                  <Md text={text} />
+                  <button className="msg-copy-btn" title="复制回复" onClick={() => { void navigator.clipboard.writeText(text); }}
+                    style={{ position: 'absolute', top: 6, right: 6, padding: '2px 7px', fontSize: 10.5, border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--text-3)', borderRadius: 5, cursor: 'pointer', opacity: 0.6 }}
+                    onMouseEnter={(ev) => (ev.currentTarget.style.opacity = '1')}
+                    onMouseLeave={(ev) => (ev.currentTarget.style.opacity = '0.6')}>复制</button>
+                </div>
+              );
             }
             if (e.eventType === 'tool_call') {
               return <div key={e.id} style={{ marginBottom: 8, fontSize: 12, color: 'var(--warning)' }}>🔧 {String(e.payload.name ?? '')} {JSON.stringify(e.payload.args ?? {}).slice(0, 60)}</div>;
@@ -198,6 +236,18 @@ export function Chat() {
             }
             return null;
           })}
+          {/* 打字指示器 */}
+          {sending && (
+            <div style={{ marginBottom: 12, padding: '10px 14px', background: 'var(--input-bg)', borderRadius: 10, fontSize: 13, color: 'var(--text-3)', display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+              <span className="typing-dot" />正在思考并执行<span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
+            </div>
+          )}
+          {/* 重新生成（有历史回复且未在生成时） */}
+          {!sending && lastUserMsg && messages.some((m) => m.eventType === 'output') && (
+            <div style={{ marginBottom: 12 }}>
+              <button className="btn small" onClick={regenerate} style={{ fontSize: 11.5 }}>↻ 重新生成</button>
+            </div>
+          )}
           <div ref={bottomRef} />
         </div>
 

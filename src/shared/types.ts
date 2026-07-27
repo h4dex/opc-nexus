@@ -67,6 +67,34 @@ export type TaskSource = 'desktop' | 'channel' | 'schedule' | 'webhook' | 'deleg
 
 // ---------- 核心实体（13.1 核心表） ----------
 
+export type ProjectStatus = 'planning' | 'active' | 'paused' | 'completed' | 'archived';
+
+/** 经营项目：承接目标，并统一关联任务、专家团运行与成果。 */
+export interface Project {
+  id: string;
+  name: string;
+  objective: string;
+  description: string;
+  clientName: string;
+  status: ProjectStatus;
+  color: string;
+  dueAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectInput {
+  name: string;
+  objective?: string;
+  description?: string;
+  clientName?: string;
+  status?: Exclude<ProjectStatus, 'archived'>;
+  color?: string;
+  dueAt?: number | null;
+}
+
+export type ProjectPatch = Partial<Omit<ProjectInput, 'status'>> & { status?: ProjectStatus };
+
 export interface Agent {
   id: string;
   name: string;
@@ -169,6 +197,7 @@ export interface ScheduleInput {
 export interface Task {
   id: string;
   agentId: string;
+  projectId: string | null;
   title: string;
   source: TaskSource;
   parentId: string | null;
@@ -178,12 +207,16 @@ export interface Task {
   stage: string;            // 当前阶段描述
   error: string | null;
   result: string | null;    // 执行产物全文（截断 16KB）
+  quality: TaskQuality;     // 人工质量标记（成果管理）
   sessionId: string | null; // 会话锚点（CLI resume / LLM 上下文重建，追问时继承）
   workspaceOverride: string | null; // 任务级工作空间覆盖（团队共享工作空间）
   createdAt: number;
   startedAt: number | null;
   endedAt: number | null;
 }
+
+/** 任务产出的人工质量标记 */
+export type TaskQuality = 'accepted' | 'rejected' | 'rework' | null;
 
 /** 任务执行事件（13.2 审计可追溯；详情页时间线） */
 export interface TaskEvent {
@@ -573,11 +606,11 @@ export interface CollabConnectInfo {
 
 // ---------- 专家团流水线 ----------
 
-/** 团队执行子任务状态（retrying = 手动/调度重试中） */
-export type TeamRunSubtaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'retrying';
+/** 团队执行子任务状态（retrying = 重试中；skipped = 被人工跳过） */
+export type TeamRunSubtaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'retrying' | 'skipped';
 
-/** 团队执行流水线阶段 */
-export type TeamRunPhase = 'clarify' | 'decompose' | 'execute' | 'review' | 'done' | 'failed';
+/** 团队执行流水线阶段（cancelled = 人工取消） */
+export type TeamRunPhase = 'clarify' | 'decompose' | 'execute' | 'review' | 'done' | 'failed' | 'cancelled';
 
 export interface TeamRunSubtask {
   agent: string;          // 成员名
@@ -593,6 +626,7 @@ export interface TeamRunSubtask {
 export interface TeamRun {
   id: string;
   teamId: string;
+  projectId: string | null;
   taskText: string;
   phase: TeamRunPhase;
   currentStep: number;
@@ -607,12 +641,15 @@ export interface TeamRun {
   durationMs: number | null;
 }
 
-/** 专家团执行时间线事件（主Agent调度循环的每个关键节点） */
+/** 专家团执行时间线事件（主Agent调度循环的每个关键节点 + 人工干预标记） */
 export type TeamTimelineEvent =
   | { type: 'phase'; phase: 'clarify' | 'decompose' | 'review'; ts: number }
   | { type: 'round_start'; round: number; count: number; ts: number }
   | { type: 'subtask_done'; round: number; agent: string; agentId: string; status: 'done' | 'failed'; durationMs: number; ts: number }
-  | { type: 'decision'; round: number; action: 'finish' | 'continue'; summary: string; ts: number };
+  | { type: 'decision'; round: number; action: 'finish' | 'continue'; summary: string; reasoning?: string; ts: number }
+  | { type: 'cancelled'; ts: number }
+  | { type: 'skipped'; round: number; agent: string; ts: number }
+  | { type: 'guidance'; message: string; ts: number };
 
 /** 团队配置 */
 export interface TeamConfig {

@@ -20,11 +20,12 @@ import type { ProviderManager } from './services/providerManager.js';
 import type { WorkflowEngine } from './services/workflowEngine.js';
 import type { WfPlatformManager } from './services/wfPlatformManager.js';
 import type { TeamEngine } from './services/teamEngine.js';
+import type { ProjectManager } from './services/projectManager.js';
 import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
-import type { AppConfig, CreateAgentInput, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge } from '../shared/types.js';
+import type { AppConfig, CreateAgentInput, ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { copyFileSync } from 'node:fs';
@@ -58,16 +59,18 @@ export interface IpcDeps {
   skills: SkillManager;
   providers: ProviderManager;
   workflows: WorkflowEngine;
+  projects: ProjectManager;
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
   ocr: import('./services/ocrService.js').OcrService;
   apiBridge: import('./services/apiBridge.js').ApiBridge;
+  webServer: import('./services/webServer.js').WebServer;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, teams, wfPlatforms, collab, ocr, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -112,6 +115,23 @@ export function registerIpc(deps: IpcDeps) {
     uptimeSec: Math.floor(process.uptime()),
     appVersion: app.getVersion()
   }));
+
+  // ---------- 项目 ----------
+  ipcMain.handle('aibox:createProject', (_e, input: ProjectInput) => {
+    const project = projects.create(input);
+    pushSnapshot();
+    return project;
+  });
+  ipcMain.handle('aibox:updateProject', (_e, id: string, patch: ProjectPatch) => {
+    const project = projects.update(assertId(id, 'projectId'), patch);
+    pushSnapshot();
+    return project;
+  });
+  ipcMain.handle('aibox:archiveProject', (_e, id: string) => {
+    const project = projects.archive(assertId(id, 'projectId'));
+    pushSnapshot();
+    return project;
+  });
 
   // ---------- 数字员工 ----------
   ipcMain.handle('aibox:createAgent', (_e, input: CreateAgentInput) => {
@@ -329,12 +349,13 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:createTeam', (_e, input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }) => teams.create(input));
   ipcMain.handle('aibox:updateTeam', (_e, id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }) => teams.update(id, patch));
   ipcMain.handle('aibox:removeTeam', (_e, id: string) => teams.remove(id));
-  ipcMain.handle('aibox:triggerTeam', (_e, id: string, task: string) => {
-    const r = teams.trigger(id, task);
+  ipcMain.handle('aibox:triggerTeam', (_e, id: string, task: string, projectId?: string) => {
+    const r = teams.trigger(id, task, projectId ? assertId(projectId, 'projectId') : undefined);
     pushSnapshot();
     return r;
   });
   ipcMain.handle('aibox:getTeamRuns', (_e, teamId: string) => teams.listRuns(assertId(teamId, 'teamId')));
+  ipcMain.handle('aibox:listAttentionRuns', () => teams.listAttentionRuns());
   ipcMain.handle('aibox:getTeamConfig', (_e, teamId: string) => teams.getConfig(teamId));
   ipcMain.handle('aibox:saveTeamConfig', (_e, teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }) => {
     teams.saveConfig(teamId, config);
@@ -343,12 +364,21 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:getTeamStats', (_e, teamId: string) => teams.getStats(teamId));
   ipcMain.handle('aibox:getSubtaskOutput', (_e, taskId: string) => teams.getSubtaskOutput(taskId));
   ipcMain.handle('aibox:retryTeamSubtask', (_e, runId: string, subtaskIndex: number) => teams.retrySubtask(assertId(runId, 'runId'), subtaskIndex));
+  ipcMain.handle('aibox:cancelTeamRun', (_e, runId: string) => teams.cancelRun(assertId(runId, 'runId')));
+  ipcMain.handle('aibox:skipTeamSubtask', (_e, runId: string, subtaskIndex: number) => teams.skipSubtask(assertId(runId, 'runId'), subtaskIndex));
+  ipcMain.handle('aibox:forceRetryTeamSubtask', (_e, runId: string, subtaskIndex: number) => teams.forceRetrySubtask(assertId(runId, 'runId'), subtaskIndex));
+  ipcMain.handle('aibox:injectTeamGuidance', (_e, runId: string, message: string) => teams.injectGuidance(assertId(runId, 'runId'), assertString(message, 'message', 1, 500)));
   ipcMain.handle('aibox:saveTeamAsTemplate', (_e, teamId: string, name?: string) => teams.saveAsTemplate(teamId, name));
   ipcMain.handle('aibox:listTeamTemplates', () => teams.listTemplates());
   ipcMain.handle('aibox:removeTeamTemplate', (_e, id: string) => teams.removeTemplate(id));
 
   // ---------- 任务 ----------
-  ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string) => orchestrator.createTask(assertId(agentId, 'agentId'), assertString(title, 'title', 1, 500)));
+  ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string, projectId?: string) => orchestrator.createTask(
+    assertId(agentId, 'agentId'),
+    assertString(title, 'title', 1, 500),
+    'desktop',
+    { projectId: projectId ? assertId(projectId, 'projectId') : undefined }
+  ));
   ipcMain.handle('aibox:cancelTask', (_e, id: string) => orchestrator.cancelTask(assertId(id)));
   ipcMain.handle('aibox:pauseTask', (_e, id: string) => orchestrator.pauseTask(assertId(id)));
   ipcMain.handle('aibox:resumeTask', (_e, id: string) => orchestrator.resumeTask(assertId(id)));
@@ -358,6 +388,8 @@ export function registerIpc(deps: IpcDeps) {
   // 任务详情：事件时间线 + 产物全文（13.2 审计可追溯）
   ipcMain.handle('aibox:getTaskEvents', (_e, taskId: string) => orchestrator.taskEvents(taskId));
   ipcMain.handle('aibox:getTaskResult', (_e, taskId: string) => orchestrator.taskResult(taskId));
+  // 任务产出质量标记（成果管理：采纳/驳回/返工）
+  ipcMain.handle('aibox:setTaskQuality', (_e, taskId: string, quality: 'accepted' | 'rejected' | 'rework' | null) => orchestrator.setTaskQuality(assertId(taskId, 'taskId'), quality));
 
   // ---------- 引擎 ----------
   // 真实自动安装（npm -g，下载地址取配置文件）；完成后重新检测并推送快照
@@ -523,6 +555,8 @@ export function registerIpc(deps: IpcDeps) {
   // ---------- 设置 ----------
   ipcMain.handle('aibox:getSetting', (_e, key: string) => db.getSetting(key, null));
   ipcMain.handle('aibox:setSetting', (_e, key: string, value: unknown) => db.setSetting(key, value));
+  // Web 管理面板访问 Token：重新生成强随机 Token（同时失效旧会话）
+  ipcMain.handle('aibox:regenerateWebToken', () => ({ token: webServer.regenerateToken() }));
 
   // ---------- OCR 文字识别服务 ----------
   ipcMain.handle('aibox:getOcrStatus', () => ocr.getStatus());
@@ -639,6 +673,7 @@ function buildSnapshot(deps: IpcDeps) {
     version: ++snapshotVersion,
     stats: deps.orchestrator.stats(),
     agentCards: deps.orchestrator.agentCards(),
+    projects: deps.projects.list(),
     tasks: deps.orchestrator.listTasks(),
     todos: [...systemTodos, ...todos].slice(0, 12),
     approvals: deps.orchestrator.listApprovals(),

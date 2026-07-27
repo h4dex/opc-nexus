@@ -6,7 +6,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
-  ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
+  Project, ProjectInput, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
   TeamRun
@@ -17,6 +17,7 @@ export interface Snapshot {
   version: number;
   stats: DashboardStats;
   agentCards: AgentCardView[];
+  projects: Project[];
   tasks: Task[];
   todos: TodoItem[];
   approvals: Approval[];
@@ -38,6 +39,11 @@ const api = {
   getAppVersion: (): Promise<string> => ipcRenderer.invoke('aibox:getAppVersion'),
   getResourceHistory: (): Promise<ResourcePayload> => ipcRenderer.invoke('aibox:getResourceHistory'),
   getSystemInfo: (): Promise<SystemInfo> => ipcRenderer.invoke('aibox:getSystemInfo'),
+
+  // 项目
+  createProject: (input: ProjectInput): Promise<Project> => ipcRenderer.invoke('aibox:createProject', input),
+  updateProject: (id: string, patch: ProjectPatch): Promise<Project | null> => ipcRenderer.invoke('aibox:updateProject', id, patch),
+  archiveProject: (id: string): Promise<Project | null> => ipcRenderer.invoke('aibox:archiveProject', id),
 
   // 数字员工
   createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', input),
@@ -133,19 +139,24 @@ const api = {
   createTeam: (input: { name: string; coordinatorId: string; memberIds: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }): Promise<unknown> => ipcRenderer.invoke('aibox:createTeam', input),
   updateTeam: (id: string, patch: { name?: string; coordinatorId?: string; memberIds?: string[]; mode?: 'coordinate' | 'roundtable'; workspace?: string }): Promise<void> => ipcRenderer.invoke('aibox:updateTeam', id, patch),
   removeTeam: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeam', id),
-  triggerTeam: (id: string, task: string): Promise<{ ok: boolean; message: string; runId?: string }> => ipcRenderer.invoke('aibox:triggerTeam', id, task),
+  triggerTeam: (id: string, task: string, projectId?: string): Promise<{ ok: boolean; message: string; runId?: string }> => ipcRenderer.invoke('aibox:triggerTeam', id, task, projectId),
   getTeamRuns: (teamId: string): Promise<TeamRun[]> => ipcRenderer.invoke('aibox:getTeamRuns', teamId),
+  listAttentionRuns: (): Promise<(TeamRun & { teamName: string })[]> => ipcRenderer.invoke('aibox:listAttentionRuns'),
   getTeamConfig: (teamId: string): Promise<{ timeout: number; maxRetries: number; concurrency: number }> => ipcRenderer.invoke('aibox:getTeamConfig', teamId),
   saveTeamConfig: (teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveTeamConfig', teamId, config),
   getTeamStats: (teamId: string): Promise<{ totalRuns: number; avgDurationMs: number; successRate: number }> => ipcRenderer.invoke('aibox:getTeamStats', teamId),
   getSubtaskOutput: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getSubtaskOutput', taskId),
   retryTeamSubtask: (runId: string, subtaskIndex: number): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:retryTeamSubtask', runId, subtaskIndex),
+  cancelTeamRun: (runId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:cancelTeamRun', runId),
+  skipTeamSubtask: (runId: string, subtaskIndex: number): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:skipTeamSubtask', runId, subtaskIndex),
+  forceRetryTeamSubtask: (runId: string, subtaskIndex: number): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:forceRetryTeamSubtask', runId, subtaskIndex),
+  injectTeamGuidance: (runId: string, message: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:injectTeamGuidance', runId, message),
   saveTeamAsTemplate: (teamId: string, name?: string): Promise<{ ok: boolean; message: string; id?: string }> => ipcRenderer.invoke('aibox:saveTeamAsTemplate', teamId, name),
   listTeamTemplates: (): Promise<{ id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[]> => ipcRenderer.invoke('aibox:listTeamTemplates'),
   removeTeamTemplate: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeamTemplate', id),
 
   // 任务
-  createTask: (agentId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title),
+  createTask: (agentId: string, title: string, projectId?: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title, projectId),
   cancelTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:cancelTask', id),
   pauseTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:pauseTask', id),
   resumeTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:resumeTask', id),
@@ -153,6 +164,7 @@ const api = {
   createFollowUpTask: (parentTaskId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createFollowUpTask', parentTaskId, title),
   getTaskEvents: (taskId: string): Promise<TaskEvent[]> => ipcRenderer.invoke('aibox:getTaskEvents', taskId),
   getTaskResult: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getTaskResult', taskId),
+  setTaskQuality: (taskId: string, quality: 'accepted' | 'rejected' | 'rework' | null): Promise<Task | null> => ipcRenderer.invoke('aibox:setTaskQuality', taskId, quality),
 
   // 定时任务（P3a）
   createSchedule: (input: ScheduleInput): Promise<Schedule> => ipcRenderer.invoke('aibox:createSchedule', input),
@@ -213,6 +225,7 @@ const api = {
   // 设置 / 目录 / 凭据
   getSetting: (key: string): Promise<unknown> => ipcRenderer.invoke('aibox:getSetting', key),
   setSetting: (key: string, value: unknown): Promise<void> => ipcRenderer.invoke('aibox:setSetting', key, value),
+  regenerateWebToken: (): Promise<{ token: string }> => ipcRenderer.invoke('aibox:regenerateWebToken'),
 
   // OCR 文字识别服务
   getOcrStatus: (): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:getOcrStatus'),

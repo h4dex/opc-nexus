@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
+import { toast } from '../components/Toast';
 import { TEAM_TEMPLATES, type TeamTemplate } from '../data/teamTemplates';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
 import type { TeamRun, TeamRunSubtask, TeamTimelineEvent } from '../../../shared/types';
@@ -12,7 +13,7 @@ interface TeamData {
 }
 
 const PHASE_LABEL: Record<string, string> = {
-  clarify: '澄清/Spec', decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败'
+  clarify: '澄清/Spec', decompose: '拆解中', execute: '执行中', review: '验收中', done: '已完成', failed: '失败', cancelled: '已取消'
 };
 
 export function Teams() {
@@ -20,6 +21,7 @@ export function Teams() {
   const [teams, setTeams] = useState<TeamData[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [taskInput, setTaskInput] = useState<Record<string, string>>({});
+  const [projectInput, setProjectInput] = useState<Record<string, string>>({});
   const [triggerMsg, setTriggerMsg] = useState<Record<string, string>>({});
   const [deploying, setDeploying] = useState<string | null>(null);
   const [deployMsg, setDeployMsg] = useState('');
@@ -60,7 +62,7 @@ export function Teams() {
   const trigger = async (teamId: string) => {
     const task = taskInput[teamId]?.trim();
     if (!task) return;
-    const r = await window.aibox.triggerTeam(teamId, task);
+    const r = await window.aibox.triggerTeam(teamId, task, projectInput[teamId] || undefined);
     setTriggerMsg((m) => ({ ...m, [teamId]: r.message }));
     setTaskInput((m) => ({ ...m, [teamId]: '' }));
     setTimeout(() => setTriggerMsg((m) => ({ ...m, [teamId]: '' })), 4000);
@@ -179,6 +181,10 @@ export function Teams() {
 
             {/* 提交团队任务 */}
             <div style={{ display: 'flex', gap: 8 }}>
+              <select className="project-scope-select" value={projectInput[team.id] ?? ''} onChange={(e) => setProjectInput((current) => ({ ...current, [team.id]: e.target.value }))} aria-label="团队任务归属项目" style={{ minWidth: 160 }}>
+                <option value="">未归项目</option>
+                {(snapshot.projects ?? []).filter((project) => !['completed', 'archived'].includes(project.status)).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+              </select>
               <input
                 value={taskInput[team.id] ?? ''}
                 onChange={(e) => setTaskInput((m) => ({ ...m, [team.id]: e.target.value }))}
@@ -212,6 +218,11 @@ export function Teams() {
               setTimeout(() => setTriggerMsg((m) => ({ ...m, [team.id]: '' })), 4000);
               // 立即拉取更新
               void window.aibox.getTeamRuns(team.id).then((list) => setRuns((prev) => ({ ...prev, [team.id]: list[0] ?? null })));
+            }} onCancel={async (runId) => {
+              const r = await window.aibox.cancelTeamRun(runId);
+              setTriggerMsg((m) => ({ ...m, [team.id]: r.message }));
+              setTimeout(() => setTriggerMsg((m) => ({ ...m, [team.id]: '' })), 4000);
+              void window.aibox.getTeamRuns(team.id).then((list) => setRuns((prev) => ({ ...prev, [team.id]: list[0] ?? null })));
             }} />}
           </div>
         ))}
@@ -226,24 +237,19 @@ export function Teams() {
           run={runs[timelineTeamId]!}
           teamName={teams.find((t) => t.id === timelineTeamId)?.name ?? ''}
           onClose={() => setTimelineTeamId(null)}
-          onRetry={async (runId, idx) => {
-            const r = await window.aibox.retryTeamSubtask(runId, idx);
-            setTriggerMsg((m) => ({ ...m, [timelineTeamId]: r.message }));
-            setTimeout(() => setTriggerMsg((m) => ({ ...m, [timelineTeamId]: '' })), 4000);
-            void window.aibox.getTeamRuns(timelineTeamId).then((list) => setRuns((prev) => ({ ...prev, [timelineTeamId]: list[0] ?? null })));
-          }}
+          onChanged={() => void window.aibox.getTeamRuns(timelineTeamId).then((list) => setRuns((prev) => ({ ...prev, [timelineTeamId]: list[0] ?? null })))}
         />
       )}
     </>
   );
 }
 
-/** 流水线进度面板：阶段指示器 + 子任务状态（并行调度视图）+ 手动重试 + 耗时 + 最终结论 */
-function RunProgress({ run, onRetry }: { run: TeamRun; onRetry: (runId: string, subtaskIndex: number) => void }) {
+/** 流水线进度面板：阶段指示器 + 子任务状态（并行调度视图）+ 手动重试 + 耗时 + 取消 + 最终结论 */
+function RunProgress({ run, onRetry, onCancel }: { run: TeamRun; onRetry: (runId: string, subtaskIndex: number) => void; onCancel: (runId: string) => void }) {
   const active = ['clarify', 'decompose', 'execute', 'review'].includes(run.phase);
-  const terminal = ['done', 'failed'].includes(run.phase);
-  const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : (s === 'running' || s === 'retrying') ? 'var(--accent)' : 'var(--text-3)';
-  const statusLabel = (s: string) => s === 'done' ? '完成' : s === 'failed' ? '失败' : s === 'running' ? '执行中' : s === 'retrying' ? '重试中' : '等待';
+  const terminal = ['done', 'failed', 'cancelled'].includes(run.phase);
+  const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : s === 'skipped' ? 'var(--text-3)' : (s === 'running' || s === 'retrying') ? 'var(--accent)' : 'var(--text-3)';
+  const statusLabel = (s: string) => s === 'done' ? '完成' : s === 'failed' ? '失败' : s === 'running' ? '执行中' : s === 'retrying' ? '重试中' : s === 'skipped' ? '已跳过' : '等待';
 
   // 耗时：活跃时每秒跳动，终态显示总耗时
   const [now, setNow] = useState(Date.now());
@@ -259,14 +265,19 @@ function RunProgress({ run, onRetry }: { run: TeamRun; onRetry: (runId: string, 
     <div style={{ marginTop: 12, padding: '12px 14px', borderRadius: 8, background: 'var(--input-bg)', border: '1px solid var(--card-border)' }}>
       {/* 阶段指示器 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: run.subtasks.length > 0 ? 10 : 0 }}>
-        <span style={{ fontSize: 12, fontWeight: 650, color: run.phase === 'failed' ? 'var(--danger)' : run.phase === 'done' ? 'var(--success)' : 'var(--accent)' }}>
-          {run.phase === 'done' ? '✅' : run.phase === 'failed' ? '❌' : '⚙️'} {PHASE_LABEL[run.phase] ?? run.phase}
+        <span style={{ fontSize: 12, fontWeight: 650, color: run.phase === 'failed' ? 'var(--danger)' : run.phase === 'done' ? 'var(--success)' : run.phase === 'cancelled' ? 'var(--text-3)' : 'var(--accent)' }}>
+          {run.phase === 'done' ? '✅' : run.phase === 'failed' ? '❌' : run.phase === 'cancelled' ? '⊘' : '⚙️'} {PHASE_LABEL[run.phase] ?? run.phase}
         </span>
         {run.phase === 'execute' && run.totalSteps > 0 && (
           <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>第 {run.currentStep} 轮调度 · 共 {run.totalSteps} 个子任务（并行执行）</span>
         )}
         <span style={{ fontSize: 11, color: 'var(--text-3)', fontVariantNumeric: 'tabular-nums' }}>⏱ {elapsedText}</span>
         {active && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>· {run.taskText.slice(0, 40)}{run.taskText.length > 40 ? '…' : ''}</span>}
+        {/* 取消按钮：仅执行中可取消 */}
+        {active && (
+          <button className="btn small" style={{ marginLeft: 'auto', padding: '1px 8px', fontSize: 11, color: 'var(--danger)', flexShrink: 0 }}
+            onClick={() => onCancel(run.id)}>■ 取消</button>
+        )}
       </div>
 
       {/* 子任务列表（并行状态） */}
@@ -300,15 +311,19 @@ function RunProgress({ run, onRetry }: { run: TeamRun; onRetry: (runId: string, 
   );
 }
 
-/** 执行时间线抽屉：决策脊柱 + 可展开轮次，实时/复盘两用 */
+/** 执行时间线抽屉：决策脊柱 + 可展开轮次 + 决策透明化 + 执行干预控制，实时/复盘两用 */
 interface TlRoundSubtask { agent: string; status: string; durationMs: number }
 interface TlNode {
-  kind: 'phase' | 'round' | 'decision';
+  kind: 'phase' | 'round' | 'decision' | 'marker';
   phase?: string;
   round?: number;
   count?: number;
   action?: string;
   summary?: string;
+  reasoning?: string;
+  markerType?: 'cancelled' | 'skipped' | 'guidance';
+  agent?: string;
+  message?: string;
   ts: number;
   subtasks: TlRoundSubtask[];
 }
@@ -337,7 +352,13 @@ function buildTimeline(run: TeamRun): TlNode[] {
           }
         }
       } else if (ev.type === 'decision') {
-        nodes.push({ kind: 'decision', round: ev.round, action: ev.action, summary: ev.summary, ts: ev.ts, subtasks: [] });
+        nodes.push({ kind: 'decision', round: ev.round, action: ev.action, summary: ev.summary, reasoning: ev.reasoning, ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'cancelled') {
+        nodes.push({ kind: 'marker', markerType: 'cancelled', ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'skipped') {
+        nodes.push({ kind: 'marker', markerType: 'skipped', round: ev.round, agent: ev.agent, ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'guidance') {
+        nodes.push({ kind: 'marker', markerType: 'guidance', message: ev.message, ts: ev.ts, subtasks: [] });
       }
     }
     return nodes;
@@ -357,23 +378,36 @@ function buildTimeline(run: TeamRun): TlNode[] {
   return nodes;
 }
 
-function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
-  run: TeamRun; teamName: string; onClose: () => void;
-  onRetry: (runId: string, subtaskIndex: number) => void;
+function TeamTimelineModal({ run, teamName, onClose, onChanged }: {
+  run: TeamRun; teamName: string; onClose: () => void; onChanged: () => void;
 }) {
   const active = ['clarify', 'decompose', 'execute', 'review'].includes(run.phase);
-  const terminal = ['done', 'failed'].includes(run.phase);
+  const terminal = ['done', 'failed', 'cancelled'].includes(run.phase);
   const nodes = buildTimeline(run);
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  const [reasoningOpen, setReasoningOpen] = useState<Set<number>>(new Set());
+  const [guidance, setGuidance] = useState('');
   const toggleRound = (r: number) => setCollapsed((prev) => {
     const next = new Set(prev);
     if (next.has(r)) next.delete(r); else next.add(r);
     return next;
   });
+  const toggleReasoning = (i: number) => setReasoningOpen((prev) => {
+    const next = new Set(prev);
+    if (next.has(i)) next.delete(i); else next.add(i);
+    return next;
+  });
+
+  /** 统一执行干预控制：调用 IPC + Toast 反馈 + 触发刷新 */
+  const doCtl = async (p: Promise<{ ok: boolean; message: string }>) => {
+    const r = await p;
+    if (r.ok) toast.ok(r.message); else toast.err(r.message);
+    onChanged();
+  };
 
   const maxDur = Math.max(1, ...nodes.flatMap((n) => n.subtasks.map((s) => s.durationMs)));
-  const stColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : 'var(--accent)';
-  const stLabel = (s: string) => s === 'done' ? '✓' : s === 'failed' ? '✗' : '…';
+  const stColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : s === 'skipped' ? 'var(--text-3)' : 'var(--accent)';
+  const stLabel = (s: string) => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'skipped' ? '⊘' : '…';
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 1000, display: 'flex', justifyContent: 'flex-end' }} onClick={onClose}>
@@ -383,7 +417,14 @@ function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '16px 20px', borderBottom: '1px solid var(--card-border)' }}>
           <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, fontSize: 15 }}>⏱ 执行时间线 · {teamName}</div>
+            <div style={{ fontWeight: 700, fontSize: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
+              ⏱ 执行时间线 · {teamName}
+              {active && (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10.5, fontWeight: 650, color: 'var(--accent)', padding: '1px 8px', borderRadius: 10, background: 'var(--accent-soft)' }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)', animation: 'toast-in 1s ease-in-out infinite alternate' }} />实时
+                </span>
+              )}
+            </div>
             <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 2 }}>
               {run.taskText.slice(0, 44)}{run.taskText.length > 44 ? '…' : ''} · 总耗时 {fmtDur((run.endedAt ?? Date.now()) - run.createdAt)}
             </div>
@@ -393,6 +434,28 @@ function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
 
         <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
           {nodes.length === 0 && <div style={{ color: 'var(--text-3)', fontSize: 12.5, textAlign: 'center', padding: 40 }}>暂无时间线数据</div>}
+
+          {/* 执行干预控制面板（仅执行中） */}
+          {active && run.subtasks.length > 0 && (
+            <div style={{ marginBottom: 16, padding: '10px 12px', background: 'var(--input-bg)', border: '1px solid var(--accent)', borderRadius: 8 }}>
+              <div style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>⚡ 执行干预（主Agent 下一轮响应）</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {run.subtasks.map((st, idx) => (
+                  <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                    <span style={{ color: stColor(st.status), fontWeight: 700, width: 14, flexShrink: 0 }}>{stLabel(st.status)}</span>
+                    <span style={{ color: 'var(--text-1)', fontWeight: 550, flexShrink: 0, maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{st.agent}</span>
+                    <span style={{ color: 'var(--text-3)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>{st.subtask.slice(0, 30)}</span>
+                    {st.status === 'failed' && (
+                      <button className="btn small" style={{ padding: '1px 7px', fontSize: 10.5, color: 'var(--accent)', flexShrink: 0 }} onClick={() => void doCtl(window.aibox.forceRetryTeamSubtask(run.id, idx))}>强制重试</button>
+                    )}
+                    {(st.status === 'pending' || st.status === 'running' || st.status === 'retrying') && (
+                      <button className="btn small" style={{ padding: '1px 7px', fontSize: 10.5, color: 'var(--text-3)', flexShrink: 0 }} onClick={() => void doCtl(window.aibox.skipTeamSubtask(run.id, idx))}>跳过</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div style={{ borderLeft: '2px solid var(--accent)', marginLeft: 10, paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
             {nodes.map((n, i) => {
@@ -405,15 +468,39 @@ function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
                   </div>
                 );
               }
+              if (n.kind === 'marker') {
+                const mt = n.markerType;
+                const mColor = mt === 'cancelled' ? 'var(--danger)' : mt === 'guidance' ? 'var(--accent)' : 'var(--text-3)';
+                const mText = mt === 'cancelled' ? '⊘ 用户取消了执行'
+                  : mt === 'skipped' ? `⊘ 跳过「${n.agent}」`
+                  : `⚡ 人类指导：${n.message}`;
+                return (
+                  <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, position: 'relative', fontSize: 11.5, color: mColor, background: 'var(--input-bg)', border: `1px dashed ${mColor}`, borderRadius: 6, padding: '6px 10px' }}>
+                    <span style={{ position: 'absolute', left: -25, top: 8, width: 8, height: 8, borderRadius: '50%', background: mColor, border: '2px solid var(--bg)' }} />
+                    <span style={{ lineHeight: 1.5 }}>{mText}</span>
+                  </div>
+                );
+              }
               if (n.kind === 'decision') {
                 const isFinish = n.action === 'finish';
+                const dColor = isFinish ? 'var(--success)' : 'var(--warning)';
+                const hasReasoning = !!n.reasoning;
+                const open = reasoningOpen.has(i);
                 return (
-                  <div key={i} style={{ position: 'relative', background: 'var(--input-bg)', border: `1px solid ${isFinish ? 'var(--success)' : 'var(--warning)'}`, borderRadius: 8, padding: '10px 12px' }}>
-                    <span style={{ position: 'absolute', left: -27, top: 12, width: 10, height: 10, transform: 'rotate(45deg)', background: isFinish ? 'var(--success)' : 'var(--warning)', border: '2px solid var(--bg)' }} />
-                    <div style={{ fontSize: 12, fontWeight: 700, color: isFinish ? 'var(--success)' : 'var(--warning)' }}>
-                      ◆ 主Agent决策{isFinish ? '：完成' : '：继续调度'}
+                  <div key={i} style={{ position: 'relative', background: 'var(--input-bg)', border: `1px solid ${dColor}`, borderRadius: 8, padding: '10px 12px' }}>
+                    <span style={{ position: 'absolute', left: -27, top: 12, width: 10, height: 10, transform: 'rotate(45deg)', background: dColor, border: '2px solid var(--bg)' }} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: dColor }}>◆ 主Agent决策{isFinish ? '：完成' : '：继续调度'}</span>
+                      {hasReasoning && (
+                        <button onClick={() => toggleReasoning(i)} style={{ marginLeft: 'auto', border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 10.5, color: 'var(--text-3)' }}>
+                          {open ? '▾ 收起推理' : '▸ 查看推理'}
+                        </button>
+                      )}
                     </div>
                     {n.summary && <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3 }}>{n.summary}</div>}
+                    {hasReasoning && open && (
+                      <pre style={{ marginTop: 8, padding: '8px 10px', background: 'var(--card)', borderRadius: 6, fontSize: 11, lineHeight: 1.6, maxHeight: 220, overflowY: 'auto', whiteSpace: 'pre-wrap', color: 'var(--text-2)' }}>{n.reasoning}</pre>
+                    )}
                   </div>
                 );
               }
@@ -458,9 +545,9 @@ function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
             )}
             {terminal && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, position: 'relative' }}>
-                <span style={{ position: 'absolute', left: -27, width: 12, height: 12, borderRadius: '50%', background: run.phase === 'done' ? 'var(--success)' : 'var(--danger)', border: '2px solid var(--bg)' }} />
-                <span style={{ fontSize: 12.5, fontWeight: 700, color: run.phase === 'done' ? 'var(--success)' : 'var(--danger)' }}>
-                  {run.phase === 'done' ? '✅ 流水线完成' : '❌ 流水线失败'}
+                <span style={{ position: 'absolute', left: -27, width: 12, height: 12, borderRadius: '50%', background: run.phase === 'done' ? 'var(--success)' : run.phase === 'cancelled' ? 'var(--text-3)' : 'var(--danger)', border: '2px solid var(--bg)' }} />
+                <span style={{ fontSize: 12.5, fontWeight: 700, color: run.phase === 'done' ? 'var(--success)' : run.phase === 'cancelled' ? 'var(--text-3)' : 'var(--danger)' }}>
+                  {run.phase === 'done' ? '✅ 流水线完成' : run.phase === 'cancelled' ? '⊘ 流水线已取消' : '❌ 流水线失败'}
                 </span>
               </div>
             )}
@@ -481,12 +568,24 @@ function TeamTimelineModal({ run, teamName, onClose, onRetry }: {
                 <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, padding: '4px 0' }}>
                   <span style={{ color: 'var(--text-1)', fontWeight: 550 }}>{st.agent}</span>
                   <span style={{ color: 'var(--text-3)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{st.subtask.slice(0, 40)}</span>
-                  <button className="btn small" style={{ padding: '1px 8px', fontSize: 11, color: 'var(--accent)' }} onClick={() => onRetry(run.id, idx)}>↻ 重试</button>
+                  <button className="btn small" style={{ padding: '1px 8px', fontSize: 11, color: 'var(--accent)' }} onClick={() => void doCtl(window.aibox.retryTeamSubtask(run.id, idx))}>↻ 重试</button>
                 </div>
               ) : null)}
             </div>
           )}
         </div>
+
+        {/* 底部控制栏：注入指导 + 取消（仅执行中） */}
+        {active && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 20px', borderTop: '1px solid var(--card-border)' }}>
+            <input value={guidance} onChange={(e) => setGuidance(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && guidance.trim()) { void doCtl(window.aibox.injectTeamGuidance(run.id, guidance.trim())); setGuidance(''); } }}
+              placeholder="向主Agent注入指导（如：别纠结 X，先做 Y）…"
+              style={{ flex: 1, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5 }} />
+            <button className="btn small primary" disabled={!guidance.trim()} onClick={() => { void doCtl(window.aibox.injectTeamGuidance(run.id, guidance.trim())); setGuidance(''); }}>注入</button>
+            <button className="btn small danger" onClick={() => void doCtl(window.aibox.cancelTeamRun(run.id))}>■ 取消</button>
+          </div>
+        )}
       </div>
     </div>
   );

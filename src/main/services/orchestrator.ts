@@ -17,7 +17,7 @@ import type { ToolHost } from './executor/tools.js';
 import { notify } from './notifier.js';
 import type {
   Agent, AgentCardView, Approval, CreateAgentInput, DashboardStats, DerivedAgentStatus,
-  ExecutorKind, Task, TaskEvent, TaskStatus, TodoItem
+  ExecutorKind, Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
 } from '../../shared/types.js';
 
 type Row = Record<string, unknown>;
@@ -210,13 +210,25 @@ export class Orchestrator {
   private mapTask(r: Row): Task {
     return {
       id: r.id as string, agentId: r.agent_id as string, title: r.title as string,
+      projectId: (r.project_id as string | null) ?? null,
       source: r.source as Task['source'], parentId: r.parent_id as string | null,
       status: r.status as TaskStatus, priority: r.priority as number, progress: r.progress as number,
       stage: r.stage as string, error: r.error as string | null, result: (r.result as string | null) ?? null,
+      quality: (r.quality as TaskQuality) ?? null,
       sessionId: (r.session_id as string | null) ?? null,
       workspaceOverride: (r.workspace_override as string | null) ?? null,
       createdAt: r.created_at as number, startedAt: r.started_at as number | null, endedAt: r.ended_at as number | null
     };
+  }
+
+  /** 设置任务产出的人工质量标记（成果管理：采纳/驳回/返工） */
+  setTaskQuality(taskId: string, quality: TaskQuality): Task | null {
+    const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+    if (!row) return null;
+    this.db.raw.prepare('UPDATE tasks SET quality = ? WHERE id = ?').run(quality, taskId);
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.quality', target: taskId, result: quality ?? 'cleared' });
+    this.emit();
+    return this.mapTask({ ...row, quality });
   }
 
   private getAgent(id: string): Agent | null {
@@ -555,18 +567,27 @@ export class Orchestrator {
   /** 创建任务：该员工无活跃任务且未超并发 → 立即经执行器派发；否则进入 QUEUED 等待 FIFO 调度。
    *  opts.parentId：委派/追问的父任务；opts.sessionId：继承会话锚点（P2b 追问续跑）；
    *  opts.workspaceOverride：任务级工作空间覆盖（团队共享工作空间） */
-  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string } = {}): Task {
+  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string; projectId?: string } = {}): Task {
     const now = Date.now();
     const id = randomUUID();
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error('员工不存在');
+    let projectId = opts.projectId ?? null;
+    if (!projectId && opts.parentId) {
+      const parent = this.db.raw.prepare('SELECT project_id FROM tasks WHERE id = ?').get(opts.parentId) as { project_id: string | null } | undefined;
+      projectId = parent?.project_id ?? null;
+    }
+    if (projectId) {
+      const project = this.db.raw.prepare("SELECT id FROM projects WHERE id = ? AND status != 'archived'").get(projectId) as { id: string } | undefined;
+      if (!project) throw new Error('项目不存在或已归档');
+    }
     const active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
     const guardReason = this.dispatchGuard();
     const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null;
     this.db.transaction(() => {
       this.db.raw.prepare(
-        'INSERT INTO tasks(id, agent_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, NULL)'
-      ).run(id, agentId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, opts.workspaceOverride ?? null, now, canRun ? now : null);
+        'INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, NULL)'
+      ).run(id, agentId, projectId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, opts.workspaceOverride ?? null, now, canRun ? now : null);
       if (canRun) {
         this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
           .run(randomUUID(), agentId, id, process.pid, randomUUID(), 'RUNNING', now);

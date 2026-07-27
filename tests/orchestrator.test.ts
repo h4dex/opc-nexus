@@ -4,7 +4,7 @@
  */
 // @ts-nocheck
 /* eslint-disable */
-import { createMockDb, seedAgent, seedEngine } from './helpers/mockDb.js';
+import { createMockDb, seedAgent, seedEngine, seedProject } from './helpers/mockDb.js';
 
 // Mock notifier（避免系统通知副作用）
 vi.mock('../src/main/services/notifier.js', () => ({
@@ -133,6 +133,24 @@ describe('Orchestrator 状态机', () => {
       const task = orch.createTask(agentId, '排队任务');
       expect(task.status).toBe('QUEUED');
       expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('任务归属项目，追问任务继承原项目', () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const task = orch.createTask(agentId, '项目任务', 'desktop', { projectId });
+      expect(task.projectId).toBe(projectId);
+
+      const followUp = orch.createFollowUpTask(task.id, '继续完善项目任务');
+      expect(followUp.projectId).toBe(projectId);
+      expect(followUp.parentId).toBe(task.id);
+    });
+
+    it('拒绝关联不存在或已归档的项目', () => {
+      const agentId = seedAgent(db);
+      const archivedId = seedProject(db, { status: 'archived' });
+      expect(() => orch.createTask(agentId, '无效项目任务', 'desktop', { projectId: 'missing' })).toThrow('项目不存在或已归档');
+      expect(() => orch.createTask(agentId, '归档项目任务', 'desktop', { projectId: archivedId })).toThrow('项目不存在或已归档');
     });
 
     it('并发限制超出 → QUEUED', () => {

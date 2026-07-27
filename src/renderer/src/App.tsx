@@ -1,8 +1,11 @@
-/** 应用骨架：侧边导航（分组）+ 顶栏 + 页面路由 + FAB + 全局Toast */
-import { useEffect } from 'react';
+/** 应用骨架：侧边导航（分组）+ 顶栏 + 页面路由 + FAB + 全局Toast + 全局搜索 */
+import { useEffect, useState } from 'react';
 import { useApp, type RouteKey } from './store';
 import { Dashboard } from './pages/Dashboard';
 import { Office } from './pages/Office';
+import { Inbox } from './pages/Inbox';
+import { Projects } from './pages/Projects';
+import { Deliverables } from './pages/Deliverables';
 import { Agents } from './pages/Agents';
 import { Schedules } from './pages/Schedules';
 import { Tasks } from './pages/Tasks';
@@ -21,17 +24,21 @@ import { System } from './pages/System';
 import { Settings } from './pages/Settings';
 import { CreateAgentWizard } from './wizard/CreateAgentWizard';
 import { ToastContainer } from './components/Toast';
+import { GlobalSearch } from './components/GlobalSearch';
 import { todayText } from './components/common';
 import {
-  IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconMonitor, IconMoon, IconPlug, IconPlus,
-  IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser
+  IconAlert, IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconLayers, IconMonitor, IconMoon, IconPlug, IconPlus,
+  IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser, IconFolder
 } from './components/icons';
 
 const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: React.ReactNode }[] }[] = [
   { group: '工作', items: [
     { key: 'dashboard', label: 'AI Box 工作台', icon: <IconHome size={17} /> },
+    { key: 'inbox', label: '待我处理', icon: <IconAlert size={17} /> },
+    { key: 'projects', label: '项目中心', icon: <IconFolder size={17} /> },
     { key: 'office', label: '办公室', icon: <IconCoffee size={17} /> },
     { key: 'tasks', label: '任务中心', icon: <IconTask size={17} /> },
+    { key: 'deliverables', label: '成果库', icon: <IconLayers size={17} /> },
     { key: 'schedules', label: '定时任务', icon: <IconClock size={17} /> },
   ]},
   { group: '协作', items: [
@@ -63,24 +70,35 @@ const KEEP_ALIVE: RouteKey[] = ['chat', 'tasks', 'teams'];
 
 export function App() {
   const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, appVersion, init } = useApp();
+  const [searchOpen, setSearchOpen] = useState(false);
 
   useEffect(() => {
     void init();
-    // F11 全屏切换
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'F11') { e.preventDefault(); void window.aibox.toggleFullscreen(); } };
+    // F11 全屏切换；Ctrl/Cmd+K 全局搜索
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'F11') { e.preventDefault(); void window.aibox.toggleFullscreen(); }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); setSearchOpen((v) => !v); }
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [init]);
 
   const todos = snapshot?.stats.pendingTodos ?? 0;
+  // 收件箱待办数：待审批 + 失败任务
+  const inboxCount = snapshot
+    ? snapshot.approvals.filter((a) => a.status === 'pending').length + snapshot.tasks.filter((t) => t.status === 'FAILED').length
+    : 0;
 
   /** 页面渲染器：保活页面用 display 切换，其余条件渲染 */
   const renderPage = (key: RouteKey) => {
     switch (key) {
       case 'dashboard': return <Dashboard />;
+      case 'inbox': return <Inbox />;
+      case 'projects': return <Projects />;
       case 'office': return <Office />;
       case 'agents': return <Agents />;
       case 'tasks': return <Tasks />;
+      case 'deliverables': return <Deliverables />;
       case 'schedules': return <Schedules />;
       case 'workflows': return <Workflows />;
       case 'console': return <Console />;
@@ -116,6 +134,7 @@ export function App() {
                 <button key={n.key} className={`nav-item ${route === n.key ? 'active' : ''}`} onClick={() => setRoute(n.key)}>
                   {n.icon}{n.label}
                   {n.key === 'tasks' && todos > 0 && <span className="badge">{todos}</span>}
+                  {n.key === 'inbox' && inboxCount > 0 && <span className="badge">{inboxCount}</span>}
                 </button>
               ))}
             </div>
@@ -134,6 +153,9 @@ export function App() {
           <span className="status-pill"><span className={`dot ${online ? 'green' : 'red'}`} />{online ? '在线' : '离线'}</span>
           <span className="status-pill">{deviceName}</span>
           <div className="topbar-right">
+            <button className="icon-btn" onClick={() => setSearchOpen(true)} aria-label="搜索" title="搜索 (Ctrl+K)">
+              🔍
+            </button>
             <span>{todayText()}</span>
             <button className="icon-btn" onClick={() => void window.aibox.toggleFullscreen()} aria-label="全屏" title="全屏 (F11)">
               ⛶
@@ -164,6 +186,7 @@ export function App() {
       </button>
 
       {wizardOpen && <CreateAgentWizard onClose={() => setWizardOpen(false)} />}
+      <GlobalSearch open={searchOpen} onClose={() => setSearchOpen(false)} />
       <ToastContainer />
     </div>
   );

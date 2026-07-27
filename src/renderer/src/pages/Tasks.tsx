@@ -17,16 +17,26 @@ export function Tasks() {
   const [ctx, setCtx] = useState<CtxState | null>(null);
   const [followUpTask, setFollowUpTask] = useState<Task | null>(null);
   const [followUpText, setFollowUpText] = useState('');
+  const [projectFilter, setProjectFilter] = useState('all');
   if (!snapshot) return null;
 
   const { tasks, approvals, agentCards } = snapshot;
+  const projects = snapshot.projects ?? [];
   const agentName = new Map(agentCards.map((c) => [c.agent.id, c.agent.name]));
+  const projectName = new Map(projects.map((project) => [project.id, project.name]));
+  const matchesProject = (task: Task) => projectFilter === 'all'
+    || (projectFilter === 'unassigned' ? !task.projectId : task.projectId === projectFilter);
 
   const active = tasks.filter((t) => ['RUNNING', 'QUEUED', 'PAUSED'].includes(t.status));
   const waiting = tasks.filter((t) => t.status === 'WAITING_APPROVAL');
   const done = tasks.filter((t) => ['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(t.status));
 
-  const list: Task[] = tab === 'active' ? active : tab === 'approval' ? waiting : done;
+  const baseList: Task[] = tab === 'active' ? active : tab === 'approval' ? waiting : done;
+  const list = baseList.filter(matchesProject);
+  const visibleApprovals = approvals.filter((approval) => {
+    const task = tasks.find((item) => item.id === approval.taskId);
+    return task ? matchesProject(task) : projectFilter === 'all';
+  });
 
   /** 右键菜单：根据任务状态动态生成菜单项 */
   const ctxItems = (t: Task): CtxMenuItem[] => {
@@ -51,6 +61,11 @@ export function Tasks() {
         <h2>任务中心</h2>
         <span className="desc">执行中 {active.length} · 待审批 {approvals.length + waiting.length} · 已结束 {done.length}</span>
         <div className="right">
+          <select className="project-scope-select" value={projectFilter} onChange={(e) => setProjectFilter(e.target.value)} aria-label="按项目筛选任务" style={{ minWidth: 150 }}>
+            <option value="all">全部项目</option>
+            <option value="unassigned">未归项目</option>
+            {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+          </select>
           {(['active', 'approval', 'done'] as TabKey[]).map((k) => (
             <button key={k} className={`chip ${tab === k ? 'on' : ''}`} onClick={() => setTab(k)}>
               {k === 'active' ? '执行中 / 排队' : k === 'approval' ? '待审批' : '历史任务'}
@@ -63,8 +78,8 @@ export function Tasks() {
       {tab === 'approval' && (
         <div className="card" style={{ marginBottom: 16 }}>
           <div className="card-title">审批请求<span className="sub">高风险操作必须显示命令、路径和预期影响（15.1）</span></div>
-          {approvals.length === 0 && <div className="empty">暂无待审批事项</div>}
-          {approvals.map((a) => (
+          {visibleApprovals.length === 0 && <div className="empty">暂无待审批事项</div>}
+          {visibleApprovals.map((a) => (
             <div className="todo-item" key={a.id}>
               <span className={`dot ${a.risk === 'high' ? 'red' : a.risk === 'medium' ? 'orange' : 'green'}`} />
               <div style={{ flex: 1 }}>
@@ -88,12 +103,12 @@ export function Tasks() {
         <table className="table">
           <thead>
             <tr>
-              <th>任务</th><th>数字员工</th><th>来源</th><th>状态</th><th style={{ width: 180 }}>进度</th><th>开始时间</th><th style={{ width: 150 }}>操作</th>
+              <th>任务</th><th>项目</th><th>数字员工</th><th>来源</th><th>状态</th><th style={{ width: 160 }}>进度</th><th>开始时间</th><th style={{ width: 130 }}>操作</th>
             </tr>
           </thead>
           <tbody>
             {list.length === 0 && (
-              <tr><td colSpan={7}><div className="empty">暂无任务</div></td></tr>
+              <tr><td colSpan={8}><div className="empty">暂无任务</div></td></tr>
             )}
             {list.map((t) => {
               const meta = TASK_STATUS_META[t.status];
@@ -101,6 +116,7 @@ export function Tasks() {
                 <tr key={t.id} style={{ cursor: 'pointer' }} onClick={() => setDetailId(t.id)}
                   onContextMenu={(e) => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY, task: t }); }}>
                   <td style={{ fontWeight: 550 }}>{t.title}</td>
+                  <td>{t.projectId ? <span className="tag blue">{projectName.get(t.projectId) ?? '已归档项目'}</span> : <span style={{ color: 'var(--text-3)' }}>未归项目</span>}</td>
                   <td>{agentName.get(t.agentId) ?? '—'}</td>
                   <td><span className="tag gray">{sourceLabel(t.source)}</span></td>
                   <td><span className={`tag ${meta.tag}`}>{meta.label}</span></td>
@@ -136,7 +152,7 @@ export function Tasks() {
       {detailId && (() => {
         const task = tasks.find((t) => t.id === detailId);
         return task ? (
-          <TaskDetailModal task={task} tasks={tasks} agentName={agentName.get(task.agentId) ?? '—'}
+          <TaskDetailModal task={task} tasks={tasks} agentName={agentName.get(task.agentId) ?? '—'} projectName={task.projectId ? projectName.get(task.projectId) ?? '已归档项目' : '未归项目'}
             onOpen={setDetailId} onClose={() => setDetailId(null)} />
         ) : null;
       })()}
@@ -188,8 +204,8 @@ function eventDetail(e: TaskEvent): string {
 }
 
 /** 任务详情：事件时间线 + 实时输出 + 产物全文 + 父/子任务跳转 + 追问续跑（执行中每 2s 轮询，13.2 可追溯） */
-function TaskDetailModal({ task, tasks, agentName, onOpen, onClose }: {
-  task: Task; tasks: Task[]; agentName: string; onOpen: (id: string) => void; onClose: () => void;
+function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose }: {
+  task: Task; tasks: Task[]; agentName: string; projectName: string; onOpen: (id: string) => void; onClose: () => void;
 }) {
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [result, setResult] = useState<string | null>(null);
@@ -248,6 +264,7 @@ function TaskDetailModal({ task, tasks, agentName, onOpen, onClose }: {
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 14, flexWrap: 'wrap' }}>
         <span className={`tag ${meta.tag}`}>{meta.label}</span>
         <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{agentName} · {task.stage} · {task.progress}%</span>
+        <span className="tag gray">{projectName}</span>
         {task.parentId && <span className="tag gray">续跑/子任务</span>}
         {task.sessionId && <span className="tag blue" title={task.sessionId}>会话已保留</span>}
         {task.error && <span style={{ fontSize: 12, color: 'var(--danger)' }}>{task.error}</span>}

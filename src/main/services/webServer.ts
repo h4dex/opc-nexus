@@ -11,7 +11,7 @@
 import express from 'express';
 import cors from 'cors';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
 import type { EngineManager } from './engineManager.js';
@@ -22,6 +22,7 @@ import type { SkillManager } from './skillManager.js';
 import type { TeamEngine } from './teamEngine.js';
 import { getProviderConfig, saveProviderConfig } from './provider.js';
 import { loadConfig, saveConfig } from './config.js';
+import { notify } from './notifier.js';
 
 export interface WebServerDeps {
   db: Database;
@@ -35,7 +36,8 @@ export interface WebServerDeps {
 }
 
 const DEFAULT_PORT = 28889;
-const DEFAULT_TOKEN = 'aibox-admin';
+/** 历史默认弱口令：仅用于检测用户是否仍在使用它，不再作为新生成 Token 的来源 */
+const LEGACY_DEFAULT_TOKEN = 'aibox-admin';
 /** 会话 Token 过期时间（默认 24 小时） */
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** 通用接口频率限制：单 IP 每分钟最多请求数 */
@@ -61,7 +63,32 @@ export class WebServer {
   }
 
   get token(): string {
-    return this.deps.db.getSetting<string>('webToken', DEFAULT_TOKEN);
+    // ensureToken() 在 start() 时已保证存在强随机 Token；此处保留弱回退仅为防御性（正常不会命中）
+    return this.deps.db.getSetting<string>('webToken', '') || LEGACY_DEFAULT_TOKEN;
+  }
+
+  /** 确保存在强随机 Token：首次启动自动生成并持久化；若仍为历史弱口令则告警 */
+  ensureToken(): void {
+    const existing = this.deps.db.getSetting<string>('webToken', '');
+    if (!existing) {
+      const generated = randomBytes(16).toString('hex');
+      this.deps.db.setSetting('webToken', generated);
+      this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.auto_token', target: 'webToken', result: 'ok' });
+      console.log('[WebServer] 已自动生成强随机访问 Token（设置页可查看/重新生成）');
+    } else if (existing === LEGACY_DEFAULT_TOKEN) {
+      this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.weak_token', target: 'webToken', result: 'warn' });
+      console.warn('[WebServer] ⚠️ 检测到仍在使用默认弱口令「aibox-admin」，局域网内任何人可访问！请尽快在设置页重新生成 Token。');
+      notify(this.deps.db, '安全提醒', 'Web 管理面板仍在使用默认弱口令，请尽快在设置页重新生成访问 Token');
+    }
+  }
+
+  /** 重新生成访问 Token（设置页调用）：同时失效所有旧会话 */
+  regenerateToken(): string {
+    const generated = randomBytes(16).toString('hex');
+    this.deps.db.setSetting('webToken', generated);
+    this.sessions.clear();
+    this.deps.db.audit({ id: randomUUID(), actor: 'admin', action: 'webserver.regenerate_token', target: 'webToken', result: 'ok' });
+    return generated;
   }
 
   /** 频率限制检查（滑动窗口简化为固定窗口） */
@@ -87,6 +114,7 @@ export class WebServer {
 
   start() {
     const { db, orchestrator, engines, channels, providers, mcp, skills, teams } = this.deps;
+    this.ensureToken();
     const app = express();
     this.app = app;
     this.startCleanup();

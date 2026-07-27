@@ -43,6 +43,7 @@ export function Settings() {
         <ProviderCard />
         <RegistryCard />
         <BridgeCard />
+        <WebServerCard />
 
         <div className="card">
           <div className="card-title">外观</div>
@@ -353,6 +354,56 @@ function BridgeCard() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/** 局域网 Web 管理面板卡片：访问 Token 管理（安全加固） */
+function WebServerCard() {
+  const [token, setToken] = useState('');
+  const [port, setPort] = useState(28889);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    void window.aibox.getSetting('webToken').then((v) => setToken(typeof v === 'string' ? v : ''));
+    void window.aibox.getSetting('webPort').then((v) => setPort(typeof v === 'number' ? v : 28889));
+  }, []);
+
+  const isWeak = token === 'aibox-admin';
+
+  const regen = async () => {
+    const r = await window.aibox.regenerateWebToken();
+    setToken(r.token);
+    toast.ok('已重新生成访问 Token，旧会话已失效');
+  };
+
+  const copy = () => {
+    if (!token) return;
+    void navigator.clipboard.writeText(token);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">局域网 Web 管理面板<span className="sub">工控机无人值守远程管理 · 监听 0.0.0.0:{port}</span></div>
+      {isWeak && (
+        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--danger-soft, rgba(248,113,113,.1))', color: 'var(--danger)', fontSize: 12.5 }}>
+          ⚠️ 当前仍在使用默认弱口令「aibox-admin」，局域网内任何人可完全控制本系统！请立即重新生成。
+        </div>
+      )}
+      <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)', marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>访问 Token（Bearer）</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{token ? `${token.slice(0, 12)}••••••••` : '（未生成）'}</code>
+          <button className="btn small" onClick={copy} disabled={!token}>{copied ? '✓ 已复制' : '复制'}</button>
+          <button className="btn small primary" onClick={() => void regen()}>重新生成</button>
+        </div>
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
+        <b>访问地址：</b><code style={{ fontSize: 11.5 }}>http://&lt;本机局域网IP&gt;:{port}</code>，请求头携带 <code style={{ fontSize: 11.5 }}>Authorization: Bearer &lt;Token&gt;</code>。<br />
+        首次启动已自动生成强随机 Token；重新生成会使所有已登录会话失效。
+      </div>
     </div>
   );
 }

@@ -14,12 +14,25 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 18;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  objective TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  client_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  color TEXT NOT NULL DEFAULT '#4d6bfe',
+  due_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -58,6 +71,7 @@ CREATE TABLE IF NOT EXISTS engines (
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id),
+  project_id TEXT REFERENCES projects(id),
   title TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'desktop',
   parent_id TEXT,
@@ -259,6 +273,7 @@ CREATE TABLE IF NOT EXISTS teams (
 CREATE TABLE IF NOT EXISTS team_runs (
   id TEXT PRIMARY KEY,
   team_id TEXT NOT NULL REFERENCES teams(id),
+  project_id TEXT REFERENCES projects(id),
   task_text TEXT NOT NULL,
   phase TEXT NOT NULL DEFAULT 'decompose',
   current_step INTEGER NOT NULL DEFAULT 0,
@@ -396,10 +411,10 @@ export class Database {
 
   private migrate() {
     // 13.1：migration 在事务中执行，失败回滚；按版本号增量迁移
-    const prev = Number(this.getMeta('schema_version') ?? '0');
     this.inner.exec('BEGIN');
     try {
       this.inner.exec(DDL);
+      const prev = Number(this.getMeta('schema_version') ?? '0');
       // 辅助：安全添加列（已存在则跳过，避免 DDL 与 ALTER 冲突）
       const addCol = (table: string, col: string, type: string) => {
         const cols = this.inner.exec(`PRAGMA table_info(${table})`);
@@ -569,6 +584,16 @@ export class Database {
       if (prev < 16) {
         // v16：专家团执行时间线（事件流持久化，供可视化）
         addCol('team_runs', 'events_json', "TEXT NOT NULL DEFAULT '[]'");
+      }
+      if (prev < 17) {
+        // v17：任务产出质量标记（成果管理：采纳/驳回/返工）
+        addCol('tasks', 'quality', 'TEXT');
+      }
+      if (prev < 18) {
+        // v18：项目经营层，任务与专家团运行可选归属项目
+        addCol('tasks', 'project_id', 'TEXT REFERENCES projects(id)');
+        addCol('team_runs', 'project_id', 'TEXT REFERENCES projects(id)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at)');
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

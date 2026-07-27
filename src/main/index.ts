@@ -2,7 +2,7 @@
  * Electron 主进程入口
  * 跨平台：Windows 10/11 + Ubuntu 22.04+（PRD 4.1 首发 Windows，Linux 同架构兼容）
  */
-import { app, BrowserWindow, Menu, nativeImage, shell, Tray } from 'electron';
+import { app, BrowserWindow, Menu, nativeImage, screen, shell, Tray } from 'electron';
 import { join } from 'node:path';
 import { Database } from './services/database.js';
 import { Orchestrator } from './services/orchestrator.js';
@@ -24,6 +24,7 @@ import { ProviderManager } from './services/providerManager.js';
 import { WorkflowEngine } from './services/workflowEngine.js';
 import { WfPlatformManager } from './services/wfPlatformManager.js';
 import { TeamEngine } from './services/teamEngine.js';
+import { ProjectManager } from './services/projectManager.js';
 import { CollabManager } from './services/collabManager.js';
 import { WebServer } from './services/webServer.js';
 import { ApiBridge } from './services/apiBridge.js';
@@ -53,12 +54,22 @@ const isDev = !!process.env.ELECTRON_RENDERER_URL;
 function createWindow() {
   // 窗口状态记忆：从 settings 恢复上次位置/大小/全屏
   const saved = dbRef?.getSetting<{ x?: number; y?: number; width?: number; height?: number; fullscreen?: boolean } | null>('windowState', null) ?? null;
+  const display = saved?.x !== undefined && saved?.y !== undefined
+    ? screen.getDisplayMatching({ x: saved.x, y: saved.y, width: saved.width ?? 1440, height: saved.height ?? 900 })
+    : screen.getPrimaryDisplay();
+  const work = display.workArea;
+  const minWidth = Math.min(900, work.width);
+  const minHeight = Math.min(600, work.height);
+  const width = Math.min(Math.max(saved?.width ?? 1440, minWidth), work.width);
+  const height = Math.min(Math.max(saved?.height ?? 900, minHeight), work.height);
+  const x = saved?.x === undefined ? undefined : Math.min(Math.max(saved.x, work.x), work.x + work.width - width);
+  const y = saved?.y === undefined ? undefined : Math.min(Math.max(saved.y, work.y), work.y + work.height - height);
   mainWindow = new BrowserWindow({
-    width: saved?.width ?? 1440,
-    height: saved?.height ?? 900,
-    ...(saved?.x !== undefined && saved?.y !== undefined ? { x: saved.x, y: saved.y } : {}),
-    minWidth: 1180,   // 6.1：最小窗口 1180×720
-    minHeight: 720,
+    width,
+    height,
+    ...(x !== undefined && y !== undefined ? { x, y } : {}),
+    minWidth,
+    minHeight,
     title: '数字员工 AI Box',
     backgroundColor: '#0f1218',
     ...((): { icon?: string } => {
@@ -145,6 +156,7 @@ app.whenReady().then(async () => {
   const skillManager = new SkillManager(db);
   const wfPlatformMgr = new WfPlatformManager(db);
   const workflowEngine = new WorkflowEngine(db, providerManager, wfPlatformMgr);
+  const projectManager = new ProjectManager(db);
   const teamEngine = new TeamEngine(db, orchestrator);
   const collabManager = new CollabManager(db);
   const feishu = new FeishuChannel(db, orchestrator);
@@ -173,7 +185,7 @@ app.whenReady().then(async () => {
   channels.ensureChannels();
   // 先执行崩溃恢复（清理上次异常遗留），再写入种子数据（首次启动），避免种子任务被误标 INTERRUPTED
   orchestrator.recoverAfterRestart();
-  teamEngine.recoverRuns();
+  // 注：团队流水线的中断续跑（recoverOrResume）延迟到引擎就绪后执行，见下方 engines.detect 回调
   seedIfEmpty(db);
   seedMcpServers(db);
   seedSkills(db);
@@ -182,8 +194,11 @@ app.whenReady().then(async () => {
   // 数据保留策略：启动 + 每 24h 清理（任务 90 天 / 资源 7 天 / 审计 1 年）
   db.cleanupRetention();
   setInterval(() => db.cleanupRetention(), 24 * 3_600_000);
-  // 启动时真实检测本机 CLI（where/which + --version）与供应商配置，完成后再接管/调度任务
-  void engines.detect().then(() => orchestrator.startScheduler());
+  // 启动时真实检测本机 CLI（where/which + --version）与供应商配置，完成后再接管/调度任务，并续跑中断的团队流水线
+  void engines.detect().then(() => {
+    orchestrator.startScheduler();
+    teamEngine.recoverOrResume(); // 引擎就绪后续跑中断的专家团流水线（可恢复状态机）
+  });
   monitor.start(4000);
   scheduler.start();
   // 真实渠道凭据已配置且非停用 → 启动时自动重连（飞书 / 企微长连接 / 个微桥接）
@@ -200,10 +215,11 @@ app.whenReady().then(async () => {
   const apiBridge = new ApiBridge(db, providerManager);
   if (db.getSetting<string>('bridge_enabled', 'false') === 'true') apiBridge.start();
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, apiBridge, getMainWindow: () => mainWindow });
-
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
+
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, apiBridge, webServer, getMainWindow: () => mainWindow });
+
   webServer.start();
 
   createWindow();

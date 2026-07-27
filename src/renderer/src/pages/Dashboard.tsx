@@ -268,14 +268,16 @@ function SystemUptime() {
 
 /** 员工详情弹窗：状态详情 + 快捷操作（6.4 / 7.4） */
 function AgentDetailModal({ card, onClose }: { card: AgentCardView; onClose: () => void }) {
+  const { snapshot } = useApp();
   const [taskTitle, setTaskTitle] = useState('');
+  const [projectId, setProjectId] = useState('');
   const [editorOpen, setEditorOpen] = useState(false);
   const meta = STATUS_META[card.derivedStatus];
   const { agent } = card;
 
   const dispatchTask = async () => {
     const title = taskTitle.trim() || '手动派发任务';
-    await window.aibox.createTask(agent.id, title);
+    await window.aibox.createTask(agent.id, title, projectId || undefined);
     setTaskTitle('');
     onClose();
   };
@@ -328,6 +330,10 @@ function AgentDetailModal({ card, onClose }: { card: AgentCardView; onClose: () 
       <div className="field" style={{ marginTop: 16 }}>
         <label>快速派发任务</label>
         <div style={{ display: 'flex', gap: 8 }}>
+          <select value={projectId} onChange={(e) => setProjectId(e.target.value)} aria-label="任务归属项目" style={{ minWidth: 150 }}>
+            <option value="">未归项目</option>
+            {(snapshot?.projects ?? []).filter((project) => !['completed', 'archived'].includes(project.status)).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+          </select>
           <input
             placeholder="输入任务描述，例如：整理本周发票并生成汇总"
             value={taskTitle}
