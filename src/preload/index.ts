@@ -7,7 +7,7 @@ import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
-  Project, ProjectDeliverablePackage, ProjectInput, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
+  Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
   TeamRun
@@ -45,6 +45,7 @@ const api = {
   createProject: (input: ProjectInput): Promise<Project> => ipcRenderer.invoke('aibox:createProject', input),
   updateProject: (id: string, patch: ProjectPatch): Promise<Project | null> => ipcRenderer.invoke('aibox:updateProject', id, patch),
   archiveProject: (id: string): Promise<Project | null> => ipcRenderer.invoke('aibox:archiveProject', id),
+  getProjectOperations: (): Promise<ProjectOperationsOverview> => ipcRenderer.invoke('aibox:getProjectOperations'),
 
   // 成果验收
   listDeliverables: (): Promise<DeliverableSummary[]> => ipcRenderer.invoke('aibox:listDeliverables'),

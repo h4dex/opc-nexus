@@ -1,6 +1,6 @@
 /**
  * 首次启动种子数据：与产品基准 UI 一致的演示环境
- * （12 数字员工 = 8 执行中 + 4 空闲/待命；今日完成 23 项；待办 8 项）
+ * （3 个项目；12 数字员工 = 8 执行中 + 4 空闲/待命；今日完成 23 项；待办 8 项）
  * + 常用 MCP 服务器预置 + 常用技能预置
  */
 import { randomUUID } from 'node:crypto';
@@ -218,6 +218,27 @@ const TODO_APPROVALS = [
   { title: '客户拜访纪要归档：网络访问 CRM 接口域名首授权', agent: '销售外勤助手', risk: 'low' }
 ];
 
+const DEMO_PROJECTS = [
+  {
+    id: 'project-demo-operations', name: '经营自动化一期', objective: '打通财务、生产、采购与经营数据的例行自动化',
+    description: '优先覆盖高频、可量化、可复用的经营流程。', clientName: '内部运营', status: 'active', color: '#4d6bfe', dueDays: 14
+  },
+  {
+    id: 'project-demo-quality', name: '交付质量提升', objective: '建立测试、文档、品质与运维的交付检查闭环',
+    description: '统一质量记录、异常跟进和验收标准。', clientName: '交付中心', status: 'active', color: '#22c1a3', dueDays: 5
+  },
+  {
+    id: 'project-demo-customer', name: '客户协同标准化', objective: '沉淀招聘、销售、合同与会议协同标准流程',
+    description: '形成可复用的客户与组织协同模板。', clientName: '业务团队', status: 'completed', color: '#f59e0b', dueDays: -2
+  }
+] as const;
+
+function demoProjectForAgent(agentName: string): string {
+  if (['ERP/CRM助手', 'MES助手', '采购比价助手', '数据分析助手'].includes(agentName)) return 'project-demo-operations';
+  if (['测试验证助手', '文档助手', '品质管理助手', 'IT运维助手'].includes(agentName)) return 'project-demo-quality';
+  return 'project-demo-customer';
+}
+
 function demoTaskResult(agentName: string, sequence: number): string {
   const focus: Record<string, string> = {
     'ERP/CRM助手': '完成应收应付核对，未发现阻断项，已整理异常单据清单。',
@@ -244,13 +265,22 @@ export function seedIfEmpty(db: Database) {
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
 
   db.transaction(() => {
+    const insertProject = db.raw.prepare(
+      'INSERT INTO projects(id, name, objective, description, client_name, status, color, due_at, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
+    );
+    for (const project of DEMO_PROJECTS) {
+      insertProject.run(
+        project.id, project.name, project.objective, project.description, project.clientName, project.status, project.color,
+        now + project.dueDays * 86_400_000, now - 7 * 86_400_000, now
+      );
+    }
     const insertAgent = db.raw.prepare(
       `INSERT INTO agents(id, name, role, system_prompt, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at)
        VALUES(?, ?, ?, ?, 'READY', 'eng-hermes', ?, 'standard', 1, 0, ?, ?, ?)`
     );
     const insertTask = db.raw.prepare(
-      `INSERT INTO tasks(id, agent_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result)
-       VALUES(?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?, ?)`
+      `INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result)
+       VALUES(?, ?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?, ?)`
     );
     const insertRun = db.raw.prepare(
       `INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
@@ -271,7 +301,7 @@ export function seedIfEmpty(db: Database) {
       );
       if (a.task) {
         const tid = randomUUID();
-        insertTask.run(tid, id, a.task.title, 'RUNNING', a.task.progress, '执行中', now - 3600_000, now - 3600_000, null, null);
+        insertTask.run(tid, id, demoProjectForAgent(a.name), a.task.title, 'RUNNING', a.task.progress, '执行中', now - 3600_000, now - 3600_000, null, null);
         insertRun.run(randomUUID(), id, tid, process.pid, randomUUID(), 'RUNNING', now - 3600_000, null);
       }
     }
@@ -282,7 +312,7 @@ export function seedIfEmpty(db: Database) {
       const agentId = agentIds.get(names[i % names.length])!;
       const ended = todayStart.getTime() + 3600_000 + i * 900_000;
       insertTask.run(
-        randomUUID(), agentId, `例行任务 #${i + 1}`, 'COMPLETED', 100, '完成',
+        randomUUID(), agentId, demoProjectForAgent(names[i % names.length]), `例行任务 #${i + 1}`, 'COMPLETED', 100, '完成',
         ended - 600_000, ended - 600_000, ended, demoTaskResult(names[i % names.length], i + 1)
       );
     }

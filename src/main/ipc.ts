@@ -142,6 +142,7 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return project;
   });
+  ipcMain.handle('aibox:getProjectOperations', () => projects.operations(deliverables.list()));
 
   // ---------- 成果验收 ----------
   ipcMain.handle('aibox:listDeliverables', () => deliverables.list());

@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 20;
+const SCHEMA_VERSION = 21;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -667,6 +667,46 @@ export class Database {
                 '采购比价助手', 'IT运维助手', '销售外勤助手', '合同审核助手', '数据分析助手', '会议纪要助手'
               )
             )
+        `);
+      }
+      if (prev < 21) {
+        // v21：仅为空的默认演示环境补充项目组合，并建立演示任务归属。
+        this.inner.exec(`
+          INSERT INTO projects(id, name, objective, description, client_name, status, color, due_at, created_at, updated_at)
+          SELECT id, name, objective, description, client_name, status, color, due_at, created_at, updated_at
+          FROM (
+            SELECT 'project-demo-operations' AS id, '经营自动化一期' AS name,
+              '打通财务、生产、采购与经营数据的例行自动化' AS objective, '优先覆盖高频、可量化、可复用的经营流程。' AS description,
+              '内部运营' AS client_name, 'active' AS status, '#4d6bfe' AS color,
+              (strftime('%s','now') * 1000 + 1209600000) AS due_at, (strftime('%s','now') * 1000 - 604800000) AS created_at, (strftime('%s','now') * 1000) AS updated_at
+            UNION ALL
+            SELECT 'project-demo-quality', '交付质量提升', '建立测试、文档、品质与运维的交付检查闭环', '统一质量记录、异常跟进和验收标准。',
+              '交付中心', 'active', '#22c1a3', (strftime('%s','now') * 1000 + 432000000), (strftime('%s','now') * 1000 - 604800000), (strftime('%s','now') * 1000)
+            UNION ALL
+            SELECT 'project-demo-customer', '客户协同标准化', '沉淀招聘、销售、合同与会议协同标准流程', '形成可复用的客户与组织协同模板。',
+              '业务团队', 'completed', '#f59e0b', (strftime('%s','now') * 1000 - 172800000), (strftime('%s','now') * 1000 - 604800000), (strftime('%s','now') * 1000)
+          ) AS demo_projects
+          WHERE NOT EXISTS (SELECT 1 FROM projects)
+            AND EXISTS (SELECT 1 FROM agents WHERE name = 'ERP/CRM助手')
+            AND EXISTS (SELECT 1 FROM agents WHERE name = '会议纪要助手');
+
+          UPDATE tasks
+          SET project_id = CASE
+            WHEN agent_id IN (SELECT id FROM agents WHERE name IN ('ERP/CRM助手', 'MES助手', '采购比价助手', '数据分析助手')) THEN 'project-demo-operations'
+            WHEN agent_id IN (SELECT id FROM agents WHERE name IN ('测试验证助手', '文档助手', '品质管理助手', 'IT运维助手')) THEN 'project-demo-quality'
+            ELSE 'project-demo-customer'
+          END
+          WHERE project_id IS NULL
+            AND source = 'desktop'
+            AND (
+              title GLOB '例行任务 #[0-9]*' OR title IN (
+                '财务红冲发票提醒', '生产流程看板', '文档整理与归档', '企业内部线上学习平台',
+                '品质记录本替代A4表单', '供应商季度比价分析', '服务器例行巡检', '客户拜访纪要归档'
+              )
+            )
+            AND EXISTS (SELECT 1 FROM projects WHERE id = 'project-demo-operations')
+            AND EXISTS (SELECT 1 FROM projects WHERE id = 'project-demo-quality')
+            AND EXISTS (SELECT 1 FROM projects WHERE id = 'project-demo-customer');
         `);
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));

@@ -95,6 +95,74 @@ export interface ProjectInput {
 
 export type ProjectPatch = Partial<Omit<ProjectInput, 'status'>> & { status?: ProjectStatus };
 
+export type ProjectHealth = 'on_track' | 'attention' | 'at_risk' | 'completed' | 'inactive';
+export type ProjectRiskKind =
+  | 'overdue' | 'due_soon' | 'empty_plan' | 'paused_project'
+  | 'failed_task' | 'waiting_approval' | 'paused_task'
+  | 'rejected_deliverable' | 'rework_deliverable' | 'pending_acceptance';
+
+export interface ProjectRiskItem {
+  id: string;
+  projectId: string;
+  projectName: string;
+  kind: ProjectRiskKind;
+  severity: 'high' | 'medium' | 'low';
+  title: string;
+  detail: string;
+  count: number;
+}
+
+export interface ProjectOperationsOwner {
+  agentId: string;
+  name: string;
+  role: string;
+  totalTasks: number;
+  completedTasks: number;
+  activeTasks: number;
+  failedTasks: number;
+}
+
+export interface ProjectOperationsItem {
+  project: Project;
+  health: ProjectHealth;
+  progress: number;
+  acceptanceRate: number;
+  recentActivityAt: number;
+  tasks: {
+    total: number;
+    completed: number;
+    active: number;
+    failed: number;
+    waitingApproval: number;
+    paused: number;
+  };
+  deliverables: {
+    total: number;
+    accepted: number;
+    rejected: number;
+    rework: number;
+    unmarked: number;
+  };
+  owners: ProjectOperationsOwner[];
+  risks: ProjectRiskItem[];
+}
+
+export interface ProjectOperationsOverview {
+  generatedAt: number;
+  summary: {
+    totalProjects: number;
+    openProjects: number;
+    atRiskProjects: number;
+    overdueProjects: number;
+    taskCompletionRate: number;
+    acceptedDeliverables: number;
+    pendingAcceptance: number;
+  };
+  statusDistribution: Record<ProjectStatus, number>;
+  projects: ProjectOperationsItem[];
+  risks: ProjectRiskItem[];
+}
+
 export interface Agent {
   id: string;
   name: string;

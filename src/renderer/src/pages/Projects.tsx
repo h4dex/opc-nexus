@@ -1,12 +1,16 @@
 /** 项目中心：以经营目标组织任务、员工与成果。 */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useApp } from '../store';
 import { Modal, ProgressBar, TASK_STATUS_META } from '../components/common';
-import { IconClock, IconFolder, IconPlay, IconPlus } from '../components/icons';
+import { IconAlert, IconCheck, IconClock, IconFolder, IconLayers, IconPlay, IconPlus, IconTask, IconUser } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { Project, ProjectInput, ProjectStatus, Task } from '@shared/types';
+import type {
+  Project, ProjectHealth, ProjectInput, ProjectOperationsItem, ProjectOperationsOverview,
+  ProjectStatus, Task
+} from '@shared/types';
 
 type ProjectFilter = 'open' | 'completed' | 'archived' | 'all';
+type ProjectView = 'operations' | 'list';
 
 const STATUS_META: Record<ProjectStatus, { label: string; tone: string }> = {
   planning: { label: '规划中', tone: 'gray' },
@@ -25,7 +29,9 @@ const FILTERS: { key: ProjectFilter; label: string }[] = [
 
 export function Projects() {
   const { snapshot } = useApp();
+  const [view, setView] = useState<ProjectView>('operations');
   const [filter, setFilter] = useState<ProjectFilter>('open');
+  const [operations, setOperations] = useState<ProjectOperationsOverview | null>(null);
   const [editing, setEditing] = useState<Project | 'new' | null>(null);
   const [viewing, setViewing] = useState<Project | null>(null);
   const [dispatching, setDispatching] = useState<Project | null>(null);
@@ -33,6 +39,17 @@ export function Projects() {
 
   const projects = snapshot?.projects ?? [];
   const tasks = snapshot?.tasks ?? [];
+  useEffect(() => {
+    let active = true;
+    void window.aibox.getProjectOperations()
+      .then((value) => { if (active) setOperations(value); })
+      .catch((error) => toast.err(error instanceof Error ? error.message : '项目经营数据加载失败'));
+    return () => { active = false; };
+  }, [snapshot?.version]);
+  const operationByProject = useMemo(
+    () => new Map(operations?.projects.map((item) => [item.project.id, item]) ?? []),
+    [operations]
+  );
   const visible = useMemo(() => projects.filter((project) => {
     if (filter === 'all') return true;
     if (filter === 'open') return ['planning', 'active', 'paused'].includes(project.status);
@@ -49,24 +66,36 @@ export function Projects() {
   };
 
   const statsFor = (project: Project) => {
+    const operation = operationByProject.get(project.id);
+    if (operation) return {
+      tasks: tasks.filter((task) => task.projectId === project.id), completed: operation.tasks.completed,
+      deliverables: operation.deliverables.total, active: operation.tasks.active, progress: operation.progress,
+      acceptanceRate: operation.acceptanceRate, health: operation.health
+    };
     const scoped = tasks.filter((task) => task.projectId === project.id);
     const completed = scoped.filter((task) => task.status === 'COMPLETED').length;
     const deliverables = scoped.filter((task) => task.status === 'COMPLETED' && task.result?.trim()).length;
     const active = scoped.filter((task) => ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'].includes(task.status)).length;
-    return { tasks: scoped, completed, deliverables, active, progress: scoped.length ? Math.round((completed / scoped.length) * 100) : 0 };
+    return { tasks: scoped, completed, deliverables, active, progress: scoped.length ? Math.round((completed / scoped.length) * 100) : 0, acceptanceRate: 0, health: 'on_track' as ProjectHealth };
   };
 
   return (
     <div className="projects-page">
       <div className="page-head">
         <h2>项目中心</h2>
-        <span className="desc">{counts.open} 个进行中 · {tasks.filter((t) => t.projectId).length} 项已归属任务</span>
+        <span className="desc">{view === 'operations' ? `${counts.open} 个进行中 · ${operations?.summary.atRiskProjects ?? 0} 个需关注` : `${tasks.filter((t) => t.projectId).length} 项已归属任务`}</span>
         <div className="right">
+          <div className="project-view-switch" aria-label="项目中心视图">
+            <button type="button" className={view === 'operations' ? 'active' : ''} onClick={() => setView('operations')}>经营看板</button>
+            <button type="button" className={view === 'list' ? 'active' : ''} onClick={() => setView('list')}>项目清单</button>
+          </div>
           <button className="btn small primary" type="button" onClick={() => setEditing('new')}><IconPlus size={13} />新建项目</button>
         </div>
       </div>
 
-      <div className="project-filterbar" aria-label="项目状态筛选">
+      {view === 'operations' && <ProjectOperationsDashboard value={operations} onOpen={setViewing} onCreate={() => setEditing('new')} />}
+
+      {view === 'list' && <><div className="project-filterbar" aria-label="项目状态筛选">
         {FILTERS.map((item) => (
           <button key={item.key} type="button" className={filter === item.key ? 'active' : ''} onClick={() => setFilter(item.key)}>
             {item.label}<span>{counts[item.key]}</span>
@@ -94,6 +123,7 @@ export function Projects() {
                     <div>
                       <strong>{project.name}</strong>
                       <span className={`tag ${status.tone}`}>{status.label}</span>
+                      <ProjectHealthBadge health={stats.health} />
                     </div>
                     <p>{project.objective || project.description || '尚未填写项目目标'}</p>
                     <div className="project-meta">
@@ -112,6 +142,7 @@ export function Projects() {
                   <span><strong>{stats.tasks.length}</strong>任务</span>
                   <span><strong>{stats.active}</strong>执行中</span>
                   <span><strong>{stats.deliverables}</strong>成果</span>
+                  <span><strong>{stats.acceptanceRate}%</strong>验收率</span>
                 </div>
 
                 <div className="project-actions">
@@ -130,11 +161,11 @@ export function Projects() {
             );
           })}
         </div>
-      )}
+      )}</>}
 
       {editing && <ProjectEditor project={editing === 'new' ? null : editing} onClose={() => setEditing(null)} />}
       {dispatching && <ProjectDispatch project={dispatching} onClose={() => setDispatching(null)} />}
-      {viewing && <ProjectDetail project={viewing} tasks={tasks.filter((task) => task.projectId === viewing.id)} onClose={() => setViewing(null)} onDispatch={() => { setViewing(null); setDispatching(viewing); }} />}
+      {viewing && <ProjectDetail project={viewing} operation={operationByProject.get(viewing.id) ?? null} tasks={tasks.filter((task) => task.projectId === viewing.id)} onClose={() => setViewing(null)} onDispatch={() => { setViewing(null); setDispatching(viewing); }} />}
       {archiving && (
         <Modal title="归档项目" onClose={() => setArchiving(null)} footer={(
           <>
@@ -149,6 +180,130 @@ export function Projects() {
       )}
     </div>
   );
+}
+
+const HEALTH_META: Record<ProjectHealth, { label: string; tone: string }> = {
+  on_track: { label: '正常推进', tone: 'on-track' },
+  attention: { label: '需要关注', tone: 'attention' },
+  at_risk: { label: '存在风险', tone: 'at-risk' },
+  completed: { label: '已闭环', tone: 'completed' },
+  inactive: { label: '已归档', tone: 'inactive' }
+};
+
+function ProjectHealthBadge({ health }: { health: ProjectHealth }) {
+  const meta = HEALTH_META[health];
+  return <span className="project-health" data-tone={meta.tone}>{meta.label}</span>;
+}
+
+function ProjectOperationsDashboard({ value, onOpen, onCreate }: {
+  value: ProjectOperationsOverview | null;
+  onOpen: (project: Project) => void;
+  onCreate: () => void;
+}) {
+  const ownerLoad = useMemo(() => {
+    const owners = new Map<string, {
+      agentId: string; name: string; role: string; total: number; active: number; completed: number; failed: number; projects: Set<string>;
+    }>();
+    for (const item of value?.projects ?? []) {
+      if (item.project.status === 'archived') continue;
+      for (const owner of item.owners) {
+        const current = owners.get(owner.agentId) ?? {
+          agentId: owner.agentId, name: owner.name, role: owner.role, total: 0, active: 0, completed: 0, failed: 0, projects: new Set<string>()
+        };
+        current.total += owner.totalTasks;
+        current.active += owner.activeTasks;
+        current.completed += owner.completedTasks;
+        current.failed += owner.failedTasks;
+        current.projects.add(item.project.name);
+        owners.set(owner.agentId, current);
+      }
+    }
+    return [...owners.values()].sort((a, b) => b.active - a.active || b.total - a.total || a.name.localeCompare(b.name, 'zh-CN'));
+  }, [value]);
+
+  if (!value) return <div className="project-ops-loading">正在汇总项目经营数据...</div>;
+  if (value.projects.length === 0) return (
+    <div className="project-empty project-ops-empty">
+      <span><IconFolder size={28} /></span><strong>还没有可分析的项目</strong>
+      <button className="btn small primary" type="button" onClick={onCreate}><IconPlus size={13} />新建项目</button>
+    </div>
+  );
+
+  const healthProjects = value.projects.filter((item) => item.project.status !== 'archived');
+  const deliverableTotals = healthProjects.reduce((total, item) => ({
+    accepted: total.accepted + item.deliverables.accepted,
+    rework: total.rework + item.deliverables.rework,
+    rejected: total.rejected + item.deliverables.rejected,
+    unmarked: total.unmarked + item.deliverables.unmarked,
+    all: total.all + item.deliverables.total
+  }), { accepted: 0, rework: 0, rejected: 0, unmarked: 0, all: 0 });
+  const statusEntries: Array<{ key: ProjectStatus; label: string; color: string }> = [
+    { key: 'planning', label: '规划中', color: '#8b95a7' }, { key: 'active', label: '进行中', color: '#4d6bfe' },
+    { key: 'paused', label: '已暂停', color: '#f59e0b' }, { key: 'completed', label: '已完成', color: '#22c1a3' },
+    { key: 'archived', label: '已归档', color: '#596273' }
+  ];
+  const kpis = [
+    { label: '进行中项目', value: value.summary.openProjects, suffix: '个', icon: <IconFolder size={17} />, tone: 'blue' },
+    { label: '需要关注', value: value.summary.atRiskProjects, suffix: '个', icon: <IconAlert size={17} />, tone: value.summary.atRiskProjects ? 'red' : 'green' },
+    { label: '任务完成率', value: value.summary.taskCompletionRate, suffix: '%', icon: <IconTask size={17} />, tone: 'cyan' },
+    { label: '已采纳成果', value: value.summary.acceptedDeliverables, suffix: '项', icon: <IconCheck size={17} />, tone: 'green' },
+    { label: '待验收成果', value: value.summary.pendingAcceptance, suffix: '项', icon: <IconLayers size={17} />, tone: value.summary.pendingAcceptance ? 'orange' : 'green' }
+  ];
+
+  return <div className="project-operations">
+    <div className="project-ops-kpis">{kpis.map((item) => <div key={item.label} data-tone={item.tone}>
+      <span className="project-ops-kpi-icon">{item.icon}</span><span><small>{item.label}</small><strong>{item.value}<b>{item.suffix}</b></strong></span>
+    </div>)}</div>
+
+    <div className="project-ops-main">
+      <section className="project-ops-section">
+        <header><div><h3>项目健康度</h3><span>{healthProjects.length} 个项目组合</span></div><small>按风险优先级排序</small></header>
+        <div className="project-health-list">
+          {healthProjects.slice(0, 8).map((item) => <button key={item.project.id} type="button" onClick={() => onOpen(item.project)}>
+            <span className="project-health-color" style={{ background: item.project.color }} />
+            <span className="project-health-name"><strong>{item.project.name}</strong><small>{item.tasks.total} 项任务 · {item.deliverables.total} 项成果 · {item.owners.length} 名员工</small></span>
+            <ProjectHealthBadge health={item.health} />
+            <span className="project-health-progress"><span><i style={{ width: `${item.progress}%`, background: item.project.color }} /></span><b>{item.progress}%</b></span>
+            <span className="project-health-accept"><small>验收率</small><strong>{item.acceptanceRate}%</strong></span>
+          </button>)}
+        </div>
+      </section>
+
+      <section className="project-ops-section project-risk-section">
+        <header><div><h3>风险与阻塞</h3><span>{value.risks.length} 项待处理</span></div><small>{value.summary.overdueProjects} 个逾期</small></header>
+        {value.risks.length === 0 ? <div className="project-risk-empty"><IconCheck size={20} />暂无项目风险</div> : <div className="project-risk-list">
+          {value.risks.slice(0, 8).map((risk) => <button key={risk.id} type="button" data-severity={risk.severity} onClick={() => {
+            const item = value.projects.find((project) => project.project.id === risk.projectId);
+            if (item) onOpen(item.project);
+          }}><span className="project-risk-dot" /><span><strong>{risk.title}</strong><small>{risk.projectName} · {risk.detail}</small></span><b>{risk.count}</b></button>)}
+        </div>}
+      </section>
+    </div>
+
+    <div className="project-ops-lower">
+      <section className="project-ops-section">
+        <header><div><h3>员工负载</h3><span>{ownerLoad.length} 名参与员工</span></div><small>活跃任务优先</small></header>
+        <div className="project-owner-load">
+          {ownerLoad.slice(0, 8).map((owner) => <div key={owner.agentId}><span className="project-owner-icon"><IconUser size={14} /></span><span><strong>{owner.name}</strong><small>{[...owner.projects].slice(0, 2).join('、')}</small></span><span><b>{owner.active}</b> 活跃</span><span>{owner.completed}/{owner.total} 完成</span>{owner.failed > 0 && <span className="project-owner-failed">{owner.failed} 失败</span>}</div>)}
+        </div>
+      </section>
+
+      <section className="project-ops-section">
+        <header><div><h3>组合与验收</h3><span>{value.summary.totalProjects} 个项目 · {deliverableTotals.all} 项成果</span></div><small>当前组合结构</small></header>
+        <div className="project-status-bars">{statusEntries.map((status) => {
+          const count = value.statusDistribution[status.key];
+          const width = value.summary.totalProjects ? Math.round((count / value.summary.totalProjects) * 100) : 0;
+          return <div key={status.key}><span>{status.label}</span><span><i style={{ width: `${width}%`, background: status.color }} /></span><b>{count}</b></div>;
+        })}</div>
+        <div className="project-acceptance-strip">
+          <span data-tone="accepted"><strong>{deliverableTotals.accepted}</strong>已采纳</span>
+          <span data-tone="unmarked"><strong>{deliverableTotals.unmarked}</strong>未验收</span>
+          <span data-tone="rework"><strong>{deliverableTotals.rework}</strong>需返工</span>
+          <span data-tone="rejected"><strong>{deliverableTotals.rejected}</strong>已驳回</span>
+        </div>
+      </section>
+    </div>
+  </div>;
 }
 
 const PROJECT_COLORS = ['#4d6bfe', '#22c1a3', '#3aa7ff', '#f59e0b', '#ef6a6a', '#8a5cf6'];
@@ -236,7 +391,7 @@ function ProjectDispatch({ project, onClose }: { project: Project; onClose: () =
   );
 }
 
-function ProjectDetail({ project, tasks, onClose, onDispatch }: { project: Project; tasks: Task[]; onClose: () => void; onDispatch: () => void }) {
+function ProjectDetail({ project, operation, tasks, onClose, onDispatch }: { project: Project; operation: ProjectOperationsItem | null; tasks: Task[]; onClose: () => void; onDispatch: () => void }) {
   const { snapshot } = useApp();
   const agentNames = new Map(snapshot?.agentCards.map((card) => [card.agent.id, card.agent.name]) ?? []);
   const sorted = [...tasks].sort((a, b) => b.createdAt - a.createdAt);
@@ -252,6 +407,23 @@ function ProjectDetail({ project, tasks, onClose, onDispatch }: { project: Proje
         <div><strong>{project.objective || '未设置核心目标'}</strong>{project.description && <p>{project.description}</p>}</div>
       </div>
       <div className="project-detail-meta"><span>{STATUS_META[project.status].label}</span><span>{project.clientName || '内部项目'}</span><span>{project.dueAt ? `截止 ${new Date(project.dueAt).toLocaleDateString('zh-CN')}` : '无截止时间'}</span></div>
+      {operation && <>
+        <div className="project-detail-ops">
+          <span><small>健康状态</small><ProjectHealthBadge health={operation.health} /></span>
+          <span><small>平均进度</small><strong>{operation.progress}%</strong></span>
+          <span><small>任务</small><strong>{operation.tasks.completed}/{operation.tasks.total}</strong></span>
+          <span><small>活跃任务</small><strong>{operation.tasks.active}</strong></span>
+          <span><small>成果验收率</small><strong>{operation.acceptanceRate}%</strong></span>
+        </div>
+        {operation.risks.length > 0 && <div className="project-detail-risks">
+          <div className="card-title">风险与阻塞<span className="sub">{operation.risks.length} 项</span></div>
+          {operation.risks.map((risk) => <div key={risk.id} data-severity={risk.severity}><span className="project-risk-dot" /><strong>{risk.title}</strong><span>{risk.detail}</span></div>)}
+        </div>}
+        {operation.owners.length > 0 && <div className="project-detail-owners">
+          <div className="card-title">参与员工<span className="sub">{operation.owners.length} 名</span></div>
+          <div>{operation.owners.map((owner) => <span key={owner.agentId}><IconUser size={13} /><strong>{owner.name}</strong><small>{owner.activeTasks} 活跃 · {owner.completedTasks}/{owner.totalTasks} 完成</small></span>)}</div>
+        </div>}
+      </>}
       <div className="card-title" style={{ marginTop: 18 }}>关联任务<span className="sub">{tasks.length} 项</span></div>
       {sorted.length === 0 ? <div className="empty">暂无关联任务</div> : <div className="project-task-list">{sorted.slice(0, 20).map((task) => <div key={task.id}><span className={`tag ${TASK_STATUS_META[task.status].tag}`}>{TASK_STATUS_META[task.status].label}</span><strong>{task.title}</strong><span>{agentNames.get(task.agentId) ?? '未知员工'}</span><time>{new Date(task.createdAt).toLocaleDateString('zh-CN')}</time></div>)}</div>}
     </Modal>
