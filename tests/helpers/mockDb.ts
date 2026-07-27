@@ -33,6 +33,9 @@ interface Tables {
   usage_records: Map<string, Record<string, unknown>>;
   teams: Map<string, Record<string, unknown>>;
   team_runs: Map<string, Record<string, unknown>>;
+  deliverables: Map<string, Record<string, unknown>>;
+  deliverable_versions: Map<string, Record<string, unknown>>;
+  deliverable_reviews: Map<string, Record<string, unknown>>;
   settings: Map<string, unknown>;
 }
 
@@ -51,6 +54,9 @@ export function createMockDb(): MockDb & { tables: Tables } {
     usage_records: new Map(),
     teams: new Map(),
     team_runs: new Map(),
+    deliverables: new Map(),
+    deliverable_versions: new Map(),
+    deliverable_reviews: new Map(),
     settings: new Map()
   };
 
@@ -113,6 +119,10 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
+  if (/SELECT \* FROM agents$/.test(sql)) {
+    return [...tables.agents.values()];
+  }
+
   // SELECT * FROM agents WHERE id = ?
   if (/SELECT \* FROM agents WHERE id = \?/.test(sql)) {
     const row = tables.agents.get(args[0] as string);
@@ -134,6 +144,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   // SELECT * FROM tasks WHERE status = 'RUNNING' ...
   if (/SELECT \* FROM tasks WHERE status = 'RUNNING'/.test(sql)) {
     const result = rows.filter(r => r.status === 'RUNNING');
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM tasks WHERE status = 'COMPLETED'/.test(sql)) {
+    const result = rows.filter(r => r.status === 'COMPLETED')
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number));
     return mode === 'get' ? result[0] : result;
   }
 
@@ -261,6 +277,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? row : row ? [row] : [];
   }
 
+  if (/SELECT \* FROM team_runs WHERE phase = 'done'/.test(sql)) {
+    const result = rows.filter(r => r.phase === 'done')
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
   // SELECT project_id FROM team_runs WHERE id = ?
   if (/SELECT project_id FROM team_runs WHERE id = \?/.test(sql)) {
     const row = tables.team_runs.get(args[0] as string);
@@ -297,6 +319,41 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   // SELECT c.type, cr.agent_id FROM channel_routes ...
   if (/SELECT c\.type, cr\.agent_id FROM channel_routes/.test(sql)) {
     return [];
+  }
+
+  // ---------- 成果验收 ----------
+  if (/SELECT \* FROM deliverables ORDER BY updated_at DESC/.test(sql)) {
+    const result = [...tables.deliverables.values()]
+      .sort((a, b) => (b.updated_at as number) - (a.updated_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM deliverables WHERE source_type = \? AND source_id = \?/.test(sql)) {
+    const row = [...tables.deliverables.values()].find(r => r.source_type === args[0] && r.source_id === args[1]);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  if (/SELECT \* FROM deliverables WHERE id = \?/.test(sql)) {
+    const row = tables.deliverables.get(args[0] as string);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
+  if (/SELECT \* FROM deliverable_versions ORDER BY deliverable_id, version DESC/.test(sql)) {
+    const result = [...tables.deliverable_versions.values()].sort((a, b) =>
+      String(a.deliverable_id).localeCompare(String(b.deliverable_id)) || (b.version as number) - (a.version as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM deliverable_versions WHERE deliverable_id = \? ORDER BY version DESC/.test(sql)) {
+    const result = [...tables.deliverable_versions.values()].filter(r => r.deliverable_id === args[0])
+      .sort((a, b) => (b.version as number) - (a.version as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM deliverable_reviews WHERE deliverable_id = \? ORDER BY created_at DESC, rowid DESC/.test(sql)) {
+    const result = [...tables.deliverable_reviews.values()].reverse().filter(r => r.deliverable_id === args[0])
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number));
+    return mode === 'get' ? result[0] : result;
   }
 
   // Fallback
@@ -355,6 +412,51 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
       current_step: 0, total_steps: 0, subtasks_json: '[]', events_json: '[]',
       final_result: null, error: null, created_at: createdAt, ended_at: null
     });
+    return { changes: 1 };
+  }
+
+  // ---------- 成果验收 ----------
+  if (/INSERT INTO deliverables/.test(sql)) {
+    const [id, sourceType, sourceId, projectId, ownerType, ownerId, ownerName, ownerRole, title, type, tagsJson,
+      reviewStatus, reviewNote, sourceHash, sourceUpdatedAt, createdAt, updatedAt] = args;
+    tables.deliverables.set(id as string, {
+      id, source_type: sourceType, source_id: sourceId, project_id: projectId, owner_type: ownerType,
+      owner_id: ownerId, owner_name: ownerName, owner_role: ownerRole, title, type, tags_json: tagsJson,
+      review_status: reviewStatus, review_note: reviewNote, source_hash: sourceHash,
+      source_updated_at: sourceUpdatedAt, created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO deliverable_versions/.test(sql)) {
+    const [id, deliverableId, version, content, changeNote, origin, createdBy, createdAt] = args;
+    tables.deliverable_versions.set(id as string, {
+      id, deliverable_id: deliverableId, version, content, change_note: changeNote,
+      origin, created_by: createdBy, created_at: createdAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO deliverable_reviews/.test(sql)) {
+    const [id, deliverableId, status, note, reviewer, reworkRef, createdAt] = args;
+    tables.deliverable_reviews.set(id as string, {
+      id, deliverable_id: deliverableId, status, note, reviewer, rework_ref: reworkRef, created_at: createdAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/UPDATE deliverables SET .+ WHERE id = \?/.test(sql)) {
+    const id = args[args.length - 1] as string;
+    const deliverable = tables.deliverables.get(id);
+    if (!deliverable) return { changes: 0 };
+    const setClause = sql.match(/SET (.+) WHERE/)?.[1] ?? '';
+    let argIndex = 0;
+    for (const assignment of setClause.split(',').map(value => value.trim())) {
+      const [field, rawValue] = assignment.split(' = ').map(value => value.trim());
+      if (rawValue === '?') deliverable[field] = args[argIndex++];
+      else if (/^'.*'$/.test(rawValue)) deliverable[field] = rawValue.slice(1, -1);
+      else if (/^NULL$/i.test(rawValue)) deliverable[field] = null;
+    }
     return { changes: 1 };
   }
 
@@ -431,6 +533,13 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     const [result, now, id] = args;
     const task = tables.tasks.get(id as string);
     if (task) { task.status = 'COMPLETED'; task.progress = 100; task.stage = '完成'; task.result = result; task.ended_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  if (/UPDATE tasks SET quality = \? WHERE id = \?/.test(sql)) {
+    const [quality, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task) { task.quality = quality; return { changes: 1 }; }
     return { changes: 0 };
   }
 
@@ -588,6 +697,9 @@ function detectTable(sql: string): keyof Tables | null {
   if (/\busage_records\b/.test(sql)) return 'usage_records';
   if (/\bteam_runs\b/.test(sql)) return 'team_runs';
   if (/\bteams\b/.test(sql)) return 'teams';
+  if (/\bdeliverable_versions\b/.test(sql)) return 'deliverable_versions';
+  if (/\bdeliverable_reviews\b/.test(sql)) return 'deliverable_reviews';
+  if (/\bdeliverables\b/.test(sql)) return 'deliverables';
   return null;
 }
 

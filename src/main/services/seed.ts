@@ -218,6 +218,24 @@ const TODO_APPROVALS = [
   { title: '客户拜访纪要归档：网络访问 CRM 接口域名首授权', agent: '销售外勤助手', risk: 'low' }
 ];
 
+function demoTaskResult(agentName: string, sequence: number): string {
+  const focus: Record<string, string> = {
+    'ERP/CRM助手': '完成应收应付核对，未发现阻断项，已整理异常单据清单。',
+    'MES助手': '汇总产线工单数据，识别 2 项进度偏差并给出处置建议。',
+    '测试验证助手': '完成回归测试报告，核心流程通过，遗留问题已分级记录。',
+    '文档助手': '完成文档归档与索引更新，变更记录可追溯。',
+    '人事招聘助手': '更新候选人阶段与面试安排，待跟进事项已明确责任人。',
+    '品质管理助手': '完成品质数据统计，异常趋势和复核项已列入报告。',
+    '采购比价助手': '完成供应商报价数据对比，形成推荐顺序与风险说明。',
+    'IT运维助手': '完成系统巡检报告，服务可用性正常，容量风险已标注。',
+    '销售外勤助手': '整理客户拜访纪要，关键需求和下一步行动已结构化。',
+    '合同审核助手': '完成合同条款审查，风险条款与修订建议已归纳。',
+    '数据分析助手': '完成经营数据分析报告，核心指标和趋势结论已输出。',
+    '会议纪要助手': '完成会议纪要，决议、责任人和截止时间已提取。'
+  };
+  return `# ${agentName}例行成果 #${sequence}\n\n## 完成摘要\n\n${focus[agentName] ?? '例行工作已完成，结果与后续事项已整理。'}\n\n## 后续事项\n\n- 结果已归档，等待验收\n- 异常项进入下一轮跟进\n`;
+}
+
 export function seedIfEmpty(db: Database) {
   const count = (db.raw.prepare('SELECT COUNT(*) c FROM agents').get() as { c: number }).c;
   if (count > 0) return;
@@ -231,8 +249,8 @@ export function seedIfEmpty(db: Database) {
        VALUES(?, ?, ?, ?, 'READY', 'eng-hermes', ?, 'standard', 1, 0, ?, ?, ?)`
     );
     const insertTask = db.raw.prepare(
-      `INSERT INTO tasks(id, agent_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at)
-       VALUES(?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?)`
+      `INSERT INTO tasks(id, agent_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result)
+       VALUES(?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?, ?)`
     );
     const insertRun = db.raw.prepare(
       `INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
@@ -253,7 +271,7 @@ export function seedIfEmpty(db: Database) {
       );
       if (a.task) {
         const tid = randomUUID();
-        insertTask.run(tid, id, a.task.title, 'RUNNING', a.task.progress, '执行中', now - 3600_000, now - 3600_000, null);
+        insertTask.run(tid, id, a.task.title, 'RUNNING', a.task.progress, '执行中', now - 3600_000, now - 3600_000, null, null);
         insertRun.run(randomUUID(), id, tid, process.pid, randomUUID(), 'RUNNING', now - 3600_000, null);
       }
     }
@@ -263,7 +281,10 @@ export function seedIfEmpty(db: Database) {
     for (let i = 0; i < 23; i++) {
       const agentId = agentIds.get(names[i % names.length])!;
       const ended = todayStart.getTime() + 3600_000 + i * 900_000;
-      insertTask.run(randomUUID(), agentId, `例行任务 #${i + 1}`, 'COMPLETED', 100, '完成', ended - 600_000, ended - 600_000, ended);
+      insertTask.run(
+        randomUUID(), agentId, `例行任务 #${i + 1}`, 'COMPLETED', 100, '完成',
+        ended - 600_000, ended - 600_000, ended, demoTaskResult(names[i % names.length], i + 1)
+      );
     }
 
     // 8 项待审批（首页"待处理待办 8 项"）

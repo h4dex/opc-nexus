@@ -21,14 +21,18 @@ import type { WorkflowEngine } from './services/workflowEngine.js';
 import type { WfPlatformManager } from './services/wfPlatformManager.js';
 import type { TeamEngine } from './services/teamEngine.js';
 import type { ProjectManager } from './services/projectManager.js';
+import type { DeliverableManager } from './services/deliverableManager.js';
 import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
-import type { AppConfig, CreateAgentInput, ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge } from '../shared/types.js';
+import type {
+  AppConfig, CreateAgentInput, DeliverableMetaPatch, DeliverableReviewInput, DeliverableVersionInput,
+  ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge
+} from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { copyFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { app } from 'electron';
 
@@ -41,6 +45,11 @@ function assertString(v: unknown, field: string, min = 1, max = 500): string {
 }
 function assertId(v: unknown, field = 'id'): string {
   return assertString(v, field, 1, 100);
+}
+
+function safeFileSegment(value: string): string {
+  const safe = value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/g, '').slice(0, 80);
+  return safe || 'deliverable';
 }
 
 export interface IpcDeps {
@@ -60,6 +69,7 @@ export interface IpcDeps {
   providers: ProviderManager;
   workflows: WorkflowEngine;
   projects: ProjectManager;
+  deliverables: DeliverableManager;
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
@@ -70,7 +80,7 @@ export interface IpcDeps {
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -131,6 +141,82 @@ export function registerIpc(deps: IpcDeps) {
     const project = projects.archive(assertId(id, 'projectId'));
     pushSnapshot();
     return project;
+  });
+
+  // ---------- 成果验收 ----------
+  ipcMain.handle('aibox:listDeliverables', () => deliverables.list());
+  ipcMain.handle('aibox:getDeliverable', (_e, id: string) => deliverables.get(assertId(id, 'deliverableId')));
+  ipcMain.handle('aibox:updateDeliverableMeta', (_e, id: string, patch: DeliverableMetaPatch) =>
+    deliverables.updateMeta(assertId(id, 'deliverableId'), patch));
+  ipcMain.handle('aibox:addDeliverableVersion', (_e, id: string, input: DeliverableVersionInput) =>
+    deliverables.addVersion(assertId(id, 'deliverableId'), input));
+  ipcMain.handle('aibox:reviewDeliverable', (_e, id: string, input: DeliverableReviewInput) => {
+    const deliverableId = assertId(id, 'deliverableId');
+    const current = deliverables.get(deliverableId);
+    if (!current) throw new Error('成果不存在');
+    let reworkRef: string | null = null;
+    let reworkMessage: string | null = null;
+    if (input.status === 'rework' && input.createRework) {
+      const instruction = `返工要求：${assertString(input.note, 'note', 2, 1000)}\n原成果：${current.title}`;
+      if (current.sourceType === 'task') {
+        const task = orchestrator.createFollowUpTask(current.sourceId, instruction);
+        reworkRef = task.id;
+        reworkMessage = '返工任务已派发给原数字员工';
+      } else {
+        const result = teams.trigger(current.ownerId, instruction, current.projectId ?? undefined);
+        if (!result.ok || !result.runId) throw new Error(result.message);
+        reworkRef = result.runId;
+        reworkMessage = '专家团返工运行已启动';
+      }
+    }
+    const result = deliverables.review(deliverableId, input, reworkRef);
+    if (!result) throw new Error('成果不存在');
+    pushSnapshot();
+    return { ...result, reworkRef, reworkMessage };
+  });
+  ipcMain.handle('aibox:getProjectDeliverablePackage', (_e, projectId: string) =>
+    deliverables.packageForProject(assertId(projectId, 'projectId')));
+  ipcMain.handle('aibox:exportDeliverable', async (_e, id: string, format: 'markdown' | 'json') => {
+    const detail = deliverables.get(assertId(id, 'deliverableId'));
+    if (!detail) throw new Error('成果不存在');
+    if (!['markdown', 'json'].includes(format)) throw new Error('导出格式无效');
+    const win = getMainWindow();
+    if (!win) return { ok: false, canceled: false, message: '窗口不存在' };
+    const extension = format === 'markdown' ? 'md' : 'json';
+    const result = await dialog.showSaveDialog(win, {
+      title: format === 'markdown' ? '下载成果正文' : '导出成果详情',
+      defaultPath: `${safeFileSegment(detail.title)}-v${detail.latestVersion}.${extension}`,
+      filters: [{ name: format === 'markdown' ? 'Markdown 文档' : 'JSON 数据', extensions: [extension] }]
+    });
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true, message: '已取消' };
+    const content = format === 'markdown' ? deliverables.renderMarkdown(detail) : JSON.stringify(detail, null, 2);
+    writeFileSync(result.filePath, content, 'utf8');
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'deliverable.export', target: detail.id, result: format });
+    return { ok: true, canceled: false, message: `已导出：${result.filePath}`, path: result.filePath };
+  });
+  ipcMain.handle('aibox:exportProjectDeliverablePackage', async (_e, projectId: string) => {
+    const pkg = deliverables.packageForProject(assertId(projectId, 'projectId'));
+    const win = getMainWindow();
+    if (!win) return { ok: false, canceled: false, message: '窗口不存在' };
+    const result = await dialog.showOpenDialog(win, { title: '选择成果包保存位置', properties: ['openDirectory', 'createDirectory'] });
+    if (result.canceled || !result.filePaths[0]) return { ok: false, canceled: true, message: '已取消' };
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
+    const baseTarget = join(result.filePaths[0], `${safeFileSegment(pkg.project.name)}-成果包-${stamp}`);
+    let target = baseTarget;
+    let suffix = 2;
+    while (existsSync(target)) target = `${baseTarget}-${suffix++}`;
+    const itemsDir = join(target, 'deliverables');
+    mkdirSync(itemsDir, { recursive: true });
+    writeFileSync(join(target, 'README.md'), deliverables.renderPackageReadme(pkg), 'utf8');
+    writeFileSync(join(target, 'manifest.json'), JSON.stringify(pkg, null, 2), 'utf8');
+    pkg.deliverables.forEach((item, index) => {
+      const detail = deliverables.get(item.id);
+      if (!detail) return;
+      const filename = `${String(index + 1).padStart(2, '0')}-${safeFileSegment(item.title)}-v${item.latestVersion}.md`;
+      writeFileSync(join(itemsDir, filename), deliverables.renderMarkdown(detail), 'utf8');
+    });
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'deliverable.package.export', target: pkg.project.id, result: 'ok' });
+    return { ok: true, canceled: false, message: `成果包已导出：${target}`, path: target };
   });
 
   // ---------- 数字员工 ----------

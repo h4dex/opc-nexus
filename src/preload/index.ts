@@ -6,7 +6,8 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
-  Project, ProjectInput, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
+  DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
+  Project, ProjectDeliverablePackage, ProjectInput, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
   TeamRun
@@ -44,6 +45,16 @@ const api = {
   createProject: (input: ProjectInput): Promise<Project> => ipcRenderer.invoke('aibox:createProject', input),
   updateProject: (id: string, patch: ProjectPatch): Promise<Project | null> => ipcRenderer.invoke('aibox:updateProject', id, patch),
   archiveProject: (id: string): Promise<Project | null> => ipcRenderer.invoke('aibox:archiveProject', id),
+
+  // 成果验收
+  listDeliverables: (): Promise<DeliverableSummary[]> => ipcRenderer.invoke('aibox:listDeliverables'),
+  getDeliverable: (id: string): Promise<DeliverableDetail | null> => ipcRenderer.invoke('aibox:getDeliverable', id),
+  updateDeliverableMeta: (id: string, patch: DeliverableMetaPatch): Promise<DeliverableDetail | null> => ipcRenderer.invoke('aibox:updateDeliverableMeta', id, patch),
+  addDeliverableVersion: (id: string, input: DeliverableVersionInput): Promise<DeliverableDetail | null> => ipcRenderer.invoke('aibox:addDeliverableVersion', id, input),
+  reviewDeliverable: (id: string, input: DeliverableReviewInput): Promise<{ deliverable: DeliverableDetail; review: DeliverableReviewEvent; reworkRef: string | null; reworkMessage: string | null }> => ipcRenderer.invoke('aibox:reviewDeliverable', id, input),
+  getProjectDeliverablePackage: (projectId: string): Promise<ProjectDeliverablePackage> => ipcRenderer.invoke('aibox:getProjectDeliverablePackage', projectId),
+  exportDeliverable: (id: string, format: 'markdown' | 'json'): Promise<{ ok: boolean; canceled: boolean; message: string; path?: string }> => ipcRenderer.invoke('aibox:exportDeliverable', id, format),
+  exportProjectDeliverablePackage: (projectId: string): Promise<{ ok: boolean; canceled: boolean; message: string; path?: string }> => ipcRenderer.invoke('aibox:exportProjectDeliverablePackage', projectId),
 
   // 数字员工
   createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', input),

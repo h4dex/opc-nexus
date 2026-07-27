@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 20;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -286,6 +286,49 @@ CREATE TABLE IF NOT EXISTS team_runs (
   ended_at INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS deliverables (
+  id TEXT PRIMARY KEY,
+  source_type TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id),
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  owner_name TEXT NOT NULL,
+  owner_role TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'document',
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  review_status TEXT NOT NULL DEFAULT 'unmarked',
+  review_note TEXT NOT NULL DEFAULT '',
+  source_hash TEXT NOT NULL,
+  source_updated_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(source_type, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS deliverable_versions (
+  id TEXT PRIMARY KEY,
+  deliverable_id TEXT NOT NULL REFERENCES deliverables(id),
+  version INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  change_note TEXT NOT NULL DEFAULT '',
+  origin TEXT NOT NULL DEFAULT 'manual',
+  created_by TEXT NOT NULL DEFAULT 'admin',
+  created_at INTEGER NOT NULL,
+  UNIQUE(deliverable_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS deliverable_reviews (
+  id TEXT PRIMARY KEY,
+  deliverable_id TEXT NOT NULL REFERENCES deliverables(id),
+  status TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  reviewer TEXT NOT NULL DEFAULT 'admin',
+  rework_ref TEXT,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS collab_workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -331,6 +374,9 @@ CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(enabled, next_run_at)
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 CREATE INDEX IF NOT EXISTS idx_resource_samples_time ON resource_samples(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_deliverables_project ON deliverables(project_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_deliverable_versions_parent ON deliverable_versions(deliverable_id, version);
+CREATE INDEX IF NOT EXISTS idx_deliverable_reviews_parent ON deliverable_reviews(deliverable_id, created_at);
 `;
 
 type Row = Record<string, SqlValue>;
@@ -594,6 +640,34 @@ export class Database {
         addCol('tasks', 'project_id', 'TEXT REFERENCES projects(id)');
         addCol('team_runs', 'project_id', 'TEXT REFERENCES projects(id)');
         this.inner.exec('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at)');
+      }
+      if (prev < 19) {
+        // v19：成果实体、版本序列与人工验收事件
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_deliverables_project ON deliverables(project_id, updated_at)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_deliverable_versions_parent ON deliverable_versions(deliverable_id, version)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_deliverable_reviews_parent ON deliverable_reviews(deliverable_id, created_at)');
+      }
+      if (prev < 20) {
+        // v20：为历史默认演示任务补齐成果正文，让升级后的成果库可直接体验。
+        this.inner.exec(`
+          UPDATE tasks
+          SET result = '# ' || title || char(10) || char(10) ||
+            '## 完成摘要' || char(10) || char(10) ||
+            '系统例行任务已完成，执行结果、异常项与后续事项已整理。' || char(10) || char(10) ||
+            '## 后续事项' || char(10) || char(10) ||
+            '- 结果已归档，等待验收' || char(10) ||
+            '- 异常项进入下一轮跟进' || char(10)
+          WHERE status = 'COMPLETED'
+            AND result IS NULL
+            AND source = 'desktop'
+            AND title GLOB '例行任务 #[0-9]*'
+            AND agent_id IN (
+              SELECT id FROM agents WHERE name IN (
+                'ERP/CRM助手', 'MES助手', '测试验证助手', '文档助手', '人事招聘助手', '品质管理助手',
+                '采购比价助手', 'IT运维助手', '销售外勤助手', '合同审核助手', '数据分析助手', '会议纪要助手'
+              )
+            )
+        `);
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

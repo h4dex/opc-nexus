@@ -218,6 +218,101 @@ export interface Task {
 /** 任务产出的人工质量标记 */
 export type TaskQuality = 'accepted' | 'rejected' | 'rework' | null;
 
+// ---------- 成果验收闭环 ----------
+
+export type DeliverableSourceType = 'task' | 'team_run';
+export type DeliverableOwnerType = 'agent' | 'team';
+export type DeliverableType = 'document' | 'report' | 'code' | 'data' | 'design' | 'other';
+export type DeliverableReviewStatus = 'unmarked' | 'accepted' | 'rejected' | 'rework';
+export type DeliverableVersionOrigin = 'source' | 'manual' | 'rework';
+
+export interface DeliverableSummary {
+  id: string;
+  sourceType: DeliverableSourceType;
+  sourceId: string;
+  projectId: string | null;
+  projectName: string | null;
+  ownerType: DeliverableOwnerType;
+  ownerId: string;
+  ownerName: string;
+  ownerRole: string;
+  title: string;
+  type: DeliverableType;
+  tags: string[];
+  reviewStatus: DeliverableReviewStatus;
+  reviewNote: string;
+  latestVersion: number;
+  versionCount: number;
+  preview: string;
+  createdAt: number;
+  updatedAt: number;
+  sourceUpdatedAt: number;
+}
+
+export interface DeliverableVersion {
+  id: string;
+  deliverableId: string;
+  version: number;
+  content: string;
+  changeNote: string;
+  origin: DeliverableVersionOrigin;
+  createdBy: string;
+  createdAt: number;
+}
+
+export interface DeliverableReviewEvent {
+  id: string;
+  deliverableId: string;
+  status: DeliverableReviewStatus;
+  note: string;
+  reviewer: string;
+  reworkRef: string | null;
+  createdAt: number;
+}
+
+export interface DeliverableTrace {
+  project: { id: string; name: string; status: ProjectStatus } | null;
+  source: { type: DeliverableSourceType; id: string; title: string; status: string; createdAt: number };
+  owner: { type: DeliverableOwnerType; id: string; name: string; role: string };
+}
+
+export interface DeliverableDetail extends DeliverableSummary {
+  latestContent: string;
+  versions: DeliverableVersion[];
+  reviews: DeliverableReviewEvent[];
+  trace: DeliverableTrace;
+}
+
+export interface DeliverableMetaPatch {
+  type?: DeliverableType;
+  tags?: string[];
+}
+
+export interface DeliverableVersionInput {
+  content: string;
+  changeNote: string;
+  origin?: Exclude<DeliverableVersionOrigin, 'source'>;
+}
+
+export interface DeliverableReviewInput {
+  status: DeliverableReviewStatus;
+  note: string;
+  createRework?: boolean;
+}
+
+export interface ProjectDeliverablePackage {
+  project: Project;
+  generatedAt: number;
+  summary: {
+    total: number;
+    accepted: number;
+    rejected: number;
+    rework: number;
+    unmarked: number;
+  };
+  deliverables: Array<DeliverableSummary & { latestContent: string }>;
+}
+
 /** 任务执行事件（13.2 审计可追溯；详情页时间线） */
 export interface TaskEvent {
   id: string;
