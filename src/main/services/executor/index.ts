@@ -1,8 +1,10 @@
 /**
- * 执行器注册表：按员工所用引擎的就绪状态选择真实执行路径，未就绪回退演示模式。
- * 选择优先级：Hermes→LLM API（已配置供应商） / CLI 引擎→本机 CLI（检测健康） /
- * 外部引擎→ACP 协议（握手健康） / 否则→simulated。
- * Codex/Claude 使用专属 JSONL 解析；ZCode/OpenCode/Kimi Code 走泛化 CLI（参数可配置文件覆写）。
+ * 执行器注册表：主辅引擎策略（P1）。
+ * 解析顺序：主引擎（agent.engineId）就绪 → 用主引擎；
+ * 否则辅助引擎（user/config.yaml engine.fallbackEngineId，默认 eng-opencode）就绪 → 回退辅助引擎；
+ * 两者均不可用时按执行模式分流：production = 返回 null（任务如实 FAILED，绝不伪装完成）；
+ * demo = SimulatedExecutor（UI 标注演示模式）。
+ * Codex/Claude 使用专属 JSONL 解析；Hermes CLI/ZCode/OpenCode/Kimi Code 走泛化 CLI（参数可配置文件覆写）。
  */
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
@@ -11,6 +13,7 @@ import { LlmApiExecutor } from './llmApiExecutor.js';
 import { CliExecutor } from './cliExecutor.js';
 import { AcpExecutor } from './acpExecutor.js';
 import { SimulatedExecutor } from './simulatedExecutor.js';
+import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
 import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
 
@@ -56,23 +59,41 @@ export class ExecutorRegistry {
     return row?.type ?? 'hermes';
   }
 
-  private resolve(engineId: string): ExecutorAdapter {
+  /** 单引擎就绪解析：就绪返回适配器，否则 null（不做任何回退） */
+  private adapterFor(engineId: string): ExecutorAdapter | null {
     const type = this.engineType(engineId);
     const cli = this.cliByType.get(type);
     if (cli && cli.isReady()) return cli;
     if (type === 'hermes' && this.llm.isReady()) return this.llm;
     if (type === 'external' && this.acp.engineReady(engineId)) return this.acp;
-    return this.sim;
+    return null;
   }
 
-  /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示） */
+  /** 主辅解析：主引擎 → 辅助引擎 →（demo 模式）模拟器 / （production 模式）null */
+  private resolve(engineId: string): ExecutorAdapter | null {
+    const primary = this.adapterFor(engineId);
+    if (primary) return primary;
+    const cfg = loadUserConfig();
+    // 辅助引擎仅在与主引擎不同且就绪时生效（基础设施级回退，业务失败不换引擎）
+    if (cfg.engine.fallbackEngineId && cfg.engine.fallbackEngineId !== engineId) {
+      const fallback = this.adapterFor(cfg.engine.fallbackEngineId);
+      if (fallback) return fallback;
+    }
+    return cfg.engine.executionMode === 'production' ? null : this.sim;
+  }
+
+  /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 simulated 之外的占位） */
   kindFor(engineId: string): ExecutorKind {
-    return this.resolve(engineId).kind;
+    return this.resolve(engineId)?.kind ?? 'simulated';
   }
 
-  /** 派发任务执行；返回实际使用的执行方式 */
+  /** 派发任务执行；production 模式无可用引擎 → 直接回报错误（任务 FAILED，不伪装成功） */
   dispatch(task: Task, agent: Agent, cb: ExecutorCallbacks): ExecutorKind {
     const adapter = this.resolve(agent.engineId);
+    if (!adapter) {
+      cb.onError(task.id, '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
+      return 'simulated';
+    }
     this.running.set(task.id, adapter);
     adapter.start(task, agent, {
       onStage: (id, stage) => cb.onStage(id, stage),
