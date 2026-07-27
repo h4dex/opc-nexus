@@ -118,6 +118,9 @@ const api = {
   bindSkill: (agentId: string, skillId: string): Promise<void> => ipcRenderer.invoke('aibox:bindSkill', agentId, skillId),
   unbindSkill: (agentId: string, skillId: string): Promise<void> => ipcRenderer.invoke('aibox:unbindSkill', agentId, skillId),
   getAgentSkills: (agentId: string): Promise<{ id: string; name: string }[]> => ipcRenderer.invoke('aibox:getAgentSkills', agentId),
+  /** Skills 组合 → 数字员工：一键把单/多个技能组合成可真实执行任务的员工 */
+  createAgentFromSkills: (input: { skillIds: string[]; name?: string; engineId?: string }): Promise<Agent> =>
+    ipcRenderer.invoke('aibox:createAgentFromSkills', input),
 
   // Hermes 同步
   importFromHermes: (): Promise<{ mcp: number; skills: number; errors: string[] }> => ipcRenderer.invoke('aibox:importFromHermes'),

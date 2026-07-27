@@ -366,6 +366,25 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:bindSkill', (_e, agentId: string, skillId: string) => skills.bindAgent(agentId, skillId));
   ipcMain.handle('aibox:unbindSkill', (_e, agentId: string, skillId: string) => skills.unbindAgent(agentId, skillId));
   ipcMain.handle('aibox:getAgentSkills', (_e, agentId: string) => skills.forAgent(agentId));
+  // Skills 组合 → 数字员工（P4）：单个/多个技能一键生成可真实执行的员工
+  ipcMain.handle('aibox:createAgentFromSkills', (_e, input: { skillIds: string[]; name?: string; engineId?: string }) => {
+    if (!Array.isArray(input?.skillIds) || input.skillIds.length === 0) throw new Error('请选择至少一个技能');
+    for (const id of input.skillIds) assertId(id, 'skillId');
+    const draft = skills.composeAgentDraft(input.skillIds, input.name);
+    // 引擎优先级：显式指定 > 默认引擎 > 任一可用引擎
+    const engineId = input.engineId
+      ?? (db.raw.prepare("SELECT id FROM engines WHERE is_default = 1 LIMIT 1").get() as { id: string } | undefined)?.id
+      ?? 'eng-hermes';
+    const agent = orchestrator.createAgent({
+      name: draft.name, role: draft.role, systemPrompt: draft.systemPrompt,
+      soulMd: draft.soulMd, agentsMd: draft.agentsMd,
+      engineId, workspace: '', permissionMode: 'standard', concurrencyLimit: 1, channelIds: []
+    });
+    for (const skillId of draft.skillIds) skills.bindAgent(agent.id, skillId);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'agent.createFromSkills', target: agent.id, result: draft.skillIds.join(',') });
+    pushSnapshot();
+    return agent;
+  });
 
   // ---------- Hermes 同步 ----------
   ipcMain.handle('aibox:importFromHermes', () => importFromHermes(mcp, skills));
