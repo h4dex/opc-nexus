@@ -10,7 +10,7 @@ import type {
   Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
-  TeamRun
+  TeamCollaborationOverview, TeamRun
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -153,6 +153,7 @@ const api = {
   removeTeam: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeam', id),
   triggerTeam: (id: string, task: string, projectId?: string): Promise<{ ok: boolean; message: string; runId?: string }> => ipcRenderer.invoke('aibox:triggerTeam', id, task, projectId),
   getTeamRuns: (teamId: string): Promise<TeamRun[]> => ipcRenderer.invoke('aibox:getTeamRuns', teamId),
+  getTeamCollaborationOverview: (teamId: string): Promise<TeamCollaborationOverview> => ipcRenderer.invoke('aibox:getTeamCollaborationOverview', teamId),
   listAttentionRuns: (): Promise<(TeamRun & { teamName: string })[]> => ipcRenderer.invoke('aibox:listAttentionRuns'),
   getTeamConfig: (teamId: string): Promise<{ timeout: number; maxRetries: number; concurrency: number }> => ipcRenderer.invoke('aibox:getTeamConfig', teamId),
   saveTeamConfig: (teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveTeamConfig', teamId, config),

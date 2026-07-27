@@ -441,7 +441,14 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return r;
   });
-  ipcMain.handle('aibox:getTeamRuns', (_e, teamId: string) => teams.listRuns(assertId(teamId, 'teamId')));
+  ipcMain.handle('aibox:getTeamRuns', (_e, teamId: string) => {
+    deliverables.list();
+    return teams.listRuns(assertId(teamId, 'teamId'));
+  });
+  ipcMain.handle('aibox:getTeamCollaborationOverview', (_e, teamId: string) => {
+    deliverables.list();
+    return teams.getCollaborationOverview(assertId(teamId, 'teamId'));
+  });
   ipcMain.handle('aibox:listAttentionRuns', () => teams.listAttentionRuns());
   ipcMain.handle('aibox:getTeamConfig', (_e, teamId: string) => teams.getConfig(teamId));
   ipcMain.handle('aibox:saveTeamConfig', (_e, teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }) => {

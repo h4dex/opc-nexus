@@ -2,14 +2,23 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
-import { IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
+import { IconAlert, IconCheck, IconClock, IconFile, IconFlow, IconFolder, IconHistory, IconLayers, IconPlus, IconUser, IconPlay, IconX } from '../components/icons';
 import { toast } from '../components/Toast';
-import { TEAM_TEMPLATES, type TeamTemplate } from '../data/teamTemplates';
+import { TEAM_TEMPLATES, type TeamTemplate, type TeamTemplateAgent } from '../data/teamTemplates';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
-import type { TeamRun, TeamRunSubtask, TeamTimelineEvent } from '../../../shared/types';
+import type { TeamCollaborationOverview, TeamRun, TeamRunSubtask } from '../../../shared/types';
 
 interface TeamData {
   id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; workspace: string; createdAt: number;
+}
+
+interface SavedTeamTemplate {
+  id: string;
+  name: string;
+  description: string;
+  mode: string;
+  members: TeamTemplateAgent[];
+  createdAt: number;
 }
 
 const PHASE_LABEL: Record<string, string> = {
@@ -18,6 +27,7 @@ const PHASE_LABEL: Record<string, string> = {
 
 export function Teams() {
   const { snapshot } = useApp();
+  const [view, setView] = useState<'workspace' | 'templates'>('workspace');
   const [teams, setTeams] = useState<TeamData[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [taskInput, setTaskInput] = useState<Record<string, string>>({});
@@ -56,8 +66,6 @@ export function Teams() {
   }, [pollRuns, hasActiveRun]);
 
   if (!snapshot) return null;
-  const agents = snapshot.agentCards.filter((c) => c.agent.lifecycle === 'READY');
-  const agentName = (id: string) => agents.find((c) => c.agent.id === id)?.agent.name ?? snapshot.agentCards.find((c) => c.agent.id === id)?.agent.name ?? '未知';
 
   const trigger = async (teamId: string) => {
     const task = taskInput[teamId]?.trim();
@@ -70,14 +78,14 @@ export function Teams() {
     void window.aibox.getTeamRuns(teamId).then((list) => setRuns((prev) => ({ ...prev, [teamId]: list[0] ?? null })));
   };
 
-  /** 一键组建模板团队：自动创建缺失员工 + 创建团队 */
-  const deployTemplate = async (tpl: TeamTemplate) => {
-    setDeploying(tpl.id);
+  /** 从内置或自定义模板组建团队：自动复用同名员工，缺失成员才创建。 */
+  const deployTeamSpec = async (key: string, name: string, mode: 'coordinate' | 'roundtable', coordinator: TeamTemplateAgent, members: TeamTemplateAgent[]) => {
+    setDeploying(key);
     setDeployMsg('');
     try {
       const existingNames = new Set(snapshot?.agentCards.map((c) => c.agent.name) ?? []);
       const engineId = snapshot?.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? 'eng-hermes';
-      const allAgents = [tpl.coordinator, ...tpl.members];
+      const allAgents = [coordinator, ...members];
       const nameToId = new Map<string, string>();
 
       for (const ag of allAgents) {
@@ -93,140 +101,133 @@ export function Teams() {
         }
       }
 
-      const coordinatorId = nameToId.get(tpl.coordinator.name)!;
-      const memberIds = tpl.members.map((m) => nameToId.get(m.name)!).filter(Boolean);
-      const team = await window.aibox.createTeam({ name: tpl.name, coordinatorId, memberIds, mode: tpl.mode });
+      const coordinatorId = nameToId.get(coordinator.name)!;
+      const memberIds = members.map((m) => nameToId.get(m.name)!).filter(Boolean);
+      const team = await window.aibox.createTeam({ name, coordinatorId, memberIds, mode });
       setTeams((prev) => [team as unknown as TeamData, ...prev]);
-      setDeployMsg(`✅ 「${tpl.name}」组建成功！${allAgents.length} 位员工就位。`);
+      setDeployMsg(`「${name}」组建成功，${allAgents.length} 位员工已就位`);
+      toast.ok(`「${name}」组建成功`);
       setTimeout(() => setDeployMsg(''), 4000);
     } catch (e) {
-      setDeployMsg(`❌ 组建失败：${e instanceof Error ? e.message : String(e)}`);
+      const message = `组建失败：${e instanceof Error ? e.message : String(e)}`;
+      setDeployMsg(message);
+      toast.err(message);
     } finally {
       setDeploying(null);
     }
+  };
+
+  const deployTemplate = (tpl: TeamTemplate) => deployTeamSpec(tpl.id, tpl.name, tpl.mode, tpl.coordinator, tpl.members);
+  const deploySavedTemplate = (tpl: SavedTeamTemplate) => {
+    const [coordinator, ...members] = tpl.members;
+    if (!coordinator) { toast.err('模板没有可用成员'); return Promise.resolve(); }
+    const mode = tpl.mode === 'roundtable' ? 'roundtable' : 'coordinate';
+    return deployTeamSpec(tpl.id, tpl.name, mode, coordinator, members);
   };
 
   return (
     <>
       <div className="page-head">
         <h2>专家团</h2>
-        <span className="desc">多 Agent 协作 · 主 Agent 协调拆解 · 专家并行执行 · 综合输出</span>
+        <span className="desc">{view === 'workspace' ? `${teams.length} 个团队 · 协作过程、贡献与成果可追溯` : '内置方案与自定义团队模板'}</span>
         <div className="right">
-          <button className="btn small primary" onClick={() => setCreateOpen(true)}><IconPlus size={13} />组建团队</button>
+          <div className="team-view-switch" aria-label="专家团视图">
+            <button type="button" className={view === 'workspace' ? 'active' : ''} onClick={() => setView('workspace')}>协作工作台</button>
+            <button type="button" className={view === 'templates' ? 'active' : ''} onClick={() => setView('templates')}>团队模板</button>
+          </div>
+          {view === 'workspace' && <button className="btn small primary" onClick={() => setCreateOpen(true)}><IconPlus size={13} />组建团队</button>}
         </div>
       </div>
 
-      {teams.length === 0 && (
-        <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-3)' }}>
-          还没有专家团。从下方模板一键组建，或点击「组建团队」自定义创建。
+      {view === 'templates' && (
+        <div className="team-template-page">
+          {deployMsg && <div className="team-deploy-message">{deployMsg}</div>}
+          <section className="team-template-section">
+            <header><div><IconLayers size={15} /><h3>内置团队方案</h3></div><span>缺失员工会自动创建，同名员工直接复用</span></header>
+            <div className="team-template-grid">
+              {TEAM_TEMPLATES.map((tpl) => (
+                <div key={tpl.id} className="card team-template-card">
+                  <div className="team-template-title"><strong>{tpl.name}</strong><span>{tpl.mode === 'coordinate' ? '协调模式' : '圆桌模式'}</span></div>
+                  <p>{tpl.description}</p>
+                  <div className="team-template-members"><IconUser size={13} /><span>{tpl.coordinator.name} · {tpl.members.map((m) => m.name).join('、')}</span></div>
+                  <button className="btn small primary" disabled={deploying === tpl.id} onClick={() => void deployTemplate(tpl)}>
+                    <IconPlus size={12} />{deploying === tpl.id ? '组建中...' : '一键组建'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+          <CustomTemplates deploying={deploying} onDeploy={deploySavedTemplate} />
         </div>
       )}
 
-      {/* 团队模板 */}
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ fontSize: 13.5, fontWeight: 650, marginBottom: 10, color: 'var(--text-1)' }}>🚀 团队模板（一键组建，缺失员工自动创建）</div>
-        {deployMsg && <div style={{ fontSize: 12.5, marginBottom: 10, color: deployMsg.startsWith('✅') ? 'var(--success)' : 'var(--danger)' }}>{deployMsg}</div>}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 12 }}>
-          {TEAM_TEMPLATES.map((tpl) => (
-            <div key={tpl.id} className="card" style={{ padding: 14 }}>
-              <div style={{ fontWeight: 650, fontSize: 13.5, marginBottom: 4 }}>{tpl.name}</div>
-              <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 8, lineHeight: 1.6 }}>{tpl.description}</div>
-              <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 10 }}>
-                👑 {tpl.coordinator.name} + {tpl.members.map((m) => m.name).join('、')}
-              </div>
-              <button className="btn small primary" disabled={deploying === tpl.id} onClick={() => void deployTemplate(tpl)} style={{ width: '100%', justifyContent: 'center' }}>
-                {deploying === tpl.id ? '组建中…' : '一键组建'}
-              </button>
+      {view === 'workspace' && (
+        <div className="team-workspace">
+          {teams.length === 0 && (
+            <div className="team-empty card">
+              <IconUser size={28} />
+              <strong>还没有专家团</strong>
+              <span>可从团队模板快速组建，或按当前员工自定义协作团队。</span>
+              <div><button className="btn small primary" onClick={() => setView('templates')}><IconLayers size={13} />查看模板</button><button className="btn small" onClick={() => setCreateOpen(true)}><IconPlus size={13} />自定义组建</button></div>
             </div>
-          ))}
-        </div>
-      </div>
+          )}
 
-      {/* 自定义模板 */}
-      <CustomTemplates />
+          <div className="team-list">
+            {teams.map((team) => (
+              <div className="card team-card" key={team.id}>
+                <header className="team-card-header">
+                  <div className="team-card-icon"><IconUser size={21} /></div>
+                  <div className="team-card-title">
+                    <div><strong>{team.name}</strong><span>{team.mode === 'coordinate' ? '主专家协调' : '专家圆桌'}</span></div>
+                    <small><IconFlow size={12} />{team.mode === 'coordinate' ? '澄清 · 拆解 · 并行分派 · 验收' : '多视角分析 · 观点汇总 · 统一结论'}</small>
+                    {team.workspace && <small title={team.workspace}><IconFolder size={12} /><span>{team.workspace}</span></small>}
+                  </div>
+                  <button className="btn small danger team-remove-button" title="解散团队" aria-label={`解散团队 ${team.name}`} onClick={() => void window.aibox.removeTeam(team.id).then(() => setTeams((items) => items.filter((item) => item.id !== team.id)))}>
+                    <IconX size={12} /><span>解散</span>
+                  </button>
+                </header>
 
-      <div style={{ display: 'grid', gap: 14 }}>
-        {teams.map((team) => (
-          <div className="card" key={team.id} style={{ padding: 18 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-              <div style={{ width: 40, height: 40, borderRadius: 10, background: 'var(--accent-soft)', color: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <IconUser size={22} />
-              </div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 650, fontSize: 15 }}>{team.name}</div>
-                <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 2 }}>
-                  {team.mode === 'coordinate' ? '🎯 主专家协调：拆解→逐步分派→验收' : '🔄 专家圆桌：多视角观点→总结'}
+                <TeamCollaborationPanel team={team} refreshKey={`${runs[team.id]?.events.length ?? 0}:${runs[team.id]?.endedAt ?? 0}`} />
+
+                <div className="team-task-compose">
+                  <select className="project-scope-select" value={projectInput[team.id] ?? ''} onChange={(e) => setProjectInput((current) => ({ ...current, [team.id]: e.target.value }))} aria-label="团队任务归属项目">
+                    <option value="">未归项目</option>
+                    {(snapshot.projects ?? []).filter((project) => !['completed', 'archived'].includes(project.status)).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+                  </select>
+                  <input
+                    value={taskInput[team.id] ?? ''}
+                    onChange={(e) => setTaskInput((current) => ({ ...current, [team.id]: e.target.value }))}
+                    onKeyDown={(e) => { if (e.key === 'Enter') void trigger(team.id); }}
+                    placeholder="输入团队任务"
+                  />
+                  <button className="btn primary" disabled={!taskInput[team.id]?.trim()} onClick={() => void trigger(team.id)}><IconPlay size={13} />执行</button>
                 </div>
-                {team.workspace && <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>📁 {team.workspace}</div>}
+                {triggerMsg[team.id] && <div className="team-trigger-message">{triggerMsg[team.id]}</div>}
+
+                <div className="team-card-actions">
+                  <button className="btn small" onClick={() => setEditTeam(team)}><IconUser size={12} />编辑团队</button>
+                  <button className="btn small" disabled={!runs[team.id]} onClick={() => setTimelineTeamId(team.id)}><IconClock size={12} />执行时间线</button>
+                  <button className="btn small" onClick={() => setHistoryTeam(team)}><IconHistory size={12} />执行历史</button>
+                  <button className="btn small" onClick={() => setConfigTeam(team)}>配置</button>
+                  <button className="btn small" onClick={() => void window.aibox.saveTeamAsTemplate(team.id).then((result) => { result.ok ? toast.ok(result.message) : toast.err(result.message); })}><IconLayers size={12} />保存为模板</button>
+                </div>
+
+                {runs[team.id] && <RunProgress run={runs[team.id]!} onRetry={async (runId, idx) => {
+                  const result = await window.aibox.retryTeamSubtask(runId, idx);
+                  setTriggerMsg((messages) => ({ ...messages, [team.id]: result.message }));
+                  setTimeout(() => setTriggerMsg((messages) => ({ ...messages, [team.id]: '' })), 4000);
+                  void window.aibox.getTeamRuns(team.id).then((list) => setRuns((previous) => ({ ...previous, [team.id]: list[0] ?? null })));
+                }} onCancel={async (runId) => {
+                  const result = await window.aibox.cancelTeamRun(runId);
+                  setTriggerMsg((messages) => ({ ...messages, [team.id]: result.message }));
+                  setTimeout(() => setTriggerMsg((messages) => ({ ...messages, [team.id]: '' })), 4000);
+                  void window.aibox.getTeamRuns(team.id).then((list) => setRuns((previous) => ({ ...previous, [team.id]: list[0] ?? null })));
+                }} />}
               </div>
-              <button className="btn small danger" onClick={() => void window.aibox.removeTeam(team.id).then(() => setTeams((t) => t.filter((x) => x.id !== team.id)))}>
-                <IconX size={12} />解散
-              </button>
-            </div>
-
-            {/* 成员展示 */}
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
-              <span style={{ padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 650, background: 'var(--accent-soft)', color: 'var(--accent)' }}>
-                👑 {agentName(team.coordinatorId)}（协调者）
-              </span>
-              {team.memberIds.map((id) => (
-                <span key={id} style={{ padding: '4px 10px', borderRadius: 6, fontSize: 12, background: 'var(--input-bg)', color: 'var(--text-2)' }}>
-                  {agentName(id)}
-                </span>
-              ))}
-            </div>
-
-            {/* 团队统计 */}
-            <TeamStats teamId={team.id} />
-
-            {/* 提交团队任务 */}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <select className="project-scope-select" value={projectInput[team.id] ?? ''} onChange={(e) => setProjectInput((current) => ({ ...current, [team.id]: e.target.value }))} aria-label="团队任务归属项目" style={{ minWidth: 160 }}>
-                <option value="">未归项目</option>
-                {(snapshot.projects ?? []).filter((project) => !['completed', 'archived'].includes(project.status)).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-              </select>
-              <input
-                value={taskInput[team.id] ?? ''}
-                onChange={(e) => setTaskInput((m) => ({ ...m, [team.id]: e.target.value }))}
-                onKeyDown={(e) => { if (e.key === 'Enter') void trigger(team.id); }}
-                placeholder="输入团队任务，Enter 提交…"
-                style={{ flex: 1, padding: '9px 14px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13 }}
-              />
-              <button className="btn primary" onClick={() => void trigger(team.id)}>
-                <IconPlay size={13} />执行
-              </button>
-            </div>
-            {triggerMsg[team.id] && (
-              <div style={{ marginTop: 8, fontSize: 12.5, color: 'var(--success)', background: 'var(--input-bg)', padding: '8px 12px', borderRadius: 6 }}>
-                {triggerMsg[team.id]}
-              </div>
-            )}
-
-            {/* 操作按钮 */}
-            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-              <button className="btn small" onClick={() => setEditTeam(team)}>编辑团队</button>
-              <button className="btn small" disabled={!runs[team.id]} onClick={() => setTimelineTeamId(team.id)}>⏱ 执行时间线</button>
-              <button className="btn small" onClick={() => setHistoryTeam(team)}>执行历史</button>
-              <button className="btn small" onClick={() => setConfigTeam(team)}>配置</button>
-              <button className="btn small" onClick={() => void window.aibox.saveTeamAsTemplate(team.id).then((r) => { setDeployMsg(r.message); setTimeout(() => setDeployMsg(''), 3000); })}>保存为模板</button>
-            </div>
-
-            {/* 流水线进度面板 */}
-            {runs[team.id] && <RunProgress run={runs[team.id]!} onRetry={async (runId, idx) => {
-              const r = await window.aibox.retryTeamSubtask(runId, idx);
-              setTriggerMsg((m) => ({ ...m, [team.id]: r.message }));
-              setTimeout(() => setTriggerMsg((m) => ({ ...m, [team.id]: '' })), 4000);
-              // 立即拉取更新
-              void window.aibox.getTeamRuns(team.id).then((list) => setRuns((prev) => ({ ...prev, [team.id]: list[0] ?? null })));
-            }} onCancel={async (runId) => {
-              const r = await window.aibox.cancelTeamRun(runId);
-              setTriggerMsg((m) => ({ ...m, [team.id]: r.message }));
-              setTimeout(() => setTriggerMsg((m) => ({ ...m, [team.id]: '' })), 4000);
-              void window.aibox.getTeamRuns(team.id).then((list) => setRuns((prev) => ({ ...prev, [team.id]: list[0] ?? null })));
-            }} />}
+            ))}
           </div>
-        ))}
-      </div>
+        </div>
+      )}
 
       {createOpen && <CreateTeamModal onClose={() => setCreateOpen(false)} onCreated={(t) => { setTeams((prev) => [t, ...prev]); setCreateOpen(false); }} />}
       {editTeam && <EditTeamModal team={editTeam} onClose={() => setEditTeam(null)} onSaved={(t) => { setTeams((prev) => prev.map((x) => x.id === t.id ? t : x)); setEditTeam(null); }} />}
@@ -246,6 +247,7 @@ export function Teams() {
 
 /** 流水线进度面板：阶段指示器 + 子任务状态（并行调度视图）+ 手动重试 + 耗时 + 取消 + 最终结论 */
 function RunProgress({ run, onRetry, onCancel }: { run: TeamRun; onRetry: (runId: string, subtaskIndex: number) => void; onCancel: (runId: string) => void }) {
+  const { setRoute } = useApp();
   const active = ['clarify', 'decompose', 'execute', 'review'].includes(run.phase);
   const terminal = ['done', 'failed', 'cancelled'].includes(run.phase);
   const statusColor = (s: string) => s === 'done' ? 'var(--success)' : s === 'failed' ? 'var(--danger)' : s === 'skipped' ? 'var(--text-3)' : (s === 'running' || s === 'retrying') ? 'var(--accent)' : 'var(--text-3)';
@@ -262,7 +264,7 @@ function RunProgress({ run, onRetry, onCancel }: { run: TeamRun; onRetry: (runId
   const elapsedText = elapsedMs < 60_000 ? `${Math.max(0, Math.round(elapsedMs / 1000))}s` : `${Math.floor(elapsedMs / 60_000)}m${Math.round((elapsedMs % 60_000) / 1000)}s`;
 
   return (
-    <div style={{ marginTop: 12, padding: '12px 14px', borderRadius: 8, background: 'var(--input-bg)', border: '1px solid var(--card-border)' }}>
+    <div className="team-run-progress" style={{ marginTop: 12, padding: '12px 14px', borderRadius: 8, background: 'var(--input-bg)', border: '1px solid var(--card-border)' }}>
       {/* 阶段指示器 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: run.subtasks.length > 0 ? 10 : 0 }}>
         <span style={{ fontSize: 12, fontWeight: 650, color: run.phase === 'failed' ? 'var(--danger)' : run.phase === 'done' ? 'var(--success)' : run.phase === 'cancelled' ? 'var(--text-3)' : 'var(--accent)' }}>
@@ -279,6 +281,15 @@ function RunProgress({ run, onRetry, onCancel }: { run: TeamRun; onRetry: (runId
             onClick={() => onCancel(run.id)}>■ 取消</button>
         )}
       </div>
+
+      {(run.trace.project || run.trace.tasks.length > 0 || run.trace.deliverable) && (
+        <div className="team-run-trace">
+          <span><IconFlow size={12} />运行链路</span>
+          {run.trace.project && <button type="button" onClick={() => setRoute('projects')}><IconFolder size={12} />{run.trace.project.name}</button>}
+          {run.trace.tasks.length > 0 && <button type="button" onClick={() => setRoute('tasks')}><IconCheck size={12} />{run.trace.tasks.length} 个内部任务</button>}
+          {run.trace.deliverable && <button type="button" onClick={() => setRoute('deliverables')}><IconFile size={12} />成果 · {run.trace.deliverable.reviewStatus === 'accepted' ? '已采纳' : run.trace.deliverable.reviewStatus === 'rejected' ? '已驳回' : run.trace.deliverable.reviewStatus === 'rework' ? '待返工' : '待验收'}</button>}
+        </div>
+      )}
 
       {/* 子任务列表（并行状态） */}
       {run.subtasks.length > 0 && (
@@ -314,14 +325,15 @@ function RunProgress({ run, onRetry, onCancel }: { run: TeamRun; onRetry: (runId
 /** 执行时间线抽屉：决策脊柱 + 可展开轮次 + 决策透明化 + 执行干预控制，实时/复盘两用 */
 interface TlRoundSubtask { agent: string; status: string; durationMs: number }
 interface TlNode {
-  kind: 'phase' | 'round' | 'decision' | 'marker';
+  kind: 'phase' | 'round' | 'decision' | 'marker' | 'review';
   phase?: string;
   round?: number;
   count?: number;
   action?: string;
   summary?: string;
   reasoning?: string;
-  markerType?: 'cancelled' | 'skipped' | 'guidance';
+  markerType?: 'cancelled' | 'skipped' | 'guidance' | 'force_retry' | 'manual_retry';
+  reviewStatus?: 'passed' | 'partial' | 'failed';
   agent?: string;
   message?: string;
   ts: number;
@@ -359,6 +371,11 @@ function buildTimeline(run: TeamRun): TlNode[] {
         nodes.push({ kind: 'marker', markerType: 'skipped', round: ev.round, agent: ev.agent, ts: ev.ts, subtasks: [] });
       } else if (ev.type === 'guidance') {
         nodes.push({ kind: 'marker', markerType: 'guidance', message: ev.message, ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'intervention') {
+        const markerType = ev.action === 'cancel' ? 'cancelled' : ev.action === 'skip' ? 'skipped' : ev.action;
+        nodes.push({ kind: 'marker', markerType, message: ev.message, agent: ev.agent, ts: ev.ts, subtasks: [] });
+      } else if (ev.type === 'review') {
+        nodes.push({ kind: 'review', reviewStatus: ev.status, summary: ev.summary, ts: ev.ts, subtasks: [] });
       }
     }
     return nodes;
@@ -470,14 +487,24 @@ function TeamTimelineModal({ run, teamName, onClose, onChanged }: {
               }
               if (n.kind === 'marker') {
                 const mt = n.markerType;
-                const mColor = mt === 'cancelled' ? 'var(--danger)' : mt === 'guidance' ? 'var(--accent)' : 'var(--text-3)';
-                const mText = mt === 'cancelled' ? '⊘ 用户取消了执行'
-                  : mt === 'skipped' ? `⊘ 跳过「${n.agent}」`
-                  : `⚡ 人类指导：${n.message}`;
+                const mColor = mt === 'cancelled' ? 'var(--danger)' : ['guidance', 'force_retry', 'manual_retry'].includes(mt ?? '') ? 'var(--accent)' : 'var(--text-3)';
+                const prefix = mt === 'guidance' ? '人工指导' : mt === 'force_retry' ? '强制重试' : mt === 'manual_retry' ? '手动重试' : mt === 'cancelled' ? '取消请求' : '跳过请求';
+                const mText = `${prefix}：${n.message ?? n.agent ?? ''}`;
                 return (
                   <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, position: 'relative', fontSize: 11.5, color: mColor, background: 'var(--input-bg)', border: `1px dashed ${mColor}`, borderRadius: 6, padding: '6px 10px' }}>
                     <span style={{ position: 'absolute', left: -25, top: 8, width: 8, height: 8, borderRadius: '50%', background: mColor, border: '2px solid var(--bg)' }} />
                     <span style={{ lineHeight: 1.5 }}>{mText}</span>
+                  </div>
+                );
+              }
+              if (n.kind === 'review') {
+                const reviewColor = n.reviewStatus === 'passed' ? 'var(--success)' : n.reviewStatus === 'failed' ? 'var(--danger)' : 'var(--warning)';
+                const reviewLabel = n.reviewStatus === 'passed' ? '验收通过' : n.reviewStatus === 'failed' ? '验收未通过' : '部分通过';
+                return (
+                  <div key={i} style={{ position: 'relative', background: 'var(--input-bg)', borderLeft: `3px solid ${reviewColor}`, padding: '9px 11px' }}>
+                    <span style={{ position: 'absolute', left: -27, top: 12, width: 10, height: 10, borderRadius: '50%', background: reviewColor, border: '2px solid var(--bg)' }} />
+                    <div style={{ fontSize: 12, fontWeight: 700, color: reviewColor }}>{reviewLabel}</div>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 3, lineHeight: 1.5 }}>{n.summary}</div>
                   </div>
                 );
               }
@@ -728,20 +755,81 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
   );
 }
 
-/** 团队统计（异步加载） */
-function TeamStats({ teamId }: { teamId: string }) {
-  const [stats, setStats] = useState<{ totalRuns: number; avgDurationMs: number; successRate: number } | null>(null);
+/** 团队协作全貌：角色拓扑、贡献指标、项目成果与最近决策。 */
+function TeamCollaborationPanel({ team, refreshKey }: { team: TeamData; refreshKey: string }) {
+  const { setRoute } = useApp();
+  const [overview, setOverview] = useState<TeamCollaborationOverview | null>(null);
+  const [failed, setFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    void window.aibox.getTeamStats(teamId).then((s) => { if (!cancelled) setStats(s); });
+    setFailed(false);
+    void window.aibox.getTeamCollaborationOverview(team.id)
+      .then((value) => { if (!cancelled) setOverview(value); })
+      .catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; };
-  }, [teamId]);
-  if (!stats || stats.totalRuns === 0) return null;
+  }, [team.id, team.coordinatorId, team.memberIds.join(':'), refreshKey]);
+
+  if (failed) return <div className="team-overview-error"><IconAlert size={13} />协作数据暂时无法加载</div>;
+  if (!overview) return <div className="team-overview-loading">正在汇总协作数据...</div>;
+
+  const coordinator = overview.members.find((member) => member.teamRole === 'coordinator');
+  const experts = overview.members.filter((member) => member.teamRole === 'expert');
+  const latestDecision = overview.recentDecisions[0];
+  const metrics = overview.metrics;
+
   return (
-    <div style={{ display: 'flex', gap: 14, fontSize: 11.5, color: 'var(--text-2)', marginBottom: 12, padding: '6px 10px', background: 'var(--input-bg)', borderRadius: 6 }}>
-      <span>累计执行: <b>{stats.totalRuns}</b></span>
-      <span>平均耗时: <b style={{ color: 'var(--accent)' }}>{(stats.avgDurationMs / 1000).toFixed(1)}s</b></span>
-      <span>成功率: <b style={{ color: stats.successRate >= 80 ? 'var(--success)' : 'var(--warning)' }}>{stats.successRate}%</b></span>
+    <div className="team-overview">
+      <div className="team-overview-kpis">
+        <span><IconHistory size={14} /><small>累计运行</small><strong>{metrics.totalRuns}</strong>{metrics.activeRuns > 0 && <b>{metrics.activeRuns} 进行中</b>}</span>
+        <span><IconCheck size={14} /><small>成功率</small><strong data-tone={metrics.totalRuns === 0 ? undefined : metrics.successRate >= 80 ? 'good' : 'warn'}>{metrics.totalRuns === 0 ? '--' : `${metrics.successRate}%`}</strong></span>
+        <span><IconClock size={14} /><small>平均耗时</small><strong>{fmtDur(metrics.avgDurationMs)}</strong></span>
+        <span><IconFolder size={14} /><small>关联项目</small><strong>{metrics.projectCount}</strong></span>
+        <span><IconFile size={14} /><small>最终成果</small><strong>{metrics.deliverableCount}</strong><b>{metrics.acceptedDeliverables} 已采纳</b></span>
+      </div>
+
+      <div className="team-overview-main">
+        <section className="team-topology">
+          <header><h4>协作拓扑与贡献</h4><span>{metrics.interventionCount} 次人工介入</span></header>
+          <div className="team-topology-flow">
+            {coordinator && (
+              <div className="team-member team-member-coordinator">
+                <span className="team-member-avatar"><IconUser size={15} /></span>
+                <span><strong>{coordinator.name}</strong><small title={coordinator.role}>{coordinator.role || '协调与验收'}</small></span>
+                <b>{coordinator.decisions} 次决策</b>
+              </div>
+            )}
+            <span className="team-flow-line"><IconFlow size={15} /></span>
+            <div className="team-expert-list">
+              {experts.map((member) => (
+                <div className="team-member" key={member.agentId}>
+                  <span className="team-member-avatar"><IconUser size={14} /></span>
+                  <span><strong>{member.name}</strong><small title={member.role}>{member.role || '专业执行'}</small></span>
+                  <span className="team-member-score"><i><em style={{ width: `${member.completionRate}%` }} /></i><b>{member.completed}/{member.assigned}</b></span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="team-linkage">
+          <header><h4>项目与成果链路</h4>{overview.projects.length > 0 && <button type="button" onClick={() => setRoute('projects')}>查看项目</button>}</header>
+          {overview.projects.length === 0 ? <div className="team-linkage-empty">尚未关联项目，执行任务时可选择项目归属</div> : (
+            <div className="team-project-links">
+              {overview.projects.slice(0, 3).map((project) => (
+                <button type="button" key={project.projectId} onClick={() => setRoute('projects')}>
+                  <span><strong>{project.projectName}</strong><small>{project.runCount} 次运行 · {project.deliverableCount} 项成果</small></span>
+                  <b>{project.acceptedDeliverables}/{project.deliverableCount} 采纳</b>
+                </button>
+              ))}
+            </div>
+          )}
+          {latestDecision && (
+            <button type="button" className="team-latest-decision" onClick={() => setRoute('tasks')}>
+              <IconFlow size={13} /><span><small>最近决策 · 第 {latestDecision.round} 轮</small><strong>{latestDecision.summary}</strong></span>
+            </button>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
@@ -805,8 +893,10 @@ function EditTeamModal({ team, onClose, onSaved }: { team: TeamData; onClose: ()
 
 /** 执行历史弹窗 */
 function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => void }) {
+  const { setRoute } = useApp();
   const [runs, setRuns] = useState<TeamRun[] | null>(null);
   const [expandedOutput, setExpandedOutput] = useState<Record<string, string>>({});
+  const [timelineRun, setTimelineRun] = useState<TeamRun | null>(null);
 
   useEffect(() => {
     void window.aibox.getTeamRuns(team.id).then(setRuns);
@@ -824,7 +914,7 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
   const phaseColor = (p: string) => p === 'done' ? 'var(--success)' : p === 'failed' ? 'var(--danger)' : 'var(--accent)';
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={onClose}>
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="card" style={{ width: 640, maxHeight: '75vh', overflowY: 'auto', padding: 20 }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <h3 style={{ margin: 0, fontSize: 15 }}>执行历史 · {team.name}</h3>
@@ -838,7 +928,14 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
               <span style={{ fontSize: 12, color: 'var(--text-2)', flex: 1 }}>{run.taskText.slice(0, 50)}{run.taskText.length > 50 ? '…' : ''}</span>
               <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{new Date(run.createdAt).toLocaleString('zh-CN', { hour12: false })}</span>
               {run.durationMs != null && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{(run.durationMs / 1000).toFixed(1)}s</span>}
+              <button className="btn small" style={{ padding: '1px 7px', fontSize: 10.5 }} onClick={() => setTimelineRun(run)}><IconClock size={11} />时间线</button>
             </div>
+            {(run.trace.project || run.trace.deliverable) && (
+              <div className="team-history-trace">
+                {run.trace.project && <button type="button" onClick={() => { setRoute('projects'); onClose(); }}><IconFolder size={11} />{run.trace.project.name}</button>}
+                {run.trace.deliverable && <button type="button" onClick={() => { setRoute('deliverables'); onClose(); }}><IconFile size={11} />最终成果 · {run.trace.deliverable.reviewStatus === 'accepted' ? '已采纳' : '待验收'}</button>}
+              </div>
+            )}
             {/* 子任务列表 */}
             {run.subtasks.map((st, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, padding: '3px 0' }}>
@@ -870,6 +967,12 @@ function TeamHistoryModal({ team, onClose }: { team: TeamData; onClose: () => vo
           </div>
         ))}
       </div>
+      {timelineRun && <TeamTimelineModal run={timelineRun} teamName={team.name} onClose={() => setTimelineRun(null)} onChanged={() => {
+        void window.aibox.getTeamRuns(team.id).then((items) => {
+          setRuns(items);
+          setTimelineRun((current) => items.find((item) => item.id === current?.id) ?? current);
+        });
+      }} />}
     </div>
   );
 }
@@ -925,31 +1028,36 @@ function TeamConfigModal({ team, onClose }: { team: TeamData; onClose: () => voi
   );
 }
 
-/** 自定义模板管理：列出/删除用户保存的团队模板 */
-function CustomTemplates() {
-  const [templates, setTemplates] = useState<{ id: string; name: string; description: string; mode: string; members: unknown[]; createdAt: number }[] | null>(null);
+/** 自定义模板管理：保存后的模板可再次一键组建，不只是归档。 */
+function CustomTemplates({ deploying, onDeploy }: { deploying: string | null; onDeploy: (template: SavedTeamTemplate) => Promise<void> }) {
+  const [templates, setTemplates] = useState<SavedTeamTemplate[] | null>(null);
 
   useEffect(() => {
-    void window.aibox.listTeamTemplates().then(setTemplates);
+    void window.aibox.listTeamTemplates().then((items) => setTemplates(items as SavedTeamTemplate[]));
   }, []);
 
-  if (!templates || templates.length === 0) return null;
+  if (!templates) return <div className="team-overview-loading">正在加载自定义模板...</div>;
 
   return (
-    <div style={{ marginBottom: 20 }}>
-      <div style={{ fontSize: 13.5, fontWeight: 650, marginBottom: 10, color: 'var(--text-1)' }}>📁 自定义模板（从团队保存）</div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 12 }}>
+    <section className="team-template-section">
+      <header><div><IconFolder size={15} /><h3>自定义模板</h3></div><span>从现有团队保存，可反复组建</span></header>
+      {templates.length === 0 ? <div className="team-template-empty">暂无自定义模板，可在协作工作台中将现有团队保存为模板。</div> : (
+        <div className="team-template-grid">
         {templates.map((tpl) => (
-          <div key={tpl.id} className="card" style={{ padding: 14 }}>
-            <div style={{ fontWeight: 650, fontSize: 13.5, marginBottom: 4 }}>{tpl.name}</div>
-            <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 8, lineHeight: 1.6 }}>{tpl.description}</div>
-            <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8 }}>
-              {tpl.mode === 'coordinate' ? '🎯 协调模式' : '🔄 圆桌模式'} · {Array.isArray(tpl.members) ? tpl.members.length : 0} 位成员
+          <div key={tpl.id} className="card team-template-card">
+            <div className="team-template-title"><strong>{tpl.name}</strong><span>{tpl.mode === 'coordinate' ? '协调模式' : '圆桌模式'}</span></div>
+            <p>{tpl.description}</p>
+            <div className="team-template-members"><IconUser size={13} /><span>{tpl.members.map((member) => member.name).join('、') || '无可用成员'}</span></div>
+            <div className="team-template-actions">
+              <button className="btn small primary" disabled={deploying === tpl.id || tpl.members.length === 0} onClick={() => void onDeploy(tpl)}><IconPlus size={12} />{deploying === tpl.id ? '组建中...' : '一键组建'}</button>
+              <button className="btn small danger" title="删除模板" aria-label={`删除模板 ${tpl.name}`} onClick={() => void window.aibox.removeTeamTemplate(tpl.id).then(() => setTemplates((previous) => previous?.filter((item) => item.id !== tpl.id) ?? null))}>
+                <IconX size={12} />
+              </button>
             </div>
-            <button className="btn small danger" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void window.aibox.removeTeamTemplate(tpl.id).then(() => setTemplates((prev) => prev?.filter((t) => t.id !== tpl.id) ?? null))}>删除模板</button>
           </div>
         ))}
-      </div>
-    </div>
+        </div>
+      )}
+    </section>
   );
 }

@@ -797,6 +797,8 @@ export interface TeamRun {
   subtasks: TeamRunSubtask[];
   /** 时间线事件流（阶段/轮次/子任务完成/主Agent决策），供执行时间线可视化 */
   events: TeamTimelineEvent[];
+  /** 从团队运行到项目、内部任务与最终成果的可追溯链路 */
+  trace: TeamRunTrace;
   finalResult: string | null;
   error: string | null;
   createdAt: number;
@@ -812,7 +814,66 @@ export type TeamTimelineEvent =
   | { type: 'decision'; round: number; action: 'finish' | 'continue'; summary: string; reasoning?: string; ts: number }
   | { type: 'cancelled'; ts: number }
   | { type: 'skipped'; round: number; agent: string; ts: number }
-  | { type: 'guidance'; message: string; ts: number };
+  | { type: 'guidance'; message: string; ts: number }
+  | { type: 'intervention'; action: 'guidance' | 'skip' | 'force_retry' | 'manual_retry' | 'cancel'; message: string; agent?: string; ts: number }
+  | { type: 'review'; status: 'passed' | 'partial' | 'failed'; summary: string; ts: number };
+
+export interface TeamRunTrace {
+  project: { id: string; name: string } | null;
+  tasks: { id: string; agentId: string; agentName: string }[];
+  deliverable: { id: string; title: string; reviewStatus: DeliverableReviewStatus } | null;
+}
+
+export interface TeamMemberContribution {
+  agentId: string;
+  name: string;
+  role: string;
+  teamRole: 'coordinator' | 'expert';
+  assigned: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  retries: number;
+  decisions: number;
+  completionRate: number;
+  avgDurationMs: number;
+}
+
+export interface TeamProjectContribution {
+  projectId: string;
+  projectName: string;
+  runCount: number;
+  deliverableCount: number;
+  acceptedDeliverables: number;
+  lastRunAt: number;
+}
+
+export interface TeamDecisionRecord {
+  runId: string;
+  taskText: string;
+  round: number;
+  action: 'finish' | 'continue';
+  summary: string;
+  reasoning?: string;
+  createdAt: number;
+}
+
+export interface TeamCollaborationOverview {
+  teamId: string;
+  metrics: {
+    totalRuns: number;
+    activeRuns: number;
+    successRate: number;
+    avgDurationMs: number;
+    projectCount: number;
+    deliverableCount: number;
+    acceptedDeliverables: number;
+    interventionCount: number;
+  };
+  members: TeamMemberContribution[];
+  projects: TeamProjectContribution[];
+  recentDecisions: TeamDecisionRecord[];
+}
 
 /** 团队配置 */
 export interface TeamConfig {

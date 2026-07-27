@@ -13,7 +13,10 @@ import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs'
 import { app } from 'electron';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
-import type { Agent, TeamRun, TeamRunPhase, TeamRunSubtask, TeamTimelineEvent } from '../../shared/types.js';
+import type {
+  Agent, DeliverableReviewStatus, TeamCollaborationOverview, TeamMemberContribution,
+  TeamRun, TeamRunPhase, TeamRunSubtask, TeamRunTrace, TeamTimelineEvent
+} from '../../shared/types.js';
 
 export interface Team {
   id: string;
@@ -49,6 +52,20 @@ interface RunRow {
   error: string | null;
   created_at: number;
   ended_at: number | null;
+}
+
+interface ProjectRefRow {
+  id: string;
+  name: string;
+}
+
+interface DeliverableRefRow {
+  id: string;
+  source_type: string;
+  source_id: string;
+  project_id: string | null;
+  title: string;
+  review_status: DeliverableReviewStatus;
 }
 
 /** 单步等待超时（10 分钟） */
@@ -113,14 +130,113 @@ export class TeamEngine {
   // ---------- 执行记录 ----------
 
   listRuns(teamId: string): TeamRun[] {
-    return (this.db.raw.prepare('SELECT * FROM team_runs WHERE team_id = ? ORDER BY created_at DESC LIMIT 20').all(teamId) as unknown as RunRow[]).map(this.mapRun);
+    const rows = this.db.raw.prepare('SELECT * FROM team_runs WHERE team_id = ? ORDER BY created_at DESC LIMIT 20').all(teamId) as unknown as RunRow[];
+    return this.mapRunsWithTrace(rows);
   }
 
   /** 列出需关注的团队运行（失败/取消），供收件箱聚合 */
   listAttentionRuns(limit = 20): (TeamRun & { teamName: string })[] {
     const rows = this.db.raw.prepare("SELECT * FROM team_runs WHERE phase IN ('failed','cancelled') ORDER BY created_at DESC LIMIT ?").all(limit) as unknown as RunRow[];
     const teams = this.list();
-    return rows.map((r) => ({ ...this.mapRun(r), teamName: teams.find((t) => t.id === r.team_id)?.name ?? '未知团队' }));
+    return this.mapRunsWithTrace(rows).map((run) => ({ ...run, teamName: teams.find((t) => t.id === run.teamId)?.name ?? '未知团队' }));
+  }
+
+  getCollaborationOverview(teamId: string): TeamCollaborationOverview {
+    const team = this.list().find((item) => item.id === teamId);
+    if (!team) throw new Error('团队不存在');
+
+    const rows = this.db.raw.prepare('SELECT * FROM team_runs WHERE team_id = ? ORDER BY created_at DESC').all(teamId) as unknown as RunRow[];
+    const runs = this.mapRunsWithTrace(rows);
+    const agents = this.orchestrator.listAgents();
+    const contribution = new Map<string, TeamMemberContribution & { durationTotal: number; durationCount: number }>();
+    const memberIds = [team.coordinatorId, ...team.memberIds];
+    for (const agentId of memberIds) {
+      const agent = agents.find((item) => item.id === agentId);
+      contribution.set(agentId, {
+        agentId, name: agent?.name ?? '已归档成员', role: agent?.role ?? '',
+        teamRole: agentId === team.coordinatorId ? 'coordinator' : 'expert',
+        assigned: 0, completed: 0, failed: 0, skipped: 0, retries: 0, decisions: 0,
+        completionRate: 0, avgDurationMs: 0, durationTotal: 0, durationCount: 0
+      });
+    }
+
+    let interventionCount = 0;
+    const recentDecisions: TeamCollaborationOverview['recentDecisions'] = [];
+    for (const run of runs) {
+      const hasStructuredInterventions = run.events.some((event) => event.type === 'intervention');
+      for (const subtask of run.subtasks) {
+        let item = contribution.get(subtask.agentId);
+        if (!item) {
+          item = {
+            agentId: subtask.agentId, name: subtask.agent, role: '', teamRole: 'expert',
+            assigned: 0, completed: 0, failed: 0, skipped: 0, retries: 0, decisions: 0,
+            completionRate: 0, avgDurationMs: 0, durationTotal: 0, durationCount: 0
+          };
+          contribution.set(subtask.agentId, item);
+        }
+        item.assigned++;
+        if (subtask.status === 'done') item.completed++;
+        else if (subtask.status === 'failed') item.failed++;
+        else if (subtask.status === 'skipped') item.skipped++;
+        item.retries += subtask.retryCount ?? 0;
+      }
+      for (const event of run.events) {
+        if (event.type === 'subtask_done') {
+          const item = contribution.get(event.agentId);
+          if (item) { item.durationTotal += event.durationMs; item.durationCount++; }
+        } else if (event.type === 'decision') {
+          const coordinator = contribution.get(team.coordinatorId);
+          if (coordinator) coordinator.decisions++;
+          recentDecisions.push({
+            runId: run.id, taskText: run.taskText, round: event.round, action: event.action,
+            summary: event.summary, reasoning: event.reasoning, createdAt: event.ts
+          });
+        } else if (event.type === 'intervention' || (!hasStructuredInterventions && (event.type === 'guidance' || event.type === 'skipped' || event.type === 'cancelled'))) {
+          interventionCount++;
+        }
+      }
+    }
+
+    const members = [...contribution.values()].map(({ durationTotal, durationCount, ...item }) => ({
+      ...item,
+      completionRate: item.assigned ? Math.round((item.completed / item.assigned) * 100) : 0,
+      avgDurationMs: durationCount ? Math.round(durationTotal / durationCount) : 0
+    }));
+    const projectMap = new Map(
+      (this.db.raw.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all() as unknown as ProjectRefRow[])
+        .map((project) => [project.id, project.name])
+    );
+    const deliverables = this.db.raw.prepare('SELECT * FROM deliverables ORDER BY updated_at DESC').all() as unknown as DeliverableRefRow[];
+    const projects = [...new Set(runs.map((run) => run.projectId).filter((id): id is string => Boolean(id)))].map((projectId) => {
+      const projectRuns = runs.filter((run) => run.projectId === projectId);
+      const projectDeliverables = deliverables.filter((item) => item.project_id === projectId && item.source_type === 'team_run' && projectRuns.some((run) => run.id === item.source_id));
+      return {
+        projectId, projectName: projectMap.get(projectId) ?? '已归档项目', runCount: projectRuns.length,
+        deliverableCount: projectDeliverables.length,
+        acceptedDeliverables: projectDeliverables.filter((item) => item.review_status === 'accepted').length,
+        lastRunAt: Math.max(...projectRuns.map((run) => run.createdAt))
+      };
+    }).sort((a, b) => b.lastRunAt - a.lastRunAt);
+    const ended = runs.filter((run) => run.endedAt !== null);
+    const terminal = runs.filter((run) => ['done', 'failed', 'cancelled'].includes(run.phase));
+    const teamDeliverables = deliverables.filter((item) => item.source_type === 'team_run' && runs.some((run) => run.id === item.source_id));
+
+    return {
+      teamId,
+      metrics: {
+        totalRuns: runs.length,
+        activeRuns: runs.filter((run) => ['clarify', 'decompose', 'execute', 'review'].includes(run.phase)).length,
+        successRate: terminal.length ? Math.round((terminal.filter((run) => run.phase === 'done').length / terminal.length) * 100) : 0,
+        avgDurationMs: ended.length ? Math.round(ended.reduce((sum, run) => sum + (run.durationMs ?? 0), 0) / ended.length) : 0,
+        projectCount: projects.length,
+        deliverableCount: teamDeliverables.length,
+        acceptedDeliverables: teamDeliverables.filter((item) => item.review_status === 'accepted').length,
+        interventionCount
+      },
+      members,
+      projects,
+      recentDecisions: recentDecisions.sort((a, b) => b.createdAt - a.createdAt).slice(0, 5)
+    };
   }
 
   /** 崩溃恢复：检测中断的流水线并自动续跑（而非简单标记失败）。需在引擎就绪后调用。 */
@@ -252,6 +368,7 @@ export class TeamEngine {
     const row = this.activeRunRow(runId);
     if (!row) return { ok: false, message: '该执行不存在或已结束，无法取消' };
     this.control(runId).cancel = true;
+    this.persistEvents(runId, [{ type: 'intervention', action: 'cancel', message: '用户请求取消团队运行', ts: Date.now() }]);
     let subtasks: TeamRunSubtask[] = [];
     try { subtasks = JSON.parse(row.subtasks_json) as TeamRunSubtask[]; } catch { /* ignore */ }
     for (const st of subtasks) {
@@ -275,6 +392,7 @@ export class TeamEngine {
       try { this.orchestrator.cancelTask(st.taskId); } catch { /* ignore */ }
     }
     this.control(runId).skip.add(subtaskIndex);
+    this.persistEvents(runId, [{ type: 'intervention', action: 'skip', message: `用户请求跳过「${st.agent}」的子任务`, agent: st.agent, ts: Date.now() }]);
     return { ok: true, message: `已跳过「${st.agent}」` };
   }
 
@@ -288,6 +406,7 @@ export class TeamEngine {
     if (!st) return { ok: false, message: '子任务不存在' };
     if (st.status !== 'failed') return { ok: false, message: '只能强制重试失败的子任务' };
     this.control(runId).forceRetry.add(subtaskIndex);
+    this.persistEvents(runId, [{ type: 'intervention', action: 'force_retry', message: `用户请求重试「${st.agent}」的失败子任务`, agent: st.agent, ts: Date.now() }]);
     return { ok: true, message: `将在下一轮重试「${st.agent}」` };
   }
 
@@ -298,6 +417,7 @@ export class TeamEngine {
     const text = message.trim();
     if (!text) return { ok: false, message: '指导内容不能为空' };
     this.control(runId).guidance.push(text);
+    this.persistEvents(runId, [{ type: 'intervention', action: 'guidance', message: text, ts: Date.now() }]);
     return { ok: true, message: '已注入指导，主Agent 将在下次决策时考虑' };
   }
 
@@ -317,7 +437,8 @@ export class TeamEngine {
 
       // Phase 1：拆解（圆桌模式为固定视角分配，无需 LLM 拆解）
       events.push({ type: 'phase', phase: 'decompose', ts: Date.now() });
-      this.updateRun(runId, { phase: 'decompose', events_json: JSON.stringify(events) });
+      this.updateRun(runId, { phase: 'decompose' });
+      this.persistEvents(runId, events);
       let subtasks: TeamRunSubtask[];
       if (team.mode === 'roundtable') {
         subtasks = members.map((m) => ({
@@ -357,12 +478,23 @@ export class TeamEngine {
   private abortAsCancelled(runId: string, events: TeamTimelineEvent[], ws: string) {
     events.push({ type: 'cancelled', ts: Date.now() });
     this.appendProgress(ws, '流水线已被用户取消');
-    this.updateRun(runId, { phase: 'cancelled', error: '用户取消', ended_at: Date.now(), events_json: JSON.stringify(events) });
+    this.persistEvents(runId, events);
+    this.updateRun(runId, { phase: 'cancelled', error: '用户取消', ended_at: Date.now() });
   }
 
   /** 持久化时间线事件流（供 UI 执行时间线可视化） */
   private persistEvents(runId: string, events: TeamTimelineEvent[]) {
-    this.updateRun(runId, { events_json: JSON.stringify(events) });
+    const row = this.db.raw.prepare('SELECT * FROM team_runs WHERE id = ?').get(runId) as RunRow | undefined;
+    let persisted: TeamTimelineEvent[] = [];
+    try { persisted = JSON.parse(row?.events_json ?? '[]') as TeamTimelineEvent[]; } catch { /* ignore */ }
+    const known = new Set(persisted.map((event) => JSON.stringify(event)));
+    for (const event of events) {
+      const key = JSON.stringify(event);
+      if (!known.has(key)) { persisted.push(event); known.add(key); }
+    }
+    persisted.sort((a, b) => a.ts - b.ts);
+    events.splice(0, events.length, ...persisted);
+    this.updateRun(runId, { events_json: JSON.stringify(persisted) });
   }
 
   /** Phase 0：问题澄清 + 生成 Spec（主Agent 内部 AI 先澄清问题边界、目标、约束，输出结构化规格说明） */
@@ -523,7 +655,8 @@ ${handoffCtx}
         st.round = round;
       }
       events.push({ type: 'round_start', round, count: pending.length, ts: Date.now() });
-      this.updateRun(runId, { current_step: round, total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks), events_json: JSON.stringify(events) });
+      this.updateRun(runId, { current_step: round, total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks) });
+      this.persistEvents(runId, events);
       this.appendProgress(ws, `══ 第 ${round} 轮调度 ══ 并行分派 ${pending.length} 个子任务：${pending.map((s) => s.agent).join('、')}`);
 
       const stepTimeout = Math.max(60_000, (config.timeout || 600) * 1000);
@@ -553,7 +686,8 @@ ${handoffCtx}
           st.status = 'skipped';
           events.push({ type: 'skipped', round, agent: st.agent, ts: Date.now() });
           this.appendProgress(ws, `${st.agent} 被用户跳过（第 ${round} 轮）`);
-          this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks), events_json: JSON.stringify(events) });
+          this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+          this.persistEvents(runId, events);
           return;
         }
         const ok = done?.status === 'COMPLETED';
@@ -565,7 +699,8 @@ ${handoffCtx}
         events.push({ type: 'subtask_done', round, agent: st.agent, agentId: st.agentId, status: st.status, durationMs: Date.now() - startedAt, ts: Date.now() });
         this.writeHandoff(ws, idx + 1, member.name, st.subtask, st.output, ok);
         this.appendProgress(ws, `${st.agent} ${ok ? '✓ 完成' : '✗ 失败'}（第 ${round} 轮）`);
-        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks), events_json: JSON.stringify(events) });
+        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+        this.persistEvents(runId, events);
       }));
 
       // 干预：本轮执行期间若请求了取消，直接退出
@@ -575,8 +710,7 @@ ${handoffCtx}
       const ctl = this.control(runId);
       const guidance = [...ctl.guidance];
       ctl.guidance.length = 0;
-      for (const g of guidance) events.push({ type: 'guidance', message: g, ts: Date.now() });
-      if (guidance.length > 0) { this.appendProgress(ws, `人类监督者注入 ${guidance.length} 条指导`); this.persistEvents(runId, events); }
+      if (guidance.length > 0) this.appendProgress(ws, `人类监督者注入 ${guidance.length} 条指导`);
 
       this.appendProgress(ws, `第 ${round} 轮执行结束，向主Agent汇报结果并请求调度决策…`);
       const decision = await this.coordinatorDecide(runId, team, coordinator, members, task, ws, subtasks, round, maxRounds, config.maxRetries ?? 1, guidance);
@@ -589,6 +723,13 @@ ${handoffCtx}
       this.persistEvents(runId, events);
 
       if (decision.action === 'finish') {
+        const failed = subtasks.filter((subtask) => subtask.status === 'failed').length;
+        events.push({
+          type: 'review', status: failed > 0 ? 'partial' : 'passed',
+          summary: failed > 0 ? `验收完成，${failed} 个子任务未成功，结论按现有产出汇总` : '验收通过，所有已分派子任务均已形成有效产出',
+          ts: Date.now()
+        });
+        this.persistEvents(runId, events);
         return decision.conclusion ?? this.buildFallbackSummary(subtasks);
       }
 
@@ -606,6 +747,13 @@ ${handoffCtx}
 
     // 达到最大轮次，降级汇总
     this.appendProgress(ws, `已达最大调度轮次（${maxRounds}），直接汇总产出`);
+    const failed = subtasks.filter((subtask) => subtask.status === 'failed').length;
+    events.push({
+      type: 'review', status: failed > 0 ? 'failed' : 'partial',
+      summary: failed > 0 ? `达到最大轮次，仍有 ${failed} 个失败子任务` : '达到最大轮次，系统按现有成员产出生成阶段性结论',
+      ts: Date.now()
+    });
+    this.persistEvents(runId, events);
     return this.buildFallbackSummary(subtasks);
   }
 
@@ -817,6 +965,28 @@ _生成时间：${new Date().toLocaleString()}_
     };
   }
 
+  private mapRunsWithTrace(rows: RunRow[]): TeamRun[] {
+    const projects = new Map(
+      (this.db.raw.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all() as unknown as ProjectRefRow[])
+        .map((project) => [project.id, project.name])
+    );
+    const deliverables = new Map(
+      (this.db.raw.prepare('SELECT * FROM deliverables ORDER BY updated_at DESC').all() as unknown as DeliverableRefRow[])
+        .filter((item) => item.source_type === 'team_run')
+        .map((item) => [item.source_id, item])
+    );
+    return rows.map((row) => {
+      const run = this.mapRun(row);
+      const deliverable = deliverables.get(run.id);
+      const trace: TeamRunTrace = {
+        project: run.projectId ? { id: run.projectId, name: projects.get(run.projectId) ?? '已归档项目' } : null,
+        tasks: run.subtasks.flatMap((subtask) => subtask.taskId ? [{ id: subtask.taskId, agentId: subtask.agentId, agentName: subtask.agent }] : []),
+        deliverable: deliverable ? { id: deliverable.id, title: deliverable.title, reviewStatus: deliverable.review_status } : null
+      };
+      return { ...run, trace };
+    });
+  }
+
   private mapRun(r: RunRow): TeamRun {
     let subtasks: TeamRunSubtask[] = [];
     try { subtasks = JSON.parse(r.subtasks_json) as TeamRunSubtask[]; } catch { /* ignore */ }
@@ -825,7 +995,7 @@ _生成时间：${new Date().toLocaleString()}_
     return {
       id: r.id, teamId: r.team_id, projectId: r.project_id ?? null, taskText: r.task_text,
       phase: r.phase as TeamRunPhase, currentStep: r.current_step, totalSteps: r.total_steps,
-      subtasks, events, finalResult: r.final_result, error: r.error,
+      subtasks, events, trace: { project: null, tasks: [], deliverable: null }, finalResult: r.final_result, error: r.error,
       createdAt: r.created_at, endedAt: r.ended_at,
       durationMs: r.ended_at ? r.ended_at - r.created_at : null
     };
@@ -867,6 +1037,9 @@ _生成时间：${new Date().toLocaleString()}_
     // 标记为重试中（UI 轮询可感知）
     st.status = 'retrying';
     this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks), phase: 'execute', current_step: subtaskIndex + 1, error: '' });
+    this.persistEvents(runId, [{
+      type: 'intervention', action: 'manual_retry', message: `用户手动重试「${st.agent}」的失败子任务`, agent: st.agent, ts: Date.now()
+    }]);
     this.retryingRuns.add(runId);
     void this.doRetrySubtask(runId, row, team, coordinator, member, subtasks, subtaskIndex)
       .finally(() => this.retryingRuns.delete(runId));
@@ -903,6 +1076,9 @@ _生成时间：${new Date().toLocaleString()}_
       if (!ok) {
         // 重试仍失败，恢复终态
         const anyFailed = subtasks.some((s) => s.status === 'failed');
+        this.persistEvents(runId, [{
+          type: 'review', status: 'failed', summary: `重试后仍未通过验收：「${st.agent}」的子任务执行失败`, ts: Date.now()
+        }]);
         this.updateRun(runId, { phase: anyFailed ? 'failed' : 'done', error: anyFailed ? '部分子任务失败' : '', ended_at: Date.now() });
         return;
       }
@@ -927,11 +1103,17 @@ ${row.task_text}
         : `验收任务失败：${reviewDone?.error ?? '超时'}`;
 
       this.appendProgress(ws, '重新验收完成，最终结论已更新');
+      this.persistEvents(runId, [{
+        type: 'review', status: 'passed', summary: `重试成功，主Agent 已重新验收「${st.agent}」的产出`, ts: Date.now()
+      }]);
       this.updateRun(runId, { phase: 'done', final_result: finalResult, error: '', ended_at: Date.now() });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       st.status = 'failed';
       this.appendProgress(ws, `重试异常：${message}`);
+      this.persistEvents(runId, [{
+        type: 'review', status: 'failed', summary: `重试验收异常：${message}`, ts: Date.now()
+      }]);
       this.updateRun(runId, { phase: 'failed', error: `重试异常：${message}`, subtasks_json: JSON.stringify(subtasks), ended_at: Date.now() });
     }
   }

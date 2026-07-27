@@ -175,6 +175,8 @@ describe('TeamEngine 执行干预控制流', () => {
       expect(engine.control(id).cancel).toBe(true);
       expect(orch.cancelTask).toHaveBeenCalledTimes(1);
       expect(orch.cancelTask).toHaveBeenCalledWith('task-1');
+      const events = JSON.parse(db.tables.team_runs.get(id)?.events_json as string);
+      expect(events).toContainEqual(expect.objectContaining({ type: 'intervention', action: 'cancel' }));
     });
   });
 
@@ -223,12 +225,59 @@ describe('TeamEngine 执行干预控制流', () => {
       const r = engine.injectGuidance(id, '别纠结X，先做Y');
       expect(r.ok).toBe(true);
       expect(engine.control(id).guidance).toContain('别纠结X，先做Y');
+      const events = JSON.parse(db.tables.team_runs.get(id)?.events_json as string);
+      expect(events).toContainEqual(expect.objectContaining({ type: 'intervention', action: 'guidance', message: '别纠结X，先做Y' }));
     });
 
     it('已结束 run 拒绝注入', () => {
       const id = seedTeamRun(db, { phase: 'done' });
       expect(engine.injectGuidance(id, '指导').ok).toBe(false);
     });
+  });
+});
+
+describe('TeamEngine 协作总览与链路追溯', () => {
+  it('聚合成员贡献、项目成果和主Agent决策', () => {
+    const db = createMockDb();
+    const projectId = seedProject(db, { name: 'Alpha 项目' });
+    seedTeam(db, { id: 'team-test', coordinator_id: 'coord', member_ids: JSON.stringify(['a1', 'a2']) });
+    const runId = seedTeamRun(db, {
+      team_id: 'team-test', project_id: projectId, phase: 'done', created_at: 1000, ended_at: 7000,
+      task_text: '完成 Alpha 项目评审', final_result: '评审结论',
+      subtasks_json: JSON.stringify([
+        { agent: '研究员', agentId: 'a1', subtask: '调研', taskId: 'task-a1', status: 'done', retryCount: 1 },
+        { agent: '审查员', agentId: 'a2', subtask: '审查', taskId: 'task-a2', status: 'failed' }
+      ]),
+      events_json: JSON.stringify([
+        { type: 'subtask_done', round: 1, agent: '研究员', agentId: 'a1', status: 'done', durationMs: 2000, ts: 3000 },
+        { type: 'subtask_done', round: 1, agent: '审查员', agentId: 'a2', status: 'failed', durationMs: 3000, ts: 4000 },
+        { type: 'intervention', action: 'guidance', message: '优先检查风险', ts: 4500 },
+        { type: 'decision', round: 1, action: 'finish', summary: '完成评审', reasoning: '信息充分', ts: 5000 }
+      ])
+    });
+    db.tables.deliverables.set('deliverable-alpha', {
+      id: 'deliverable-alpha', source_type: 'team_run', source_id: runId, project_id: projectId,
+      title: 'Alpha 项目评审', review_status: 'accepted', updated_at: 7000
+    });
+    const orchestrator = createMockOrchestrator();
+    orchestrator.listAgents.mockReturnValue([
+      { id: 'coord', name: '主理人', role: '统筹与验收' },
+      { id: 'a1', name: '研究员', role: '市场研究' },
+      { id: 'a2', name: '审查员', role: '风险审查' }
+    ]);
+    const engine = new TeamEngine(db as never, orchestrator as never);
+
+    const overview = engine.getCollaborationOverview('team-test');
+    expect(overview.metrics).toMatchObject({ totalRuns: 1, successRate: 100, projectCount: 1, deliverableCount: 1, acceptedDeliverables: 1, interventionCount: 1 });
+    expect(overview.members.find((member) => member.agentId === 'coord')?.decisions).toBe(1);
+    expect(overview.members.find((member) => member.agentId === 'a1')).toMatchObject({ assigned: 1, completed: 1, retries: 1, completionRate: 100, avgDurationMs: 2000 });
+    expect(overview.projects[0]).toMatchObject({ projectName: 'Alpha 项目', runCount: 1, deliverableCount: 1, acceptedDeliverables: 1 });
+    expect(overview.recentDecisions[0]).toMatchObject({ runId, action: 'finish', reasoning: '信息充分' });
+
+    const trace = engine.listRuns('team-test')[0].trace;
+    expect(trace.project).toEqual({ id: projectId, name: 'Alpha 项目' });
+    expect(trace.tasks).toHaveLength(2);
+    expect(trace.deliverable).toMatchObject({ id: 'deliverable-alpha', reviewStatus: 'accepted' });
   });
 });
 
@@ -285,6 +334,8 @@ describe('TeamEngine 崩溃恢复续跑（可恢复状态机）', () => {
     const finalSubtasks = JSON.parse(settled.subtasks_json as string);
     expect(finalSubtasks.find((s) => s.agentId === 'a3').status).toBe('done'); // 中断的写手续跑后完成
     expect(finalSubtasks.find((s) => s.agentId === 'a1').status).toBe('done'); // 已完成的保持不变
+    const events = JSON.parse(settled.events_json as string);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'review', status: 'passed' }));
   });
 
   it('从 clarify 阶段中断：从头重启整个流水线并达成 done', async () => {

@@ -277,6 +277,15 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? row : row ? [row] : [];
   }
 
+  // SELECT * FROM team_runs WHERE team_id = ? ORDER BY created_at DESC [LIMIT 20]
+  if (/SELECT \* FROM team_runs WHERE team_id = \? ORDER BY created_at DESC/.test(sql)) {
+    const result = [...tables.team_runs.values()]
+      .filter(r => r.team_id === args[0])
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number));
+    const limited = /LIMIT 20/.test(sql) ? result.slice(0, 20) : result;
+    return mode === 'get' ? limited[0] : limited;
+  }
+
   if (/SELECT \* FROM team_runs WHERE phase = 'done'/.test(sql)) {
     const result = rows.filter(r => r.phase === 'done')
       .sort((a, b) => (b.created_at as number) - (a.created_at as number));
