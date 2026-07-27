@@ -12,6 +12,7 @@ import type { Client as LarkClient } from '@larksuiteoapi/node-sdk';
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
+import { tryChannelCommand } from './common.js';
 
 export const FEISHU_APPID_SETTING = 'channel:feishu:appId';
 export const FEISHU_SECRET_REF = 'secret:channel:feishu';
@@ -148,6 +149,8 @@ export class FeishuChannel {
       await reply('暂只支持文本消息，请用文字描述任务。');
       return;
     }
+    // 对话指令（/状态 /取消 /暂停 /继续 /帮助）：防长任务卡死的干预入口
+    if (tryChannelCommand(this.db, this.orchestrator, 'ch-feishu', text, (msg) => void reply(msg))) return;
     // 路由：该渠道绑定的第一个员工（10.4 精确会话绑定 > 账号默认）
     const route = this.db.raw
       .prepare("SELECT agent_id FROM channel_routes WHERE channel_id = 'ch-feishu' LIMIT 1")

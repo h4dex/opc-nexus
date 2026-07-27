@@ -15,6 +15,7 @@ import type { ExecutorCallbacks } from './executor/types.js';
 import type { ApprovalBroker } from './approvalBroker.js';
 import type { ToolHost } from './executor/tools.js';
 import { notify } from './notifier.js';
+import { loadUserConfig } from './userConfig.js';
 import type {
   Agent, AgentCardView, Approval, CreateAgentInput, DashboardStats, DerivedAgentStatus,
   ExecutorKind, Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
@@ -138,14 +139,46 @@ export class Orchestrator {
   }
 
   /** 执行调度器：接管数据库中 RUNNING 但无执行器在跑的任务（种子/重启恢复），
-   *  并周期补位维持演示水位。随机推进逻辑已移交 SimulatedExecutor 内部。 */
+   *  并周期补位维持演示水位 + 长任务看门狗。随机推进逻辑已移交 SimulatedExecutor 内部。 */
   startScheduler() {
     this.adoptRunningTasks();
     if (this.schedulerTimer) return;
     this.schedulerTimer = setInterval(() => {
       this.replenishTasks();
+      this.watchdogSweep();
       this.emit();
     }, 2000);
+  }
+
+  /** 长任务看门狗（P4 防卡死/死循环）：RUNNING 超过 config.yaml task.maxRunMinutes 的任务
+   *  强制中断（abort 执行器 + INTERRUPTED），如实告知超时原因；0 = 不限制。
+   *  WAITING_APPROVAL/PAUSED 属人工等待，不计入看门狗。 */
+  private watchdogSweep() {
+    const maxMinutes = loadUserConfig().task.maxRunMinutes;
+    if (!maxMinutes || maxMinutes <= 0) return;
+    const deadline = Date.now() - maxMinutes * 60_000;
+    const rows = this.db.raw
+      .prepare("SELECT id, agent_id, title, started_at FROM tasks WHERE status = 'RUNNING' AND started_at IS NOT NULL AND started_at < ?")
+      .all(deadline) as { id: string; agent_id: string; title: string; started_at: number }[];
+    for (const t of rows) {
+      const now = Date.now();
+      this.broker.abandonTask(t.id);
+      this.executors.abort(t.id);
+      this.db.transaction(() => {
+        this.db.raw.prepare("UPDATE tasks SET status = 'INTERRUPTED', ended_at = ?, error = ? WHERE id = ? AND status = 'RUNNING'")
+          .run(now, `看门狗超时：运行超过 ${maxMinutes} 分钟已强制中断（user/config.yaml task.maxRunMinutes 可调）`, t.id);
+        this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'INTERRUPTED' WHERE task_id = ? AND ended_at IS NULL").run(now, t.id);
+        this.recordEvent(t.id, 'interrupted', { reason: 'watchdog-timeout', maxMinutes }, now);
+      });
+      this.db.audit({ id: randomUUID(), actor: 'system', action: 'task.watchdogInterrupt', target: t.id, result: `${maxMinutes}min` });
+      notify(this.db, '任务看门狗中断', `「${t.title.slice(0, 60)}」运行超过 ${maxMinutes} 分钟，已强制中断`);
+      for (const fn of this.finishListeners) {
+        try {
+          fn({ taskId: t.id, agentId: t.agent_id, status: 'INTERRUPTED', title: t.title, result: null, error: `看门狗超时（${maxMinutes} 分钟）` });
+        } catch { /* 通知失败不影响调度 */ }
+      }
+      this.scheduleNext(t.agent_id);
+    }
   }
 
   /** 启动接管：把无主 RUNNING 任务交给执行器（模拟器从当前进度继续；LLM/CLI 重新发起执行） */

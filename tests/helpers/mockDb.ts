@@ -164,6 +164,14 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
+  // 看门狗:SELECT id, agent_id, title, started_at FROM tasks WHERE status = 'RUNNING' AND started_at < ?
+  if (/SELECT id, agent_id, title, started_at FROM tasks WHERE status = 'RUNNING'/.test(sql)) {
+    const result = [...tables.tasks.values()]
+      .filter(r => r.status === 'RUNNING' && r.started_at != null && (r.started_at as number) < (args[0] as number))
+      .map(r => ({ id: r.id, agent_id: r.agent_id, title: r.title, started_at: r.started_at }));
+    return mode === 'get' ? result[0] : result;
+  }
+
   if (/SELECT id FROM agents WHERE id = \? AND archived = 0/.test(sql)) {
     const row = tables.agents.get(args[0] as string);
     const result = row && row.archived === 0 ? { id: row.id } : undefined;
@@ -365,6 +373,22 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   // SELECT c.type, cr.agent_id FROM channel_routes ...
   if (/SELECT c\.type, cr\.agent_id FROM channel_routes/.test(sql)) {
     return [];
+  }
+
+  // SELECT agent_id FROM channel_routes WHERE channel_id = ? LIMIT 1（渠道路由/指令）
+  if (/SELECT agent_id FROM channel_routes WHERE channel_id = \?/.test(sql)) {
+    const row = [...tables.channel_routes.values()].find(r => r.channel_id === args[0]);
+    return mode === 'get' ? (row ? { agent_id: row.agent_id } : undefined) : row ? [{ agent_id: row.agent_id }] : [];
+  }
+
+  // SELECT id, title, status, progress, stage FROM tasks WHERE agent_id = ? ... status IN（渠道 /状态 指令）
+  if (/SELECT id, title, status, progress, stage FROM tasks WHERE agent_id = \?/.test(sql)) {
+    const statuses = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
+    const result = [...tables.tasks.values()]
+      .filter(r => r.agent_id === args[0] && r.deleted_at == null && statuses.includes(r.status as string))
+      .sort((a, b) => (a.created_at as number) - (b.created_at as number))
+      .map(r => ({ id: r.id, title: r.title, status: r.status, progress: r.progress, stage: r.stage }));
+    return mode === 'get' ? result[0] : result;
   }
 
   // ---------- 成果验收 ----------
@@ -843,6 +867,14 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     const [sessionId, id] = args;
     const task = tables.tasks.get(id as string);
     if (task && task.session_id === null) { task.session_id = sessionId; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // UPDATE tasks SET status = 'INTERRUPTED' ... WHERE id = ? AND status = 'RUNNING'（看门狗,带 error 参数）
+  if (/UPDATE tasks SET status = 'INTERRUPTED', ended_at = \?, error = \? WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
+    const [now, error, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'RUNNING') { task.status = 'INTERRUPTED'; task.ended_at = now; task.error = error; return { changes: 1 }; }
     return { changes: 0 };
   }
 

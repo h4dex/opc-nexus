@@ -14,7 +14,7 @@ import { safeStorage } from 'electron';
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
-import { dispatchChannelTask, createWs, tryChannelApproval, type WsLike } from './common.js';
+import { dispatchChannelTask, createWs, tryChannelApproval, tryChannelCommand, type WsLike } from './common.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 
 export const WEIXIN_URL_SETTING = 'channel:weixin:bridgeUrl';
@@ -241,6 +241,8 @@ export class WeixinChannel {
         /* 回发失败不中断渠道 */
       }
     };
+    // 对话指令（/状态 /取消 /暂停 /继续 /帮助）：防长任务卡死的干预入口
+    if (tryChannelCommand(this.db, this.orchestrator, CHANNEL_ID, text, send)) return;
     // 渠道审批拦截：回复“批准/拒绝”触发审批决策
     if (tryChannelApproval(this.db, this.broker, CHANNEL_ID, text, send)) return;
     dispatchChannelTask({

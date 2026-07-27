@@ -2,6 +2,7 @@
  * 渠道任务公共链路：文本消息 → channel_routes 路由绑定员工 → createTask(source='channel')
  * → 轮询任务终态后回复结果（与飞书渠道同一套流程约定，超时 15 分钟转控制中心查看）。
  * 渠道来源任务的权限收紧（10.5）由执行器层统一实施（trusted 降级 + 写类工具强制审批）。
+ * 对话指令（防长任务卡死/死循环的人工干预入口）：/状态 /取消 /暂停 /继续 /帮助。
  */
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
@@ -13,6 +14,100 @@ const REPLY_TIMEOUT_MS = 15 * 60_000;
 /** 审批关键词检测：用户通过渠道回复“批准/同意/拒绝/取消”触发审批决策 */
 const APPROVE_RE = /^(批准|同意|approve|yes|确认执行)$/i;
 const REJECT_RE = /^(拒绝|取消|reject|no|不执行)$/i;
+
+/** 对话指令（以 / 或 # 开头，全角斜杠亦可） */
+const COMMAND_RE = /^[/#／]\s*(\S+)\s*(.*)$/;
+
+const HELP_TEXT = [
+  '可用指令：',
+  '/状态 — 查看当前执行中/排队任务与进度',
+  '/取消 — 终止当前任务（防卡死/死循环）',
+  '/取消 全部 — 终止该员工全部活跃任务',
+  '/暂停 — 暂停当前执行中任务',
+  '/继续 — 恢复暂停的任务',
+  '/帮助 — 显示本说明',
+  '回复「批准 / 拒绝」处理待审批操作'
+].join('\n');
+
+/**
+ * 渠道对话指令拦截：/状态 /取消 /暂停 /继续 /帮助。
+ * 返回 true 表示已处理（不再创建新任务）。设计目标（P4）：
+ * 长任务卡死或模型陷入死循环时，用户可从聊天侧随时干预，无需回到控制中心。
+ */
+export function tryChannelCommand(db: Database, orchestrator: Orchestrator, channelId: string, text: string, ack: (msg: string) => void): boolean {
+  const m = text.trim().match(COMMAND_RE);
+  if (!m) return false;
+  const [, cmd, arg] = m;
+
+  const route = db.raw.prepare('SELECT agent_id FROM channel_routes WHERE channel_id = ? LIMIT 1').get(channelId) as { agent_id: string } | undefined;
+  if (!route) {
+    ack('该渠道尚未绑定数字员工，请在控制中心「连接中心」完成绑定。');
+    return true;
+  }
+  const agentId = route.agent_id;
+  const activeRows = () => db.raw.prepare(
+    "SELECT id, title, status, progress, stage FROM tasks WHERE agent_id = ? AND deleted_at IS NULL AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED') ORDER BY created_at"
+  ).all(agentId) as { id: string; title: string; status: string; progress: number; stage: string }[];
+
+  if (/^(状态|status)$/i.test(cmd)) {
+    const rows = activeRows();
+    if (rows.length === 0) {
+      ack('当前没有执行中的任务。');
+      return true;
+    }
+    const statusLabel: Record<string, string> = { RUNNING: '执行中', QUEUED: '排队', WAITING_APPROVAL: '待审批', PAUSED: '已暂停' };
+    ack(rows.map((r, i) =>
+      `${i + 1}. [${statusLabel[r.status] ?? r.status}] ${r.title}（${r.progress}% · ${r.stage}）`
+    ).join('\n'));
+    return true;
+  }
+
+  if (/^(取消|停止|终止|cancel|stop)$/i.test(cmd)) {
+    const rows = activeRows();
+    if (rows.length === 0) {
+      ack('当前没有可取消的任务。');
+      return true;
+    }
+    const all = /^(全部|所有|all)$/i.test(arg.trim());
+    const targets = all ? rows : [rows[0]];
+    let done = 0;
+    for (const t of targets) {
+      try { orchestrator.cancelTask(t.id); done++; } catch { /* 已终态跳过 */ }
+    }
+    ack(all ? `🛑 已终止 ${done} 个任务。` : `🛑 已终止任务：${targets[0].title}`);
+    return true;
+  }
+
+  if (/^(暂停|pause)$/i.test(cmd)) {
+    const running = activeRows().find((r) => r.status === 'RUNNING');
+    if (!running) {
+      ack('当前没有执行中的任务可暂停。');
+      return true;
+    }
+    orchestrator.pauseTask(running.id);
+    ack(`⏸️ 已暂停任务：${running.title}（回复 /继续 恢复）`);
+    return true;
+  }
+
+  if (/^(继续|恢复|resume)$/i.test(cmd)) {
+    const paused = activeRows().find((r) => r.status === 'PAUSED');
+    if (!paused) {
+      ack('当前没有暂停中的任务。');
+      return true;
+    }
+    orchestrator.resumeTask(paused.id);
+    ack(`▶️ 已恢复任务：${paused.title}`);
+    return true;
+  }
+
+  if (/^(帮助|help|\?|？)$/i.test(cmd)) {
+    ack(HELP_TEXT);
+    return true;
+  }
+
+  ack(`未识别的指令「/${cmd}」。\n${HELP_TEXT}`);
+  return true;
+}
 
 /**
  * 渠道审批拦截：若消息是审批回复且该渠道绑定员工有待审批，则执行审批决策而非创建新任务。
