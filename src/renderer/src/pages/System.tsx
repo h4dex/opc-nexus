@@ -10,7 +10,7 @@ export function System() {
   const diskPct = last && last.diskTotal > 0 ? Math.round(((last.diskTotal - last.diskFree) / last.diskTotal) * 100) : null;
 
   const healthItems = [
-    { key: 'runtime', label: 'Hermes Runtime', icon: <IconLayers size={18} /> },
+    { key: 'runtime', label: 'Nexus Runtime', icon: <IconLayers size={18} /> },
     { key: 'gateway', label: 'Messaging Gateway', icon: <IconWifi size={18} /> },
     { key: 'database', label: '本地数据库', icon: <IconDb size={18} /> }
   ] as const;

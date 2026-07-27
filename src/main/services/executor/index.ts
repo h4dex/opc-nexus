@@ -29,6 +29,8 @@ export class ExecutorRegistry {
     this.sim = new SimulatedExecutor();
     this.cliByType.set('codex', new CliExecutor('codex-cli', db, 'eng-codex'));
     this.cliByType.set('claude-code', new CliExecutor('claude-cli', db, 'eng-claude'));
+    // 真实 Hermes Agent CLI（P0）：非交互运行参数可被配置文件 engines['eng-hermes-cli'].runArgs 覆写
+    this.cliByType.set('hermes-cli', new CliExecutor('generic-cli', db, 'eng-hermes-cli', ['run', '{prompt}']));
     this.cliByType.set('zcode', new CliExecutor('generic-cli', db, 'eng-zcode', ['-p', '{prompt}']));
     this.cliByType.set('opencode', new CliExecutor('generic-cli', db, 'eng-opencode', ['run', '{prompt}']));
     this.cliByType.set('kimicode', new CliExecutor('generic-cli', db, 'eng-kimi', ['-p', '{prompt}']));

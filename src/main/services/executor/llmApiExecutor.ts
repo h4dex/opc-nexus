@@ -1,6 +1,6 @@
 /**
- * Hermes 内置引擎：OpenAI 兼容 API 工具循环执行器（P1b，参考 Cherry Studio 供应商直连模式）
- * - Base URL / Model 存 settings；API Key 仅存 safeStorage（15.1），用前在主进程解密
+ * Nexus Agent 内置引擎（自研 Runtime）：OpenAI 兼容 API 工具循环执行器（P1b，参考 Cherry Studio 供应商直连模式）
+ * - 供应商配置以 providers 表为唯一数据源（provider.ts 统一读取）；API Key 仅存 safeStorage（15.1），用前在主进程解密
  * - 原生 fetch + 手写 SSE 解析（含 tool_calls delta 合并），零新增依赖
  * - 工具循环：每轮携带 MCP 风格工具声明，模型产生 tool_calls 则执行工具后继续，最多 15 轮
  * - 权限语义：readonly 只注册只读工具；standard 下写/删工具经审批代理挂起等待人工批准；

@@ -18,6 +18,7 @@ import { Scheduler } from './services/scheduler.js';
 import { notify } from './services/notifier.js';
 import { seedIfEmpty, seedMcpServers, seedSkills } from './services/seed.js';
 import { importCredentialsBootstrap } from './services/bootstrap.js';
+import { migrateLegacyProvider } from './services/provider.js';
 import { McpManager } from './services/mcpManager.js';
 import { SkillManager } from './services/skillManager.js';
 import { ProviderManager } from './services/providerManager.js';
@@ -205,6 +206,8 @@ app.whenReady().then(async () => {
   knowledgeManager.syncAcceptedDeliverables(deliverableManager);
   // 凭据引导文件自动导入（credentials.bootstrap.json → safeStorage，导入后重命名）
   importCredentialsBootstrap(db);
+  // 旧版供应商配置（settings provider:hermes）→ providers 表（P0：单一数据源）
+  migrateLegacyProvider(db);
   // 数据保留策略：启动 + 每 24h 清理（任务 90 天 / 资源 7 天 / 审计 1 年）
   db.cleanupRetention();
   setInterval(() => db.cleanupRetention(), 24 * 3_600_000);

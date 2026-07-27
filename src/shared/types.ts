@@ -59,7 +59,7 @@ export interface AgentCapabilities {
   computer: boolean;
 }
 
-export type EngineType = 'hermes' | 'codex' | 'claude-code' | 'zcode' | 'opencode' | 'kimicode' | 'external';
+export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'claude-code' | 'zcode' | 'opencode' | 'kimicode' | 'external';
 
 export type ChannelType = 'weixin' | 'wecom' | 'feishu' | 'qq';
 

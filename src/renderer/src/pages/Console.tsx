@@ -89,7 +89,7 @@ export function Console() {
     <>
       <div className="page-head">
         <h2>执行监控</h2>
-        <span className="desc">实时查看 Hermes / CLI 引擎执行轨迹、工具调用与人工审批干预</span>
+        <span className="desc">实时查看 Nexus Agent / CLI 引擎执行轨迹、工具调用与人工审批干预</span>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 16, height: 'calc(100vh - 160px)' }}>

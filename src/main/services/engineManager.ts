@@ -1,11 +1,11 @@
 /**
  * 引擎中心（PRD 9.x）
- * 引擎目录：内置 Hermes（直连 OpenAI 兼容 API）+ 5 个本机 CLI 引擎
- * （Codex CLI / Claude Code / ZCode / OpenCode / Kimi Code）。
+ * 引擎目录：内置 Nexus Agent（自研 Runtime，直连 OpenAI 兼容 API）+ 真实 Hermes Agent CLI
+ * + 5 个本机 CLI 引擎（Codex CLI / Claude Code / ZCode / OpenCode / Kimi Code）。
  * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / HEALTHY，不做假安装。
  * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）；
  * ZCode 为桌面应用无公开 npm 包，仅提供官方指引。
- * Hermes 状态按供应商配置派生：已配置 = HEALTHY，未配置 = SETUP_REQUIRED（演示模式）。
+ * Nexus Agent 状态按供应商配置派生：已配置 = HEALTHY，未配置 = SETUP_REQUIRED（演示模式）。
  */
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
@@ -42,9 +42,14 @@ export interface CatalogEntry {
 
 export const ENGINE_CATALOG: CatalogEntry[] = [
   {
-    id: 'eng-hermes', type: 'hermes', name: 'Hermes Runtime', bin: null, npmPackage: null,
+    id: 'eng-hermes', type: 'hermes', name: 'Nexus Agent', bin: null, npmPackage: null,
     dataBoundary: '本地运行；模型请求发送至所配置模型提供商',
     guide: { guide: '内置引擎无需安装，在设置页完成模型供应商配置即可启用', url: null }
+  },
+  {
+    id: 'eng-hermes-cli', type: 'hermes-cli', name: 'Hermes Agent', bin: 'hermes', npmPackage: null,
+    dataBoundary: '本地 Hermes Agent Runtime；数据发送目标取决于 Hermes 自身配置',
+    guide: { guide: '请按 Hermes Agent 官方方式安装 hermes CLI；如可执行名或运行参数不同，可在配置文件 engines["eng-hermes-cli"] 中覆写 bin/runArgs', url: null }
   },
   {
     id: 'eng-codex', type: 'codex', name: 'OpenAI Codex CLI', bin: 'codex', npmPackage: '@openai/codex',
@@ -193,7 +198,7 @@ export class EngineManager {
       this.db.raw.prepare("UPDATE engines SET status = ?, version = ? WHERE id = ?")
         .run(probe.ok ? 'HEALTHY' : 'NOT_INSTALLED', probe.ok ? 'acp' : null, ext.id);
     }
-    // Hermes：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED（演示模式，UI 必须标注）
+    // Nexus Agent：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED（演示模式，UI 必须标注）
     this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
     return this.list();
   }
@@ -280,10 +285,10 @@ export class EngineManager {
   async restart(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
     if (id === 'eng-hermes') {
-      // Hermes：重新检测供应商配置是否就绪
+      // Nexus Agent：重新检测供应商配置是否就绪
       this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
       const ready = providerReady(this.db);
-      return { ok: ready, message: ready ? 'Hermes 引擎已重新加载，供应商配置生效' : 'Hermes 引擎未就绪：请先在设置页完成模型供应商配置' };
+      return { ok: ready, message: ready ? 'Nexus Agent 引擎已重新加载，供应商配置生效' : 'Nexus Agent 引擎未就绪：请先在设置页完成模型供应商配置' };
     }
     if (!entry) {
       // 外部 ACP 引擎

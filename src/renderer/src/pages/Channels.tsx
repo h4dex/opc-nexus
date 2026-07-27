@@ -29,7 +29,7 @@ export function Channels() {
     <>
       <div className="page-head">
         <h2>连接中心</h2>
-        <span className="desc">复用 Hermes Messaging Gateway；默认拒绝外部身份，需显式白名单（10.5）</span>
+        <span className="desc">消息渠道网关；默认拒绝外部身份，需显式白名单（10.5）</span>
       </div>
 
       <div className="agent-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))' }}>
