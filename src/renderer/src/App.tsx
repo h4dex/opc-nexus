@@ -71,7 +71,7 @@ const ALL_NAV = NAV_GROUPS.flatMap((g) => g.items);
 const KEEP_ALIVE: RouteKey[] = ['chat', 'tasks', 'teams'];
 
 export function App() {
-  const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, appVersion, init } = useApp();
+  const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, appVersion, actionCenter, refreshActionCenter, init } = useApp();
   const [searchOpen, setSearchOpen] = useState(false);
 
   useEffect(() => {
@@ -85,11 +85,14 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [init]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => void refreshActionCenter(), 8_000);
+    return () => window.clearInterval(timer);
+  }, [refreshActionCenter]);
+
   const todos = snapshot?.stats.pendingTodos ?? 0;
-  // 收件箱待办数：待审批 + 失败任务
-  const inboxCount = snapshot
-    ? snapshot.approvals.filter((a) => a.status === 'pending').length + snapshot.tasks.filter((t) => t.status === 'FAILED').length
-    : 0;
+  // 行动中心聚合审批、失败、成果验收和经营风险。
+  const inboxCount = actionCenter?.total ?? 0;
 
   /** 页面渲染器：保活页面用 display 切换，其余条件渲染 */
   const renderPage = (key: RouteKey) => {

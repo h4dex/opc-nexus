@@ -1,99 +1,74 @@
-/** 全局搜索（Ctrl/Cmd+K 唤起）：跨员工 / 任务 / 团队快速定位并跳转 */
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useApp, type RouteKey } from '../store';
+/** 全局搜索（Ctrl/Cmd+K）：跨项目、员工、任务、团队、成果与知识定位。 */
+import { useEffect, useRef, useState } from 'react';
+import { useApp } from '../store';
+import { IconBook, IconFile, IconFolder, IconLayers, IconSearch, IconTask, IconUser } from './icons';
+import type { GlobalSearchResult, SearchEntityType } from '../../../shared/types';
 
-interface SearchResult {
-  key: string;
-  type: '员工' | '任务' | '项目' | '团队';
-  title: string;
-  subtitle: string;
-  route: RouteKey;
-}
+const ENTITY_META: Record<SearchEntityType, { label: string; tone: string; icon: React.ReactNode }> = {
+  project: { label: '项目', tone: 'info', icon: <IconFolder size={14} /> },
+  agent: { label: '员工', tone: 'accent', icon: <IconUser size={14} /> },
+  task: { label: '任务', tone: 'success', icon: <IconTask size={14} /> },
+  team: { label: '专家团', tone: 'warning', icon: <IconLayers size={14} /> },
+  deliverable: { label: '成果', tone: 'success', icon: <IconFile size={14} /> },
+  knowledge: { label: '知识', tone: 'info', icon: <IconBook size={14} /> }
+};
 
 export function GlobalSearch({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { snapshot, setRoute } = useApp();
+  const { navigate } = useApp();
   const [query, setQuery] = useState('');
+  const [results, setResults] = useState<GlobalSearchResult[]>([]);
   const [active, setActive] = useState(0);
+  const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (open) {
-      setQuery('');
-      setActive(0);
-      setTimeout(() => inputRef.current?.focus(), 30);
-    }
+    if (!open) return;
+    setQuery('');
+    setActive(0);
+    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 30);
+    return () => window.clearTimeout(focusTimer);
   }, [open]);
 
-  const results = useMemo<SearchResult[]>(() => {
-    if (!snapshot) return [];
-    const q = query.trim().toLowerCase();
-    const list: SearchResult[] = [];
-
-    for (const project of snapshot.projects ?? []) {
-      if (!q || project.name.toLowerCase().includes(q) || project.objective.toLowerCase().includes(q) || project.clientName.toLowerCase().includes(q)) {
-        list.push({ key: `pr-${project.id}`, type: '项目', title: project.name, subtitle: project.objective || project.status, route: 'projects' });
-      }
-    }
-
-    for (const c of snapshot.agentCards) {
-      if (!q || c.agent.name.toLowerCase().includes(q) || (c.agent.role ?? '').toLowerCase().includes(q)) {
-        list.push({ key: `ag-${c.agent.id}`, type: '员工', title: c.agent.name, subtitle: c.agent.role || '数字员工', route: 'agents' });
-      }
-    }
-    for (const t of snapshot.tasks) {
-      if (!q || t.title.toLowerCase().includes(q)) {
-        list.push({ key: `tk-${t.id}`, type: '任务', title: t.title, subtitle: t.status, route: 'tasks' });
-      }
-    }
-    return list.slice(0, 30);
-  }, [snapshot, query]);
-
-  useEffect(() => { setActive(0); }, [query]);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoading(true);
+    const timer = window.setTimeout(() => {
+      void window.aibox.globalSearch(query).then((value) => {
+        if (!cancelled) { setResults(value); setActive(0); }
+      }).catch(() => { if (!cancelled) setResults([]); })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    }, query ? 140 : 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [open, query]);
 
   if (!open) return null;
 
-  const go = (r: SearchResult) => {
-    setRoute(r.route);
+  const go = (result: GlobalSearchResult) => {
+    navigate(result.route, { entityType: result.entityType, entityId: result.entityId });
     onClose();
   };
-
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); setActive((a) => Math.min(a + 1, results.length - 1)); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((a) => Math.max(a - 1, 0)); }
-    else if (e.key === 'Enter' && results[active]) { e.preventDefault(); go(results[active]); }
-    else if (e.key === 'Escape') { onClose(); }
+  const onKey = (event: React.KeyboardEvent) => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); setActive((value) => Math.min(value + 1, results.length - 1)); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); setActive((value) => Math.max(value - 1, 0)); }
+    else if (event.key === 'Enter' && results[active]) { event.preventDefault(); go(results[active]); }
+    else if (event.key === 'Escape') onClose();
   };
 
-  const typeColor: Record<string, string> = { '员工': 'var(--accent)', '任务': 'var(--success)', '项目': 'var(--info)', '团队': 'var(--warning)' };
-
-  return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.45)', zIndex: 2000, display: 'flex', justifyContent: 'center', paddingTop: '12vh' }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="card" style={{ width: 560, maxHeight: '60vh', display: 'flex', flexDirection: 'column', padding: 0, overflow: 'hidden', animation: 'toast-in .15s ease-out' }}
-        onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px 16px', borderBottom: '1px solid var(--border)' }}>
-          <span style={{ fontSize: 15, color: 'var(--text-3)' }}>🔍</span>
-          <input ref={inputRef} value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={onKey}
-            placeholder="搜索项目 / 员工 / 任务…（↑↓ 选择，Enter 跳转，Esc 关闭）"
-            style={{ flex: 1, border: 'none', background: 'transparent', color: 'var(--text-1)', fontSize: 14, outline: 'none' }} />
-        </div>
-        <div style={{ flex: 1, overflowY: 'auto', padding: 8 }}>
-          {results.length === 0 ? (
-            <div style={{ padding: 30, textAlign: 'center', color: 'var(--text-3)', fontSize: 13 }}>
-              {query.trim() ? '没有匹配的结果' : '输入关键词开始搜索'}
-            </div>
-          ) : (
-            results.map((r, i) => (
-              <div key={r.key} onClick={() => go(r)} onMouseEnter={() => setActive(i)}
-                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', borderRadius: 8, cursor: 'pointer', background: i === active ? 'var(--accent-soft)' : 'transparent' }}>
-                <span style={{ fontSize: 10.5, fontWeight: 700, color: typeColor[r.type], padding: '1px 7px', borderRadius: 8, background: 'var(--input-bg)', flexShrink: 0 }}>{r.type}</span>
-                <span style={{ fontSize: 13, color: 'var(--text-1)', fontWeight: 550, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.title}</span>
-                <span style={{ fontSize: 11, color: 'var(--text-3)', flexShrink: 0 }}>{r.subtitle}</span>
-              </div>
-            ))
-          )}
-        </div>
+  return <div className="global-search-mask" onClick={(event) => event.target === event.currentTarget && onClose()}>
+    <section className="global-search-panel" role="dialog" aria-label="全局搜索">
+      <label className="global-search-input"><IconSearch size={17} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKey} placeholder="搜索项目、员工、任务、专家团、成果或知识" /><span>Esc</span></label>
+      <div className="global-search-results">
+        {loading && results.length === 0 ? <div className="global-search-empty">正在检索</div> : results.length === 0 ? <div className="global-search-empty">没有匹配结果</div> : results.map((result, index) => {
+          const meta = ENTITY_META[result.entityType];
+          return <button key={result.key} className={index === active ? 'active' : ''} type="button" onClick={() => go(result)} onMouseEnter={() => setActive(index)}>
+            <span className="global-search-icon" data-tone={meta.tone}>{meta.icon}</span>
+            <span className="global-search-copy"><strong>{result.title}</strong><small>{result.subtitle}</small></span>
+            <span className="global-search-type">{meta.label}</span>
+          </button>;
+        })}
       </div>
-    </div>
-  );
+      <footer><span>↑↓ 选择</span><span>Enter 打开</span><span>{results.length} 项结果</span></footer>
+    </section>
+  </div>;
 }

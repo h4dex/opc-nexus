@@ -65,3 +65,4 @@ export const IconSearch = svg('M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16z', 'M17 17l4
 export const IconBook = svg('M4 4.5A2.5 2.5 0 0 1 6.5 2H11v18H6.5A2.5 2.5 0 0 0 4 22z', 'M20 4.5A2.5 2.5 0 0 0 17.5 2H13v18h4.5A2.5 2.5 0 0 1 20 22z');
 export const IconPin = svg('M9 3h6l-1 5 3 3v2H7v-2l3-3z', 'M12 13v8');
 export const IconArchive = svg('M4 7h16v13H4zM3 3h18v4H3z', 'M9 11h6');
+export const IconTrash = svg('M4 7h16M9 7V4h6v3m-9 0 1 14h10l1-14', 'M10 11v6m4-6v6');

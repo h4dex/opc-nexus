@@ -35,7 +35,7 @@ const REVIEW_FILTERS: Array<{ key: ReviewFilter; label: string }> = [
 ];
 
 export function Deliverables() {
-  const { snapshot } = useApp();
+  const { snapshot, navigationTarget, clearNavigationTarget } = useApp();
   const [items, setItems] = useState<DeliverableSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [projectFilter, setProjectFilter] = useState('all');
@@ -114,6 +114,17 @@ export function Deliverables() {
     const next = await window.aibox.getDeliverable(id);
     if (next) setDetail(next);
   };
+  useEffect(() => {
+    if (navigationTarget?.entityType !== 'deliverable') return;
+    let active = true;
+    void window.aibox.getDeliverable(navigationTarget.entityId).then((value) => {
+      if (active && value) {
+        setDetail(value);
+        clearNavigationTarget();
+      }
+    });
+    return () => { active = false; };
+  }, [clearNavigationTarget, navigationTarget]);
   const refreshDetail = async (id: string) => {
     await load();
     const next = await window.aibox.getDeliverable(id);

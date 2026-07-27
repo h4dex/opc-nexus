@@ -103,7 +103,7 @@ export class ProjectManager {
     const now = Date.now();
     const projects = this.list();
     const projectIds = new Set(projects.map((project) => project.id));
-    const tasks = this.db.raw.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all() as unknown as TaskOperationsRow[];
+    const tasks = this.db.raw.prepare('SELECT * FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC').all() as unknown as TaskOperationsRow[];
     const agents = new Map(
       (this.db.raw.prepare('SELECT * FROM agents').all() as unknown as AgentOperationsRow[])
         .map((agent) => [agent.id, agent])

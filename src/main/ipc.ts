@@ -23,6 +23,7 @@ import type { TeamEngine } from './services/teamEngine.js';
 import type { ProjectManager } from './services/projectManager.js';
 import type { DeliverableManager } from './services/deliverableManager.js';
 import type { KnowledgeManager } from './services/knowledgeManager.js';
+import type { DiscoveryManager } from './services/discoveryManager.js';
 import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
@@ -73,6 +74,7 @@ export interface IpcDeps {
   projects: ProjectManager;
   deliverables: DeliverableManager;
   knowledge: KnowledgeManager;
+  discovery: DiscoveryManager;
   teams: TeamEngine;
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
@@ -83,7 +85,7 @@ export interface IpcDeps {
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, discovery, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -128,6 +130,12 @@ export function registerIpc(deps: IpcDeps) {
     uptimeSec: Math.floor(process.uptime()),
     appVersion: app.getVersion()
   }));
+  ipcMain.handle('aibox:globalSearch', (_e, query: string) => discovery.search(assertString(query ?? '', 'query', 0, 100)));
+  ipcMain.handle('aibox:getActionCenter', () => discovery.actions());
+  ipcMain.handle('aibox:dismissAction', (_e, actionKey: string, fingerprint: string) => {
+    discovery.dismiss(assertString(actionKey, 'actionKey', 1, 180), assertString(fingerprint, 'fingerprint', 8, 80));
+    return { ok: true };
+  });
 
   // ---------- 项目 ----------
   ipcMain.handle('aibox:createProject', (_e, input: ProjectInput) => {
@@ -488,6 +496,14 @@ export function registerIpc(deps: IpcDeps) {
     { projectId: projectId ? assertId(projectId, 'projectId') : undefined }
   ));
   ipcMain.handle('aibox:cancelTask', (_e, id: string) => orchestrator.cancelTask(assertId(id)));
+  ipcMain.handle('aibox:retryTask', (_e, id: string) => {
+    const taskId = assertId(id, 'taskId');
+    const action = discovery.actions().items.find((item) => item.key === `failed_task:${taskId}`);
+    const retried = orchestrator.retryTask(taskId);
+    if (action) discovery.dismiss(action.key, action.fingerprint);
+    return retried;
+  });
+  ipcMain.handle('aibox:deleteTask', (_e, id: string) => orchestrator.deleteTask(assertId(id, 'taskId')));
   ipcMain.handle('aibox:pauseTask', (_e, id: string) => orchestrator.pauseTask(assertId(id)));
   ipcMain.handle('aibox:resumeTask', (_e, id: string) => orchestrator.resumeTask(assertId(id)));
   ipcMain.handle('aibox:decideApproval', (_e, id: string, approve: boolean) => orchestrator.decideApproval(assertId(id), approve === true));

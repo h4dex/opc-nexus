@@ -38,6 +38,7 @@ interface Tables {
   deliverable_reviews: Map<string, Record<string, unknown>>;
   knowledge_entries: Map<string, Record<string, unknown>>;
   knowledge_versions: Map<string, Record<string, unknown>>;
+  action_dismissals: Map<string, Record<string, unknown>>;
   settings: Map<string, unknown>;
 }
 
@@ -61,6 +62,7 @@ export function createMockDb(): MockDb & { tables: Tables } {
     deliverable_reviews: new Map(),
     knowledge_entries: new Map(),
     knowledge_versions: new Map(),
+    action_dismissals: new Map(),
     settings: new Map()
   };
 
@@ -142,7 +144,8 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   // SELECT * FROM tasks WHERE id = ?
   if (/SELECT \* FROM tasks WHERE id = \?/.test(sql)) {
     const row = tables.tasks.get(args[0] as string);
-    return mode === 'get' ? row : row ? [row] : [];
+    const visible = row && (!/deleted_at IS NULL/.test(sql) || row.deleted_at == null) ? row : undefined;
+    return mode === 'get' ? visible : visible ? [visible] : [];
   }
 
   // SELECT * FROM tasks WHERE status = 'RUNNING' ...
@@ -171,9 +174,11 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
-  // SELECT * FROM tasks ORDER BY created_at DESC LIMIT 200
-  if (/SELECT \* FROM tasks ORDER BY created_at DESC/.test(sql)) {
-    const result = [...tables.tasks.values()].sort((a, b) => (b.created_at as number) - (a.created_at as number));
+  // SELECT * FROM tasks [WHERE deleted_at IS NULL] ORDER BY created_at DESC
+  if (/SELECT \* FROM tasks (?:WHERE deleted_at IS NULL )?ORDER BY created_at DESC/.test(sql)) {
+    const result = [...tables.tasks.values()]
+      .filter((row) => !/deleted_at IS NULL/.test(sql) || row.deleted_at == null)
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number));
     return mode === 'get' ? result[0] : result;
   }
 
@@ -208,7 +213,7 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
 
   // SELECT COUNT(*) c FROM tasks WHERE status = 'COMPLETED' AND ended_at >= ?
   if (/SELECT COUNT\(\*\) c FROM tasks WHERE status = 'COMPLETED'/.test(sql)) {
-    const count = [...tables.tasks.values()].filter(r => r.status === 'COMPLETED' && (r.ended_at as number) >= (args[0] as number)).length;
+    const count = [...tables.tasks.values()].filter(r => r.status === 'COMPLETED' && r.deleted_at == null && (r.ended_at as number) >= (args[0] as number)).length;
     return { c: count };
   }
 
@@ -228,6 +233,18 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   if (/SELECT parent_id FROM tasks WHERE id = \?/.test(sql)) {
     const row = tables.tasks.get(args[0] as string);
     return mode === 'get' ? (row ? { parent_id: row.parent_id } : undefined) : [];
+  }
+
+  if (/SELECT agent_id, status FROM tasks WHERE id = \? AND deleted_at IS NULL/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    const result = row && row.deleted_at == null ? { agent_id: row.agent_id, status: row.status } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id FROM tasks WHERE parent_id = \? AND deleted_at IS NULL/.test(sql)) {
+    const active = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
+    const result = [...tables.tasks.values()].find((row) => row.parent_id === args[0] && row.deleted_at == null && active.includes(row.status as string));
+    return mode === 'get' ? (result ? { id: result.id } : undefined) : result ? [{ id: result.id }] : [];
   }
 
   // SELECT project_id FROM tasks WHERE id = ?
@@ -398,11 +415,24 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
+  if (/SELECT \* FROM action_dismissals ORDER BY dismissed_at DESC/.test(sql)) {
+    const result = [...tables.action_dismissals.values()].sort((a, b) => (b.dismissed_at as number) - (a.dismissed_at as number));
+    return mode === 'get' ? result[0] : result;
+  }
+
   // Fallback
   return mode === 'get' ? undefined : [];
 }
 
 function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: number } {
+  if (/INSERT INTO action_dismissals/.test(sql)) {
+    const [actionKey, fingerprint, dismissedAt] = args;
+    tables.action_dismissals.set(actionKey as string, {
+      action_key: actionKey, fingerprint, dismissed_at: dismissedAt
+    });
+    return { changes: 1 };
+  }
+
   // INSERT INTO projects
   if (/INSERT INTO projects/.test(sql)) {
     const [id, name, objective, description, clientName, status, color, dueAt, createdAt, updatedAt] = args;
@@ -441,7 +471,7 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     tables.tasks.set(id as string, {
       id, agent_id: agentId, project_id: projectId, title, source, parent_id: parentId, status,
       priority: 0, progress: 0, stage, error: null, session_id: sessionId,
-      workspace_override: workspaceOverride, created_at: now, started_at: startedAt, ended_at: null, result: null, quality: null
+      workspace_override: workspaceOverride, created_at: now, started_at: startedAt, ended_at: null, deleted_at: null, result: null, quality: null
     });
     return { changes: 1 };
   }
@@ -644,6 +674,13 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
+  if (/UPDATE tasks SET deleted_at = \? WHERE id = \? AND deleted_at IS NULL/.test(sql)) {
+    const [deletedAt, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.deleted_at == null) { task.deleted_at = deletedAt; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
   // UPDATE tasks SET status = 'PAUSED' WHERE id = ? AND status = 'RUNNING'
   if (/UPDATE tasks SET status = 'PAUSED' WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
     const [id] = args;
@@ -737,6 +774,17 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
+  if (/UPDATE approvals SET status = 'rejected', decided_at = \? WHERE task_id = \?/.test(sql)) {
+    const [now, taskId] = args;
+    let changes = 0;
+    for (const approval of tables.approvals.values()) {
+      if (approval.task_id === taskId && approval.status === 'pending') {
+        approval.status = 'rejected'; approval.decided_at = now; changes++;
+      }
+    }
+    return { changes };
+  }
+
   // UPDATE engines SET status = 'AUTH_REQUIRED'
   if (/UPDATE engines SET status = 'AUTH_REQUIRED'/.test(sql)) {
     const [id] = args;
@@ -787,6 +835,7 @@ function detectTable(sql: string): keyof Tables | null {
   if (/\bdeliverables\b/.test(sql)) return 'deliverables';
   if (/\bknowledge_versions\b/.test(sql)) return 'knowledge_versions';
   if (/\bknowledge_entries\b/.test(sql)) return 'knowledge_entries';
+  if (/\baction_dismissals\b/.test(sql)) return 'action_dismissals';
   return null;
 }
 

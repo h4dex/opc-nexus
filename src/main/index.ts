@@ -27,6 +27,7 @@ import { TeamEngine } from './services/teamEngine.js';
 import { ProjectManager } from './services/projectManager.js';
 import { DeliverableManager } from './services/deliverableManager.js';
 import { KnowledgeManager } from './services/knowledgeManager.js';
+import { DiscoveryManager } from './services/discoveryManager.js';
 import { CollabManager } from './services/collabManager.js';
 import { WebServer } from './services/webServer.js';
 import { ApiBridge } from './services/apiBridge.js';
@@ -162,6 +163,9 @@ app.whenReady().then(async () => {
   const deliverableManager = new DeliverableManager(db);
   const knowledgeManager = new KnowledgeManager(db);
   const teamEngine = new TeamEngine(db, orchestrator, knowledgeManager);
+  const discoveryManager = new DiscoveryManager(db, {
+    projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, teams: teamEngine
+  });
   const collabManager = new CollabManager(db);
   const feishu = new FeishuChannel(db, orchestrator);
     const wecom = new WecomChannel(db, orchestrator, broker);
@@ -223,7 +227,7 @@ app.whenReady().then(async () => {
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, apiBridge, webServer, getMainWindow: () => mainWindow });
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, apiBridge, webServer, getMainWindow: () => mainWindow });
 
   webServer.start();
 

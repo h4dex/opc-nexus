@@ -14,7 +14,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 22;
+const SCHEMA_VERSION = 24;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   workspace_override TEXT,
   created_at INTEGER NOT NULL,
   started_at INTEGER,
-  ended_at INTEGER
+  ended_at INTEGER,
+  deleted_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS agent_runs (
@@ -359,6 +360,12 @@ CREATE TABLE IF NOT EXISTS knowledge_versions (
   UNIQUE(knowledge_id, version)
 );
 
+CREATE TABLE IF NOT EXISTS action_dismissals (
+  action_key TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  dismissed_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS collab_workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -409,6 +416,7 @@ CREATE INDEX IF NOT EXISTS idx_deliverable_versions_parent ON deliverable_versio
 CREATE INDEX IF NOT EXISTS idx_deliverable_reviews_parent ON deliverable_reviews(deliverable_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_entries(project_id, status, pinned, updated_at);
 CREATE INDEX IF NOT EXISTS idx_knowledge_versions_parent ON knowledge_versions(knowledge_id, version);
+CREATE INDEX IF NOT EXISTS idx_action_dismissed_at ON action_dismissals(dismissed_at);
 `;
 
 type Row = Record<string, SqlValue>;
@@ -745,6 +753,14 @@ export class Database {
         // v22：项目知识库、不可变知识版本与成果来源追溯。
         this.inner.exec('CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_entries(project_id, status, pinned, updated_at)');
         this.inner.exec('CREATE INDEX IF NOT EXISTS idx_knowledge_versions_parent ON knowledge_versions(knowledge_id, version)');
+      }
+      if (prev < 23) {
+        // v23：行动中心派生事项的版本化忽略记录。
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_action_dismissed_at ON action_dismissals(dismissed_at)');
+      }
+      if (prev < 24) {
+        // v24：终态任务软删除，保留执行记录与成果来源追溯。
+        addCol('tasks', 'deleted_at', 'INTEGER');
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

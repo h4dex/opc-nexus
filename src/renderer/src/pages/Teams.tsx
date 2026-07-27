@@ -26,7 +26,7 @@ const PHASE_LABEL: Record<string, string> = {
 };
 
 export function Teams() {
-  const { snapshot } = useApp();
+  const { snapshot, navigationTarget, clearNavigationTarget } = useApp();
   const [view, setView] = useState<'workspace' | 'templates'>('workspace');
   const [teams, setTeams] = useState<TeamData[]>([]);
   const [createOpen, setCreateOpen] = useState(false);
@@ -44,6 +44,14 @@ export function Teams() {
   useEffect(() => {
     void window.aibox.listTeams().then(setTeams);
   }, [snapshot?.tasks.length]);
+  useEffect(() => {
+    if (navigationTarget?.entityType !== 'team') return;
+    const team = teams.find((item) => item.id === navigationTarget.entityId);
+    if (!team) return;
+    setView('workspace');
+    setHistoryTeam(team);
+    clearNavigationTarget();
+  }, [clearNavigationTarget, navigationTarget, teams]);
 
   /** 轮询活跃流水线进度（2s，有未完成 run 时） */
   const hasActiveRun = Object.values(runs).some((r) => r && (

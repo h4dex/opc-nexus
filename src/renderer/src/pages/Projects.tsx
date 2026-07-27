@@ -28,7 +28,7 @@ const FILTERS: { key: ProjectFilter; label: string }[] = [
 ];
 
 export function Projects() {
-  const { snapshot } = useApp();
+  const { snapshot, navigationTarget, clearNavigationTarget } = useApp();
   const [view, setView] = useState<ProjectView>('operations');
   const [filter, setFilter] = useState<ProjectFilter>('open');
   const [operations, setOperations] = useState<ProjectOperationsOverview | null>(null);
@@ -46,6 +46,14 @@ export function Projects() {
       .catch((error) => toast.err(error instanceof Error ? error.message : '项目经营数据加载失败'));
     return () => { active = false; };
   }, [snapshot?.version]);
+  useEffect(() => {
+    if (!snapshot || navigationTarget?.entityType !== 'project') return;
+    const project = snapshot.projects.find((item) => item.id === navigationTarget.entityId);
+    if (!project) return;
+    setView('operations');
+    setViewing(project);
+    clearNavigationTarget();
+  }, [clearNavigationTarget, navigationTarget, snapshot]);
   const operationByProject = useMemo(
     () => new Map(operations?.projects.map((item) => [item.project.id, item]) ?? []),
     [operations]

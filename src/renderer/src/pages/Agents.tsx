@@ -1,5 +1,5 @@
 /** 数字员工管理：搜索/筛选 + 批量操作 + 表格/卡片视图切换 + 标签管理 + 导入/导出 */
-import { useState, useMemo } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { useApp } from '../store';
 import { AgentEditor } from '../components/AgentEditor';
 import { ContextMenu, type CtxMenuItem } from '../components/common';
@@ -24,7 +24,7 @@ const LIFECYCLE_LABEL: Record<string, { text: string; color: string }> = {
 type ViewMode = 'table' | 'card';
 
 export function Agents() {
-  const { snapshot, setWizardOpen } = useApp();
+  const { snapshot, setWizardOpen, navigationTarget, clearNavigationTarget } = useApp();
   const [editAgent, setEditAgent] = useState<Agent | null>(null);
   const [ctx, setCtx] = useState<{ x: number; y: number; card: AgentCardView } | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('table');
@@ -36,6 +36,18 @@ export function Agents() {
   const [batchMsg, setBatchMsg] = useState('');
   const [importMsg, setImportMsg] = useState('');
   const [detailAgent, setDetailAgent] = useState<Agent | null>(null);
+
+  useEffect(() => {
+    if (!snapshot || navigationTarget?.entityType !== 'agent') return;
+    const agent = snapshot.agentCards.find((item) => item.agent.id === navigationTarget.entityId)?.agent;
+    if (!agent) return;
+    setSearch('');
+    setFilterStatus('');
+    setFilterPerm('');
+    setFilterTag('');
+    setDetailAgent(agent);
+    clearNavigationTarget();
+  }, [clearNavigationTarget, navigationTarget, snapshot]);
 
   if (!snapshot) return null;
   const { agentCards } = snapshot;

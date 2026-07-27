@@ -1509,6 +1509,106 @@ textarea.input { resize: vertical; line-height: 1.5; }
   .deliverable-package-summary { grid-template-columns: repeat(2, 1fr); }
 }
 
+/* 全局检索 */
+.global-search-mask {
+  position: fixed; inset: 0; z-index: 120; padding: 12vh 18px 18px;
+  background: rgba(4, 7, 12, 0.58); backdrop-filter: blur(4px);
+  display: flex; align-items: flex-start; justify-content: center;
+}
+.global-search-panel {
+  width: min(680px, 100%); min-width: 0; overflow: hidden;
+  border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg-elev); box-shadow: var(--shadow);
+}
+.global-search-input {
+  height: 54px; padding: 0 16px; border-bottom: 1px solid var(--divider);
+  color: var(--text-3); display: flex; align-items: center; gap: 10px;
+}
+.global-search-input input { min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-1); flex: 1; font-size: 13px; }
+.global-search-input input::placeholder { color: var(--text-3); }
+.global-search-input > span { padding: 2px 6px; border: 1px solid var(--card-border); border-radius: 5px; background: var(--input-bg); font-size: 9px; }
+.global-search-results { max-height: min(52vh, 480px); overflow-y: auto; }
+.global-search-results > button {
+  width: 100%; min-height: 58px; padding: 8px 14px; border-bottom: 1px solid var(--divider);
+  display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; text-align: left;
+}
+.global-search-results > button:hover, .global-search-results > button.active { background: var(--accent-soft); }
+.global-search-icon { width: 32px; height: 32px; border-radius: 7px; background: var(--input-bg); color: var(--text-2); display: grid; place-items: center; }
+.global-search-icon[data-tone='info'] { color: var(--info); background: var(--info-soft); }
+.global-search-icon[data-tone='accent'] { color: var(--accent); background: var(--accent-soft); }
+.global-search-icon[data-tone='success'] { color: var(--success); background: var(--success-soft); }
+.global-search-icon[data-tone='warning'] { color: var(--warning); background: var(--warning-soft); }
+.global-search-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.global-search-copy strong, .global-search-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.global-search-copy strong { color: var(--text-1); font-size: 12px; font-weight: 650; }
+.global-search-copy small { color: var(--text-3); font-size: 10px; }
+.global-search-type { color: var(--text-3); font-size: 9.5px; }
+.global-search-empty { min-height: 160px; color: var(--text-3); display: grid; place-items: center; font-size: 11px; }
+.global-search-panel footer { min-height: 35px; padding: 0 14px; color: var(--text-3); display: flex; align-items: center; gap: 16px; font-size: 9px; }
+.global-search-panel footer span:last-child { margin-left: auto; }
+
+/* 统一行动中心 */
+.action-center-page { min-width: 0; padding-bottom: 18px; }
+.action-center-summary {
+  min-height: 76px; margin-bottom: 12px; border-top: 1px solid var(--divider); border-bottom: 1px solid var(--divider);
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.action-center-summary > span { min-width: 0; padding: 12px 18px; display: grid; grid-template-columns: 24px auto; grid-template-rows: auto auto; align-items: center; column-gap: 8px; }
+.action-center-summary > span + span { border-left: 1px solid var(--divider); }
+.action-center-summary svg { grid-row: span 2; color: var(--text-3); }
+.action-center-summary b { color: var(--text-1); font-size: 18px; line-height: 1.2; }
+.action-center-summary small { color: var(--text-3); font-size: 9.5px; }
+.action-center-summary span[data-tone='danger'] svg, .action-center-summary span[data-tone='danger'] b { color: var(--danger); }
+.action-center-summary span[data-tone='warn'] svg, .action-center-summary span[data-tone='warn'] b { color: var(--warning); }
+.action-center-summary span[data-tone='info'] svg, .action-center-summary span[data-tone='info'] b { color: var(--info); }
+.action-center-filter { min-width: 0; margin-bottom: 9px; display: flex; align-items: center; gap: 4px; overflow-x: auto; }
+.action-center-filter button { height: 30px; padding: 0 9px; border-radius: 6px; color: var(--text-3); display: flex; align-items: center; gap: 5px; font-size: 10.5px; white-space: nowrap; }
+.action-center-filter button:hover { color: var(--text-1); background: var(--hover-bg); }
+.action-center-filter button.active { color: var(--accent); background: var(--accent-soft); }
+.action-center-filter button span { min-width: 17px; height: 17px; padding: 0 4px; border-radius: 5px; background: var(--input-bg); display: inline-grid; place-items: center; font-size: 9px; }
+.action-center-list { border-top: 1px solid var(--divider); }
+.action-center-item {
+  position: relative; min-width: 0; min-height: 104px; padding: 14px 12px;
+  border-bottom: 1px solid var(--divider); display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: start; gap: 11px;
+}
+.action-center-item::before { content: ''; position: absolute; left: 0; top: 16px; bottom: 16px; width: 2px; border-radius: 2px; background: var(--info); }
+.action-center-item[data-severity='warn']::before { background: var(--warning); }
+.action-center-item[data-severity='danger']::before { background: var(--danger); }
+.action-center-item:hover { background: var(--hover-bg); }
+.action-center-kind-icon { width: 34px; height: 34px; border-radius: 7px; background: var(--input-bg); color: var(--text-2); display: grid; place-items: center; }
+.action-center-item[data-severity='warn'] .action-center-kind-icon { color: var(--warning); background: var(--warning-soft); }
+.action-center-item[data-severity='danger'] .action-center-kind-icon { color: var(--danger); background: var(--danger-soft); }
+.action-center-body { min-width: 0; }
+.action-center-body header { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.action-center-body header > span { height: 19px; padding: 0 6px; border-radius: 5px; background: var(--input-bg); color: var(--text-3); display: inline-flex; align-items: center; font-size: 9px; }
+.action-center-body header strong { overflow: hidden; color: var(--text-1); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.action-center-body time { color: var(--text-3); font-size: 9.5px; white-space: nowrap; }
+.action-center-body p { margin-top: 6px; color: var(--text-2); font-size: 10.5px; line-height: 1.55; word-break: break-word; }
+.action-center-body p b { margin-right: 7px; color: var(--text-3); font-weight: 500; }
+.action-center-body small { margin-top: 3px; color: var(--text-3); display: block; font-size: 9.5px; }
+.action-center-actions { min-width: 0; padding-top: 1px; display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
+.action-center-actions .btn { padding: 5px 8px; font-size: 10px; white-space: nowrap; }
+.action-center-dismiss { width: 28px; height: 28px; flex: 0 0 auto; }
+.action-center-empty { min-height: 330px; border-top: 1px solid var(--divider); border-bottom: 1px solid var(--divider); color: var(--text-3); display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 7px; }
+.action-center-empty strong { color: var(--text-1); font-size: 13px; }
+.action-center-empty small { font-size: 10px; }
+
+@media (max-width: 900px) {
+  .action-center-item { grid-template-columns: 36px minmax(0, 1fr); }
+  .action-center-actions { grid-column: 2; justify-content: flex-start; flex-wrap: wrap; }
+}
+
+@media (max-width: 700px) {
+  .global-search-mask { padding: 58px 10px 10px; }
+  .global-search-panel footer span:first-child { display: none; }
+  .action-center-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .action-center-summary > span:nth-child(3) { border-left: 0; }
+  .action-center-summary > span:nth-child(n+3) { border-top: 1px solid var(--divider); }
+  .action-center-item { padding-right: 54px; }
+  .action-center-body header { grid-template-columns: auto minmax(0, 1fr); }
+  .action-center-body time { grid-column: 2; }
+  .action-center-actions .btn { flex: 1 1 auto; justify-content: center; }
+}
+
 /* 可访问性：键盘焦点（16 非功能：颜色不是唯一状态表达；支持键盘导航） */
 :focus-visible { outline: 2px solid var(--accent-border); outline-offset: 2px; border-radius: 4px; }
 

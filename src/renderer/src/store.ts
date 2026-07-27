@@ -1,7 +1,14 @@
 import { create } from 'zustand';
 import type { Snapshot, ResourcePayload } from '../../preload/index';
+import type { ActionCenterOverview, SearchEntityType, SearchRoute } from '../../shared/types';
 
 export type RouteKey = 'dashboard' | 'projects' | 'office' | 'inbox' | 'deliverables' | 'knowledge' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'chat' | 'teams' | 'collab' | 'market' | 'engines' | 'channels' | 'mcp' | 'skills' | 'usage' | 'system' | 'settings';
+
+export interface NavigationTarget {
+  entityType: SearchEntityType;
+  entityId: string;
+  nonce: number;
+}
 
 interface AppState {
   snapshot: Snapshot | null;
@@ -12,8 +19,13 @@ interface AppState {
   deviceName: string;
   online: boolean;
   appVersion: string;
+  actionCenter: ActionCenterOverview | null;
+  navigationTarget: NavigationTarget | null;
 
   setRoute: (r: RouteKey) => void;
+  navigate: (route: SearchRoute, target?: Omit<NavigationTarget, 'nonce'>) => void;
+  clearNavigationTarget: () => void;
+  refreshActionCenter: () => Promise<void>;
   setTheme: (t: 'dark' | 'light') => void;
   setWizardOpen: (v: boolean) => void;
   init: () => Promise<void>;
@@ -28,8 +40,18 @@ export const useApp = create<AppState>((set) => ({
   deviceName: 'Senke AI Box-01',
   online: true,
   appVersion: '1.0.0',
+  actionCenter: null,
+  navigationTarget: null,
 
-  setRoute: (route) => set({ route }),
+  setRoute: (route) => set({ route, navigationTarget: null }),
+  navigate: (route, target) => set({
+    route,
+    navigationTarget: target ? { ...target, nonce: Date.now() } : null
+  }),
+  clearNavigationTarget: () => set({ navigationTarget: null }),
+  refreshActionCenter: async () => {
+    try { set({ actionCenter: await window.aibox.getActionCenter() }); } catch { /* 主进程重启期间保留旧值 */ }
+  },
   setWizardOpen: (wizardOpen) => set({ wizardOpen }),
 
   setTheme: (theme) => {
@@ -52,11 +74,12 @@ export const useApp = create<AppState>((set) => ({
 
     void window.aibox.getAppVersion().then((v) => set({ appVersion: v })).catch(() => {});
 
-    const [snapshot, resources] = await Promise.all([
+    const [snapshot, resources, actionCenter] = await Promise.all([
       window.aibox.getSnapshot(),
-      window.aibox.getResourceHistory()
+      window.aibox.getResourceHistory(),
+      window.aibox.getActionCenter()
     ]);
-    set({ snapshot, resources, online: true });
+    set({ snapshot, resources, actionCenter, online: true });
 
     window.aibox.onSnapshot((s) => set({ snapshot: s }));
     window.aibox.onResources((r) => {

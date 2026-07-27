@@ -22,7 +22,7 @@ const SOURCE_META: Record<KnowledgeSourceType, string> = { manual: '手动记录
 type DetailTab = 'content' | 'versions' | 'trace';
 
 export function Knowledge() {
-  const { snapshot, setRoute } = useApp();
+  const { snapshot, navigate, navigationTarget, clearNavigationTarget } = useApp();
   const [items, setItems] = useState<KnowledgeSummary[]>([]);
   const [allItems, setAllItems] = useState<KnowledgeSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -76,6 +76,17 @@ export function Knowledge() {
     const value = await window.aibox.getKnowledge(id);
     if (value) setDetail(value);
   };
+  useEffect(() => {
+    if (navigationTarget?.entityType !== 'knowledge') return;
+    let active = true;
+    void window.aibox.getKnowledge(navigationTarget.entityId).then((value) => {
+      if (active && value) {
+        setDetail(value);
+        clearNavigationTarget();
+      }
+    });
+    return () => { active = false; };
+  }, [clearNavigationTarget, navigationTarget]);
   const refreshDetail = async (id: string) => {
     await load();
     setDetail(await window.aibox.getKnowledge(id));
@@ -138,7 +149,11 @@ export function Knowledge() {
     </div>}
 
     {creating && <KnowledgeEditor projects={activeProjects} onClose={() => setCreating(false)} onSaved={async (id) => { setCreating(false); await load(); await openDetail(id); }} />}
-    {detail && <KnowledgeDetailModal detail={detail} onClose={() => setDetail(null)} onEdit={() => setEditing(detail)} onVersion={() => setVersioning(detail)} onOpenSource={() => { setDetail(null); setRoute('deliverables'); }} />}
+    {detail && <KnowledgeDetailModal detail={detail} onClose={() => setDetail(null)} onEdit={() => setEditing(detail)} onVersion={() => setVersioning(detail)} onOpenSource={() => {
+      const sourceId = detail.sourceId;
+      setDetail(null);
+      if (sourceId) navigate('deliverables', { entityType: 'deliverable', entityId: sourceId });
+    }} />}
     {editing && <KnowledgeMetaEditor detail={editing} onClose={() => setEditing(null)} onSaved={async (id) => { setEditing(null); await refreshDetail(id); }} />}
     {versioning && <KnowledgeVersionEditor detail={versioning} onClose={() => setVersioning(null)} onSaved={async (id) => { setVersioning(null); await refreshDetail(id); }} />}
   </div>;

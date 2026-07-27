@@ -461,6 +461,46 @@ export interface KnowledgeQuery {
   search?: string;
 }
 
+// ---------- 全局检索与行动中心 ----------
+
+export type SearchEntityType = 'project' | 'agent' | 'task' | 'team' | 'deliverable' | 'knowledge';
+export type SearchRoute = 'projects' | 'agents' | 'tasks' | 'teams' | 'deliverables' | 'knowledge';
+
+export interface GlobalSearchResult {
+  key: string;
+  entityType: SearchEntityType;
+  entityId: string;
+  route: SearchRoute;
+  title: string;
+  subtitle: string;
+  status: string;
+  projectId: string | null;
+  updatedAt: number;
+}
+
+export type ActionCenterKind = 'approval' | 'failed_task' | 'team_run' | 'deliverable' | 'project_risk';
+
+export interface ActionCenterItem {
+  key: string;
+  fingerprint: string;
+  kind: ActionCenterKind;
+  title: string;
+  owner: string;
+  reason: string;
+  suggestion: string;
+  severity: 'info' | 'warn' | 'danger';
+  createdAt: number;
+  target: { route: SearchRoute; entityType: SearchEntityType; entityId: string };
+  approvalId: string | null;
+}
+
+export interface ActionCenterOverview {
+  generatedAt: number;
+  total: number;
+  counts: Record<ActionCenterKind, number>;
+  items: ActionCenterItem[];
+}
+
 /** 任务执行事件（13.2 审计可追溯；详情页时间线） */
 export interface TaskEvent {
   id: string;

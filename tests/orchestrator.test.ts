@@ -179,6 +179,70 @@ describe('Orchestrator 状态机', () => {
       expect(t2After?.status).toBe('RUNNING');
     });
 
+    it('取消等待审批任务时同步关闭待审批记录', () => {
+      const agentId = seedAgent(db);
+      const task = orch.createTask(agentId, '等待审批任务');
+      db.tables.tasks.get(task.id)!.status = 'WAITING_APPROVAL';
+      db.tables.approvals.set('approval-cancel', {
+        id: 'approval-cancel', task_id: task.id, agent_id: agentId, status: 'pending', created_at: Date.now(), decided_at: null
+      });
+
+      orch.cancelTask(task.id);
+      expect(db.tables.tasks.get(task.id)?.status).toBe('CANCELLED');
+      expect(db.tables.approvals.get('approval-cancel')).toMatchObject({ status: 'rejected', decided_at: expect.any(Number) });
+    });
+
+    it('已结束任务不可再次取消', () => {
+      const agentId = seedAgent(db);
+      const task = orch.createTask(agentId, '已完成任务');
+      const row = db.tables.tasks.get(task.id)!;
+      row.status = 'COMPLETED';
+      row.ended_at = Date.now();
+
+      expect(() => orch.cancelTask(task.id)).toThrow('任务已经结束');
+      expect(row.status).toBe('COMPLETED');
+    });
+
+    it('retryTask 保留员工、项目、工作区和父任务追溯', () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const task = orch.createTask(agentId, '重新生成周报', 'desktop', { projectId, workspaceOverride: 'D:/project-work' });
+      const row = db.tables.tasks.get(task.id)!;
+      row.status = 'FAILED';
+      row.error = '模型超时';
+      row.ended_at = Date.now();
+
+      const retried = orch.retryTask(task.id);
+      expect(retried).toMatchObject({ agentId, projectId, title: task.title, parentId: task.id, workspaceOverride: 'D:/project-work' });
+      expect(retried.id).not.toBe(task.id);
+      expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'task.retry', target: task.id, result: retried.id }));
+    });
+
+    it('deleteTask 仅软删除终态任务并从任务列表隐藏', () => {
+      const agentId = seedAgent(db);
+      const task = orch.createTask(agentId, '待删除任务');
+      const row = db.tables.tasks.get(task.id)!;
+      row.status = 'CANCELLED';
+      row.ended_at = Date.now();
+
+      orch.deleteTask(task.id);
+      expect(row.deleted_at).toEqual(expect.any(Number));
+      expect(db.tables.tasks.has(task.id)).toBe(true);
+      expect(orch.listTasks().some((item) => item.id === task.id)).toBe(false);
+      expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'task.delete', target: task.id, result: 'soft-deleted' }));
+      expect(() => orch.deleteTask(task.id)).toThrow('任务不存在或已删除');
+    });
+
+    it('执行中的任务和仍有活跃后续任务的父任务不可删除', () => {
+      const agentId = seedAgent(db, { concurrency_limit: 2 });
+      const parent = orch.createTask(agentId, '父任务');
+      expect(() => orch.deleteTask(parent.id)).toThrow('请先取消任务');
+      db.tables.tasks.get(parent.id)!.status = 'FAILED';
+      db.tables.tasks.get(parent.id)!.ended_at = Date.now();
+      orch.createTask(agentId, '后续任务', 'desktop', { parentId: parent.id });
+      expect(() => orch.deleteTask(parent.id)).toThrow('后续任务');
+    });
+
     it('pauseTask → PAUSED（仅 RUNNING 可暂停）', () => {
       const agentId = seedAgent(db);
       const task = orch.createTask(agentId, '暂停测试');

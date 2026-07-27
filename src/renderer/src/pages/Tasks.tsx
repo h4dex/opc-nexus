@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { TASK_STATUS_META, Modal, ProgressBar, ContextMenu, type CtxMenuItem } from '../components/common';
-import { IconCheck, IconPause, IconPlay, IconStop, IconX } from '../components/icons';
+import { IconCheck, IconPause, IconPlay, IconRefresh, IconStop, IconTrash, IconX } from '../components/icons';
 import { toast } from '../components/Toast';
 import type { Task, TaskEvent } from '@shared/types';
 
@@ -11,13 +11,24 @@ type TabKey = 'active' | 'approval' | 'done';
 interface CtxState { x: number; y: number; task: Task }
 
 export function Tasks() {
-  const { snapshot } = useApp();
+  const { snapshot, navigationTarget, clearNavigationTarget } = useApp();
   const [tab, setTab] = useState<TabKey>('active');
   const [detailId, setDetailId] = useState<string | null>(null);
   const [ctx, setCtx] = useState<CtxState | null>(null);
   const [followUpTask, setFollowUpTask] = useState<Task | null>(null);
   const [followUpText, setFollowUpText] = useState('');
   const [projectFilter, setProjectFilter] = useState('all');
+  const [deleting, setDeleting] = useState<Task | null>(null);
+  useEffect(() => {
+    if (!snapshot || navigationTarget?.entityType !== 'task') return;
+    const task = snapshot.tasks.find((item) => item.id === navigationTarget.entityId);
+    if (!task) return;
+    setProjectFilter('all');
+    setTab(task.status === 'WAITING_APPROVAL' ? 'approval'
+      : ['RUNNING', 'QUEUED', 'PAUSED'].includes(task.status) ? 'active' : 'done');
+    setDetailId(task.id);
+    clearNavigationTarget();
+  }, [clearNavigationTarget, navigationTarget, snapshot]);
   if (!snapshot) return null;
 
   const { tasks, approvals, agentCards } = snapshot;
@@ -37,6 +48,37 @@ export function Tasks() {
     const task = tasks.find((item) => item.id === approval.taskId);
     return task ? matchesProject(task) : projectFilter === 'all';
   });
+  const terminal = (task: Task) => ['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(task.status);
+
+  const retryTask = async (task: Task) => {
+    try {
+      await window.aibox.retryTask(task.id);
+      toast.ok(`已重新执行“${task.title}”`);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '任务重试失败');
+    }
+  };
+
+  const cancelTask = async (task: Task) => {
+    try {
+      await window.aibox.cancelTask(task.id);
+      toast.ok('任务已取消');
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '任务取消失败');
+    }
+  };
+
+  const deleteTask = async () => {
+    if (!deleting) return;
+    try {
+      await window.aibox.deleteTask(deleting.id);
+      toast.ok('任务已从任务中心删除，执行审计与成果追溯仍会保留');
+      setDeleting(null);
+      if (detailId === deleting.id) setDetailId(null);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '任务删除失败');
+    }
+  };
 
   /** 右键菜单：根据任务状态动态生成菜单项 */
   const ctxItems = (t: Task): CtxMenuItem[] => {
@@ -47,9 +89,14 @@ export function Tasks() {
     if (['COMPLETED', 'FAILED'].includes(t.status)) {
       items.push({ label: '追问 / 续跑', onClick: () => { setFollowUpTask(t); setFollowUpText(''); } });
     }
+    if (terminal(t)) items.push(
+      { label: '重新执行', onClick: () => void retryTask(t) },
+      { divider: true, label: '', onClick: () => {} },
+      { label: '删除任务', danger: true, onClick: () => setDeleting(t) }
+    );
     if (t.status === 'RUNNING') items.push({ label: '暂停', onClick: () => void window.aibox.pauseTask(t.id) });
     if (t.status === 'PAUSED') items.push({ label: '继续', onClick: () => void window.aibox.resumeTask(t.id) });
-    if (['RUNNING', 'PAUSED', 'QUEUED'].includes(t.status)) {
+    if (['RUNNING', 'PAUSED', 'QUEUED', 'WAITING_APPROVAL'].includes(t.status)) {
       items.push({ divider: true, label: '', onClick: () => {} }, { label: '取消任务', danger: true, onClick: () => void window.aibox.cancelTask(t.id) });
     }
     return items;
@@ -103,7 +150,7 @@ export function Tasks() {
         <table className="table">
           <thead>
             <tr>
-              <th>任务</th><th>项目</th><th>数字员工</th><th>来源</th><th>状态</th><th style={{ width: 160 }}>进度</th><th>开始时间</th><th style={{ width: 130 }}>操作</th>
+              <th>任务</th><th>项目</th><th>数字员工</th><th>来源</th><th>状态</th><th style={{ width: 160 }}>进度</th><th>开始时间</th><th style={{ width: 170 }}>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -137,9 +184,13 @@ export function Tasks() {
                       {t.status === 'PAUSED' && (
                         <button className="btn small" title="继续" onClick={() => void window.aibox.resumeTask(t.id)}><IconPlay size={13} /></button>
                       )}
-                      {['RUNNING', 'PAUSED', 'QUEUED'].includes(t.status) && (
-                        <button className="btn small danger" title="取消" onClick={() => void window.aibox.cancelTask(t.id)}><IconStop size={13} /></button>
+                      {['RUNNING', 'PAUSED', 'QUEUED', 'WAITING_APPROVAL'].includes(t.status) && (
+                        <button className="btn small danger" title="取消任务" aria-label={`取消 ${t.title}`} onClick={() => void cancelTask(t)}><IconStop size={13} /></button>
                       )}
+                      {terminal(t) && <>
+                        <button className="btn small" title="重新执行" aria-label={`重新执行 ${t.title}`} onClick={() => void retryTask(t)}><IconRefresh size={13} /></button>
+                        <button className="btn small danger" title="删除任务" aria-label={`删除 ${t.title}`} onClick={() => setDeleting(t)}><IconTrash size={13} /></button>
+                      </>}
                     </div>
                   </td>
                 </tr>
@@ -178,6 +229,13 @@ export function Tasks() {
           </div>
         </Modal>
       )}
+
+      {deleting && <Modal title="删除任务" onClose={() => setDeleting(null)} footer={<>
+        <button className="btn" type="button" onClick={() => setDeleting(null)}>取消</button>
+        <button className="btn danger" type="button" onClick={() => void deleteTask()}><IconTrash size={13} />确认删除</button>
+      </>}>
+        <p style={{ color: 'var(--text-2)', lineHeight: 1.7 }}>“{deleting.title}”将从任务中心和经营统计中移除。执行审计、关联成果及知识来源仍会保留。</p>
+      </Modal>}
     </>
   );
 }

@@ -353,7 +353,7 @@ export class Orchestrator {
   }
 
   listTasks(): Task[] {
-    return (this.db.raw.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 200').all() as Row[]).map((r) => this.mapTask(r));
+    return (this.db.raw.prepare('SELECT * FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200').all() as Row[]).map((r) => this.mapTask(r));
   }
 
   listApprovals(): Approval[] {
@@ -470,7 +470,7 @@ export class Orchestrator {
     s.activeTasks = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").get() as { c: number }).c;
     s.pendingTodos = (this.db.raw.prepare("SELECT COUNT(*) c FROM approvals WHERE status = 'pending'").get() as { c: number }).c;
     const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-    s.todayCompleted = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE status = 'COMPLETED' AND ended_at >= ?").get(dayStart.getTime()) as { c: number }).c;
+    s.todayCompleted = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE status = 'COMPLETED' AND deleted_at IS NULL AND ended_at >= ?").get(dayStart.getTime()) as { c: number }).c;
     return s;
   }
 
@@ -631,6 +631,34 @@ export class Orchestrator {
     });
   }
 
+  /** 重新执行终态任务：保留归属与工作区，但不复用失败会话。 */
+  retryTask(taskId: string): Task {
+    const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as Row | undefined;
+    if (!row) throw new Error('原任务不存在或已删除');
+    const original = this.mapTask(row);
+    if (!['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(original.status)) throw new Error('任务尚未结束，不能重试');
+    const retried = this.createTask(original.agentId, original.title, original.source === 'schedule' ? 'desktop' : original.source, {
+      parentId: original.id,
+      projectId: original.projectId ?? undefined,
+      workspaceOverride: original.workspaceOverride ?? undefined
+    });
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.retry', target: taskId, result: retried.id });
+    return retried;
+  }
+
+  /** 软删除终态任务：执行记录和成果来源仍保留在数据库中。 */
+  deleteTask(taskId: string): void {
+    const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as Row | undefined;
+    if (!row) throw new Error('任务不存在或已删除');
+    const task = this.mapTask(row);
+    if (!['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(task.status)) throw new Error('请先取消任务，再执行删除');
+    const activeChild = this.db.raw.prepare("SELECT id FROM tasks WHERE parent_id = ? AND deleted_at IS NULL AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").get(taskId) as { id: string } | undefined;
+    if (activeChild) throw new Error('该任务仍有执行中的后续任务，暂不能删除');
+    this.db.raw.prepare('UPDATE tasks SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL').run(Date.now(), taskId);
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.delete', target: taskId, result: 'soft-deleted' });
+    this.emit();
+  }
+
   /** 经执行器注册表派发（真实引擎未就绪时自动回退演示模式） */
   private dispatchTask(task: Task, agent: Agent) {
     const kind = this.executors.kindFor(agent.engineId);
@@ -725,18 +753,21 @@ export class Orchestrator {
   }
 
   private cancelTaskInternal(taskId: string, now: number) {
-    this.db.raw.prepare("UPDATE tasks SET status = 'CANCELLED', ended_at = ? WHERE id = ?").run(now, taskId);
+    this.db.raw.prepare("UPDATE tasks SET status = 'CANCELLED', ended_at = ? WHERE id = ? AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").run(now, taskId);
     this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'CANCELLED' WHERE task_id = ? AND ended_at IS NULL").run(now, taskId);
+    this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE task_id = ? AND status = 'pending'").run(now, taskId);
   }
 
   cancelTask(taskId: string) {
+    const task = this.db.raw.prepare('SELECT agent_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as { agent_id: string; status: TaskStatus } | undefined;
+    if (!task) throw new Error('任务不存在或已删除');
+    if (!['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'].includes(task.status)) throw new Error('任务已经结束，不能取消');
     this.broker.abandonTask(taskId);
     this.executors.abort(taskId);
-    const row = this.db.raw.prepare('SELECT agent_id FROM tasks WHERE id = ?').get(taskId) as { agent_id: string } | undefined;
     this.cancelTaskInternal(taskId, Date.now());
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.cancel', target: taskId, result: 'ok' });
     this.emit();
-    if (row) this.scheduleNext(row.agent_id);
+    this.scheduleNext(task.agent_id);
   }
 
   pauseTask(taskId: string) {

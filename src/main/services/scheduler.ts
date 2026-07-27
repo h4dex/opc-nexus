@@ -145,7 +145,7 @@ export class Scheduler {
     const schedule = this.list().find((s) => s.id === scheduleId);
     if (!schedule) return [];
     return (this.db.raw.prepare(
-      "SELECT id, title, status, created_at FROM tasks WHERE agent_id = ? AND source = 'schedule' AND title LIKE ? ORDER BY created_at DESC LIMIT 20"
+      "SELECT id, title, status, created_at FROM tasks WHERE agent_id = ? AND source = 'schedule' AND deleted_at IS NULL AND title LIKE ? ORDER BY created_at DESC LIMIT 20"
     ).all(schedule.agentId, `%${schedule.title}%`) as { id: string; title: string; status: string; created_at: number }[])
       .map((r) => ({ id: r.id, title: r.title, status: r.status, createdAt: r.created_at }));
   }

@@ -8,6 +8,7 @@ import type {
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
   KnowledgeDetail, KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeSummary, KnowledgeVersionInput,
+  ActionCenterOverview, GlobalSearchResult,
   Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
@@ -41,6 +42,9 @@ const api = {
   getAppVersion: (): Promise<string> => ipcRenderer.invoke('aibox:getAppVersion'),
   getResourceHistory: (): Promise<ResourcePayload> => ipcRenderer.invoke('aibox:getResourceHistory'),
   getSystemInfo: (): Promise<SystemInfo> => ipcRenderer.invoke('aibox:getSystemInfo'),
+  globalSearch: (query: string): Promise<GlobalSearchResult[]> => ipcRenderer.invoke('aibox:globalSearch', query),
+  getActionCenter: (): Promise<ActionCenterOverview> => ipcRenderer.invoke('aibox:getActionCenter'),
+  dismissAction: (actionKey: string, fingerprint: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:dismissAction', actionKey, fingerprint),
 
   // 项目
   createProject: (input: ProjectInput): Promise<Project> => ipcRenderer.invoke('aibox:createProject', input),
@@ -179,6 +183,8 @@ const api = {
   // 任务
   createTask: (agentId: string, title: string, projectId?: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title, projectId),
   cancelTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:cancelTask', id),
+  retryTask: (id: string): Promise<Task> => ipcRenderer.invoke('aibox:retryTask', id),
+  deleteTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteTask', id),
   pauseTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:pauseTask', id),
   resumeTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:resumeTask', id),
   decideApproval: (id: string, approve: boolean): Promise<void> => ipcRenderer.invoke('aibox:decideApproval', id, approve),
