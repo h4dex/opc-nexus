@@ -2,6 +2,27 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.5.3] - 2026-07-29
+
+### 修复
+
+- **CLI 事件流报错后仍可能被覆盖为成功**:Codex `error` 事件(及 Claude `result.is_error`)
+  只调 `onError` 而未标记中止,进程随后以 `code=0` 退出时 close 分支会再调 `onDone`,
+  任务显示成功。现报错即写入 `abortedTasks`,与超时路径一致
+
+### 新增
+
+- **CliExecutor 测试 27 项**(核心执行路径,评审文档标记的覆盖缺口):
+  权限→沙箱映射(`readonly`→`read-only` / `standard`→`workspace-write` /
+  `trusted`→`danger-full-access`,渠道任务 trusted 降级、专家团提升)、
+  会话续跑参数(`exec resume`)、泛化 CLI 模板覆写与 `{prompt}` 缺失兜底、
+  JSONL 解析(跨 chunk 分片 / 非 JSON 容错 / 错误事件 / 无产物说明)、
+  退出码与 ENOENT 提示、abort 后不回报
+
+### 变更
+
+- `claude-cli` 分支标注为历史兼容(四引擎收敛后已无处实例化)
+
 ## [1.5.2] - 2026-07-29
 
 ### 安全修复

@@ -64,7 +64,8 @@ export class CliExecutor implements ExecutorAdapter {
       return { bin: this.resolveBin('codex'), args: [...base, '--json', '--skip-git-repo-check', '--sandbox', sandbox, prompt] };
     }
     if (this.kind === 'claude-cli') {
-      // claude -p --output-format stream-json：NDJSON 事件流；--resume 续跑同一会话（P2b）
+      // 保留分支以兼容配置文件仍指向 Claude Code 的历史安装；
+      // 四引擎收敛后已无处实例化（Claude Code 于 v26 下线），正常不会走到这里。
       const perm =
         mode === 'readonly'
           ? ['--allowedTools', 'Read,Glob,Grep']
@@ -175,7 +176,11 @@ export class CliExecutor implements ExecutorAdapter {
           if (itemType === 'agent_message' && item?.text) pushText(item.text);
           else bump('调用工具', Math.min(88, lastProgress + 6));
         } else if (type === 'turn.completed') bump('校验结果', 95);
-        else if (type === 'error') cb.onError(task.id, String(ev.message ?? 'Codex 执行错误'));
+        else if (type === 'error') {
+          // 事件流已报错：标记中止，避免进程随后以 code=0 退出时 close 分支再调 onDone
+          this.abortedTasks.add(task.id);
+          cb.onError(task.id, String(ev.message ?? 'Codex 执行错误'));
+        }
       } else {
         const type = ev.type as string;
         if (type === 'system') {
@@ -189,8 +194,10 @@ export class CliExecutor implements ExecutorAdapter {
             else if (c.type === 'tool_use') bump('调用工具', Math.min(88, lastProgress + 6));
           }
         } else if (type === 'result') {
-          if (ev.is_error) cb.onError(task.id, String(ev.result ?? 'Claude Code 执行错误'));
-          else if (typeof ev.result === 'string' && ev.result && !full) pushText(ev.result);
+          if (ev.is_error) {
+            this.abortedTasks.add(task.id); // 同上：防 close 分支覆盖为成功
+            cb.onError(task.id, String(ev.result ?? 'Claude Code 执行错误'));
+          } else if (typeof ev.result === 'string' && ev.result && !full) pushText(ev.result);
           bump('校验结果', 95);
         }
       }
