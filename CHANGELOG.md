@@ -2,6 +2,25 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.5.4] - 2026-07-29
+
+### 修复
+
+- **API Bridge 带 query 的请求误返 404**:路由用完整 `req.url` 精确比较,
+  而 OpenAI 客户端常附加 query(如 `/v1/models?limit=1`),导致匹配失败。
+  现只比较 pathname
+- **API Bridge key 比较改为定长比较**,消除时序侧信道
+- **API Bridge CORS 不再放行任意来源**:原设 `Access-Control-Allow-Origin: *`,
+  任意网页都能借用户浏览器打这个回环端口。该代理供本机 CLI 直连,无跨源需求
+- **API Bridge 补请求体上限(10MB)与流式背压处理**:原 SSE 透传不检查 `res.write`
+  返回值也不响应客户端断开,客户端提前断连会泄漏上游读取器与内存
+
+### 新增
+
+- **API Bridge 测试 24 项**:鉴权(缺失/错误/截断 key 均拒)、bridge key 生成与轮换、
+  路由(含带 query)、上游错误 502、状态码透传(429 不被吞成 200)、
+  **转发时用供应商密钥替换客户端 key**(不把真实密钥回传调用方)、启停幂等
+
 ## [1.5.3] - 2026-07-29
 
 ### 修复
