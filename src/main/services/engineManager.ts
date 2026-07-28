@@ -2,17 +2,23 @@
  * 引擎中心（PRD 9.x）
  * 引擎目录：内置 Nexus Agent（自研 Runtime，直连 OpenAI 兼容 API）+ 真实 Hermes Agent CLI
  * + 5 个本机 CLI 引擎（Codex CLI / Claude Code / ZCode / OpenCode / Kimi Code）。
+ * 注：引擎清单待收敛为四种（Nexus / Hermes / OpenCode / Codex CLI），见 docs/architecture-review.md E-1。
  * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / HEALTHY，不做假安装。
  * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）；
  * ZCode 为桌面应用无公开 npm 包，仅提供官方指引。
  * Nexus Agent 状态按供应商配置派生：已配置 = HEALTHY，未配置 = SETUP_REQUIRED（演示模式）。
+ * 凭据：自定义环境变量中的敏感键经 engineEnv.ts 拆分加密，config_json 仅存占位符。
+ *
+ * @author liyingjie <y@senke.com>
  */
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
+import { safeStorage } from 'electron';
 import type { Database } from './database.js';
 import { providerReady } from './provider.js';
 import { loadConfig, sanitizeRegistry } from './config.js';
 import { acpCommandFor, probeAcpEngine } from './executor/acpExecutor.js';
+import { engineEnvSecretRef, resolveEngineEnv, splitSecretEnv, SECRET_PLACEHOLDER } from './engineEnv.js';
 import type { Engine, EngineInstallGuide, EngineInstallResult, EngineType } from '../../shared/types.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
@@ -418,17 +424,53 @@ export class EngineManager {
 
   // ---------- 配置 / 日志 / 指标 / 自定义注册 ----------
 
-  /** 保存引擎运行配置 */
+  /**
+   * 保存引擎运行配置。
+   *
+   * 【密钥处理】敏感环境变量（KEY/TOKEN/SECRET/PASSWORD 等）不写入 config_json，
+   * 而是经 safeStorage 加密后存入 settings 表（key = secret:engine:{id}:env）。
+   * config_json 中仅保留占位符，确保 Renderer 与日志都拿不到明文。
+   * 与 providerManager 的密钥处理保持同一模式。
+   */
   saveConfig(id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }) {
-    this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(config), id);
-    this.addLog(id, 'info', `配置已更新: ${JSON.stringify(config).slice(0, 100)}`);
+    const { safe, secrets } = splitSecretEnv(config.env ?? {});
+    const persisted = { ...config, env: safe };
+    this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(persisted), id);
+
+    const ref = engineEnvSecretRef(id);
+    if (Object.keys(secrets).length > 0) {
+      if (safeStorage.isEncryptionAvailable()) {
+        this.db.setSetting(ref, safeStorage.encryptString(JSON.stringify(secrets)).toString('base64'));
+        this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.saveSecretEnv', target: id, result: `${Object.keys(secrets).length} keys` });
+      } else {
+        // 加密不可用时拒绝落盘，避免明文存储
+        this.addLog(id, 'warn', '系统加密不可用，敏感环境变量未保存（请检查 OS 凭据服务）');
+        this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.saveSecretEnv', target: id, result: 'rejected: no encryption' });
+      }
+    } else if (!Object.values(safe).includes(SECRET_PLACEHOLDER)) {
+      // 仅当本次配置完全不含敏感项时才清除；占位符表示「沿用已存密钥」
+      this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(ref);
+    }
+    // 日志只记录非敏感部分，避免凭据进入 engine_logs
+    this.addLog(id, 'info', `配置已更新: ${JSON.stringify(persisted).slice(0, 100)}`);
   }
 
-  /** 获取引擎配置 */
+  /**
+   * 获取引擎配置（供 Renderer 展示）。
+   * 敏感环境变量以占位符形式返回，绝不返回明文。
+   */
   getConfig(id: string): { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null {
     const row = this.db.raw.prepare('SELECT config_json FROM engines WHERE id = ?').get(id) as { config_json?: string } | undefined;
     if (!row?.config_json) return null;
     try { return JSON.parse(row.config_json); } catch { return null; }
+  }
+
+  /**
+   * 解析引擎完整环境变量（含解密后的敏感项），**仅供主进程执行器 spawn 时使用**。
+   * 禁止经 IPC 暴露给 Renderer。
+   */
+  resolveEnv(id: string): Record<string, string> {
+    return resolveEngineEnv(this.db, id);
   }
 
   /** 添加引擎日志 */

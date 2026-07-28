@@ -5,7 +5,11 @@
  * - Token 认证（Bearer token，可在设置页配置，默认 aibox-admin）
  * - 会话 Token 过期机制：登录后颁发 session token，默认 24h 过期
  * - 请求频率限制：单 IP 每分钟最多 120 次请求，认证接口每分钟 10 次
- * - 监听 0.0.0.0:PORT（默认 28889，可配置）
+ * - 监听地址默认 127.0.0.1:PORT（默认 28889）；需局域网访问时显式开启 webExposeLan
+ *   才绑 0.0.0.0，避免默认把管理界面暴露到局域网
+ * - 访问 Token 不写入 console/日志，仅经 IPC 回传给本机 Renderer
+ *
+ * @author liyingjie <y@senke.com>
  * - 主进程启动时自动开启，与桌面窗口并行运行
  */
 import express from 'express';
@@ -77,7 +81,7 @@ export class WebServer {
       console.log('[WebServer] 已自动生成强随机访问 Token（设置页可查看/重新生成）');
     } else if (existing === LEGACY_DEFAULT_TOKEN) {
       this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.weak_token', target: 'webToken', result: 'warn' });
-      console.warn('[WebServer] ⚠️ 检测到仍在使用默认弱口令「aibox-admin」，局域网内任何人可访问！请尽快在设置页重新生成 Token。');
+      console.warn('[WebServer] ⚠️ 检测到仍在使用默认弱口令「aibox-admin」，若开启局域网暴露将极不安全！请尽快在设置页重新生成 Token。');
       notify(this.deps.db, '安全提醒', 'Web 管理面板仍在使用默认弱口令，请尽快在设置页重新生成访问 Token');
     }
   }
@@ -278,11 +282,25 @@ export class WebServer {
       res.json({ ok: true });
     });
 
-    // 启动监听
+    // 启动监听：默认仅绑本机回环，避免管理面板暴露到局域网；
+    // 需要局域网访问时由用户显式开启 settings.webExposeLan（并强制使用强 Token）
     const port = this.port;
-    this.server = app.listen(port, '0.0.0.0', () => {
-      console.log(`[WebServer] 管理面板已启动: http://0.0.0.0:${port} (Token: ${this.token})`);
+    const host = this.bindHost();
+    this.server = app.listen(port, host, () => {
+      // 不打印 Token：凭据不得进入日志，设置页可查看
+      console.log(`[WebServer] 管理面板已启动: http://${host === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1'}:${port}`);
+      if (host === '0.0.0.0') {
+        console.warn('[WebServer] ⚠️ 已监听所有网卡，局域网内可访问管理面板，请确认 Token 为强随机值');
+      }
     });
+  }
+
+  /** 监听地址：默认 127.0.0.1（仅本机）；settings.webExposeLan = true 时才绑 0.0.0.0 */
+  private bindHost(): string {
+    const expose = this.deps.db.getSetting<boolean>('webExposeLan', false);
+    if (!expose) return '127.0.0.1';
+    this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.expose_lan', target: 'webExposeLan', result: 'enabled' });
+    return '0.0.0.0';
   }
 
   stop() {

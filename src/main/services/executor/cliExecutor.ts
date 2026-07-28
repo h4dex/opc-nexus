@@ -4,6 +4,9 @@
  * - 工作目录限定在员工 workspace（7.2 边界），不存在则创建
  * - 事件解析对版本差异保持容忍：JSONL 解析失败的行当纯文本输出处理
  * - 泛化 CLI（generic-cli）：运行参数模板取自引擎目录，可被配置文件 engines[id].runArgs 覆写
+ * - 凭据：spawn 前经 resolveEngineEnv 还原加密的环境变量，明文仅存活于子进程
+ *
+ * @author liyingjie <y@senke.com>
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
@@ -12,6 +15,7 @@ import { app } from 'electron';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
+import { resolveEngineEnv } from '../engineEnv.js';
 import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
 
 const TIMEOUT_MS = 10 * 60_000;
@@ -94,7 +98,13 @@ export class CliExecutor implements ExecutorAdapter {
 
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, { cwd: workspace, shell: false, windowsHide: true, env: process.env });
+      // 引擎自定义环境变量：敏感项经 safeStorage 解密后在此还原，仅存活于子进程
+      child = spawn(bin, args, {
+        cwd: workspace,
+        shell: false,
+        windowsHide: true,
+        env: { ...process.env, ...resolveEngineEnv(this.db, this.engineId) }
+      });
     } catch (err) {
       cb.onError(task.id, `无法启动 ${bin}：${err instanceof Error ? err.message : String(err)}`);
       return;

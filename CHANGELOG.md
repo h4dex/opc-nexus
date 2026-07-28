@@ -2,6 +2,31 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.2.0] - 2026-07-28
+
+### 新增
+
+- **架构与产品诊断报告** `src/docs/architecture-review.md`:记录诚实性缺陷、安全问题、引擎体系设计、
+  架构缺陷与后端迁出 Electron 的演进路径,附录含实测核实的 hermes-agent CLI 接口(v0.19.0)
+- **引擎凭据隔离模块** `engineEnv.ts`:统一的敏感环境变量拆分/解密逻辑(含 10 项单元测试)
+
+### 修复
+
+- **P0 生产模式未默认生效**:`executionMode` 默认值为 `demo`,导致引擎不可用时仍生成虚构产物并标记
+  任务完成;现默认 `production`,演示模式需显式开启
+- **P0 自动补位造假任务**:`demoAutoTasks` 默认开启且水位 8,系统会自动创建用户从未派发的任务并计入
+  统计;现默认关闭、水位 0
+- **P0 引擎环境变量明文存储凭据**:自定义 env 整体明文写入 `engines.config_json` 并进入引擎日志,
+  违反密钥必须走 safeStorage 的安全基线;现敏感键(KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH)
+  加密存 `secret:engine:<id>:env`,`config_json` 仅留 `***` 占位符,spawn 时还原且仅存活于子进程
+- **P0 Web 管理面板默认暴露局域网**:默认监听 `0.0.0.0` 且访问 Token 打印到 console;现默认绑
+  `127.0.0.1`,需显式开启 `webExposeLan` 才暴露,Token 不再写入日志
+- **P0 Hermes 配置目录冲突**:同步逻辑写死 `~/.hermes/` 并以覆盖方式导出,会破坏真实 hermes-agent 的
+  `config.yaml`/`.env`/`skills/`;现划定归属边界(仅写 `mcp_servers.json` 与 `skills/opc-nexus/`),
+  并按 `HERMES_HOME` > Windows `%LOCALAPPDATA%\hermes` > `~/.hermes` 解析真实目录
+- **看门狗误杀恢复任务**:暂停与审批等待期被计入运行时长,长时间等待后恢复即被中断;现恢复时重置
+  `started_at`,按本段运行时长计时
+
 ## [1.1.0] - 2026-07-28
 
 ### 新增

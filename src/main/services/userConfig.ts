@@ -6,6 +6,9 @@
  *   引擎策略（辅助引擎/执行模式）、任务看门狗参数
  * - 解析：内置 YAML 子集解析器（两级映射 + 标量 + 注释），零新增依赖
  * - 安全：文件含凭据，模板头部注明勿入仓库；Secret 导入系统密钥库后运行期不再读明文
+ * - executionMode 默认 production：引擎不可用时任务转 FAILED，绝不用模拟结果冒充完成
+ *
+ * @author liyingjie <y@senke.com>
  */
 import { app } from 'electron';
 import { dirname, join } from 'node:path';
@@ -23,7 +26,7 @@ export interface UserConfig {
   engine: {
     /** 辅助引擎：主引擎不可用时的回退引擎 ID */
     fallbackEngineId: string;
-    /** production = 引擎不可用任务直接失败；demo = 回退演示模式 */
+    /** production（默认）= 引擎不可用任务直接失败；demo = 回退演示模式（生成虚构产物，仅演示用） */
     executionMode: 'production' | 'demo';
   };
   task: {
@@ -34,7 +37,7 @@ export interface UserConfig {
 
 export const USER_CONFIG_DEFAULTS: UserConfig = {
   wecom: { botId: '', secret: '', webhookUrl: '' },
-  engine: { fallbackEngineId: 'eng-opencode', executionMode: 'demo' },
+  engine: { fallbackEngineId: 'eng-opencode', executionMode: 'production' },
   task: { maxRunMinutes: 30 }
 };
 
@@ -53,7 +56,7 @@ wecom:
 # 引擎策略
 engine:
   fallbackEngineId: "eng-opencode"   # 辅助引擎：主引擎不可用时回退（eng-opencode / eng-codex / eng-claude / eng-hermes-cli）
-  executionMode: "demo"              # production = 引擎不可用任务直接失败；demo = 回退演示模式
+  executionMode: "production"        # production(默认) = 引擎不可用任务直接失败；demo = 回退演示模式(仅演示用，会生成虚构产物)
 
 # 任务保护（防长任务卡死 / 死循环）
 task:

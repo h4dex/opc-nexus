@@ -4,6 +4,10 @@
  * - FIFO 队列 + 固定并发（6.2：V1.0 基础调度）
  * - 首页派生状态互斥归类：异常/离线 > 执行中/待审批 > 暂停 > 排队/启动中 > 空闲
  * - 崩溃恢复：启动时扫描 RUNNING 记录，无法恢复的标记 INTERRUPTED（13.2）
+ * - 自动补位（replenishTasks）默认关闭：它会生成用户从未派发的任务，
+ *   开启后统计口径不再可信，仅供演示环境显式启用
+ *
+ * @author liyingjie <y@senke.com>
  */
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -32,8 +36,8 @@ const DEMO_TASK_POOL = [
   '待办事项跟进', '周报素材汇总', '接口连通性巡检', '文档版本整理'
 ];
 
-/** 默认演示水位（可通过 settings.demoTargetRunning 配置） */
-const DEFAULT_TARGET_RUNNING = 8;
+/** 默认演示水位：0 = 生产默认不自动补位（演示需显式设置 settings.demoTargetRunning > 0） */
+const DEFAULT_TARGET_RUNNING = 0;
 
 export class Orchestrator {
   private listeners = new Set<() => void>();
@@ -192,14 +196,15 @@ export class Orchestrator {
     }
   }
 
-  /** 读取可配置的演示水位（settings.demoTargetRunning），生产环境设为 0 即关闭自动补位 */
+  /** 读取可配置的演示水位（settings.demoTargetRunning），默认 0 = 关闭自动补位 */
   private targetRunning(): number {
     return this.db.getSetting<number>('demoTargetRunning', DEFAULT_TARGET_RUNNING);
   }
 
-  /** 为无活跃任务且处于演示模式的 READY 员工补充后续任务（可开关；资源保护时暂停；真实引擎员工不自动派单） */
+  /** 为无活跃任务且处于演示模式的 READY 员工补充后续任务。
+   *  默认关闭（demoAutoTasks=false）：生产环境绝不自动造任务，仅演示场景显式开启。 */
   private replenishTasks() {
-    if (!this.db.getSetting<boolean>('demoAutoTasks', true)) return;
+    if (!this.db.getSetting<boolean>('demoAutoTasks', false)) return;
     if (this.dispatchGuard() !== null) return;
     const target = this.targetRunning();
     if (target <= 0) return; // 水位为 0 = 生产模式，不自动补位
