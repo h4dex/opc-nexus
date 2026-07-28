@@ -5,7 +5,22 @@
  *  - Codex CLI / Claude Code → child_process headless 拉起（shell:false）
  *  - simulated → 演示回退（引擎未就绪时保持界面鲜活，UI 明确标注"演示模式"）
  */
+import type { ChildProcess } from 'node:child_process';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
+
+/**
+ * 安全终止子进程：Windows 下 SIGTERM 常被 CLI 忽略，统一用 SIGKILL 强制终止；
+ * 进程若已自行退出（spawn 失败/崩溃），kill 会抛 EINVAL/ESRCH，此处吞掉避免外泄成未捕获异常。
+ *
+ * @author liyingjie <y@senke.com>
+ */
+export function killQuietly(child: ChildProcess): void {
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    /* 进程已不存在，无需处理 */
+  }
+}
 
 export interface ExecutorCallbacks {
   /** 阶段切换（理解需求/规划步骤/调用工具/生成产物/校验结果） */

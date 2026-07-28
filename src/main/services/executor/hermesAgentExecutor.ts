@@ -30,7 +30,7 @@ import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
 import { resolveEngineEnv } from '../engineEnv.js';
-import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 
 const ENGINE_ID = 'eng-hermes-cli';
 const TIMEOUT_MS = 15 * 60_000;
@@ -129,7 +129,10 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     }
 
     const timer = setTimeout(() => {
-      child.kill();
+      this.abortedTasks.add(task.id); // 标记为超时中止，防止 close 事件双重回调
+      this.running.delete(task.id);
+      this.cleanupUsage(usageFile);
+      killQuietly(child);
       cb.onError(task.id, '执行超时（15 分钟），已终止 Hermes 进程');
     }, TIMEOUT_MS);
     this.running.set(task.id, { child, timer, usageFile });
@@ -216,7 +219,8 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     if (run) {
       this.abortedTasks.add(taskId);
       clearTimeout(run.timer);
-      run.child.kill();
+      killQuietly(run.child);
+      this.cleanupUsage(run.usageFile); // 中止路径同样要清理临时用量文件，避免 tmp 堆积
       this.running.delete(taskId);
     }
   }

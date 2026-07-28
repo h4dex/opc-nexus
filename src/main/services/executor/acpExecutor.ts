@@ -13,7 +13,7 @@ import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { loadConfig } from '../config.js';
-import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 
 const TIMEOUT_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
@@ -83,7 +83,7 @@ export class AcpExecutor implements ExecutorAdapter {
       child,
       timer: setTimeout(() => {
         run.aborted = true;
-        child.kill();
+        killQuietly(child);
         cb.onError(task.id, '执行超时（15 分钟），已终止 ACP 进程');
       }, TIMEOUT_MS),
       aborted: false
@@ -241,7 +241,7 @@ export class AcpExecutor implements ExecutorAdapter {
         if (run.aborted) return;
         this.running.delete(task.id);
         clearTimeout(run.timer);
-        child.kill();
+        killQuietly(child);
 
         const stopReason = String(result.stopReason ?? 'end_turn');
         if (stopReason === 'end_turn' || stopReason === 'max_turn_requests') {
@@ -261,7 +261,7 @@ export class AcpExecutor implements ExecutorAdapter {
         if (run.aborted) return;
         this.running.delete(task.id);
         clearTimeout(run.timer);
-        child.kill();
+        killQuietly(child);
         cb.onError(task.id, `ACP 执行失败：${err instanceof Error ? err.message : String(err)}`);
       }
     })();
@@ -273,7 +273,7 @@ export class AcpExecutor implements ExecutorAdapter {
       run.aborted = true;
       clearTimeout(run.timer);
       this.broker.abandonTask(taskId);
-      run.child.kill();
+      killQuietly(run.child);
       this.running.delete(taskId);
     }
   }
@@ -292,7 +292,7 @@ export function probeAcpEngine(command: string[]): Promise<{ ok: boolean; messag
     const done = (ok: boolean, message: string) => {
       if (!settled) {
         settled = true;
-        child.kill();
+        killQuietly(child);
         resolve({ ok, message });
       }
     };

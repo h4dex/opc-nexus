@@ -16,7 +16,7 @@ import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
 import { resolveEngineEnv } from '../engineEnv.js';
-import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 
 const TIMEOUT_MS = 10 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
@@ -111,7 +111,9 @@ export class CliExecutor implements ExecutorAdapter {
     }
 
     const timer = setTimeout(() => {
-      child.kill();
+      this.abortedTasks.add(task.id); // 标记为超时中止，防止 close 事件双重回调
+      this.running.delete(task.id);
+      killQuietly(child); // Windows 兼容 + 进程已退出时不抛
       cb.onError(task.id, '执行超时（10 分钟），已终止进程');
     }, TIMEOUT_MS);
     this.running.set(task.id, { child, timer });
@@ -236,7 +238,8 @@ export class CliExecutor implements ExecutorAdapter {
     if (run) {
       this.abortedTasks.add(taskId);
       clearTimeout(run.timer);
-      run.child.kill();
+      // 进程可能已自行退出（spawn 失败/崩溃），此时 kill 抛 EINVAL/ESRCH，不应外泄
+      killQuietly(run.child);
       this.running.delete(taskId);
     }
   }

@@ -84,17 +84,24 @@ export class ExecutorRegistry {
     return cfg.engine.executionMode === 'production' ? null : this.sim;
   }
 
-  /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 simulated 之外的占位） */
+  /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 unavailable） */
   kindFor(engineId: string): ExecutorKind {
-    return this.resolve(engineId)?.kind ?? 'simulated';
+    const adapter = this.resolve(engineId);
+    if (!adapter) {
+      const cfg = loadUserConfig();
+      return cfg.engine.executionMode === 'production' ? 'unavailable' : 'simulated';
+    }
+    return adapter.kind;
   }
 
   /** 派发任务执行；production 模式无可用引擎 → 直接回报错误（任务 FAILED，不伪装成功） */
   dispatch(task: Task, agent: Agent, cb: ExecutorCallbacks): ExecutorKind {
-    const adapter = this.resolve(agent.engineId);
+    // P1 修复：编码委派优先 —— task.engineOverride 覆盖 agent.engineId
+    const targetEngineId = task.engineOverride || agent.engineId;
+    const adapter = this.resolve(targetEngineId);
     if (!adapter) {
       cb.onError(task.id, '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
-      return 'simulated';
+      return 'unavailable';
     }
     this.running.set(task.id, adapter);
     adapter.start(task, agent, {

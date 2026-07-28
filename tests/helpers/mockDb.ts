@@ -775,12 +775,21 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
-  // UPDATE tasks SET status = 'COMPLETED'
+  /** 解析 SQL 里的 `status IN ('A','B')` 守卫；无该子句返回 null 表示不设限 */
+  const statusGuard = (s: string): string[] | null => {
+    const m = s.match(/status IN \(([^)]+)\)/);
+    return m ? m[1].split(',').map((x) => x.trim().replace(/^'|'$/g, '')) : null;
+  };
+
+  // UPDATE tasks SET status = 'COMPLETED'（可带终态守卫 AND status IN (...)）
   if (/UPDATE tasks SET status = 'COMPLETED'/.test(sql)) {
     const [result, now, id] = args;
     const task = tables.tasks.get(id as string);
-    if (task) { task.status = 'COMPLETED'; task.progress = 100; task.stage = '完成'; task.result = result; task.ended_at = now; return { changes: 1 }; }
-    return { changes: 0 };
+    if (!task) return { changes: 0 };
+    const guard = statusGuard(sql);
+    if (guard && !guard.includes(task.status as string)) return { changes: 0 };
+    task.status = 'COMPLETED'; task.progress = 100; task.stage = '完成'; task.result = result; task.ended_at = now;
+    return { changes: 1 };
   }
 
   if (/UPDATE tasks SET quality = \? WHERE id = \?/.test(sql)) {
@@ -790,12 +799,15 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
-  // UPDATE tasks SET status = ?, error = ?, ended_at = ?
+  // UPDATE tasks SET status = ?, error = ?, ended_at = ?（可带终态守卫）
   if (/UPDATE tasks SET status = \?, error = \?, ended_at = \?/.test(sql)) {
     const [status, error, now, id] = args;
     const task = tables.tasks.get(id as string);
-    if (task) { task.status = status; task.error = error; task.ended_at = now; return { changes: 1 }; }
-    return { changes: 0 };
+    if (!task) return { changes: 0 };
+    const guard = statusGuard(sql);
+    if (guard && !guard.includes(task.status as string)) return { changes: 0 };
+    task.status = status; task.error = error; task.ended_at = now;
+    return { changes: 1 };
   }
 
   // UPDATE tasks SET status = 'CANCELLED'

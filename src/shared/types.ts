@@ -648,7 +648,7 @@ export interface TaskEvent {
 }
 
 /** 执行器类型：真实 LLM API / 真实 CLI（含泛化 CLI）/ ACP 协议 / 演示模拟 */
-export type ExecutorKind = 'llm-api' | 'codex-cli' | 'claude-cli' | 'generic-cli' | 'acp' | 'simulated';
+export type ExecutorKind = 'llm-api' | 'codex-cli' | 'claude-cli' | 'generic-cli' | 'acp' | 'simulated' | 'unavailable';
 
 /** 模型供应商配置（脱敏视图：密钥不离开主进程，15.1） */
 export interface ProviderConfig {

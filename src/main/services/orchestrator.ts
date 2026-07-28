@@ -746,13 +746,22 @@ export class Orchestrator {
       const now = Date.now();
       // 真实执行鉴权失败：如实把引擎标为 AUTH_REQUIRED，不掩盖
       const authFailed = kind !== 'simulated' && !!info.error && /401|403|unauthorized|auth|鉴权|登录/i.test(info.error);
+      // 终态守卫（数据层最后防线）：只有非终态任务才能落终态。
+      // 迟到回调（看门狗中断后进程才退出、用户取消后执行器才收尾、执行器双重回调）
+      // 一律丢弃，绝不把已 INTERRUPTED/CANCELLED 的任务改写成 COMPLETED。
+      const LIVE = "('QUEUED','RUNNING','WAITING_APPROVAL','PAUSED')";
+      let applied = false;
       this.db.transaction(() => {
         if (status === 'COMPLETED') {
-          this.db.raw.prepare("UPDATE tasks SET status = 'COMPLETED', progress = 100, stage = '完成', result = ?, ended_at = ? WHERE id = ?").run(info.result ?? null, now, taskId);
+          applied = this.db.raw.prepare(`UPDATE tasks SET status = 'COMPLETED', progress = 100, stage = '完成', result = ?, ended_at = ? WHERE id = ? AND status IN ${LIVE}`)
+            .run(info.result ?? null, now, taskId).changes > 0;
+          if (!applied) return;
           this.recordEvent(taskId, 'result', { result: info.result ?? '' }, now);
           this.recordEvent(taskId, 'completed', { progress: 100 }, now);
         } else {
-          this.db.raw.prepare('UPDATE tasks SET status = ?, error = ?, ended_at = ? WHERE id = ?').run(status, info.error ?? null, now, taskId);
+          applied = this.db.raw.prepare(`UPDATE tasks SET status = ?, error = ?, ended_at = ? WHERE id = ? AND status IN ${LIVE}`)
+            .run(status, info.error ?? null, now, taskId).changes > 0;
+          if (!applied) return;
           this.recordEvent(taskId, status === 'FAILED' ? 'failed' : 'interrupted', { error: info.error ?? '' }, now);
         }
         this.db.raw.prepare('UPDATE agent_runs SET ended_at = ?, status = ? WHERE task_id = ? AND ended_at IS NULL').run(now, status, taskId);
@@ -760,6 +769,12 @@ export class Orchestrator {
           this.db.raw.prepare("UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required' WHERE id = ?").run(engineId);
         }
       });
+      // 守卫拦下的迟到回调：不通知、不推 webhook、不触发补位，只做一次并发释放后返回
+      if (!applied) {
+        this.emit();
+        this.scheduleNext(agentId);
+        return;
+      }
       if (status === 'FAILED') {
         const t = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(taskId) as { title: string } | undefined;
         notify(this.db, '任务执行失败', `${t?.title ?? taskId}：${(info.error ?? '').slice(0, 120)}`);
