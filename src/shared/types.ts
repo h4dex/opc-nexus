@@ -66,7 +66,8 @@ export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'opencode' | 'exter
 
 export type ChannelType = 'weixin' | 'wecom' | 'feishu' | 'qq';
 
-export type TaskSource = 'desktop' | 'channel' | 'schedule' | 'webhook' | 'delegated' | 'team';
+/** voice = 语音下达（经确认后派发，审计与统计可与手动派发区分） */
+export type TaskSource = 'desktop' | 'channel' | 'schedule' | 'webhook' | 'delegated' | 'team' | 'voice';
 
 // ---------- 核心实体（13.1 核心表） ----------
 
@@ -703,6 +704,68 @@ export interface AuditLog {
   result: string;
   source: string;
   createdAt: number;
+}
+
+// ---------- 全双工语音任务下达 ----------
+
+/** 语音识别提供方：cloud = 阿里云 NLS 实时识别；local = 本地离线模型；auto = 云端优先、未配置回退本地 */
+export type VoiceProvider = 'auto' | 'cloud' | 'local';
+
+/** 语音会话状态机（与四层状态模型独立，仅描述一次语音输入的生命周期）
+ *  IDLE → LISTENING（拾音中，边说边出字）→ CONFIRMING（等待用户确认）→ DISPATCHED
+ *  任意态可 → ERROR；用户取消回到 IDLE */
+export type VoiceSessionStatus = 'IDLE' | 'LISTENING' | 'CONFIRMING' | 'DISPATCHED' | 'ERROR';
+
+/** 语音配置（脱敏视图：凭据只回传是否已配置，明文不出主进程） */
+export interface VoiceConfig {
+  enabled: boolean;
+  provider: VoiceProvider;
+  /** 阿里云 NLS AppKey（非密钥，可明文展示） */
+  appKey: string;
+  /** AccessKeyId / AccessKeySecret 是否已配置（走 safeStorage，不回传明文） */
+  hasAccessKeyId: boolean;
+  hasAccessKeySecret: boolean;
+  /** 本地模型是否就绪（模型文件存在） */
+  localModelReady: boolean;
+  /** 静音多久判定一句话结束（毫秒） */
+  silenceMs: number;
+}
+
+export interface VoiceConfigInput {
+  enabled?: boolean;
+  provider?: VoiceProvider;
+  appKey?: string;
+  /** 留空表示沿用已存凭据 */
+  accessKeyId?: string;
+  accessKeySecret?: string;
+  silenceMs?: number;
+}
+
+/** 识别结果分片：partial = 中间结果（会被后续覆盖），final = 一句话最终结果 */
+export interface VoiceTranscript {
+  text: string;
+  isFinal: boolean;
+  timestamp: number;
+}
+
+/** 语音指令解析结果：把一句话映射为「派给谁、做什么」，供用户确认 */
+export interface VoiceCommandDraft {
+  /** 原始识别文本 */
+  rawText: string;
+  /** 解析出的任务标题 */
+  title: string;
+  /** 目标员工（未能解析出时为 null，由用户在确认界面选择） */
+  agentId: string | null;
+  agentName: string | null;
+  /** 命中的解析方式：mention = 话中点名；default = 回落默认员工 */
+  matchedBy: 'mention' | 'default' | 'none';
+}
+
+export interface VoiceTestResult {
+  ok: boolean;
+  provider: 'cloud' | 'local' | null;
+  latencyMs: number;
+  error: string | null;
 }
 
 // ---------- 11.x 资源监控 ----------

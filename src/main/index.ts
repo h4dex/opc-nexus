@@ -55,6 +55,8 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let dbRef: Database | null = null;
+/** 语音服务引用：退出时需关闭活跃会话，避免麦克风与云端连接残留 */
+let voiceRef: import('./services/voiceService.js').VoiceService | null = null;
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
 
@@ -189,6 +191,10 @@ app.whenReady().then(async () => {
   const { OcrService } = await import('./services/ocrService.js');
   const ocrService = new OcrService(db);
   executors.setOcrService(ocrService);
+  // 语音任务下达服务（云端 NLS / 本地模型双路；凭据留在主进程）
+  const { VoiceService } = await import('./services/voiceService.js');
+  const voiceService = new VoiceService(db);
+  voiceRef = voiceService;
   orchestrator.setDispatchGuard(() => monitor.getGuardReason());
   // 阈值来自设置页（settings.thresholds）；新告警边沿推系统通知
   monitor.setThresholdProvider(() => {
@@ -256,7 +262,7 @@ app.whenReady().then(async () => {
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, apiBridge, webServer, getMainWindow: () => mainWindow });
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, getMainWindow: () => mainWindow });
 
   webServer.start();
 
@@ -270,6 +276,11 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  try {
+    voiceRef?.stopAll(); // 关闭活跃语音会话，停止拾音与云端连接
+  } catch {
+    /* 关闭失败不阻塞退出 */
+  }
   try {
     dbRef?.flush();
   } catch {

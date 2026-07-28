@@ -26,6 +26,7 @@ import { Settings } from './pages/Settings';
 import { CreateAgentWizard } from './wizard/CreateAgentWizard';
 import { ToastContainer } from './components/Toast';
 import { GlobalSearch } from './components/GlobalSearch';
+import { VoicePanel } from './components/VoicePanel';
 import { todayText } from './components/common';
 import {
   IconAlert, IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconLayers, IconMonitor, IconMoon, IconPlug, IconPlus,
@@ -73,6 +74,7 @@ const KEEP_ALIVE: RouteKey[] = ['chat', 'tasks', 'teams'];
 export function App() {
   const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, appVersion, actionCenter, refreshActionCenter, init } = useApp();
   const [searchOpen, setSearchOpen] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
 
   useEffect(() => {
     void init();
@@ -162,6 +164,9 @@ export function App() {
             <button className="icon-btn" onClick={() => setSearchOpen(true)} aria-label="搜索" title="搜索 (Ctrl+K)">
               🔍
             </button>
+            <button className="icon-btn" onClick={() => setVoiceOpen(true)} aria-label="语音下达任务" title="语音下达任务">
+              🎤
+            </button>
             <span>{todayText()}</span>
             <button className="icon-btn" onClick={() => void window.aibox.toggleFullscreen()} aria-label="全屏" title="全屏 (F11)">
               ⛶
@@ -193,6 +198,7 @@ export function App() {
 
       {wizardOpen && <CreateAgentWizard onClose={() => setWizardOpen(false)} />}
       <GlobalSearch open={searchOpen} onClose={() => setSearchOpen(false)} />
+      {voiceOpen && <VoicePanel onClose={() => setVoiceOpen(false)} />}
       <ToastContainer />
     </div>
   );

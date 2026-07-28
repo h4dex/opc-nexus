@@ -30,6 +30,7 @@ import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
 import { demoDataStats, purgeDemoData } from './services/seed.js';
+import { parseVoiceCommand } from './services/voiceCommand.js';
 import type {
   AppConfig, CreateAgentInput, DeliverableMetaPatch, DeliverableReviewInput, DeliverableVersionInput,
   KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeVersionInput,
@@ -83,13 +84,14 @@ export interface IpcDeps {
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
   ocr: import('./services/ocrService.js').OcrService;
+  voice: import('./services/voiceService.js').VoiceService;
   apiBridge: import('./services/apiBridge.js').ApiBridge;
   webServer: import('./services/webServer.js').WebServer;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, webServer, getMainWindow } = deps;
+  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, voice, webServer, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -114,6 +116,13 @@ export function registerIpc(deps: IpcDeps) {
   // 任务输出流式推送（逐字显示，无需轮询）
   orchestrator.onOutput((taskId, chunk) => {
     broadcast('aibox:taskOutput', { taskId, chunk });
+  });
+  // 语音识别结果流式推送（边说边出字）与错误如实上报
+  voice.onTranscript((sessionId, transcript) => {
+    broadcast('aibox:voiceTranscript', { sessionId, ...transcript });
+  });
+  voice.onError((sessionId, message) => {
+    broadcast('aibox:voiceError', { sessionId, message });
   });
   // 资源样本 → 实时推送
   monitor.onSample(() => {
@@ -744,6 +753,38 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:toggleOcr', (_e, enabled: boolean) => { ocr.setEnabled(enabled); return ocr.getStatus(); });
   ipcMain.handle('aibox:downloadOcrModels', () => ocr.downloadModels());
   ipcMain.handle('aibox:ocrRecognize', (_e, imagePath: string) => ocr.recognize(imagePath));
+
+  // ---------- 语音任务下达（全双工实时识别） ----------
+  // 音频经主进程转发而非 Renderer 直连云端：云端凭据必须留在主进程（安全基线 15.1）
+  ipcMain.handle('aibox:getVoiceConfig', () => voice.getConfig());
+  ipcMain.handle('aibox:saveVoiceConfig', (_e, input: import('../shared/types.js').VoiceConfigInput) => {
+    const r = voice.saveConfig(input ?? {});
+    pushSnapshot();
+    return r;
+  });
+  ipcMain.handle('aibox:testVoice', () => voice.test());
+  ipcMain.handle('aibox:startVoiceSession', () => voice.start());
+  ipcMain.handle('aibox:pushVoiceAudio', (_e, sessionId: string, chunk: ArrayBuffer) => {
+    voice.pushAudio(assertId(sessionId, 'sessionId'), Buffer.from(chunk));
+  });
+  ipcMain.handle('aibox:stopVoiceSession', (_e, sessionId: string) => {
+    voice.stop(assertId(sessionId, 'sessionId'));
+  });
+  /** 解析语音文本为任务草稿（不派发；供确认界面展示） */
+  ipcMain.handle('aibox:parseVoiceCommand', (_e, text: string) => {
+    const agents = orchestrator.listAgents()
+      .filter((a) => a.lifecycle === 'READY')
+      .map((a) => ({ id: a.id, name: a.name }));
+    const defaultAgentId = db.getSetting<string | null>('voice:defaultAgentId', null);
+    return parseVoiceCommand(assertString(text, 'text', 0, 2000), agents, defaultAgentId);
+  });
+  /** 确认后派发：source='voice' 便于审计与统计区分手动派发 */
+  ipcMain.handle('aibox:dispatchVoiceTask', (_e, agentId: string, title: string) => {
+    const task = orchestrator.createTask(assertId(agentId, 'agentId'), assertString(title, 'title', 1, 200), 'voice');
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'voice.dispatch', target: task.id, result: 'ok' });
+    pushSnapshot();
+    return task;
+  });
   // 数据库维护：完整性检查 + 手动清理
   ipcMain.handle('aibox:integrityCheck', () => db.integrityCheck());
   ipcMain.handle('aibox:manualCleanup', () => { db.cleanupRetention(); return { ok: true, message: '数据清理完成' }; });

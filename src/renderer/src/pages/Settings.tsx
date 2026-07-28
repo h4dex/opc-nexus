@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconMoon, IconSun } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { SystemInfo } from '@shared/types';
+import type { SystemInfo, VoiceConfig, VoiceConfigInput } from '@shared/types';
 
 export function Settings() {
   const { theme, setTheme } = useApp();
@@ -42,6 +42,7 @@ export function Settings() {
 
       <div className="dash-grid">
         <ProviderCard />
+        <VoiceCard />
         <RegistryCard />
         <BridgeCard />
         <WebServerCard />
@@ -171,6 +172,114 @@ function DemoDataPurge() {
             <button className="btn small" disabled={busy} onClick={() => setConfirming(false)}>取消</button>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 语音任务下达配置：阿里云 NLS 凭据 + 双路策略。
+ * 凭据经 IPC 交给主进程走 safeStorage 加密，此处只显示「是否已配置」，不回显明文。
+ */
+function VoiceCard() {
+  const [cfg, setCfg] = useState<VoiceConfig | null>(null);
+  const [appKey, setAppKey] = useState('');
+  const [keyId, setKeyId] = useState('');
+  const [keySecret, setKeySecret] = useState('');
+  const [saved, setSaved] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const load = () => {
+    void window.aibox.getVoiceConfig().then((c) => { setCfg(c); setAppKey(c.appKey); });
+  };
+  useEffect(() => { load(); }, []);
+  if (!cfg) return null;
+
+  const save = async (patch: VoiceConfigInput) => {
+    const next = await window.aibox.saveVoiceConfig(patch);
+    setCfg(next);
+    setKeyId(''); setKeySecret(''); // 提交后清空输入框，避免明文停留在内存/界面
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const test = async () => {
+    setTesting(true);
+    try {
+      const r = await window.aibox.testVoice();
+      setTestMsg({
+        ok: r.ok,
+        text: r.ok ? `可用（${r.provider === 'cloud' ? '云端' : '本地'}，${r.latencyMs}ms）` : r.error ?? '不可用'
+      });
+    } finally { setTesting(false); }
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--border)',
+    background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5, outline: 'none'
+  };
+  const labelStyle: React.CSSProperties = { fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 };
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">
+        语音任务下达<span className="sub">说话即可安排任务 · 识别结果需确认后才派发</span>
+      </div>
+
+      <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer', marginBottom: 12 }}>
+        <input type="checkbox" checked={cfg.enabled} onChange={(e) => void save({ enabled: e.target.checked })} />
+        启用语音任务下达
+      </label>
+
+      <label style={labelStyle}>识别通道</label>
+      <select
+        value={cfg.provider}
+        onChange={(e) => void save({ provider: e.target.value as VoiceConfig['provider'] })}
+        style={{ ...inputStyle, marginBottom: 12 }}
+      >
+        <option value="auto">自动（云端凭据齐备走云端，否则用本地模型）</option>
+        <option value="cloud">仅云端（阿里云 NLS 实时识别）</option>
+        <option value="local">仅本地（离线，数据不出本机）</option>
+      </select>
+
+      <div style={{ fontSize: 12, color: 'var(--text-2)', background: 'var(--input-bg)', borderRadius: 8, padding: '8px 12px', marginBottom: 12, lineHeight: 1.8 }}>
+        云端凭据：AppKey {cfg.appKey ? '已填' : <span style={{ color: 'var(--danger)' }}>未填</span>} ·
+        AccessKeyId {cfg.hasAccessKeyId ? '已配置' : <span style={{ color: 'var(--danger)' }}>未配置</span>} ·
+        AccessKeySecret {cfg.hasAccessKeySecret ? '已配置' : <span style={{ color: 'var(--danger)' }}>未配置</span>}
+        <div style={{ color: 'var(--text-3)', fontSize: 11.5 }}>
+          本地模型：{cfg.localModelReady ? '已就绪' : '未安装（本地离线识别尚未实现，当前请使用云端）'}
+        </div>
+      </div>
+
+      <label style={labelStyle}>AppKey（阿里云智能语音交互项目 AppKey）</label>
+      <input style={{ ...inputStyle, marginBottom: 10 }} value={appKey} onChange={(e) => setAppKey(e.target.value)} placeholder="项目 AppKey" />
+
+      <label style={labelStyle}>AccessKeyId{cfg.hasAccessKeyId && '（留空则沿用已存值）'}</label>
+      <input style={{ ...inputStyle, marginBottom: 10 }} type="password" value={keyId} onChange={(e) => setKeyId(e.target.value)}
+        placeholder={cfg.hasAccessKeyId ? '••••••（已配置）' : 'LTAI...'} autoComplete="off" />
+
+      <label style={labelStyle}>AccessKeySecret{cfg.hasAccessKeySecret && '（留空则沿用已存值）'}</label>
+      <input style={{ ...inputStyle, marginBottom: 10 }} type="password" value={keySecret} onChange={(e) => setKeySecret(e.target.value)}
+        placeholder={cfg.hasAccessKeySecret ? '••••••（已配置）' : 'AccessKeySecret'} autoComplete="off" />
+
+      <label style={labelStyle}>静音判定（毫秒）：说完停顿多久算一句话结束</label>
+      <input style={{ ...inputStyle, marginBottom: 14 }} type="number" min={300} max={5000} step={100}
+        value={cfg.silenceMs} onChange={(e) => void save({ silenceMs: Number(e.target.value) })} />
+
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button className="btn primary" onClick={() => void save({ appKey, accessKeyId: keyId || undefined, accessKeySecret: keySecret || undefined })}>
+          保存配置
+        </button>
+        <button className="btn" disabled={testing} onClick={() => void test()}>{testing ? '检测中…' : '检测可用性'}</button>
+        <button className="btn small" onClick={() => void window.aibox.openExternal('https://nls-portal.console.aliyun.com/')}>
+          获取凭据
+        </button>
+        {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
+        {testMsg && <span style={{ fontSize: 12, color: testMsg.ok ? 'var(--success)' : 'var(--danger)' }}>{testMsg.text}</span>}
+      </div>
+      <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 8, lineHeight: 1.7 }}>
+        凭据经系统密钥库加密存储，不会明文落库、不会回传界面。音频由主进程转发至识别服务，渲染进程不接触凭据。
       </div>
     </div>
   );

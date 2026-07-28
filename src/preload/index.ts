@@ -14,7 +14,8 @@ import type {
   Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
-  TeamCollaborationOverview, TeamRun
+  TeamCollaborationOverview, TeamRun,
+  VoiceConfig, VoiceConfigInput, VoiceCommandDraft, VoiceTestResult
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -321,6 +322,33 @@ const api = {
     const handler = (_: unknown, p: { taskId: string; chunk: string }) => fn(p);
     ipcRenderer.on('aibox:taskOutput', handler);
     return () => ipcRenderer.removeListener('aibox:taskOutput', handler);
+  },
+
+  // ---------- 语音任务下达 ----------
+  getVoiceConfig: (): Promise<VoiceConfig> => ipcRenderer.invoke('aibox:getVoiceConfig'),
+  saveVoiceConfig: (input: VoiceConfigInput): Promise<VoiceConfig> => ipcRenderer.invoke('aibox:saveVoiceConfig', input),
+  testVoice: (): Promise<VoiceTestResult> => ipcRenderer.invoke('aibox:testVoice'),
+  startVoiceSession: (): Promise<{ ok: boolean; sessionId: string | null; provider: 'cloud' | 'local' | null; message: string }> =>
+    ipcRenderer.invoke('aibox:startVoiceSession'),
+  /** 推送麦克风 PCM 分片（16kHz/16bit/单声道） */
+  pushVoiceAudio: (sessionId: string, chunk: ArrayBuffer): Promise<void> =>
+    ipcRenderer.invoke('aibox:pushVoiceAudio', sessionId, chunk),
+  stopVoiceSession: (sessionId: string): Promise<void> => ipcRenderer.invoke('aibox:stopVoiceSession', sessionId),
+  /** 解析语音文本为任务草稿（不派发） */
+  parseVoiceCommand: (text: string): Promise<VoiceCommandDraft> => ipcRenderer.invoke('aibox:parseVoiceCommand', text),
+  /** 用户确认后派发（source='voice'） */
+  dispatchVoiceTask: (agentId: string, title: string): Promise<Task> =>
+    ipcRenderer.invoke('aibox:dispatchVoiceTask', agentId, title),
+  /** 识别结果流式订阅（边说边出字） */
+  onVoiceTranscript: (fn: (p: { sessionId: string; text: string; isFinal: boolean; timestamp: number }) => void): (() => void) => {
+    const handler = (_: unknown, p: { sessionId: string; text: string; isFinal: boolean; timestamp: number }) => fn(p);
+    ipcRenderer.on('aibox:voiceTranscript', handler);
+    return () => ipcRenderer.removeListener('aibox:voiceTranscript', handler);
+  },
+  onVoiceError: (fn: (p: { sessionId: string; message: string }) => void): (() => void) => {
+    const handler = (_: unknown, p: { sessionId: string; message: string }) => fn(p);
+    ipcRenderer.on('aibox:voiceError', handler);
+    return () => ipcRenderer.removeListener('aibox:voiceError', handler);
   },
   /** 工作流节点执行事件（实时变色） */
   onWfNodeEvent: (fn: (e: WfNodeEvent) => void): (() => void) => {

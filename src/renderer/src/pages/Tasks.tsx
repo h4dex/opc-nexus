@@ -376,5 +376,5 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
 }
 
 function sourceLabel(s: Task['source']): string {
-  return { desktop: '桌面', channel: '消息渠道', schedule: '定时', webhook: 'Webhook', delegated: '子代理', team: '专家团' }[s];
+  return { desktop: '桌面', channel: '消息渠道', schedule: '定时', webhook: 'Webhook', delegated: '子代理', team: '专家团', voice: '语音' }[s];
 }
