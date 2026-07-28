@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { app } from 'electron';
 import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync, openSync, closeSync, fsyncSync } from 'node:fs';
 import { validateDatabaseBackup } from './backupValidator.js';
 
 const require = createRequire(import.meta.url);
@@ -534,13 +534,42 @@ export class Database {
 
     const pendingRestore = join(dir, 'aibox.restore.pending.db');
     const sourceFile = existsSync(pendingRestore) ? pendingRestore : d.file;
-    d.inner = existsSync(sourceFile)
-      ? new SQL.Database(new Uint8Array(readFileSync(sourceFile)))
-      : new SQL.Database();
+    // 损坏容错：直接 new SQL.Database(损坏字节) 会抛 "file is not a database"，
+    // 且异常发生在启动路径上会导致整个应用打不开、用户无任何自救手段。
+    // 因此这里捕获并把损坏文件改名留存（不删除，便于事后取证/人工抢救），以空库继续启动。
+    d.inner = Database.openOrRecover(SQL, sourceFile);
     if (sourceFile === pendingRestore) d.dirty = true;
     d.migrate();
     if (sourceFile === pendingRestore) rmSync(pendingRestore, { force: true });
     return d;
+  }
+
+  /** 打开数据库文件；损坏时留存原文件并返回空库，保证应用始终能启动 */
+  private static openOrRecover(SQL: Awaited<ReturnType<typeof initSqlJs>>, sourceFile: string): SqlJsDatabase {
+    if (!existsSync(sourceFile)) return new SQL.Database();
+    try {
+      const bytes = readFileSync(sourceFile);
+      if (bytes.length === 0) throw new Error('数据库文件为空');
+      // 先校验 SQLite 魔数（"SQLite format 3\0"）：sql.js 的构造函数是惰性的，
+      // 传入损坏字节不会立刻抛错，而是等到第一次 exec（即 migrate）才抛，
+      // 那时异常已脱离本函数的 try/catch，会直接冒泡成启动崩溃。
+      const MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
+      if (bytes.length < MAGIC.length || !bytes.subarray(0, MAGIC.length).equals(MAGIC)) {
+        throw new Error('缺少 SQLite 文件头，内容已损坏');
+      }
+      const db = new SQL.Database(new Uint8Array(bytes));
+      db.exec('PRAGMA quick_check'); // 触发一次真实读取，确认可用
+      return db;
+    } catch (err) {
+      const salvaged = `${sourceFile}.corrupt-${Date.now()}`;
+      try {
+        renameSync(sourceFile, salvaged);
+        console.error(`[Database] 数据库文件损坏（${err instanceof Error ? err.message : String(err)}），已留存为 ${salvaged}，以空库启动`);
+      } catch (renameErr) {
+        console.error(`[Database] 数据库文件损坏且无法留存：${renameErr instanceof Error ? renameErr.message : String(renameErr)}`);
+      }
+      return new SQL.Database();
+    }
   }
 
   private migrate() {
@@ -881,17 +910,38 @@ export class Database {
     this.saveTimer = setTimeout(() => this.flush(), 400);
   }
 
-  /** 立即落盘（退出前必须调用） */
+  /** 立即落盘（退出前必须调用）。
+   *  原子写：先写临时文件并 fsync，再 rename 覆盖目标。
+   *  直接 writeFileSync 覆盖live 库时若进程被杀/断电，会留下截断或全零文件，
+   *  下次启动 sql.js 直接抛 "file is not a database" 且无法恢复（已实际发生过）。 */
   flush() {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
     if (!this.dirty && existsSync(this.file)) return;
-    const data = this.inner.export();
+    const data = Buffer.from(this.inner.export());
+    // 导出为空视为异常，宁可不写也不要用空内容覆盖已有数据
+    if (data.length === 0) {
+      console.error('[Database] 导出结果为空，已跳过本次落盘以避免破坏现有数据库');
+      return;
+    }
     mkdirSync(dirname(this.file), { recursive: true });
-    writeFileSync(this.file, Buffer.from(data));
-    this.dirty = false;
+    const tmp = `${this.file}.tmp`;
+    let fd: number | null = null;
+    try {
+      fd = openSync(tmp, 'w');
+      writeFileSync(fd, data);
+      fsyncSync(fd); // 确保数据真正落盘后再 rename，避免 rename 成功但内容仍在页缓存
+      closeSync(fd);
+      fd = null;
+      renameSync(tmp, this.file); // 同目录 rename 在 Windows/POSIX 上均为原子替换
+      this.dirty = false;
+    } catch (err) {
+      if (fd !== null) { try { closeSync(fd); } catch { /* 忽略 */ } }
+      try { rmSync(tmp, { force: true }); } catch { /* 忽略 */ }
+      throw err;
+    }
   }
 
   /** 校验外部备份并暂存；下次启动时先加载该文件，迁移成功后才覆盖当前数据库。 */

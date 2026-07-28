@@ -2,6 +2,17 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.4.1] - 2026-07-28
+
+### 修复
+
+- **P0 数据库损坏导致应用无法启动**(真机测试发现):`flush()` 用 `writeFileSync` 就地覆盖 live 数据库,
+  进程在写入中途被终止即留下截断/全零文件;而启动路径无任何容错,sql.js 抛
+  `file is not a database` 后整个应用打不开且用户无自救手段(实测本机 aibox.db 已成 41MB 全零文件)。
+  现改为**原子落盘**(临时文件 + fsync + rename)并拒绝空导出覆盖既有库;
+  启动时校验 SQLite 魔数 + `PRAGMA quick_check`,损坏文件留存为 `.corrupt-<时间戳>` 后以空库启动
+- 新增 schema 迁移链路测试(真实 sql.js 跑 v25→v28,9 项)与数据库损坏容错测试(9 项)
+
 ## [1.4.0] - 2026-07-28
 
 ### 新增
