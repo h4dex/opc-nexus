@@ -1,6 +1,6 @@
 {
   "name": "aibox-control-center",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "数字员工 AI Box 控制中心 - 本地优先的桌面 Agent 管理器",
   "homepage": "https://github.com/senke/aibox-control-center",
   "main": "out/main/index.js",

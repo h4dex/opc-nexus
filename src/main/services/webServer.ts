@@ -15,7 +15,7 @@
 import express from 'express';
 import cors from 'cors';
 import { join } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
 import type { EngineManager } from './engineManager.js';
@@ -51,6 +51,42 @@ const AUTH_RATE_LIMIT_PER_MIN = 10;
 
 interface SessionEntry { token: string; expiresAt: number; }
 interface RateBucket { count: number; resetAt: number; }
+
+/** 免认证白名单（精确匹配 + assets 前缀），判定前须先规范化路径 */
+const PUBLIC_PATHS = new Set(['/', '/index.html', '/api/health', '/api/login']);
+
+/**
+ * 判定是否免认证路径。
+ *
+ * 安全要点：必须对**规范化后**的路径判断。裸 socket 请求可发送
+ * `GET /assets/../api/snapshot`，此时 req.path 保持原样，
+ * `startsWith('/assets/')` 会误判为公开资源而放行认证
+ * （实测确认可绕过，仅因路由层未匹配才侥幸返回 404）。
+ */
+export function isPublicPath(rawPath: string): boolean {
+  let p = rawPath;
+  // 解码后再判断，避免 %2e%2e%2f 之类编码穿越
+  try { p = decodeURIComponent(p); } catch { /* 非法编码按原样处理 */ }
+  p = p.replace(/\\/g, '/');
+  // 逐段消解 . 与 ..，得到规范路径
+  const out: string[] = [];
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; }
+    out.push(seg);
+  }
+  const norm = '/' + out.join('/');
+  if (PUBLIC_PATHS.has(norm)) return true;
+  return norm.startsWith('/assets/');
+}
+
+/** 定长比较，避免 Token 校验的时序侧信道 */
+function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ba.length !== bb.length) return false;
+  return timingSafeEqual(ba, bb);
+}
 
 export class WebServer {
   private app: ReturnType<typeof express> | null = null;
@@ -123,8 +159,11 @@ export class WebServer {
     this.app = app;
     this.startCleanup();
 
-    app.use(cors());
-    app.use(express.json());
+    // CORS：不放行任意来源。管理面板由本服务自身托管（同源），
+    // 无需跨源；开放 * 会让任意网页在用户浏览器里调用本 API（Token 若被读到即可控台）。
+    app.use(cors({ origin: false }));
+    // 请求体上限：管理接口无大 body 场景，限制以免被单请求打满内存
+    app.use(express.json({ limit: '1mb' }));
 
     // 全局频率限制中间件
     app.use((req, res, next) => {
@@ -137,13 +176,11 @@ export class WebServer {
 
     // Token 认证中间件（静态资源、健康检查、登录接口免认证）
     app.use((req, res, next) => {
-      if (req.path === '/api/health' || req.path === '/api/login' || req.path.startsWith('/assets/') || req.path === '/' || req.path === '/index.html') {
-        return next();
-      }
+      if (isPublicPath(req.path)) return next();
       const auth = req.headers.authorization;
       const bearerToken = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
       // 支持永久 Token（设置页配置的原始 token）或会话 Token
-      if (bearerToken === this.token) return next();
+      if (bearerToken && safeEqual(bearerToken, this.token)) return next();
       const session = bearerToken ? this.sessions.get(bearerToken) : null;
       if (session && Date.now() < session.expiresAt) return next();
       return res.status(401).json({ error: '未授权：请提供有效的 Access Token 或先登录获取会话 Token' });
@@ -171,7 +208,8 @@ export class WebServer {
         return res.status(429).json({ error: '登录尝试过于频繁，请 1 分钟后再试' });
       }
       const { token } = req.body as { token?: string };
-      if (token !== this.token) {
+      if (typeof token !== 'string' || !safeEqual(token, this.token)) {
+        this.deps.db.audit({ id: randomUUID(), actor: 'web', action: 'webserver.login_failed', target: ip, result: 'invalid-token' });
         return res.status(401).json({ error: 'Token 无效' });
       }
       const sessionToken = randomBytes(32).toString('hex');
