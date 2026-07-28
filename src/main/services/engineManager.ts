@@ -46,6 +46,12 @@ export interface CatalogEntry {
   guide: EngineInstallGuide;
 }
 
+/**
+ * 引擎目录（四引擎收敛，见 src/docs/architecture-review.md E-1）：
+ * Nexus Agent（内置自研 Runtime）/ Hermes Agent（默认主引擎，真实 CLI）/
+ * OpenCode（编码专家）/ Codex CLI（备选编码引擎）。
+ * ZCode / Kimi Code / Claude Code 已下线：清单膨胀且缺乏验证，由 v26 迁移改绑到 Nexus。
+ */
 export const ENGINE_CATALOG: CatalogEntry[] = [
   {
     id: 'eng-hermes', type: 'hermes', name: 'Nexus Agent', bin: null, npmPackage: null,
@@ -58,31 +64,19 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
     guide: { guide: '请按 Hermes Agent 官方方式安装 hermes CLI；如可执行名或运行参数不同，可在配置文件 engines["eng-hermes-cli"] 中覆写 bin/runArgs', url: null }
   },
   {
-    id: 'eng-codex', type: 'codex', name: 'OpenAI Codex CLI', bin: 'codex', npmPackage: '@openai/codex',
-    dataBoundary: '数据将发送至 OpenAI API',
-    guide: { guide: 'npm install -g @openai/codex，安装后运行 codex 完成登录', url: 'https://github.com/openai/codex' }
-  },
-  {
-    id: 'eng-claude', type: 'claude-code', name: 'Claude Code', bin: 'claude', npmPackage: '@anthropic-ai/claude-code',
-    dataBoundary: '数据将发送至 Anthropic API',
-    guide: { guide: 'npm install -g @anthropic-ai/claude-code，安装后运行 claude 完成登录', url: 'https://docs.anthropic.com/zh-CN/docs/claude-code/overview' }
-  },
-  {
-    id: 'eng-zcode', type: 'zcode', name: 'ZCode (Z.ai)', bin: 'zcode', npmPackage: null,
-    dataBoundary: '数据将发送至 Z.ai / 智谱 BigModel API',
-    guide: { guide: 'ZCode 为桌面应用，请前往官网下载安装包安装', url: 'https://zcode.z.ai/cn' }
-  },
-  {
     id: 'eng-opencode', type: 'opencode', name: 'OpenCode', bin: 'opencode', npmPackage: 'opencode-ai',
     dataBoundary: '数据发送目标取决于 OpenCode 内所配置的模型提供商',
     guide: { guide: 'npm install -g opencode-ai，安装后运行 opencode auth login 配置提供商', url: 'https://opencode.ai/docs' }
   },
   {
-    id: 'eng-kimi', type: 'kimicode', name: 'Kimi Code CLI', bin: 'kimi', npmPackage: '@moonshot-ai/kimi-code',
-    dataBoundary: '数据将发送至 Moonshot AI API',
-    guide: { guide: 'npm install -g @moonshot-ai/kimi-code，安装后在 CLI 内执行 /login 登录', url: 'https://github.com/MoonshotAI/kimi-code' }
+    id: 'eng-codex', type: 'codex', name: 'OpenAI Codex CLI', bin: 'codex', npmPackage: '@openai/codex',
+    dataBoundary: '数据将发送至 OpenAI API',
+    guide: { guide: 'npm install -g @openai/codex，安装后运行 codex 完成登录', url: 'https://github.com/openai/codex' }
   }
 ];
+
+/** 已下线引擎：v26 迁移把绑定它们的员工改绑 Nexus，并从 engines 表清理 */
+export const RETIRED_ENGINE_IDS = ['eng-claude', 'eng-zcode', 'eng-kimi'] as const;
 
 /** 外部 ACP 引擎（P2a）：配置文件 engines 中带 acpCommand 的非内置条目，新增即接入引擎中心 */
 function externalAcpEntries(): { id: string; name: string; command: string[] }[] {
@@ -248,9 +242,45 @@ export class EngineManager {
       : { ok: false, message: '安装命令已完成，但未检测到可执行文件；请检查 npm 全局 bin 目录是否在 PATH 中后点击"重新检测"' };
   }
 
-  markAuthed(id: string) {
-    this.db.raw.prepare("UPDATE engines SET auth_status = 'authed', status = 'HEALTHY' WHERE id = ?").run(id);
-    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id, result: 'authed' });
+  /**
+   * 引擎鉴权探测（H-4）：真实验证凭据可用性，不再点一下就标 HEALTHY。
+   *
+   * 原实现直接把 auth_status 改 authed、status 改 HEALTHY，用户以为已登录，
+   * 实际首次派发任务才会失败 —— 健康状态不可信。
+   *
+   * 探测方式按引擎类型区分：
+   * - 内置 Nexus：供应商配置是否齐备（baseUrl + model + 可解密 Key）
+   * - CLI 引擎：定位二进制 + 跑一次最小 headless 提示词，能拿到输出才算真的可用；
+   *   鉴权类错误（401/unauthorized/login 等）如实标记 AUTH_REQUIRED
+   */
+  async probeAuth(id: string): Promise<EngineInstallResult> {
+    const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (!entry) return { ok: false, message: '未知引擎' };
+
+    // 内置 Nexus：凭据即供应商配置
+    if (entry.bin === null) {
+      const ready = providerReady(this.db);
+      this.db.raw.prepare("UPDATE engines SET status = ?, auth_status = ? WHERE id = ?")
+        .run(ready ? 'HEALTHY' : 'SETUP_REQUIRED', ready ? 'authed' : 'required', id);
+      this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id, result: ready ? 'authed' : 'setup-required' });
+      return ready
+        ? { ok: true, message: `${entry.name} 供应商配置有效，引擎可用` }
+        : { ok: false, message: `${entry.name} 未就绪：请先在设置页完成模型供应商配置` };
+    }
+
+    const { bin } = effective(entry);
+    const found = bin ? await locateBin(bin) : null;
+    if (!found) {
+      this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(id);
+      return { ok: false, message: `未检测到 ${entry.name} 可执行文件，请先完成安装` };
+    }
+
+    const probe = await probeCliAuth(id, found, this.db);
+    this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+      .run(probe.status, probe.authStatus, id);
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id, result: probe.ok ? 'authed' : probe.message.slice(0, 80) });
+    this.addLog(id, probe.ok ? 'info' : 'warn', `鉴权探测：${probe.message}`);
+    return { ok: probe.ok, message: probe.message };
   }
 
   setDefault(id: string) {
@@ -586,5 +616,72 @@ function binVersion(binPath: string): Promise<string | null> {
         resolve(out || null);
       });
     } catch { resolve(null); }
+  });
+}
+
+/** 各 CLI 引擎的最小 headless 探测参数（跑一次真实请求，验证凭据而非仅验证二进制存在） */
+const AUTH_PROBE_ARGS: Record<string, string[]> = {
+  'eng-hermes-cli': ['-z', 'ping'],
+  'eng-opencode': ['run', 'ping'],
+  'eng-codex': ['exec', '--skip-git-repo-check', '--sandbox', 'read-only', 'ping']
+};
+
+/** 鉴权失败特征：命中则判定为待登录，而非通用错误 */
+const AUTH_ERROR_PATTERN = /401|403|unauthorized|forbidden|not\s*logged\s*in|login|auth|api[_\s-]?key|credential|token|鉴权|登录|未授权/i;
+
+/**
+ * CLI 引擎鉴权探测：跑一次最小提示词，按退出码与错误特征判定。
+ * 60s 超时（真实模型请求可能较慢）；超时视为不确定，保持 DEGRADED 而非误判为已登录。
+ */
+function probeCliAuth(
+  engineId: string,
+  binPath: string,
+  db: Database
+): Promise<{ ok: boolean; status: string; authStatus: string; message: string }> {
+  const args = AUTH_PROBE_ARGS[engineId];
+  if (!args) {
+    return Promise.resolve({ ok: false, status: 'DEGRADED', authStatus: 'unknown', message: '该引擎暂不支持自动鉴权探测，请在终端中手工验证登录状态' });
+  }
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const done = (r: { ok: boolean; status: string; authStatus: string; message: string }) => {
+      if (!settled) { settled = true; resolve(r); }
+    };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(binPath, args, {
+        shell: false,
+        windowsHide: true,
+        env: { ...process.env, ...resolveEngineEnv(db, engineId) }
+      });
+    } catch (err) {
+      return done({ ok: false, status: 'ERROR', authStatus: 'unknown', message: `无法启动引擎：${err instanceof Error ? err.message : String(err)}` });
+    }
+
+    const timer = setTimeout(() => {
+      child.kill();
+      done({ ok: false, status: 'DEGRADED', authStatus: 'unknown', message: '鉴权探测超时（60 秒），未能确认登录状态，请稍后重试或在终端手工验证' });
+    }, 60_000);
+
+    child.stdout?.on('data', (c: Buffer) => { stdout += c.toString('utf8'); });
+    child.stderr?.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      done({ ok: false, status: 'ERROR', authStatus: 'unknown', message: `探测失败：${err.message}` });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.trim()) {
+        return done({ ok: true, status: 'HEALTHY', authStatus: 'authed', message: '鉴权有效，引擎可正常执行任务' });
+      }
+      const detail = (stderr || stdout || '无输出').trim().slice(0, 200);
+      if (AUTH_ERROR_PATTERN.test(detail)) {
+        return done({ ok: false, status: 'AUTH_REQUIRED', authStatus: 'required', message: `需要登录：${detail}` });
+      }
+      done({ ok: false, status: 'DEGRADED', authStatus: 'unknown', message: `探测未通过（退出码 ${code ?? 'null'}）：${detail}` });
+    });
   });
 }

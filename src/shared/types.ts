@@ -59,7 +59,10 @@ export interface AgentCapabilities {
   computer: boolean;
 }
 
-export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'claude-code' | 'zcode' | 'opencode' | 'kimicode' | 'external';
+/** 引擎类型（四引擎收敛）：hermes = 内置 Nexus Agent 自研 Runtime；hermes-cli = 真实 Hermes Agent CLI；
+ *  opencode = 编码专家；codex = 备选编码引擎；external = 配置文件接入的 ACP 引擎。
+ *  claude-code / zcode / kimicode 已于 v26 下线。 */
+export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'opencode' | 'external';
 
 export type ChannelType = 'weixin' | 'wecom' | 'feishu' | 'qq';
 

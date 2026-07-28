@@ -55,7 +55,7 @@ wecom:
 
 # 引擎策略
 engine:
-  fallbackEngineId: "eng-opencode"   # 辅助引擎：主引擎不可用时回退（eng-opencode / eng-codex / eng-claude / eng-hermes-cli）
+  fallbackEngineId: "eng-opencode"   # 辅助引擎：主引擎不可用时回退（eng-opencode / eng-codex / eng-hermes-cli / eng-hermes）
   executionMode: "production"        # production(默认) = 引擎不可用任务直接失败；demo = 回退演示模式(仅演示用，会生成虚构产物)
 
 # 任务保护（防长任务卡死 / 死循环）

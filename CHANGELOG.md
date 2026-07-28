@@ -2,6 +2,28 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.3.0] - 2026-07-28
+
+### 新增
+
+- **真实 Hermes Agent 执行器** `HermesAgentExecutor`:接入 NousResearch/hermes-agent CLI 的
+  headless 模式(`hermes -z`),经 `--usage-file` 捕获 session_id 实现会话续接(`-r` + `--no-restore-cwd`),
+  按退出码语义(0/1/2/130)如实分流结果,token 用量落 usage_records
+- **引擎鉴权真实探测**:内置引擎校验供应商配置,CLI 引擎跑一次最小 headless 请求验证凭据;
+  鉴权类错误标 AUTH_REQUIRED,探测超时标 DEGRADED,不再点一下就标记 HEALTHY
+- **引擎层测试**(此前零覆盖,补齐 CLAUDE.md 要求的状态机测试):EngineManager 引擎目录与
+  鉴权状态迁移 11 项、HermesAgentExecutor 参数构造与权限映射 16 项
+
+### 变更
+
+- **引擎清单收敛为四种**:Nexus Agent(内置自研 Runtime)/ Hermes Agent(默认主引擎,真实 CLI)/
+  OpenCode(编码专家)/ Codex CLI(备选编码引擎);下线 Claude Code / ZCode / Kimi Code
+- **schema v26 迁移**:绑定已下线引擎的员工自动改绑内置 Nexus,避免 engine_id 指向不存在的引擎
+- Hermes CLI 权限映射:`trusted`/`autonomous` → `--accept-hooks`;`readonly` → `-t` 限制工具集;
+  渠道任务 `trusted` 降级为 `standard`;任何情况下都不传 `--yolo`
+- 引擎中心「登录授权」按钮改为「验证登录」,如实回报探测结果
+- 引擎状态 `SETUP_REQUIRED` 文案去掉「演示模式」(生产模式已是默认)
+
 ## [1.2.0] - 2026-07-28
 
 ### 新增

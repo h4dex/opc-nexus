@@ -7,7 +7,7 @@ import type { Engine } from '@shared/types';
 const STATUS_META: Record<Engine['status'], { label: string; tag: string }> = {
   NOT_INSTALLED: { label: '未安装', tag: 'gray' },
   INSTALLING: { label: '安装中', tag: 'blue' },
-  SETUP_REQUIRED: { label: '待配置（演示模式）', tag: 'orange' },
+  SETUP_REQUIRED: { label: '待配置', tag: 'orange' },
   AUTH_REQUIRED: { label: '待登录', tag: 'orange' },
   HEALTHY: { label: '健康', tag: 'green' },
   DEGRADED: { label: '降级', tag: 'orange' },
@@ -45,6 +45,13 @@ export function Engines() {
   const restart = async (id: string) => {
     setInstallMsg((m) => ({ ...m, [id]: { ok: true, message: '正在重新检测引擎…' } }));
     const r = await window.aibox.restartEngine(id);
+    setInstallMsg((m) => ({ ...m, [id]: r }));
+  };
+
+  /** 鉴权探测：真实跑一次最小请求，如实回报结果（不再点一下就标已登录） */
+  const probeAuth = async (id: string) => {
+    setInstallMsg((m) => ({ ...m, [id]: { ok: true, message: '正在验证登录状态（最长 60 秒）…' } }));
+    const r = await window.aibox.authEngine(id);
     setInstallMsg((m) => ({ ...m, [id]: r }));
   };
 
@@ -125,8 +132,8 @@ export function Engines() {
                 {e.status === 'SETUP_REQUIRED' && (
                   <span style={{ fontSize: 12, color: 'var(--warning)', alignSelf: 'center' }}>请在设置页完成模型供应商配置</span>
                 )}
-                {e.status === 'AUTH_REQUIRED' && (
-                  <button className="btn small primary" onClick={() => void window.aibox.authEngine(e.id)}>登录授权</button>
+                {(e.status === 'AUTH_REQUIRED' || e.status === 'DEGRADED') && (
+                  <button className="btn small primary" onClick={() => void probeAuth(e.id)}>验证登录</button>
                 )}
                 {(e.status === 'HEALTHY' || e.status === 'DEGRADED' || e.status === 'SETUP_REQUIRED') && (
                   <button className="btn small" onClick={() => void restart(e.id)} title="重新检测引擎状态">

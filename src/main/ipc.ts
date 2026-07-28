@@ -615,9 +615,10 @@ export function registerIpc(deps: IpcDeps) {
     const err = await shell.openPath(ws);
     return err ? { ok: false, message: err } : { ok: true, message: '' };
   });
-  ipcMain.handle('aibox:authEngine', (_e, id: string) => {
-    engines.markAuthed(id);
+  ipcMain.handle('aibox:authEngine', async (_e, id: string) => {
+    const r = await engines.probeAuth(assertId(id));
     pushSnapshot();
+    return r;
   });
   ipcMain.handle('aibox:setDefaultEngine', (_e, id: string) => {
     engines.setDefault(id);

@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 25;
+const SCHEMA_VERSION = 26;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -834,6 +834,16 @@ export class Database {
         `);
         this.inner.exec('CREATE INDEX IF NOT EXISTS idx_automation_reports_project ON automation_reports(project_id, created_at)');
         this.inner.exec('CREATE INDEX IF NOT EXISTS idx_customer_deliveries_project ON customer_deliveries(project_id, updated_at)');
+      }
+      if (prev < 26) {
+        // v26：引擎清单收敛为四种（Nexus / Hermes / OpenCode / Codex CLI）。
+        // 下线 Claude Code / ZCode / Kimi Code：把绑定它们的员工改绑内置 Nexus，
+        // 避免 engine_id 指向不存在的引擎导致派发时无执行器可用。
+        this.inner.exec(`
+          UPDATE agents SET engine_id = 'eng-hermes'
+          WHERE engine_id IN ('eng-claude', 'eng-zcode', 'eng-kimi');
+          DELETE FROM engines WHERE id IN ('eng-claude', 'eng-zcode', 'eng-kimi');
+        `);
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

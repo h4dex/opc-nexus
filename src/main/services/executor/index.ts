@@ -4,13 +4,16 @@
  * 否则辅助引擎（user/config.yaml engine.fallbackEngineId，默认 eng-opencode）就绪 → 回退辅助引擎；
  * 两者均不可用时按执行模式分流：production = 返回 null（任务如实 FAILED，绝不伪装完成）；
  * demo = SimulatedExecutor（UI 标注演示模式）。
- * Codex/Claude 使用专属 JSONL 解析；Hermes CLI/ZCode/OpenCode/Kimi Code 走泛化 CLI（参数可配置文件覆写）。
+ * Codex 使用专属 JSONL 解析；Hermes CLI / OpenCode 走泛化 CLI（参数可配置文件覆写）。
+ *
+ * @author liyingjie <y@senke.com>
  */
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { LlmApiExecutor } from './llmApiExecutor.js';
 import { CliExecutor } from './cliExecutor.js';
+import { HermesAgentExecutor } from './hermesAgentExecutor.js';
 import { AcpExecutor } from './acpExecutor.js';
 import { SimulatedExecutor } from './simulatedExecutor.js';
 import { loadUserConfig } from '../userConfig.js';
@@ -21,6 +24,8 @@ export class ExecutorRegistry {
   private llm: LlmApiExecutor;
   private acp: AcpExecutor;
   private sim: SimulatedExecutor;
+  /** 真实 Hermes Agent CLI（专属执行器：-z headless + usage-file 会话锚点） */
+  private hermes: HermesAgentExecutor;
   /** 引擎类型 → CLI 执行器 */
   private cliByType = new Map<string, CliExecutor>();
   /** taskId → 正在执行它的适配器（用于 abort） */
@@ -30,13 +35,9 @@ export class ExecutorRegistry {
     this.llm = new LlmApiExecutor(db, broker, providerMgr);
     this.acp = new AcpExecutor(db, broker);
     this.sim = new SimulatedExecutor();
+    this.hermes = new HermesAgentExecutor(db);
     this.cliByType.set('codex', new CliExecutor('codex-cli', db, 'eng-codex'));
-    this.cliByType.set('claude-code', new CliExecutor('claude-cli', db, 'eng-claude'));
-    // 真实 Hermes Agent CLI（P0）：非交互运行参数可被配置文件 engines['eng-hermes-cli'].runArgs 覆写
-    this.cliByType.set('hermes-cli', new CliExecutor('generic-cli', db, 'eng-hermes-cli', ['run', '{prompt}']));
-    this.cliByType.set('zcode', new CliExecutor('generic-cli', db, 'eng-zcode', ['-p', '{prompt}']));
     this.cliByType.set('opencode', new CliExecutor('generic-cli', db, 'eng-opencode', ['run', '{prompt}']));
-    this.cliByType.set('kimicode', new CliExecutor('generic-cli', db, 'eng-kimi', ['-p', '{prompt}']));
   }
 
   /** 注入编排器能力（delegate_task 委派），避免构造期循环依赖 */
@@ -62,6 +63,7 @@ export class ExecutorRegistry {
   /** 单引擎就绪解析：就绪返回适配器，否则 null（不做任何回退） */
   private adapterFor(engineId: string): ExecutorAdapter | null {
     const type = this.engineType(engineId);
+    if (type === 'hermes-cli' && this.hermes.isReady()) return this.hermes;
     const cli = this.cliByType.get(type);
     if (cli && cli.isReady()) return cli;
     if (type === 'hermes' && this.llm.isReady()) return this.llm;

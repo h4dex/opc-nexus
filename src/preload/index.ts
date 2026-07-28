@@ -226,7 +226,8 @@ const api = {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('aibox:openExternal', url),
   openTaskWorkspace: (taskId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openTaskWorkspace', taskId),
   openAgentWorkspace: (agentId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openAgentWorkspace', agentId),
-  authEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:authEngine', id),
+  /** 鉴权探测：真实跑一次最小请求验证凭据，返回结果而非静默标记 */
+  authEngine: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:authEngine', id),
   setDefaultEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:setDefaultEngine', id),
   getEngineConfig: (id: string): Promise<{ runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null> => ipcRenderer.invoke('aibox:getEngineConfig', id),
   saveEngineConfig: (id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveEngineConfig', id, config),

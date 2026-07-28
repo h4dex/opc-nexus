@@ -14,7 +14,7 @@
 项目功能广度已显著超出验证深度。核心矛盾是：
 
 - **37 个主进程服务、23 个前端页面、1134 行共享类型定义**
-- **15 个测试文件 / 150 个用例，引擎层（EngineManager、各 Executor、主辅路由）仍近乎零覆盖**
+- **17 个测试文件 / 177 个用例**（引擎层从零覆盖补到 EngineManager 状态机 + Hermes 执行器 + 凭据隔离）
 
 产品的核心价值主张是「本地优先的桌面 AI Agent 管理器」，但直到近期提交前，
 默认引擎调用的并非真实 Agent Runtime，而是自研的 OpenAI 兼容工具循环。
@@ -47,7 +47,7 @@
 | H-1 | `executionMode` 默认值为 `demo`，模拟回退在默认配置下仍生效 | `userConfig.ts` | 引擎配错时任务显示 COMPLETED，产物为虚构内容 | ✅ 已改为 `production` |
 | H-2 | 自动补位造假任务默认开启（`demoAutoTasks=true`，水位 8） | `orchestrator.ts` `replenishTasks()` | 系统自动生成用户从未派发的任务 | ✅ 已改为默认关闭、水位 0 |
 | H-3 | 演示种子数据混入生产库（12 员工 / 23 已完成任务 / 8 待审批） | `seed.ts` | 首次启动即显示 23 条虚假「已完成」，与真实数据同表无隔离标记 | ⬜ 待办 |
-| H-4 | 「登录授权」按钮直接改库状态，无真实鉴权 | `engineManager.ts` `markAuthed()` | 点击即标记 HEALTHY，健康状态不可信 | ⬜ 待办 |
+| H-4 | 「登录授权」按钮直接改库状态，无真实鉴权 | `engineManager.ts` | 点击即标记 HEALTHY，健康状态不可信 | ✅ 改为 `probeAuth()` 真实探测：内置引擎查供应商配置，CLI 引擎跑最小 headless 请求；鉴权类错误标 AUTH_REQUIRED，超时标 DEGRADED 而非误判已登录 |
 
 **H-3 的严重性高于模拟执行**：演示数据与真实数据共用同一张表且无 `is_demo` 标记，
 一旦用户开始真实使用，统计口径永久污染，无法区分。
@@ -79,14 +79,14 @@ Web 面板的鉴权基线本身不差（Bearer Token、会话 24h 过期、分�
 即：它是一套自研 Agent Runtime，只是借用了 Hermes 的名字。
 `4cd2cd3` 已将其更名 **Nexus Agent**，命名语义就此对齐。
 
-### 目标引擎清单（E-1 ⬜）
+### 目标引擎清单（E-1 ✅）
 
 收敛为四种，其余（ZCode、Kimi、Claude Code 等）从种子数据与 UI 移除：
 
 | 引擎 | 定位 | 执行器 | 说明 |
 |---|---|---|---|
 | **Nexus Agent** | 自研内置运行时 | `LlmApiExecutor` | 工具循环 / 审批门禁 / 会话记忆已实现，零外部依赖，作保底可用引擎 |
-| **Hermes Agent** | 默认主引擎 | `HermesAgentExecutor`（待建） | 真实 CLI，负责规划、记忆、通用任务 |
+| **Hermes Agent** | 默认主引擎 | `HermesAgentExecutor` ✅ | 真实 CLI（`hermes -z` headless），负责规划、记忆、通用任务 |
 | **OpenCode** | 编码专家 | `CliExecutor` | 由主引擎委派承接代码修改、仓库分析、测试 |
 | **Codex CLI** | 备选编码引擎 | `CliExecutor` | 与 OpenCode 同类，供用户择一 |
 
@@ -158,14 +158,16 @@ WASM SQLite + 防抖全库导出，换来「零原生编译」的部署优势，
 
 **建议**：短期明确文档化容量上限与备份策略；中期评估迁移 better-sqlite3（用打包复杂度换可靠性）。
 
-### A-4 引擎层零测试 ⬜
+### A-4 引擎层测试 ✅（部分）
 
 `CLAUDE.md` 明确要求「状态机变更必须有对应测试覆盖」，
 而引擎状态机（`EngineStatus`）作为四层状态模型之一，连同各 Executor 与主辅路由策略均无测试。
 项目自订的规则未被遵守。
 
-**建议**：补齐 EngineManager 状态机、HermesAgentExecutor / OpenCodeExecutor 真实探活、
-主辅路由与回退判定三类测试。
+已补齐：EngineManager 引擎目录与鉴权状态迁移（11 项）、HermesAgentExecutor 参数构造与
+权限映射（16 项）、引擎凭据隔离（10 项）。
+
+**仍缺**：OpenCode 委派路由（E-2 落地后补）、CliExecutor 的 Codex JSONL 解析分支。
 
 ---
 
@@ -218,11 +220,11 @@ Computer Use、Git HTTP 服务、MCP 服务端、Web 管理面板、四种消息
 6. ⬜ 演示种子数据隔离或移除（H-3）
 
 ### P1 — 核心路径可信
-7. ⬜ 引擎清单收敛为四种（E-1）
-8. ⬜ 接入真实 hermes-agent CLI（`hermes -z` headless 模式）
-9. ⬜ OpenCode 编码委派路由落地（E-2）
-10. ⬜ `markAuthed` 改为真实鉴权探测（H-4）
-11. ⬜ 引擎层测试补齐（A-4）
+7. ✅ 引擎清单收敛为四种（E-1，含 v26 迁移改绑下线引擎的员工）
+8. ✅ 接入真实 hermes-agent CLI（`HermesAgentExecutor`：`-z` headless + `--usage-file` 会话锚点）
+9. ✅ `markAuthed` 改为真实鉴权探测（H-4）
+10. ✅ 引擎层测试补齐（A-4，新增 27 项）
+11. ⬜ OpenCode 编码委派路由落地（E-2）
 
 ### P2 — 架构健康
 12. ⬜ 拆分 `ipc.ts`（A-1）
