@@ -257,7 +257,18 @@ function demoTaskResult(agentName: string, sequence: number): string {
   return `# ${agentName}例行成果 #${sequence}\n\n## 完成摘要\n\n${focus[agentName] ?? '例行工作已完成，结果与后续事项已整理。'}\n\n## 后续事项\n\n- 结果已归档，等待验收\n- 异常项进入下一轮跟进\n`;
 }
 
+/**
+ * 首次启动种子数据。
+ *
+ * 【默认不写入】演示数据（12 员工 / 23 条已完成任务 / 8 待审批 / 3 项目）会与真实数据
+ * 共用同一批表，若无标记则统计口径无法区分真伪。因此：
+ *  - 默认跳过，新装用户看到干净的空状态；
+ *  - 仅当 settings.seedDemoData 显式为 true 时写入，且所有行标记 is_demo = 1；
+ *  - 首页统计与项目经营分析一律排除 is_demo 行（见 orchestrator.stats）。
+ * 需要演示环境时在设置页开启，或调用 purgeDemoData 清空。
+ */
 export function seedIfEmpty(db: Database) {
+  if (db.getSetting<boolean>('seedDemoData', false) !== true) return;
   const count = (db.raw.prepare('SELECT COUNT(*) c FROM agents').get() as { c: number }).c;
   if (count > 0) return;
 
@@ -266,7 +277,7 @@ export function seedIfEmpty(db: Database) {
 
   db.transaction(() => {
     const insertProject = db.raw.prepare(
-      'INSERT INTO projects(id, name, objective, description, client_name, status, color, due_at, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
+      'INSERT INTO projects(id, name, objective, description, client_name, status, color, due_at, created_at, updated_at, is_demo) VALUES(?,?,?,?,?,?,?,?,?,?,1)'
     );
     for (const project of DEMO_PROJECTS) {
       insertProject.run(
@@ -275,12 +286,12 @@ export function seedIfEmpty(db: Database) {
       );
     }
     const insertAgent = db.raw.prepare(
-      `INSERT INTO agents(id, name, role, system_prompt, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at)
-       VALUES(?, ?, ?, ?, 'READY', 'eng-hermes', ?, 'standard', 1, 0, ?, ?, ?)`
+      `INSERT INTO agents(id, name, role, system_prompt, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at, is_demo)
+       VALUES(?, ?, ?, ?, 'READY', 'eng-hermes', ?, 'standard', 1, 0, ?, ?, ?, 1)`
     );
     const insertTask = db.raw.prepare(
-      `INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result)
-       VALUES(?, ?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?, ?)`
+      `INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result, is_demo)
+       VALUES(?, ?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?, ?, 1)`
     );
     const insertRun = db.raw.prepare(
       `INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
@@ -325,4 +336,46 @@ export function seedIfEmpty(db: Database) {
   });
 
   db.audit({ id: randomUUID(), actor: 'system', action: 'seed.demo', target: '12 agents / 8 approvals', result: 'ok' });
+}
+
+/** 演示数据统计：供设置页展示「当前库中有多少演示数据」 */
+export function demoDataStats(db: Database): { agents: number; tasks: number; projects: number } {
+  const count = (sql: string) => (db.raw.prepare(sql).get() as { c: number }).c;
+  return {
+    agents: count('SELECT COUNT(*) c FROM agents WHERE is_demo = 1'),
+    tasks: count('SELECT COUNT(*) c FROM tasks WHERE is_demo = 1'),
+    projects: count('SELECT COUNT(*) c FROM projects WHERE is_demo = 1')
+  };
+}
+
+/**
+ * 清空演示数据（H-3）：删除所有 is_demo = 1 的员工/任务/项目及其派生记录。
+ * 只删标记为演示的行，真实数据不受影响；外键顺序从叶子表向主表删除。
+ */
+export function purgeDemoData(db: Database): { agents: number; tasks: number; projects: number } {
+  const before = demoDataStats(db);
+  db.transaction(() => {
+    const demoTasks = 'SELECT id FROM tasks WHERE is_demo = 1';
+    const demoAgents = 'SELECT id FROM agents WHERE is_demo = 1';
+    // 任务派生记录
+    db.raw.prepare(`DELETE FROM task_events WHERE task_id IN (${demoTasks})`).run();
+    db.raw.prepare(`DELETE FROM task_messages WHERE task_id IN (${demoTasks})`).run();
+    db.raw.prepare(`DELETE FROM agent_runs WHERE task_id IN (${demoTasks})`).run();
+    db.raw.prepare(`DELETE FROM usage_records WHERE task_id IN (${demoTasks})`).run();
+    // 审批与员工派生记录（种子审批的 task_id 为随机值，按 agent 清理）
+    db.raw.prepare(`DELETE FROM approvals WHERE agent_id IN (${demoAgents})`).run();
+    db.raw.prepare(`DELETE FROM agent_runs WHERE agent_id IN (${demoAgents})`).run();
+    db.raw.prepare(`DELETE FROM agent_skills WHERE agent_id IN (${demoAgents})`).run();
+    db.raw.prepare(`DELETE FROM conversations WHERE agent_id IN (${demoAgents})`).run();
+    db.raw.prepare(`DELETE FROM channel_routes WHERE agent_id IN (${demoAgents})`).run();
+    // 主表
+    db.raw.prepare('DELETE FROM tasks WHERE is_demo = 1').run();
+    db.raw.prepare('DELETE FROM agents WHERE is_demo = 1').run();
+    db.raw.prepare('DELETE FROM projects WHERE is_demo = 1').run();
+  });
+  db.audit({
+    id: randomUUID(), actor: 'admin', action: 'seed.purgeDemo',
+    target: `${before.agents} agents / ${before.tasks} tasks / ${before.projects} projects`, result: 'ok'
+  });
+  return before;
 }

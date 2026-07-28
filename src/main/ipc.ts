@@ -29,6 +29,7 @@ import type { CollabManager } from './services/collabManager.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
+import { demoDataStats, purgeDemoData } from './services/seed.js';
 import type {
   AppConfig, CreateAgentInput, DeliverableMetaPatch, DeliverableReviewInput, DeliverableVersionInput,
   KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeVersionInput,
@@ -728,6 +729,13 @@ export function registerIpc(deps: IpcDeps) {
   // ---------- 设置 ----------
   ipcMain.handle('aibox:getSetting', (_e, key: string) => db.getSetting(key, null));
   ipcMain.handle('aibox:setSetting', (_e, key: string, value: unknown) => db.setSetting(key, value));
+  // 演示数据（H-3）：查询库中残留量 / 一键清空（只删 is_demo=1 行，真实数据不受影响）
+  ipcMain.handle('aibox:getDemoDataStats', () => demoDataStats(db));
+  ipcMain.handle('aibox:purgeDemoData', () => {
+    const removed = purgeDemoData(db);
+    pushSnapshot();
+    return removed;
+  });
   // Web 管理面板访问 Token：重新生成强随机 Token（同时失效旧会话）
   ipcMain.handle('aibox:regenerateWebToken', () => ({ token: webServer.regenerateToken() }));
 

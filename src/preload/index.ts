@@ -265,6 +265,10 @@ const api = {
   // 设置 / 目录 / 凭据
   getSetting: (key: string): Promise<unknown> => ipcRenderer.invoke('aibox:getSetting', key),
   setSetting: (key: string, value: unknown): Promise<void> => ipcRenderer.invoke('aibox:setSetting', key, value),
+  /** 演示数据残留量（H-3：演示与真实数据同表，需可查可清） */
+  getDemoDataStats: (): Promise<{ agents: number; tasks: number; projects: number }> => ipcRenderer.invoke('aibox:getDemoDataStats'),
+  /** 清空演示数据：只删 is_demo=1 行，真实数据不受影响 */
+  purgeDemoData: (): Promise<{ agents: number; tasks: number; projects: number }> => ipcRenderer.invoke('aibox:purgeDemoData'),
   regenerateWebToken: (): Promise<{ token: string }> => ipcRenderer.invoke('aibox:regenerateWebToken'),
 
   // OCR 文字识别服务

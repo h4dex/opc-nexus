@@ -342,7 +342,9 @@ function RoutingRules({ engines }: { engines: Engine[] }) {
     return null;
   }
 
-  const healthyEngines = engines.filter((e) => ['HEALTHY', 'SETUP_REQUIRED'].includes(e.status));
+  // 仅列出 HEALTHY 引擎：主进程的路由消费同样只认 HEALTHY，
+  // 若把待配置引擎列进来，用户选了却不生效，又成了假开关
+  const healthyEngines = engines.filter((e) => e.status === 'HEALTHY');
 
   const save = async () => {
     await window.aibox.saveEngineRouting(rules);
@@ -352,7 +354,7 @@ function RoutingRules({ engines }: { engines: Engine[] }) {
 
   return (
     <div className="card" style={{ marginTop: 16 }}>
-      <div className="card-title">引擎路由规则<span className="sub">按任务来源指定优先引擎（留空则用默认引擎）</span></div>
+      <div className="card-title">引擎路由规则<span className="sub">按任务来源指定优先引擎（留空 = 用员工自身引擎；仅当所选引擎健康时生效）</span></div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10 }}>
         {TASK_SOURCES.map((src) => (
           <div key={src.key} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

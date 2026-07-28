@@ -412,6 +412,8 @@ export interface Task {
   quality: TaskQuality;     // 人工质量标记（成果管理）
   sessionId: string | null; // 会话锚点（CLI resume / LLM 上下文重建，追问时继承）
   workspaceOverride: string | null; // 任务级工作空间覆盖（团队共享工作空间）
+  /** 任务级引擎覆盖（E-2 编码委派：主引擎把编码类子任务交给 OpenCode 执行，员工归属不变） */
+  engineOverride: string | null;
   createdAt: number;
   startedAt: number | null;
   endedAt: number | null;

@@ -36,6 +36,10 @@ export interface ToolHost {
   listReadyAgents?(): { id: string; name: string; role: string }[];
   /** 主 Agent 全局调度：触发专家团 */
   triggerTeamByName?(teamName: string, task: string): { ok: boolean; message: string };
+  /** E-2 编码委派：把编码类子任务交给指定引擎（OpenCode）执行，员工归属不变 */
+  createEngineDelegatedTask?(agentId: string, title: string, parentTaskId: string, engineId: string): Task;
+  /** E-2：编码引擎是否可用（未安装/未就绪时不注册委派工具，避免模型调用必然失败的工具） */
+  codingEngineReady?(): { ready: boolean; engineId: string; name: string };
 }
 
 export interface ToolDef {
@@ -228,6 +232,43 @@ export const TOOLS: ToolDef[] = [
       if (!done) throw new Error('子任务等待超时（10 分钟），已放弃等待');
       if (done.status === 'COMPLETED') return `子任务完成。产出：\n${(done.result ?? '（无文本产物）').slice(0, 8000)}`;
       throw new Error(`子任务未成功（${done.status}）：${done.error ?? '无错误信息'}`);
+    }
+  },
+  {
+    // E-2 编码专家委派：主引擎（Hermes/Nexus）负责规划与通用任务，
+    // 遇到需要真正改代码、跑测试、分析仓库的工作时交给 OpenCode 执行。
+    // 与 delegate_task 的区别：不换员工（归属与审批链路不变），只换执行引擎。
+    name: 'delegate_coding_task',
+    description:
+      '把编码类工作交给编码专家引擎（OpenCode）执行，等待完成并返回结果。' +
+      '适用于：修改/新增代码文件、重构、跑测试与修复失败、分析代码仓库结构。' +
+      '不适用于：纯问答、写文档、数据分析等非编码任务（这些应自己完成）。',
+    risk: 'write',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: '编码任务的完整描述：目标、涉及的文件或模块、验收标准。描述要自包含，编码引擎看不到当前对话上下文。'
+        }
+      },
+      required: ['title']
+    },
+    async execute(args, ctx) {
+      if (!ctx.host?.createEngineDelegatedTask || !ctx.host.codingEngineReady) throw new Error('编码委派能力未启用');
+      const coding = ctx.host.codingEngineReady();
+      if (!coding.ready) throw new Error(`编码引擎「${coding.name}」当前不可用，请自行完成该任务或先在引擎中心完成安装/登录`);
+      if (ctx.host.delegationDepth(ctx.taskId) >= 2) throw new Error('委托深度已达上限（2 级），请直接完成任务');
+      const title = String(args.title ?? '').trim();
+      if (!title) throw new Error('请提供编码任务描述');
+
+      const sub = ctx.host.createEngineDelegatedTask(ctx.agentId, title, ctx.taskId, coding.engineId);
+      const done = await ctx.host.waitForTask(sub.id, MAX_DELEGATE_WAIT_MS);
+      if (!done) throw new Error('编码子任务等待超时（10 分钟），已放弃等待');
+      if (done.status === 'COMPLETED') {
+        return `编码任务已由 ${coding.name} 完成。产出：\n${(done.result ?? '（无文本产物）').slice(0, 8000)}`;
+      }
+      throw new Error(`编码子任务未成功（${done.status}）：${done.error ?? '无错误信息'}`);
     }
   },
   {
@@ -734,7 +775,9 @@ public class WheelSim {
 /** 按权限模式 + 能力开关过滤可注册工具 */
 export function toolsForPermission(
   mode: 'readonly' | 'standard' | 'trusted' | 'autonomous',
-  capabilities?: { network?: boolean; shell?: boolean; install?: boolean; browser?: boolean; computer?: boolean }
+  capabilities?: { network?: boolean; shell?: boolean; install?: boolean; browser?: boolean; computer?: boolean },
+  /** 编码引擎是否就绪（E-2）：不就绪则不注册 delegate_coding_task，避免模型调用必然失败的工具 */
+  codingEngineReady = false
 ): ToolDef[] {
   let tools = mode === 'readonly' ? TOOLS.filter((t) => t.risk === 'safe') : TOOLS;
   // 能力开关过滤：未开启对应能力的工具不注册给 LLM
@@ -744,6 +787,7 @@ export function toolsForPermission(
       return capabilities[t.requiresCapability] === true;
     });
   }
+  if (!codingEngineReady) tools = tools.filter((t) => t.name !== 'delegate_coding_task');
   return tools;
 }
 

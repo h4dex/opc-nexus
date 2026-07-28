@@ -289,6 +289,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? (row ? { result: row.result } : undefined) : [];
   }
 
+  // SELECT name, status FROM engines WHERE id = ?（编码委派就绪探测）
+  if (/SELECT name, status FROM engines WHERE id = \?/.test(sql)) {
+    const row = tables.engines.get(args[0] as string);
+    return mode === 'get' ? (row ? { name: row.name, status: row.status } : undefined) : [];
+  }
+
   // SELECT status FROM engines WHERE id = ?
   if (/SELECT status FROM engines WHERE id = \?/.test(sql)) {
     const row = tables.engines.get(args[0] as string);
@@ -592,11 +598,12 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
 
   // INSERT INTO tasks
   if (/INSERT INTO tasks/.test(sql)) {
-    const [id, agentId, projectId, title, source, parentId, status, stage, sessionId, workspaceOverride, now, startedAt] = args;
+    const [id, agentId, projectId, title, source, parentId, status, stage, sessionId, workspaceOverride, engineOverride, now, startedAt] = args;
     tables.tasks.set(id as string, {
       id, agent_id: agentId, project_id: projectId, title, source, parent_id: parentId, status,
       priority: 0, progress: 0, stage, error: null, session_id: sessionId,
-      workspace_override: workspaceOverride, created_at: now, started_at: startedAt, ended_at: null, deleted_at: null, result: null, quality: null
+      workspace_override: workspaceOverride, engine_override: engineOverride ?? null,
+      is_demo: 0, created_at: now, started_at: startedAt, ended_at: null, deleted_at: null, result: null, quality: null
     });
     return { changes: 1 };
   }

@@ -14,7 +14,7 @@
 项目功能广度已显著超出验证深度。核心矛盾是：
 
 - **37 个主进程服务、23 个前端页面、1134 行共享类型定义**
-- **17 个测试文件 / 177 个用例**（引擎层从零覆盖补到 EngineManager 状态机 + Hermes 执行器 + 凭据隔离）
+- **18 个测试文件 / 190 个用例**（引擎层从零覆盖补到 EngineManager 状态机 + Hermes 执行器 + 凭据隔离 + 编码委派）
 
 产品的核心价值主张是「本地优先的桌面 AI Agent 管理器」，但直到近期提交前，
 默认引擎调用的并非真实 Agent Runtime，而是自研的 OpenAI 兼容工具循环。
@@ -46,7 +46,7 @@
 |---|---|---|---|---|
 | H-1 | `executionMode` 默认值为 `demo`，模拟回退在默认配置下仍生效 | `userConfig.ts` | 引擎配错时任务显示 COMPLETED，产物为虚构内容 | ✅ 已改为 `production` |
 | H-2 | 自动补位造假任务默认开启（`demoAutoTasks=true`，水位 8） | `orchestrator.ts` `replenishTasks()` | 系统自动生成用户从未派发的任务 | ✅ 已改为默认关闭、水位 0 |
-| H-3 | 演示种子数据混入生产库（12 员工 / 23 已完成任务 / 8 待审批） | `seed.ts` | 首次启动即显示 23 条虚假「已完成」，与真实数据同表无隔离标记 | ⬜ 待办 |
+| H-3 | 演示种子数据混入生产库（12 员工 / 23 已完成任务 / 8 待审批） | `seed.ts` | 首次启动即显示 23 条虚假「已完成」，与真实数据同表无隔离标记 | ✅ 默认不再写入（需 `seedDemoData` 显式开启）；v27 增加 `is_demo` 列并回填历史库，首页统计排除演示行，设置页可一键清空 |
 | H-4 | 「登录授权」按钮直接改库状态，无真实鉴权 | `engineManager.ts` | 点击即标记 HEALTHY，健康状态不可信 | ✅ 改为 `probeAuth()` 真实探测：内置引擎查供应商配置，CLI 引擎跑最小 headless 请求；鉴权类错误标 AUTH_REQUIRED，超时标 DEGRADED 而非误判已登录 |
 
 **H-3 的严重性高于模拟执行**：演示数据与真实数据共用同一张表且无 `is_demo` 标记，
@@ -90,15 +90,18 @@ Web 面板的鉴权基线本身不差（Bearer Token、会话 24h 过期、分�
 | **OpenCode** | 编码专家 | `CliExecutor` | 由主引擎委派承接代码修改、仓库分析、测试 |
 | **Codex CLI** | 备选编码引擎 | `CliExecutor` | 与 OpenCode 同类，供用户择一 |
 
-### 主辅策略（E-2 ⬜）
+### 主辅策略（E-2 ✅）
 
 已确认语义为**编码专家委派**，而非故障回退：
 
 - Hermes 作主脑负责规划与通用任务；判定为编码类任务（代码修改 / 仓库分析 / 测试）时委派 OpenCode。
 - **业务失败不切引擎**；仅基础设施级错误（启动失败、超时、限流、服务不可用）才走辅助引擎。
 - `agents.engine_id` 保留为主引擎，委派与回退规则收敛到独立的 EnginePolicy。
-- 现有 `engine_routing` 表已存规则但主进程无消费方 —— 要么落地消费，要么从 UI 移除，
-  不可保留「配了不生效」的假开关。
+- ✅ `engine_routing` 已落地消费：按任务来源路由，且**仅当目标引擎 HEALTHY 时生效**；
+  UI 下拉同步只列 HEALTHY 引擎，避免「选了不生效」的假开关。
+- ✅ 实现方式：任务级 `engineOverride`（v28 `tasks.engine_override`），
+  子任务仍归属原员工（审批与审计链路不变），仅执行引擎不同；
+  `delegate_coding_task` 工具仅在 OpenCode HEALTHY 时注册给模型。
 
 ### 推荐安装方式（UI 待接入）
 
@@ -217,14 +220,14 @@ Computer Use、Git HTTP 服务、MCP 服务端、Web 管理面板、四种消息
 3. ✅ Web 面板默认绑回环、Token 不入日志（S-1、S-2）
 4. ✅ 解决 `~/.hermes/` 目录冲突与 Windows 路径错误（S-3）
 5. ✅ 引擎凭据改走 `safeStorage`（S-4，含 10 项隔离测试）
-6. ⬜ 演示种子数据隔离或移除（H-3）
+6. ✅ 演示种子数据隔离或移除（H-3）
 
 ### P1 — 核心路径可信
 7. ✅ 引擎清单收敛为四种（E-1，含 v26 迁移改绑下线引擎的员工）
 8. ✅ 接入真实 hermes-agent CLI（`HermesAgentExecutor`：`-z` headless + `--usage-file` 会话锚点）
 9. ✅ `markAuthed` 改为真实鉴权探测（H-4）
 10. ✅ 引擎层测试补齐（A-4，新增 27 项）
-11. ⬜ OpenCode 编码委派路由落地（E-2）
+11. ✅ OpenCode 编码委派路由落地（E-2，含 13 项测试）
 
 ### P2 — 架构健康
 12. ⬜ 拆分 `ipc.ts`（A-1）

@@ -66,6 +66,14 @@ export class Orchestrator {
         return r?.id ?? null;
       },
       createDelegatedTask: (agentId, title, parentTaskId) => this.createTask(agentId, title, 'delegated', { parentId: parentTaskId }),
+      // E-2 编码委派：员工归属不变，仅把执行引擎覆盖为编码引擎
+      createEngineDelegatedTask: (agentId, title, parentTaskId, engineId) =>
+        this.createTask(agentId, title, 'delegated', { parentId: parentTaskId, engineOverride: engineId }),
+      codingEngineReady: () => {
+        const engineId = 'eng-opencode';
+        const row = this.db.raw.prepare('SELECT name, status FROM engines WHERE id = ?').get(engineId) as { name: string; status: string } | undefined;
+        return { ready: row?.status === 'HEALTHY', engineId, name: row?.name ?? 'OpenCode' };
+      },
       waitForTask: (taskId, timeoutMs) =>
         new Promise((resolve) => {
           const started = Date.now();
@@ -263,6 +271,7 @@ export class Orchestrator {
       quality: (r.quality as TaskQuality) ?? null,
       sessionId: (r.session_id as string | null) ?? null,
       workspaceOverride: (r.workspace_override as string | null) ?? null,
+      engineOverride: (r.engine_override as string | null) ?? null,
       createdAt: r.created_at as number, startedAt: r.started_at as number | null, endedAt: r.ended_at as number | null
     };
   }
@@ -513,10 +522,10 @@ export class Orchestrator {
       else if (c.derivedStatus === 'error') s.errorOrOffline++;
       else s.pausedOrStarting++;
     }
-    s.activeTasks = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").get() as { c: number }).c;
-    s.pendingTodos = (this.db.raw.prepare("SELECT COUNT(*) c FROM approvals WHERE status = 'pending'").get() as { c: number }).c;
+    s.activeTasks = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE is_demo = 0 AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").get() as { c: number }).c;
+    s.pendingTodos = (this.db.raw.prepare("SELECT COUNT(*) c FROM approvals WHERE status = 'pending' AND agent_id NOT IN (SELECT id FROM agents WHERE is_demo = 1)").get() as { c: number }).c;
     const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-    s.todayCompleted = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE status = 'COMPLETED' AND deleted_at IS NULL AND ended_at >= ?").get(dayStart.getTime()) as { c: number }).c;
+    s.todayCompleted = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE is_demo = 0 AND status = 'COMPLETED' AND deleted_at IS NULL AND ended_at >= ?").get(dayStart.getTime()) as { c: number }).c;
     return s;
   }
 
@@ -612,12 +621,24 @@ export class Orchestrator {
 
   /** 创建任务：该员工无活跃任务且未超并发 → 立即经执行器派发；否则进入 QUEUED 等待 FIFO 调度。
    *  opts.parentId：委派/追问的父任务；opts.sessionId：继承会话锚点（P2b 追问续跑）；
-   *  opts.workspaceOverride：任务级工作空间覆盖（团队共享工作空间） */
-  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string; projectId?: string } = {}): Task {
+   *  opts.workspaceOverride：任务级工作空间覆盖（团队共享工作空间）；
+   *  opts.engineOverride：任务级引擎覆盖（E-2 编码委派，员工归属不变） */
+  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string; projectId?: string; engineOverride?: string } = {}): Task {
     const now = Date.now();
     const id = randomUUID();
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error('员工不存在');
+    // 引擎路由规则（settings.engine_routing）：按任务来源指定优先引擎。
+    // 显式 engineOverride（编码委派）优先级最高；路由规则仅在引擎健康时生效，
+    // 避免把任务路由到未安装的引擎上。
+    let engineOverride = opts.engineOverride ?? null;
+    if (!engineOverride) {
+      const routed = this.db.getSetting<Record<string, string>>('engine_routing', {})[source];
+      if (routed && routed !== agent.engineId) {
+        const row = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(routed) as { status: string } | undefined;
+        if (row?.status === 'HEALTHY') engineOverride = routed;
+      }
+    }
     let projectId = opts.projectId ?? null;
     if (!projectId && opts.parentId) {
       const parent = this.db.raw.prepare('SELECT project_id FROM tasks WHERE id = ?').get(opts.parentId) as { project_id: string | null } | undefined;
@@ -632,8 +653,8 @@ export class Orchestrator {
     const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null;
     this.db.transaction(() => {
       this.db.raw.prepare(
-        'INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, NULL)'
-      ).run(id, agentId, projectId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, opts.workspaceOverride ?? null, now, canRun ? now : null);
+        'INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, engine_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, ?, NULL)'
+      ).run(id, agentId, projectId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride, now, canRun ? now : null);
       if (canRun) {
         this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
           .run(randomUUID(), agentId, id, process.pid, randomUUID(), 'RUNNING', now);
@@ -707,8 +728,10 @@ export class Orchestrator {
 
   /** 经执行器注册表派发（真实引擎未就绪时自动回退演示模式） */
   private dispatchTask(task: Task, agent: Agent) {
-    const kind = this.executors.kindFor(agent.engineId);
-    this.executors.dispatch(task, agent, this.makeCallbacks(task.id, agent.id, agent.engineId, kind));
+    // 任务级引擎覆盖优先（E-2 编码委派）：子任务仍归属原员工，仅执行引擎不同
+    const engineId = task.engineOverride || agent.engineId;
+    const kind = this.executors.kindFor(engineId);
+    this.executors.dispatch(task, { ...agent, engineId }, this.makeCallbacks(task.id, agent.id, engineId, kind));
   }
 
   /** 任务事件落库（13.2 审计可追溯；详情页时间线数据源） */

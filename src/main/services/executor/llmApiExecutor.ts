@@ -164,7 +164,8 @@ export class LlmApiExecutor implements ExecutorAdapter {
 
     // 专家团任务（source='team'）默认完全自主，无需人工审批，由 AI 自助判断
     const effectivePermission = task.source === 'team' ? 'autonomous' : agent.permissionMode;
-    const tools = toolsForPermission(effectivePermission, agent.capabilities);
+    // 编码引擎就绪时才注册 delegate_coding_task（E-2），避免模型调用必然失败的工具
+    const tools = toolsForPermission(effectivePermission, agent.capabilities, this.host?.codingEngineReady?.().ready ?? false);
     const userPrompt = `当前任务：${task.title}\n请执行该任务并输出结构化结果（Markdown）。`;
 
     // 组合人设 system prompt：soul.md + agents.md + user.md + 基础 prompt + 绑定 skills

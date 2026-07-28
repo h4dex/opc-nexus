@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 26;
+const SCHEMA_VERSION = 28;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -844,6 +844,27 @@ export class Database {
           WHERE engine_id IN ('eng-claude', 'eng-zcode', 'eng-kimi');
           DELETE FROM engines WHERE id IN ('eng-claude', 'eng-zcode', 'eng-kimi');
         `);
+      }
+      if (prev < 27) {
+        // v27：演示数据隔离（H-3）。演示种子与真实数据此前共用同一张表且无标记，
+        // 用户无法区分「23 条今日完成」哪些是真的，统计口径被永久污染。
+        // 增加 is_demo 标记列，并按已知的演示数据特征回填历史库。
+        addCol('projects', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
+        addCol('agents', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
+        addCol('tasks', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
+        // 演示项目 id 固定为 project-demo-*，据此回填项目及其关联的员工与任务
+        this.inner.exec(`
+          UPDATE projects SET is_demo = 1 WHERE id LIKE 'project-demo-%';
+          UPDATE tasks SET is_demo = 1 WHERE project_id LIKE 'project-demo-%';
+          UPDATE agents SET is_demo = 1 WHERE id IN (
+            SELECT DISTINCT agent_id FROM tasks WHERE project_id LIKE 'project-demo-%'
+          );
+        `);
+      }
+      if (prev < 28) {
+        // v28：任务级引擎覆盖（E-2 编码委派）。主引擎把编码类子任务委派给 OpenCode 执行时，
+        // 子任务仍归属原员工（保留归属与审计链路），仅执行引擎不同。
+        addCol('tasks', 'engine_override', 'TEXT');
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

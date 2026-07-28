@@ -12,7 +12,7 @@ export function Settings() {
   const [memAlert, setMemAlert] = useState(85);
   const [gpuTempAlert, setGpuTempAlert] = useState(85);
   const [notifications, setNotifications] = useState(true);
-  const [demoAutoTasks, setDemoAutoTasks] = useState(true);
+  const [demoAutoTasks, setDemoAutoTasks] = useState(false);
 
   useEffect(() => {
     void window.aibox.getSystemInfo().then(setInfo);
@@ -25,7 +25,8 @@ export function Settings() {
       }
     });
     void window.aibox.getSetting('notifications').then((v) => setNotifications(v !== false));
-    void window.aibox.getSetting('demoAutoTasks').then((v) => setDemoAutoTasks(v !== false));
+    // 默认关闭：生产环境绝不自动造任务（与主进程 orchestrator 默认值保持一致）
+    void window.aibox.getSetting('demoAutoTasks').then((v) => setDemoAutoTasks(v === true));
   }, []);
 
   const saveThresholds = () => {
@@ -69,8 +70,9 @@ export function Settings() {
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer' }}>
               <input type="checkbox" checked={demoAutoTasks}
                 onChange={(e) => { setDemoAutoTasks(e.target.checked); void window.aibox.setSetting('demoAutoTasks', e.target.checked); }} />
-              演示自动派单（仅对演示模式员工自动补位；接入真实引擎后建议关闭）
+              演示自动派单（自动创建虚构任务维持水位；生产环境务必保持关闭）
             </label>
+            <DemoDataPurge />
           </div>
         </div>
 
@@ -125,6 +127,52 @@ export function Settings() {
         </div>
       </div>
     </>
+  );
+}
+
+/**
+ * 演示数据清理（H-3）：演示种子与真实数据同表，此处展示残留量并提供一键清空。
+ * 只删 is_demo = 1 的行，用户自己创建的员工/任务/项目不受影响。
+ */
+function DemoDataPurge() {
+  const [stats, setStats] = useState<{ agents: number; tasks: number; projects: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  useEffect(() => { void window.aibox.getDemoDataStats().then(setStats); }, []);
+
+  const total = stats ? stats.agents + stats.tasks + stats.projects : 0;
+  if (!stats || total === 0) return null;
+
+  const purge = async () => {
+    setBusy(true);
+    try {
+      const removed = await window.aibox.purgeDemoData();
+      toast.ok(`已清空演示数据：${removed.agents} 名员工 / ${removed.tasks} 条任务 / ${removed.projects} 个项目`);
+      setStats(await window.aibox.getDemoDataStats());
+      setConfirming(false);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10, marginTop: 2 }}>
+      <div style={{ fontSize: 12.5, color: 'var(--warning)', lineHeight: 1.7 }}>
+        当前库中有演示数据：<b>{stats.agents}</b> 名员工 · <b>{stats.tasks}</b> 条任务 · <b>{stats.projects}</b> 个项目
+        <div style={{ color: 'var(--text-3)', fontSize: 11.5 }}>
+          演示数据已从首页统计中排除，但仍显示在列表页。清空后不可恢复（仅删除演示数据，真实数据保留）。
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+        {!confirming && <button className="btn small danger" onClick={() => setConfirming(true)}>清空演示数据</button>}
+        {confirming && (
+          <>
+            <span style={{ fontSize: 12.5 }}>确认删除全部演示数据？</span>
+            <button className="btn small danger" disabled={busy} onClick={() => void purge()}>{busy ? '清理中…' : '确认删除'}</button>
+            <button className="btn small" disabled={busy} onClick={() => setConfirming(false)}>取消</button>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
