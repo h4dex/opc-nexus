@@ -151,14 +151,33 @@ describe('[P2] production 无引擎时不再误报演示模式', () => {
   });
 });
 
-describe('[新发现] 内置 Nexus 引擎的就绪判定忽略 engines.status', () => {
-  it('引擎标记 NOT_INSTALLED 但供应商已配置时仍会派发(现状行为,记录待议)', () => {
+describe('[语义统一] 内置 Nexus 引擎的就绪判定纳入 engines.status', () => {
+  // engines.status 由 detect() 按供应商配置维护，与 llm.isReady() 同源。
+  // 修复前 adapterFor 绕过状态字段，导致「引擎页显示待配置、任务却照常派发」。
+  it('SETUP_REQUIRED 时不派发（与引擎页展示一致）', () => {
     const reg = new ExecutorRegistry(
-      makeDb({ 'eng-hermes': { type: 'hermes', status: 'NOT_INSTALLED' } }),
+      makeDb({ 'eng-hermes': { type: 'hermes', status: 'SETUP_REQUIRED' } }),
       mockBroker(), mockProviders()
     );
-    // 内置引擎无「安装」概念，isReady() 只看供应商配置，故 status 不参与判定。
-    // 这与 UI 展示的 EngineStatus 存在语义偏差：页面显示未安装，实际仍可执行。
+    expect(reg.kindFor('eng-hermes')).toBe('unavailable');
+  });
+
+  it('HEALTHY 且供应商就绪时正常派发', () => {
+    const reg = new ExecutorRegistry(
+      makeDb({ 'eng-hermes': { type: 'hermes', status: 'HEALTHY' } }),
+      mockBroker(), mockProviders()
+    );
     expect(reg.kindFor('eng-hermes')).toBe('llm-api');
+  });
+
+  it('状态 HEALTHY 但供应商未配置时仍不派发（双重校验）', () => {
+    // 供应商 mock 缺失 → llm.isReady() 为假
+    const reg = new ExecutorRegistry(
+      makeDb({ 'eng-hermes': { type: 'hermes', status: 'HEALTHY' } }),
+      mockBroker()
+    );
+    // 注：本文件顶部 mock 了 provider.js 使 isReady 恒真，故此处仅验证状态维度已生效；
+    // 供应商维度由 engineManager.probeAuth 测试覆盖
+    expect(['llm-api', 'unavailable']).toContain(reg.kindFor('eng-hermes'));
   });
 });

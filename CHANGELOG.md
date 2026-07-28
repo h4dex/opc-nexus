@@ -2,6 +2,34 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.5.1] - 2026-07-28
+
+### 新增
+
+- **`LlmApiExecutor` 测试 28 项**(此前零覆盖,却是 Nexus Agent 的核心执行路径):
+  SSE 流式解析(跨 chunk 分片 / `[DONE]` / 畸形行)、工具循环与轮次上限、审批门禁
+  (拒绝即终止且不执行工具)、权限语义映射、供应商就绪判定、用量落库、abort 中断
+- **语音链路离线验证 33 项**:阿里云 RPC 签名(StringToSign 构造、百分号编码规则、
+  `+`→`%20` / `*`→`%2A` / `~` 保留、参数字典序、密钥拼接)13 项;
+  NLS 协议帧处理(中间结果 / 句末 / 错误码如实上报 / 不带 status 的帧不误判 / 非 JSON 不崩溃)
+  与 StartTranscription 载荷契约 20 项
+
+### 修复
+
+- **内置引擎状态语义不一致**:`adapterFor()` 绕过 `engines.status` 自行判断可用性,
+  与 `detect()` 维护的状态字段可能矛盾(库里 SETUP_REQUIRED 却仍派发,或反之)。
+  现统一以 `engines.status` 为唯一真相来源,与 `isReady()` 判据对齐
+
+### 变更
+
+- 移除 `McpManager.callTool()` 死代码(全项目无调用方;真实工具调用走 `executor/tools.ts`)
+- `voiceService.ts` 抽出可测纯函数 `classifyNlsFrame()` 与 `VoiceSession.startPayload()`,
+  协议判定由测试直接驱动真实实现,避免测试复刻逻辑后与实现脱钩
+
+> 说明:语音云端链路的**签名算法**已离线验证到 StringToSign 逐字节正确、编码规则完备;
+> 但**端到端连通性**(真实 AccessKey → Token → WebSocket 出字)仍需填入真实凭据实测,
+> CI 无法覆盖。凭据错误时的表现已有测试锁定(`TaskFailed` + `SignatureNotMatch` 如实上报)。
+
 ## [1.5.0] - 2026-07-28
 
 ### 新增

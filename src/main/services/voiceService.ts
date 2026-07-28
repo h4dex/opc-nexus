@@ -17,7 +17,7 @@
  *
  * @author liyingjie <y@senke.com>
  */
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { app, safeStorage } from 'electron';
@@ -47,6 +47,72 @@ const DEFAULTS: StoredConfig = { enabled: false, provider: 'auto', appKey: '', s
 /** 本地离线模型目录（与 OCR 模型同级，缺失时本地路不可用） */
 function localModelDir(): string {
   return join(app.getPath('userData'), 'aibox-data', 'models', 'asr');
+}
+
+/**
+ * RFC3986 百分号编码（阿里云签名要求）。
+ * encodeURIComponent 不满足规范：空格编成 `+`、`*` 不编码、`~` 被编码，需逐一纠正。
+ */
+export function rfc3986(s: string): string {
+  return encodeURIComponent(s).replace(/\+/g, '%20').replace(/\*/g, '%2A').replace(/%7E/g, '~');
+}
+
+/** NLS 服务端帧分类结果 */
+export type NlsFrameEvent =
+  | { kind: 'started' }
+  | { kind: 'partial'; text: string }
+  | { kind: 'final'; text: string }
+  | { kind: 'error'; error: string }
+  | { kind: 'ignored' };
+
+/** NLS 成功状态码；其余数值状态一律视为错误 */
+const NLS_STATUS_OK = 20000000;
+
+/**
+ * 解析阿里云 NLS 服务端帧。纯函数，便于用真实帧结构做离线契约测试
+ * （云端链路依赖真实凭据，无法在 CI 中端到端验证）。
+ *
+ * 语义要点：
+ * - 只有「显式带非成功 status」才判为错误；部分帧不带 status，不能误判
+ * - 空 result 不产出回调，避免把空串推给界面
+ */
+export function classifyNlsFrame(raw: Buffer): NlsFrameEvent {
+  let msg: { header?: { name?: string; status?: number; status_text?: string }; payload?: { result?: string } };
+  try {
+    msg = JSON.parse(raw.toString('utf8'));
+  } catch {
+    return { kind: 'ignored' };
+  }
+  const status = msg.header?.status;
+  if (typeof status === 'number' && status !== NLS_STATUS_OK) {
+    return { kind: 'error', error: `识别服务返回错误（${status}）：${msg.header?.status_text ?? '未知原因'}` };
+  }
+  const text = msg.payload?.result;
+  switch (msg.header?.name) {
+    case 'TranscriptionStarted': return { kind: 'started' };
+    case 'TranscriptionResultChanged': return text ? { kind: 'partial', text } : { kind: 'ignored' };
+    case 'SentenceEnd': return text ? { kind: 'final', text } : { kind: 'ignored' };
+    default: return { kind: 'ignored' };
+  }
+}
+
+/**
+ * 阿里云 RPC 风格签名（HMAC-SHA1）。
+ * 规则：参数按 key 字典序排列 → `k=v` 用 & 连接（键值各自 RFC3986 编码）→
+ * 与 HTTP 方法和路径组成 StringToSign（整段再编码一次）→
+ * 以 `AccessKeySecret + "&"` 为密钥做 HMAC-SHA1 → base64。
+ *
+ * 导出以便测试用官方文档的测试向量校验（签名错会导致取令牌 403，
+ * 而这条链路依赖真实凭据，无法在 CI 中端到端验证）。
+ */
+export function signAliyunRpc(
+  params: Record<string, string>,
+  keySecret: string
+): { canonical: string; stringToSign: string; signature: string } {
+  const canonical = Object.keys(params).sort().map((k) => `${rfc3986(k)}=${rfc3986(params[k])}`).join('&');
+  const stringToSign = `GET&${rfc3986('/')}&${rfc3986(canonical)}`;
+  const signature = createHmac('sha1', `${keySecret}&`).update(stringToSign).digest('base64');
+  return { canonical, stringToSign, signature };
 }
 
 function decrypt(db: Database, ref: string): string | null {
@@ -245,25 +311,21 @@ export class VoiceService {
     const keySecret = decrypt(this.db, KEY_SECRET_REF);
     if (!keyId || !keySecret) throw new Error('阿里云 AccessKey 未配置或无法解密');
 
-    const { createHmac } = await import('node:crypto');
-    const params: Record<string, string> = {
-      AccessKeyId: keyId,
-      Action: 'CreateToken',
-      Format: 'JSON',
-      RegionId: 'cn-shanghai',
-      SignatureMethod: 'HMAC-SHA1',
-      SignatureNonce: randomUUID(),
-      SignatureVersion: '1.0',
-      Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-      Version: '2019-02-28'
-    };
-    // RPC 签名：参数按字典序拼接后与 HTTP 方法一同签名
-    const encode = (s: string) =>
-      encodeURIComponent(s).replace(/\+/g, '%20').replace(/\*/g, '%2A').replace(/%7E/g, '~');
-    const canonical = Object.keys(params).sort().map((k) => `${encode(k)}=${encode(params[k])}`).join('&');
-    const stringToSign = `GET&${encode('/')}&${encode(canonical)}`;
-    const signature = createHmac('sha1', `${keySecret}&`).update(stringToSign).digest('base64');
-    const url = `https://nls-meta.cn-shanghai.aliyuncs.com/?Signature=${encode(signature)}&${canonical}`;
+    const { canonical, signature } = signAliyunRpc(
+      {
+        AccessKeyId: keyId,
+        Action: 'CreateToken',
+        Format: 'JSON',
+        RegionId: 'cn-shanghai',
+        SignatureMethod: 'HMAC-SHA1',
+        SignatureNonce: randomUUID(),
+        SignatureVersion: '1.0',
+        Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+        Version: '2019-02-28'
+      },
+      keySecret
+    );
+    const url = `https://nls-meta.cn-shanghai.aliyuncs.com/?Signature=${rfc3986(signature)}&${canonical}`;
 
     const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`获取令牌失败：HTTP ${res.status}`);
@@ -277,7 +339,7 @@ export class VoiceService {
  * 单次语音会话：持有识别后端连接，把音频流转发过去并回吐识别结果。
  * 云端走阿里云 NLS WebSocket 协议；本地走离线模型（模型缺失时如实报错）。
  */
-class VoiceSession {
+export class VoiceSession {
   private ws: import('ws').WebSocket | null = null;
   private taskId = randomUUID().replace(/-/g, '');
   private ready = false;
@@ -292,6 +354,21 @@ class VoiceSession {
     private onFail: (message: string) => void
   ) {}
 
+  /**
+   * StartTranscription 指令载荷。
+   * enable_intermediate_result 必须为 true —— 否则只在句末出字，失去全双工体验。
+   * 采样率/格式须与 Renderer 侧采集一致（16kHz / 16bit / 单声道 PCM）。
+   */
+  static startPayload() {
+    return {
+      format: 'pcm',
+      sample_rate: 16000,
+      enable_intermediate_result: true,
+      enable_punctuation_prediction: true,
+      enable_inverse_text_normalization: true
+    };
+  }
+
   /** 建立阿里云 NLS 实时识别连接并发送 StartTranscription 指令 */
   async connectCloud(endpoint: string, appKey: string, token: string): Promise<void> {
     const { WebSocket } = await import('ws');
@@ -304,12 +381,7 @@ class VoiceSession {
         clearTimeout(timeout);
         ws.send(JSON.stringify({
           header: { message_id: randomUUID().replace(/-/g, ''), task_id: this.taskId, namespace: 'SpeechTranscriber', name: 'StartTranscription', appkey: appKey },
-          payload: {
-            format: 'pcm', sample_rate: 16000,
-            enable_intermediate_result: true,   // 边说边出字的关键
-            enable_punctuation_prediction: true,
-            enable_inverse_text_normalization: true
-          }
+          payload: VoiceSession.startPayload()
         }));
         resolve();
       });
@@ -324,25 +396,23 @@ class VoiceSession {
   }
 
   private handleCloudMessage(raw: Buffer): void {
-    let msg: { header?: { name?: string; status?: number; status_text?: string }; payload?: { result?: string } };
-    try {
-      msg = JSON.parse(raw.toString('utf8'));
-    } catch {
-      return; // 非 JSON 帧忽略
-    }
-    const name = msg.header?.name;
-    const status = msg.header?.status;
-    if (typeof status === 'number' && status !== 20000000) {
-      this.onFail(`识别服务返回错误（${status}）：${msg.header?.status_text ?? '未知原因'}`);
-      return;
-    }
-    if (name === 'TranscriptionStarted') {
-      this.ready = true;
-      for (const buf of this.pending.splice(0)) this.ws?.send(buf);
-    } else if (name === 'TranscriptionResultChanged') {
-      if (msg.payload?.result) this.onText(msg.payload.result, false);
-    } else if (name === 'SentenceEnd') {
-      if (msg.payload?.result) this.onText(msg.payload.result, true);
+    const ev = classifyNlsFrame(raw);
+    switch (ev.kind) {
+      case 'error':
+        this.onFail(ev.error);
+        return;
+      case 'started':
+        this.ready = true;
+        for (const buf of this.pending.splice(0)) this.ws?.send(buf);
+        return;
+      case 'partial':
+        this.onText(ev.text, false);
+        return;
+      case 'final':
+        this.onText(ev.text, true);
+        return;
+      default:
+        return; // 非 JSON / 未知帧 / 空结果：忽略
     }
   }
 

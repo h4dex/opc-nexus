@@ -366,7 +366,10 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:startMcpServer', (_e, id: string) => mcp.start(id));
   ipcMain.handle('aibox:stopMcpServer', (_e, id: string) => mcp.stop(id));
   ipcMain.handle('aibox:getMcpTools', () => mcp.allTools());
-  ipcMain.handle('aibox:callMcpTool', (_e, serverId: string, toolName: string, args: Record<string, unknown>) => mcp.callTool(serverId, toolName, args));
+  // 注：aibox:callMcpTool 已移除 —— preload 未暴露、无任何调用方，
+  // 保留只是把「任意 MCP 工具调用」暴露成可达攻击面。
+  // McpManager.callTool 目前仅供后续执行器接入 MCP 工具时在主进程内调用；
+  // 真正接入时应经工具注册表（tools.ts）声明，而非重新开放 IPC 通道。
 
   // ---------- Skills 管理 ----------
   ipcMain.handle('aibox:listSkills', () => skills.list());

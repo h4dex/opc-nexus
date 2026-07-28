@@ -66,9 +66,17 @@ export class ExecutorRegistry {
     if (type === 'hermes-cli' && this.hermes.isReady()) return this.hermes;
     const cli = this.cliByType.get(type);
     if (cli && cli.isReady()) return cli;
-    if (type === 'hermes' && this.llm.isReady()) return this.llm;
+    // 内置 Nexus：engines.status 由 detect() 按供应商配置维护（HEALTHY / SETUP_REQUIRED），
+    // 与 llm.isReady() 判据同源。此处一并校验状态，避免「引擎页显示待配置、任务却照常派发」
+    // 的语义分裂 —— 引擎状态必须是唯一真相来源。
+    if (type === 'hermes' && this.engineStatus(engineId) === 'HEALTHY' && this.llm.isReady()) return this.llm;
     if (type === 'external' && this.acp.engineReady(engineId)) return this.acp;
     return null;
+  }
+
+  private engineStatus(engineId: string): string {
+    const row = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(engineId) as { status: string } | undefined;
+    return row?.status ?? 'NOT_INSTALLED';
   }
 
   /** 主辅解析：主引擎 → 辅助引擎 →（demo 模式）模拟器 / （production 模式）null */
