@@ -814,11 +814,11 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
-  // UPDATE tasks SET status = 'RUNNING' WHERE id = ? AND status = 'PAUSED'
-  if (/UPDATE tasks SET status = 'RUNNING' WHERE id = \? AND status = 'PAUSED'/.test(sql)) {
-    const [id] = args;
+  // UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'PAUSED'
+  if (/UPDATE tasks SET status = 'RUNNING', started_at = \? WHERE id = \? AND status = 'PAUSED'/.test(sql)) {
+    const [now, id] = args;
     const task = tables.tasks.get(id as string);
-    if (task && task.status === 'PAUSED') { task.status = 'RUNNING'; return { changes: 1 }; }
+    if (task && task.status === 'PAUSED') { task.status = 'RUNNING'; task.started_at = now; return { changes: 1 }; }
     return { changes: 0 };
   }
 
@@ -830,11 +830,11 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
-  // UPDATE tasks SET status = 'RUNNING' WHERE id = ? AND status = 'WAITING_APPROVAL'
-  if (/UPDATE tasks SET status = 'RUNNING' WHERE id = \? AND status = 'WAITING_APPROVAL'/.test(sql)) {
-    const [id] = args;
+  // UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'WAITING_APPROVAL'
+  if (/UPDATE tasks SET status = 'RUNNING', started_at = \? WHERE id = \? AND status = 'WAITING_APPROVAL'/.test(sql)) {
+    const [now, id] = args;
     const task = tables.tasks.get(id as string);
-    if (task && task.status === 'WAITING_APPROVAL') { task.status = 'RUNNING'; return { changes: 1 }; }
+    if (task && task.status === 'WAITING_APPROVAL') { task.status = 'RUNNING'; task.started_at = now; return { changes: 1 }; }
     return { changes: 0 };
   }
 

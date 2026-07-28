@@ -158,4 +158,29 @@ describe('看门狗 watchdogSweep', () => {
     orch['watchdogSweep']();
     expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: task.id, status: 'INTERRUPTED' }));
   });
+
+  it('暂停等待期不计入看门狗:长时间暂停后恢复不被误杀', () => {
+    const { db, orch, agentId } = setup();
+    const task = orch.createTask(agentId, '暂停后恢复的任务');
+    orch.pauseTask(task.id);
+    // 暂停期间 started_at 已是 2 小时前
+    db.tables.tasks.get(task.id).started_at = Date.now() - 2 * 60 * 60_000;
+    orch.resumeTask(task.id);
+    orch['watchdogSweep']();
+    // resumeTask 重置了 started_at,看门狗不应中断
+    expect(db.tables.tasks.get(task.id).status).toBe('RUNNING');
+  });
+
+  it('审批等待期不计入看门狗:批准后 started_at 被重置', () => {
+    const { db, orch, agentId } = setup();
+    const task = orch.createTask(agentId, '等待审批的任务');
+    const row = db.tables.tasks.get(task.id);
+    row.status = 'WAITING_APPROVAL';
+    row.started_at = Date.now() - 2 * 60 * 60_000; // 审批等了 2 小时
+    db.tables.approvals.set('ap-1', { id: 'ap-1', task_id: task.id, agent_id: agentId, type: 'write', request: '写文件', risk: 'low', status: 'pending', created_at: Date.now(), decided_at: null });
+    orch.decideApproval('ap-1', true);
+    expect(row.status).toBe('RUNNING');
+    orch['watchdogSweep']();
+    expect(row.status).toBe('RUNNING'); // started_at 已重置,不被误杀
+  });
 });

@@ -827,7 +827,8 @@ export class Orchestrator {
   }
 
   resumeTask(taskId: string) {
-    const changed = this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING' WHERE id = ? AND status = 'PAUSED'").run(taskId).changes;
+    // 重置 started_at：看门狗按“本段运行时长”计时，暂停等待期不计入（否则恢复即被误杀）
+    const changed = this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'PAUSED'").run(Date.now(), taskId).changes;
     if (changed > 0) {
       const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
       const agent = row ? this.getAgent(row.agent_id as string) : null;
@@ -845,7 +846,8 @@ export class Orchestrator {
     this.db.transaction(() => {
       this.db.raw.prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ?').run(approve ? 'approved' : 'rejected', now, approvalId);
       if (approve || wasLive) {
-        this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING' WHERE id = ? AND status = 'WAITING_APPROVAL'").run(ap.task_id as string);
+        // 重置 started_at：审批等待期不计入看门狗时长（否则长时间等审批的任务恢复即被误杀）
+        this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, ap.task_id as string);
       } else {
         this.db.raw.prepare("UPDATE tasks SET status = 'FAILED', ended_at = ?, error = '审批被拒绝' WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, ap.task_id as string);
       }
