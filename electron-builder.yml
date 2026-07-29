@@ -88,14 +88,50 @@ files:
   - node_modules/long/**
   - node_modules/@protobufjs/**
   - node_modules/crypto-js/**
+  # OCR（onnxruntime-node + sharp）与浏览器自动化（playwright-core）：
+  # 主进程用动态 import() 加载，externalizeDepsPlugin 不会内联进产物，
+  # 必须显式打包，否则安装后调用即 MODULE_NOT_FOUND。
+  - node_modules/onnxruntime-node/**
+  - node_modules/onnxruntime-common/**
+  - node_modules/sharp/**
+  - node_modules/@img/**
+  - node_modules/playwright-core/**
+  # 上述三者的传递依赖
+  - node_modules/adm-zip/**
+  - node_modules/global-agent/**
+  - node_modules/boolean/**
+  - node_modules/detect-node/**
+  - node_modules/es6-error/**
+  - node_modules/globalthis/**
+  - node_modules/json-stringify-safe/**
+  - node_modules/matcher/**
+  - node_modules/escape-string-regexp/**
+  - node_modules/roarr/**
+  - node_modules/semver-compare/**
+  - node_modules/serialize-error/**
+  - node_modules/sprintf-js/**
+  - node_modules/type-fest/**
+  - node_modules/define-properties/**
+  - node_modules/object-keys/**
+  - node_modules/detect-libc/**
+  - node_modules/semver/**
 
 asar: true
 
-# WASM 二进制不压缩进 asar，避免加载问题
+# 原生二进制不压缩进 asar，否则无法被加载
 asarUnpack:
   - node_modules/sql.js/dist/sql-wasm.wasm
+  - node_modules/onnxruntime-node/bin/**
+  - node_modules/sharp/**
+  - node_modules/@img/**
+  - "**/*.node"
 
 win:
+  # onnxruntime-node 自带 darwin/linux/win32 三平台二进制（约 260M）。
+  # Windows 包只需 win32 那份，剔除另两份可省约 132M。
+  files:
+    - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
+    - "!node_modules/onnxruntime-node/bin/napi-v6/linux/**"
   target:
     - target: nsis
       arch: [x64]
@@ -109,6 +145,10 @@ nsis:
   shortcutName: 数字员工 AI Box
 
 linux:
+  # 同理：Linux 包只保留 linux 那份 onnxruntime 二进制
+  files:
+    - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
+    - "!node_modules/onnxruntime-node/bin/napi-v6/win32/**"
   target:
     - target: AppImage
       arch: [x64]
