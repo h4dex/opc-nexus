@@ -39,12 +39,16 @@ class FakeChild extends EventEmitter {
 
 let lastSpawn: { bin: string; args: string[]; opts: unknown } | null = null;
 let child: FakeChild;
-vi.mock('node:child_process', () => ({
-  spawn: (bin: string, args: string[], opts: unknown) => {
+// 拦截 cliLauncher 而非 node:child_process：执行器现经 spawnCli 启动，
+// 由它负责 Windows 上 .cmd / npm shim / Store 应用的 cmd.exe 包装。
+// 在此层断言可拿到「逻辑命令与参数」，不受平台包装干扰。
+vi.mock('../src/main/services/cliLauncher.js', () => ({
+  spawnCli: (bin: string, args: string[], opts: unknown) => {
     lastSpawn = { bin, args, opts };
     child = new FakeChild();
     return child;
-  }
+  },
+  runCli: async () => ({ ok: true, code: 0, stdout: 'v1.0.0', stderr: '' })
 }));
 
 const { CliExecutor } = await import('../src/main/services/executor/cliExecutor.js');

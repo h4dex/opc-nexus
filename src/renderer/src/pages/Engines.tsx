@@ -8,11 +8,56 @@ const STATUS_META: Record<Engine['status'], { label: string; tag: string }> = {
   NOT_INSTALLED: { label: '未安装', tag: 'gray' },
   INSTALLING: { label: '安装中', tag: 'blue' },
   SETUP_REQUIRED: { label: '待配置', tag: 'orange' },
-  AUTH_REQUIRED: { label: '待登录', tag: 'orange' },
-  HEALTHY: { label: '健康', tag: 'green' },
+  AUTH_REQUIRED: { label: '待验证', tag: 'orange' },
+  HEALTHY: { label: '已验证可用', tag: 'green' },
   DEGRADED: { label: '降级', tag: 'orange' },
   ERROR: { label: '异常', tag: 'red' }
 };
+
+/**
+ * 四级探活信号（发布要求）：把「健康」拆成可解释的独立维度逐条展示。
+ * 只有四项全绿才会是 HEALTHY —— 此前仅「检测到入口」就标健康，
+ * 用户以为能用，实际一跑就 ENOENT / EPERM / 参数错。
+ */
+function HealthSignals({ engine }: { engine: Engine }) {
+  const s = engine.healthSignals;
+  if (!s) return null;
+  const items: { key: string; label: string; ok: boolean; hint: string }[] = [
+    { key: 'detected', label: '已检测', ok: s.detected, hint: '在 PATH 中定位到可执行文件' },
+    { key: 'launchable', label: '可启动', ok: s.launchable, hint: '进程能真正拉起（Windows 上 npm shim / .cmd / Store 应用各有坑）' },
+    { key: 'authenticated', label: '凭据有效', ok: s.authenticated, hint: '未返回 401 / 未登录' },
+    { key: 'task_verified', label: '任务已验证', ok: s.taskVerified, hint: '最小任务真的产出了结果' }
+  ];
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+        {items.map((it) => (
+          <span
+            key={it.key}
+            title={it.hint}
+            style={{
+              fontSize: 11, padding: '2px 7px', borderRadius: 4, cursor: 'help',
+              background: it.ok ? 'var(--success-soft, rgba(34,193,163,.14))' : 'var(--input-bg)',
+              color: it.ok ? 'var(--success)' : 'var(--text-3)',
+              border: `1px solid ${it.ok ? 'var(--success)' : 'var(--border)'}`
+            }}
+          >
+            {it.ok ? '✓' : '○'} {it.label}
+          </span>
+        ))}
+      </div>
+      {s.detail && (
+        <div style={{
+          fontSize: 11.5, color: 'var(--text-3)', lineHeight: 1.6, background: 'var(--input-bg)',
+          borderRadius: 6, padding: '6px 10px', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+          maxHeight: 88, overflowY: 'auto'
+        }}>
+          {s.detail}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function Engines() {
   const { snapshot } = useApp();
@@ -110,6 +155,9 @@ export function Engines() {
                 </div>
               )}
 
+              {/* 四级探活信号：detected / launchable / authenticated / task_verified */}
+              <HealthSignals engine={e} />
+
               {/* 性能指标 */}
               <EngineMetrics engineId={e.id} />
 
@@ -132,10 +180,17 @@ export function Engines() {
                 {e.status === 'SETUP_REQUIRED' && (
                   <span style={{ fontSize: 12, color: 'var(--warning)', alignSelf: 'center' }}>请在设置页完成模型供应商配置</span>
                 )}
-                {(e.status === 'AUTH_REQUIRED' || e.status === 'DEGRADED') && (
-                  <button className="btn small primary" onClick={() => void probeAuth(e.id)}>验证登录</button>
+                {/* 四级探活入口：AUTH_REQUIRED / DEGRADED / ERROR 都需要跑最小任务确认；
+                    HEALTHY 也允许重验（凭据可能过期） */}
+                {(e.status === 'AUTH_REQUIRED' || e.status === 'DEGRADED' || e.status === 'ERROR') && (
+                  <button className="btn small primary" onClick={() => void probeAuth(e.id)} title="跑一次最小任务，确认可启动、凭据有效且真能产出结果">
+                    验证可用性
+                  </button>
                 )}
-                {(e.status === 'HEALTHY' || e.status === 'DEGRADED' || e.status === 'SETUP_REQUIRED') && (
+                {e.status === 'HEALTHY' && (
+                  <button className="btn small" onClick={() => void probeAuth(e.id)} title="重新跑最小任务复验">重新验证</button>
+                )}
+                {(e.status === 'HEALTHY' || e.status === 'DEGRADED' || e.status === 'SETUP_REQUIRED' || e.status === 'ERROR') && (
                   <button className="btn small" onClick={() => void restart(e.id)} title="重新检测引擎状态">
                     <IconRefresh size={13} />重启
                   </button>

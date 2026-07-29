@@ -2,7 +2,53 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.6.0] - 2026-07-30
+
+### 修复（第三方引擎全部无法执行任务）
+
+三个 CLI 引擎在引擎中心均显示 HEALTHY,实际派发任务全部失败。根因各不相同,
+共性是**健康探测只证明「检测到入口」,不能证明「能启动并完成任务」**:
+
+- **OpenCode `spawn ENOENT`**:`locateBin` 回退到 npm 生成的**无扩展名 shim**
+  (`...
+pm\opencode`),Windows 不视其为可执行文件。实测三条路径:
+  无扩展名 shim → ENOENT;`.cmd` 直接 spawn → EINVAL(Node 安全策略禁止);
+  **`cmd.exe /d /s /c <命令>` → 唯一可行**
+- **Codex CLI `spawn EPERM`**:解析到 Microsoft Store 分发路径
+  (`WindowsApps\...\codex.exe`,reparse point),直接 spawn 被拒
+- **Hermes 退出码 2**:`-t files` 传了不存在的工具集名。实测 `hermes tools list`
+  确认内置名为**单数 `file`**;传未知名时 hermes 直接拒绝执行整个任务
+- **中文 Windows 错误信息乱码**:cmd.exe 以 GBK 写 stderr,按 UTF-8 解码得到 `�`,
+  既无法阅读也无法用中文特征匹配「命令未找到」。现按 UTF-8 → GBK 回退解码
+
+### 新增
+
+- **`cliLauncher` 跨平台启动器**:把「怎么正确启动一个 CLI」收敛到一处,
+  检测 / 版本探测 / 鉴权探测 / 任务执行共用同一策略,避免各处各写一套而漏掉某种形态
+- **四级探活信号**(发布要求):把「健康」拆成 `detected` / `launchable` /
+  `authenticated` / `task_verified` 四个可解释维度,逐级递进,任一级失败即停在该级并如实回报。
+  **只有最小任务通过才写 HEALTHY** —— 检测只能得到 `AUTH_REQUIRED`,
+  起不来得到 `ERROR`。引擎中心逐条展示四个信号 + 最近一次探活的原始输出
+- **供应商凭据下发**:第三方 CLI 起来了却读不到凭据,一调用即 401
+  (实测 Hermes 报 `HTTP 401: Missing Authentication header`)。现把应用内已配置的
+  供应商按 OpenAI 兼容约定(`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_API_BASE`)
+  注入子进程 env;用户在引擎配置页手填的同名变量优先。凭据只存活于子进程,不落盘、不进日志
+- 探活能区分「参数不被接受」(我方调用方式与 CLI 版本不匹配)与「凭据无效」,并提示可用
+  `engines[id].runArgs` 覆写参数
+- **测试 +23 项**(合计 391):cliLauncher 三种 Windows 形态与 GBK 解码 16 项、
+  供应商凭据下发 7 项
+
 ## [1.5.4] - 2026-07-29
+
+### 修复（打包）
+
+- **安装后 OCR 与浏览器自动化必然失效**:`onnxruntime-node` / `sharp` /
+  `playwright-core` 由主进程动态 `import()` 加载,`externalizeDepsPlugin` 不内联进产物,
+  而 `electron-builder.yml` 的 files 白名单未列入 —— 装完一调用即 `MODULE_NOT_FOUND`。
+  开发模式测不出(能直接读 node_modules),只有装完才暴露。现补入三者及传递依赖,
+  原生 `.node` 与 `sharp`/`@img` 加入 `asarUnpack`
+- **Windows 安装包多打 132MB 无用二进制**:`onnxruntime-node` 自带 darwin/linux/win32
+  三平台库(约 260MB),现按 win/linux target 分别剔除另两平台
 
 ### 修复
 

@@ -8,7 +8,8 @@
  *
  * @author liyingjie <y@senke.com>
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
+import { spawnCli } from '../cliLauncher.js';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { app } from 'electron';
@@ -100,7 +101,7 @@ export class CliExecutor implements ExecutorAdapter {
     let child: ChildProcess;
     try {
       // 引擎自定义环境变量：敏感项经 safeStorage 解密后在此还原，仅存活于子进程
-      child = spawn(bin, args, {
+      child = spawnCli(bin, args, {
         cwd: workspace,
         shell: false,
         windowsHide: true,

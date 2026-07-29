@@ -17,11 +17,17 @@ import { safeStorage } from 'electron';
 import type { Database } from './database.js';
 import { providerReady } from './provider.js';
 import { loadConfig, sanitizeRegistry } from './config.js';
+import { runCli } from './cliLauncher.js';
 import { acpCommandFor, probeAcpEngine } from './executor/acpExecutor.js';
 import { engineEnvSecretRef, resolveEngineEnv, splitSecretEnv, SECRET_PLACEHOLDER } from './engineEnv.js';
-import type { Engine, EngineInstallGuide, EngineInstallResult, EngineType } from '../../shared/types.js';
+import type { Engine, EngineHealthSignals, EngineInstallGuide, EngineInstallResult, EngineType } from '../../shared/types.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
+
+/** 四级探活信号在 settings 中的存储键 */
+function healthSignalsKey(engineId: string): string {
+  return `engine:health:${engineId}`;
+}
 
 interface EngineRow {
   id: string;
@@ -149,7 +155,8 @@ export class EngineManager {
         isDefault: r.is_default === 1,
         runningInstances: perEngine.get(r.id) ?? 0,
         dataBoundary: r.data_boundary,
-        installable: !!(entry && effective(entry).npmPackage)
+        installable: !!(entry && effective(entry).npmPackage),
+        healthSignals: this.getHealthSignals(r.id)
       };
     });
   }
@@ -172,7 +179,17 @@ export class EngineManager {
     return healthy > 0 || providerReady(this.db);
   }
 
-  /** 真实检测：where/which 定位 CLI + --version 取版本；外部 ACP 引擎握手探测；Hermes 按供应商配置派生状态 */
+  /**
+   * 真实检测：where/which 定位 CLI + --version 验证可启动。
+   *
+   * 【状态语义（发布要求）】检测只能证明「找到了入口且进程能起来」，
+   * 不能证明「凭据有效、能完成任务」。因此：
+   *   定位失败            → NOT_INSTALLED
+   *   定位到但起不来      → ERROR（Windows 上 npm shim / Store 应用即属此类）
+   *   能起来但未验证任务  → AUTH_REQUIRED（提示用户点「验证登录」跑最小任务）
+   *   四级探活全通过      → HEALTHY（仅由 probeAuth 写入）
+   * 已 HEALTHY 的引擎重新检测时保留 HEALTHY，避免把验证过的引擎打回未验证。
+   */
   async detect(): Promise<Engine[]> {
     this.ensureBuiltinEngines(); // 配置文件新增的外部引擎随检测同步入库
     for (const entry of ENGINE_CATALOG) {
@@ -182,10 +199,42 @@ export class EngineManager {
       const found = bin ? await locateBin(bin) : null;
       if (!found) {
         this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(entry.id);
+        this.db.setSetting(healthSignalsKey(entry.id), {
+          detected: false, launchable: false, authenticated: false, taskVerified: false,
+          detail: `未在 PATH 中找到 ${bin}`, checkedAt: Date.now()
+        });
         continue;
       }
-      const version = await binVersion(found);
-      this.db.raw.prepare("UPDATE engines SET status = 'HEALTHY', version = ?, path = ? WHERE id = ?").run(version ?? 'unknown', found, entry.id);
+
+      // 用 --version 验证「真能启动」：Windows 上 npm 无扩展名 shim（ENOENT）、
+      // .cmd（EINVAL）、Store 应用（EPERM）都会在此暴露，而非等到派发任务才失败。
+      const ver = await runCli(found, ['--version'], { timeoutMs: 15_000 });
+      const version = (ver.stdout || ver.stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80) || null;
+      const launchable = !(ver.error && !ver.stdout && !ver.stderr);
+
+      if (!launchable) {
+        this.db.raw.prepare("UPDATE engines SET status = 'ERROR', version = NULL, path = ? WHERE id = ?").run(found, entry.id);
+        this.db.setSetting(healthSignalsKey(entry.id), {
+          detected: true, launchable: false, authenticated: false, taskVerified: false,
+          detail: `无法启动：${ver.error ?? '未知原因'}`, checkedAt: Date.now()
+        });
+        this.addLog(entry.id, 'error', `检测到 ${found} 但无法启动：${ver.error ?? '未知原因'}`);
+        continue;
+      }
+
+      // 可启动但未跑最小任务：保守标 AUTH_REQUIRED，等用户点「验证登录」做四级探活。
+      // 已经四级通过的引擎不回退状态。
+      const prev = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(entry.id) as { status: string } | undefined;
+      const verified = this.getHealthSignals(entry.id)?.taskVerified === true;
+      const nextStatus = prev?.status === 'HEALTHY' && verified ? 'HEALTHY' : 'AUTH_REQUIRED';
+      this.db.raw.prepare('UPDATE engines SET status = ?, version = ?, path = ? WHERE id = ?')
+        .run(nextStatus, version ?? 'unknown', found, entry.id);
+      if (nextStatus !== 'HEALTHY') {
+        this.db.setSetting(healthSignalsKey(entry.id), {
+          detected: true, launchable: true, authenticated: false, taskVerified: false,
+          detail: '已确认可启动；请点「验证登录」跑最小任务以确认凭据与产出', checkedAt: Date.now()
+        });
+      }
     }
     // 外部 ACP 引擎：spawn + initialize 握手成功 = HEALTHY（P2a）
     for (const ext of externalAcpEntries()) {
@@ -278,9 +327,20 @@ export class EngineManager {
     const probe = await probeCliAuth(id, found, this.db);
     this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
       .run(probe.status, probe.authStatus, id);
+    this.saveHealthSignals(id, probe.signals);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id, result: probe.ok ? 'authed' : probe.message.slice(0, 80) });
-    this.addLog(id, probe.ok ? 'info' : 'warn', `鉴权探测：${probe.message}`);
+    this.addLog(id, probe.ok ? 'info' : 'warn', `四级探活：${probe.message}`);
     return { ok: probe.ok, message: probe.message };
+  }
+
+  /** 四级探活信号存 settings（避免为诊断数据加 schema 迁移） */
+  private saveHealthSignals(id: string, signals: EngineHealthSignals) {
+    this.db.setSetting(healthSignalsKey(id), { ...signals, checkedAt: Date.now() });
+  }
+
+  /** 读取四级探活信号；未探活过返回 undefined */
+  getHealthSignals(id: string): EngineHealthSignals | undefined {
+    return this.db.getSetting<EngineHealthSignals | undefined>(healthSignalsKey(id), undefined);
   }
 
   setDefault(id: string) {
@@ -593,7 +653,12 @@ function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }
   });
 }
 
-/** where（Windows）/ which（Linux）定位可执行文件；优先 .exe（Node 对 .cmd 禁止 shell:false 直启） */
+/**
+ * where（Windows）/ which（Linux）定位可执行文件。
+ * Windows 上优先 .exe → .cmd → 其余（无扩展名 npm shim 排最后）：
+ * .exe 可直接 spawn；.cmd 与无扩展名 shim 都需经 cmd.exe 拉起（见 cliLauncher），
+ * 但 .cmd 语义明确，优先选它便于后续判定。
+ */
 function locateBin(bin: string): Promise<string | null> {
   const cmd = process.platform === 'win32' ? 'where' : 'which';
   return new Promise((resolve) => {
@@ -601,22 +666,22 @@ function locateBin(bin: string): Promise<string | null> {
       execFile(cmd, [bin], { shell: false, timeout: 10_000 }, (err, stdout) => {
         if (err) return resolve(null);
         const lines = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-        resolve(lines.find((l) => /\.exe$/i.test(l)) ?? lines[0] ?? null);
+        if (lines.length === 0) return resolve(null);
+        resolve(
+          lines.find((l) => /\.exe$/i.test(l))
+          ?? lines.find((l) => /\.cmd$/i.test(l))
+          ?? lines[0]
+        );
       });
     } catch { resolve(null); }
   });
 }
 
-/** --version 探测（10s 超时；部分 CLI 把版本写到 stderr） */
-function binVersion(binPath: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile(binPath, ['--version'], { shell: false, timeout: 10_000 }, (_err, stdout, stderr) => {
-        const out = (stdout || stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80);
-        resolve(out || null);
-      });
-    } catch { resolve(null); }
-  });
+/** --version 探测（10s 超时；部分 CLI 把版本写到 stderr；经 cliLauncher 兼容 .cmd/shim/Store 应用） */
+async function binVersion(binPath: string): Promise<string | null> {
+  const r = await runCli(binPath, ['--version'], { timeoutMs: 10_000 });
+  const out = (r.stdout || r.stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80);
+  return out || null;
 }
 
 /** 各 CLI 引擎的最小 headless 探测参数（跑一次真实请求，验证凭据而非仅验证二进制存在） */
@@ -629,59 +694,96 @@ const AUTH_PROBE_ARGS: Record<string, string[]> = {
 /** 鉴权失败特征：命中则判定为待登录，而非通用错误 */
 const AUTH_ERROR_PATTERN = /401|403|unauthorized|forbidden|not\s*logged\s*in|login|auth|api[_\s-]?key|credential|token|鉴权|登录|未授权/i;
 
+/** 参数/用法类错误特征：命中说明进程能起但调用方式不对（我方 bug，非用户凭据问题） */
+const USAGE_ERROR_PATTERN = /unrecognized arguments|unknown (option|argument|flag)|invalid choice|did not contain any valid|usage:|no such option/i;
+
 /**
- * CLI 引擎鉴权探测：跑一次最小提示词，按退出码与错误特征判定。
- * 60s 超时（真实模型请求可能较慢）；超时视为不确定，保持 DEGRADED 而非误判为已登录。
+ * CLI 引擎四级探活（发布要求）：把「健康」拆成可解释的独立信号，
+ * 逐级递进，任一级失败即停在该级并如实回报，不再用单一 HEALTHY 掩盖。
+ *
+ *   detected      → 定位到可执行文件
+ *   launchable    → 进程能真正启动（Windows 上 .cmd/npm shim/Store 应用各有坑）
+ *   authenticated → 凭据有效（非 401/未登录）
+ *   task_verified → 最小任务真的产出了结果
+ *
+ * 只有四级全通过才写 HEALTHY —— 此前只验证到 detected 就标 HEALTHY，
+ * 导致引擎页显示健康但实际一跑就 ENOENT / EPERM / 参数错。
  */
-function probeCliAuth(
+async function probeCliAuth(
   engineId: string,
   binPath: string,
   db: Database
-): Promise<{ ok: boolean; status: string; authStatus: string; message: string }> {
+): Promise<{ ok: boolean; status: string; authStatus: string; message: string; signals: EngineHealthSignals }> {
+  const signals: EngineHealthSignals = {
+    detected: true, // 调用方已 locateBin 成功
+    launchable: false,
+    authenticated: false,
+    taskVerified: false,
+    detail: ''
+  };
+  const env = { ...process.env, ...resolveEngineEnv(db, engineId) };
+
+  // 第 1 级：launchable —— 用 --version 验证进程真能起来（最轻量、不消耗额度）
+  const ver = await runCli(binPath, ['--version'], { timeoutMs: 15_000, env });
+  if (ver.error && !ver.stdout && !ver.stderr) {
+    signals.detail = `进程无法启动：${ver.error}`;
+    return {
+      ok: false, status: 'ERROR', authStatus: 'unknown', signals,
+      message: `已检测到可执行文件但无法启动：${ver.error}。`
+        + '（Windows 上 npm 无扩展名 shim、.cmd 批处理与 Microsoft Store 应用均需经 cmd.exe 拉起）'
+    };
+  }
+  signals.launchable = true;
+
+  // 第 2、3 级：跑最小任务，同时验证凭据与产出
   const args = AUTH_PROBE_ARGS[engineId];
   if (!args) {
-    return Promise.resolve({ ok: false, status: 'DEGRADED', authStatus: 'unknown', message: '该引擎暂不支持自动鉴权探测，请在终端中手工验证登录状态' });
-  }
-  return new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    const done = (r: { ok: boolean; status: string; authStatus: string; message: string }) => {
-      if (!settled) { settled = true; resolve(r); }
+    signals.detail = '该引擎未定义最小任务探测参数';
+    return {
+      ok: false, status: 'DEGRADED', authStatus: 'unknown', signals,
+      message: '进程可启动，但该引擎暂不支持自动最小任务验证，请在终端手工确认登录状态'
     };
+  }
 
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(binPath, args, {
-        shell: false,
-        windowsHide: true,
-        env: { ...process.env, ...resolveEngineEnv(db, engineId) }
-      });
-    } catch (err) {
-      return done({ ok: false, status: 'ERROR', authStatus: 'unknown', message: `无法启动引擎：${err instanceof Error ? err.message : String(err)}` });
-    }
+  // 60s：真实模型请求可能较慢
+  const run = await runCli(binPath, args, { timeoutMs: 60_000, env });
+  const detail = (run.stderr || run.stdout || run.error || '无输出').trim().slice(0, 300);
 
-    const timer = setTimeout(() => {
-      child.kill();
-      done({ ok: false, status: 'DEGRADED', authStatus: 'unknown', message: '鉴权探测超时（60 秒），未能确认登录状态，请稍后重试或在终端手工验证' });
-    }, 60_000);
+  if (run.error && run.code === null) {
+    // 超时/启动异常：不确定，不可乐观判定为已登录
+    signals.detail = detail;
+    return {
+      ok: false, status: 'DEGRADED', authStatus: 'unknown', signals,
+      message: `最小任务未能完成：${run.error}。未能确认登录状态，请稍后重试或在终端手工验证`
+    };
+  }
 
-    child.stdout?.on('data', (c: Buffer) => { stdout += c.toString('utf8'); });
-    child.stderr?.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      done({ ok: false, status: 'ERROR', authStatus: 'unknown', message: `探测失败：${err.message}` });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0 && stdout.trim()) {
-        return done({ ok: true, status: 'HEALTHY', authStatus: 'authed', message: '鉴权有效，引擎可正常执行任务' });
-      }
-      const detail = (stderr || stdout || '无输出').trim().slice(0, 200);
-      if (AUTH_ERROR_PATTERN.test(detail)) {
-        return done({ ok: false, status: 'AUTH_REQUIRED', authStatus: 'required', message: `需要登录：${detail}` });
-      }
-      done({ ok: false, status: 'DEGRADED', authStatus: 'unknown', message: `探测未通过（退出码 ${code ?? 'null'}）：${detail}` });
-    });
-  });
+  if (run.code === 0 && run.stdout.trim()) {
+    signals.authenticated = true;
+    signals.taskVerified = true;
+    signals.detail = run.stdout.trim().slice(0, 200);
+    return { ok: true, status: 'HEALTHY', authStatus: 'authed', signals, message: '四级探活通过：可启动、凭据有效、最小任务已产出结果' };
+  }
+
+  if (AUTH_ERROR_PATTERN.test(detail)) {
+    signals.detail = detail;
+    return { ok: false, status: 'AUTH_REQUIRED', authStatus: 'required', signals, message: `需要登录：${detail}` };
+  }
+
+  if (USAGE_ERROR_PATTERN.test(detail)) {
+    // 参数不被接受 = 本应用的调用方式与该 CLI 版本不匹配，属我方缺陷，如实说明
+    signals.authenticated = true; // 能报参数错说明已越过鉴权阶段
+    signals.detail = detail;
+    return {
+      ok: false, status: 'DEGRADED', authStatus: 'unknown', signals,
+      message: `引擎可启动，但拒绝了本应用传入的参数（可能是 CLI 版本差异）：${detail}\n`
+        + `可在配置文件 engines["${engineId}"].runArgs 中覆写运行参数`
+    };
+  }
+
+  signals.detail = detail;
+  return {
+    ok: false, status: 'DEGRADED', authStatus: 'unknown', signals,
+    message: `最小任务未通过（退出码 ${run.code ?? 'null'}）：${detail}`
+  };
 }

@@ -20,7 +20,8 @@
  *
  * @author liyingjie <y@senke.com>
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
+import { spawnCli } from '../cliLauncher.js';
 import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,6 +36,14 @@ import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './typ
 const ENGINE_ID = 'eng-hermes-cli';
 const TIMEOUT_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
+
+/**
+ * readonly 权限下允许的 Hermes 内置工具集。
+ * 名称必须与 `hermes tools list` 输出一致（均为单数形式）；传入未知名称时
+ * hermes 会报 "did not contain any valid toolsets" 并以退出码 2 直接失败。
+ * 这里只放只读类：检索/看文件/看图，不含 terminal、code_execution、browser 等可写副作用的集合。
+ */
+const READONLY_TOOLSETS = ['file', 'web', 'vision', 'memory', 'session_search'];
 
 /** hermes --usage-file 写出的 JSON 结构（仅取本应用需要的字段） */
 interface HermesUsageReport {
@@ -89,7 +98,9 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     const baseMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
     const mode = task.source === 'channel' && baseMode === 'trusted' ? 'standard' : baseMode;
     if (mode === 'trusted' || mode === 'autonomous') args.push('--accept-hooks');
-    if (mode === 'readonly') args.push('-t', 'files');
+    // readonly：限制为只读工具集。名称须与 `hermes tools list` 的内置 toolset 一致
+    // （实测为单数 `file`；曾误写 `files` 导致 hermes 直接以退出码 2 拒绝执行）。
+    if (mode === 'readonly') args.push('-t', READONLY_TOOLSETS.join(','));
 
     // 会话续接：工作目录由本应用托管，阻止 hermes cd 回会话记录的旧目录
     if (task.sessionId?.startsWith('hermes-')) {
@@ -117,7 +128,7 @@ export class HermesAgentExecutor implements ExecutorAdapter {
 
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, {
+      child = spawnCli(bin, args, {
         cwd: workspace,
         shell: false,
         windowsHide: true,

@@ -118,10 +118,18 @@ describe('HermesAgentExecutor 权限映射', () => {
     expect(argsFor('standard')).not.toContain('--accept-hooks');
   });
 
-  it('readonly 不免审批且用 -t 限制工具集', () => {
+  it('readonly 不免审批且用 -t 限制为只读工具集', () => {
     const args = argsFor('readonly');
     expect(args).not.toContain('--accept-hooks');
-    expect(args[args.indexOf('-t') + 1]).toBe('files');
+    const sets = args[args.indexOf('-t') + 1].split(',');
+    // 名称必须是 hermes 内置 toolset 的真实名（单数 file）；
+    // 曾误写复数 files，hermes 直接以退出码 2 拒绝执行整个任务。
+    expect(sets).toContain('file');
+    expect(sets).not.toContain('files');
+    // 只读集合不得包含可写副作用的工具集
+    for (const forbidden of ['terminal', 'code_execution', 'browser', 'computer_use']) {
+      expect(sets).not.toContain(forbidden);
+    }
   });
 
   it('渠道来源任务的 trusted 降级为 standard(10.5)', () => {

@@ -195,6 +195,26 @@ export interface Agent {
   updatedAt: number;
 }
 
+/**
+ * 引擎四级探活信号（发布要求）：把「健康」拆成可解释的独立维度，逐级递进。
+ * 只有四项全通过才应显示 HEALTHY —— 仅 detected 就标健康会让用户以为能用，
+ * 实际一跑就 ENOENT / EPERM / 参数错。
+ */
+export interface EngineHealthSignals {
+  /** 已定位到可执行文件（where/which 命中） */
+  detected: boolean;
+  /** 进程能真正启动（Windows 上 npm shim / .cmd / Store 应用各有坑） */
+  launchable: boolean;
+  /** 凭据有效（非 401 / 未登录） */
+  authenticated: boolean;
+  /** 最小任务真的产出了结果 */
+  taskVerified: boolean;
+  /** 最近一次探活的原始输出片段，供用户自查 */
+  detail: string;
+  /** 探活时间戳 */
+  checkedAt?: number;
+}
+
 export interface Engine {
   id: string;
   type: EngineType;
@@ -211,6 +231,8 @@ export interface Engine {
   config?: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number };
   /** 引擎性能指标 */
   metrics?: { avgLatencyMs?: number; successRate?: number; totalRuns?: number };
+  /** 四级探活信号（未探活过则为 undefined） */
+  healthSignals?: EngineHealthSignals;
 }
 
 /** 引擎日志条目 */

@@ -15,6 +15,7 @@
  */
 import { safeStorage } from 'electron';
 import type { Database } from './database.js';
+import { getProviderSettings, readProviderKey } from './provider.js';
 
 /** 敏感环境变量名匹配规则：命中则走 safeStorage，不落 config_json */
 export const SECRET_ENV_PATTERN = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i;
@@ -70,11 +71,46 @@ export function resolveEngineEnv(db: Database, engineId: string): Record<string,
   }
 
   const b64 = db.getSetting<string>(engineEnvSecretRef(engineId), '');
-  if (!b64 || !safeStorage.isEncryptionAvailable()) return env;
-  try {
-    Object.assign(env, JSON.parse(safeStorage.decryptString(Buffer.from(b64, 'base64'))) as Record<string, string>);
-  } catch {
-    /* 解密失败视为无敏感变量 */
+  if (b64 && safeStorage.isEncryptionAvailable()) {
+    try {
+      Object.assign(env, JSON.parse(safeStorage.decryptString(Buffer.from(b64, 'base64'))) as Record<string, string>);
+    } catch {
+      /* 解密失败视为无敏感变量 */
+    }
   }
+
+  // 供应商凭据下发：让第三方 CLI 复用应用内已配置的供应商，避免用户在
+  // 每个引擎里重复配一遍 key。用户自定义的同名变量优先（上面已写入，此处不覆盖）。
+  for (const [k, v] of Object.entries(providerEnvFor(db))) {
+    if (env[k] === undefined) env[k] = v;
+  }
+  return env;
+}
+
+/**
+ * 把应用内配置的默认供应商翻译成第三方 CLI 认识的环境变量。
+ *
+ * 【为什么需要】Hermes / OpenCode / Codex 都读自己的配置或环境变量取模型凭据。
+ * 用户在本应用配好了供应商（如 DeepSeek），第三方引擎却一无所知，
+ * 于是启动成功但一调用就 401（实测 Hermes 报 "HTTP 401: Missing Authentication header"）。
+ *
+ * 这里按各家 CLI 的通用约定注入 OpenAI 兼容变量。仅在用户未自行设置同名变量时生效，
+ * 保证「引擎配置页里手填的值」始终优先。
+ *
+ * 注：凭据只出现在子进程 env 中，不落盘、不进日志、不回传 Renderer。
+ */
+export function providerEnvFor(db: Database): Record<string, string> {
+  const settings = getProviderSettings(db);
+  const key = readProviderKey(db);
+  if (!key || !settings.baseUrl) return {};
+
+  const baseUrl = settings.baseUrl.replace(/\/+$/, '');
+  // OpenAI 兼容约定：绝大多数 CLI（含 Hermes、OpenCode、Codex）均识别这组变量
+  const env: Record<string, string> = {
+    OPENAI_API_KEY: key,
+    OPENAI_BASE_URL: baseUrl,
+    OPENAI_API_BASE: baseUrl // 部分工具用旧名
+  };
+  if (settings.model) env.OPENAI_MODEL = settings.model;
   return env;
 }

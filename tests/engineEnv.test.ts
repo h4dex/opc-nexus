@@ -12,8 +12,21 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
-const { splitSecretEnv, resolveEngineEnv, engineEnvSecretRef, SECRET_PLACEHOLDER } =
+// 供应商配置由用例控制：验证凭据下发行为
+let mockProvider: { baseUrl: string; model: string } = { baseUrl: '', model: '' };
+let mockKey: string | null = null;
+vi.mock('../src/main/services/provider.js', () => ({
+  getProviderSettings: () => mockProvider,
+  readProviderKey: () => mockKey
+}));
+
+const { splitSecretEnv, resolveEngineEnv, engineEnvSecretRef, providerEnvFor, SECRET_PLACEHOLDER } =
   await import('../src/main/services/engineEnv.js');
+
+beforeEach(() => {
+  mockProvider = { baseUrl: '', model: '' };
+  mockKey = null;
+});
 
 /** 最小 Database 桩：engines.config_json + settings 键值 */
 function makeDb(configJson?: string, settings: Record<string, string> = {}) {
@@ -108,5 +121,65 @@ describe('resolveEngineEnv', () => {
   it('密钥存储键按引擎隔离', () => {
     expect(engineEnvSecretRef('eng-a')).toBe('secret:engine:eng-a:env');
     expect(engineEnvSecretRef('eng-b')).not.toBe(engineEnvSecretRef('eng-a'));
+  });
+});
+
+describe('供应商凭据下发给第三方引擎', () => {
+  // 背景：第三方 CLI 起来了但读不到凭据，一调用就 401
+  // （实测 Hermes 报 "HTTP 401: Missing Authentication header"）。
+  // 这里验证应用内配好的供应商能以 OpenAI 兼容变量下发给子进程。
+
+  it('未配置供应商时不下发任何变量', () => {
+    expect(providerEnvFor(makeDb() as never)).toEqual({});
+  });
+
+  it('缺 key 时不下发（只有 baseUrl 无意义）', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' };
+    mockKey = null;
+    expect(providerEnvFor(makeDb() as never)).toEqual({});
+  });
+
+  it('配置齐备时下发 OpenAI 兼容变量', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' };
+    mockKey = 'sk-deepseek-real';
+    const env = providerEnvFor(makeDb() as never);
+    expect(env.OPENAI_API_KEY).toBe('sk-deepseek-real');
+    expect(env.OPENAI_BASE_URL).toBe('https://api.deepseek.com/v1');
+    expect(env.OPENAI_API_BASE).toBe('https://api.deepseek.com/v1'); // 旧名兼容
+    expect(env.OPENAI_MODEL).toBe('deepseek-chat');
+  });
+
+  it('baseUrl 末尾斜杠被规范化（拼接路径时不产生双斜杠）', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1///', model: 'm' };
+    mockKey = 'sk-x';
+    expect(providerEnvFor(makeDb() as never).OPENAI_BASE_URL).toBe('https://api.deepseek.com/v1');
+  });
+
+  it('resolveEngineEnv 会带上供应商凭据', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' };
+    mockKey = 'sk-injected';
+    const env = resolveEngineEnv(makeDb() as never, 'eng-opencode');
+    expect(env.OPENAI_API_KEY).toBe('sk-injected');
+  });
+
+  it('用户在引擎配置页手填的同名变量优先于自动下发', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' };
+    mockKey = 'sk-auto-injected';
+    const ref = engineEnvSecretRef('eng-opencode');
+    const db = makeDb(
+      JSON.stringify({ env: { OPENAI_API_KEY: SECRET_PLACEHOLDER } }),
+      { [ref]: Buffer.from('enc:' + JSON.stringify({ OPENAI_API_KEY: 'sk-user-explicit' })).toString('base64') }
+    );
+    // 用户显式配置的值不被自动下发覆盖，否则引擎配置页形同虚设
+    expect(resolveEngineEnv(db as never, 'eng-opencode').OPENAI_API_KEY).toBe('sk-user-explicit');
+  });
+
+  it('未设置同名变量时才填充（不影响其他自定义变量）', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' };
+    mockKey = 'sk-auto';
+    const db = makeDb(JSON.stringify({ env: { MY_FLAG: '1' } }));
+    const env = resolveEngineEnv(db as never, 'eng-opencode');
+    expect(env.MY_FLAG).toBe('1');
+    expect(env.OPENAI_API_KEY).toBe('sk-auto');
   });
 });
