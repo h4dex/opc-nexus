@@ -1,0 +1,70 @@
+name: Repair v1.6.0 release assets
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/repair-v1.6.0.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    name: Normalize published asset names
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: v1.6.0
+    steps:
+      - name: Rename assets and replace checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rename_asset() {
+            local old_name="$1"
+            local new_name="$2"
+            local new_id old_id
+            new_id="$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" \
+              --jq ".assets[] | select(.name == \"${new_name}\") | .id")"
+            if [[ -n "$new_id" ]]; then
+              echo "Already normalized: $new_name"
+              return
+            fi
+
+            old_id="$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" \
+              --jq ".assets[] | select(.name == \"${old_name}\") | .id")"
+            if [[ -z "$old_id" ]]; then
+              echo "Release asset not found: $old_name" >&2
+              exit 1
+            fi
+            gh api --method PATCH "repos/${GH_REPO}/releases/assets/${old_id}" \
+              -f name="$new_name" --silent
+          }
+
+          rename_asset "AI.Box-1.6.0-amd64.deb" "OPC-Nexus-1.6.0-amd64.deb"
+          rename_asset "AI.Box-1.6.0-x86_64.AppImage" "OPC-Nexus-1.6.0-x86_64.AppImage"
+          rename_asset "AI.Box-Setup-1.6.0-x64.exe" "OPC-Nexus-Setup-1.6.0-x64.exe"
+          rename_asset "AI.Box-Setup-1.6.0-x64.exe.blockmap" "OPC-Nexus-Setup-1.6.0-x64.exe.blockmap"
+
+          checksum_dir="$(mktemp -d)"
+          printf '%s\n' \
+            "7bf1aae25a99974e2ccff44fe1c822fece43327f8f5bc36b1f90750669ca4378  OPC-Nexus-1.6.0-amd64.deb" \
+            "918696616c228dc26529eee8b2ae492ee09df1ddd0f1d4e386cc41476c80060d  OPC-Nexus-1.6.0-x86_64.AppImage" \
+            "051d0bb8f454ff947f1ddc06132f0c557616e0030efbf1d5ec7e7df6f1d1a004  OPC-Nexus-Setup-1.6.0-x64.exe" \
+            "045f1df79928049dddf88a12fe7f757eca347163ff10e4baf79b2d80c6e81edc  OPC-Nexus-Setup-1.6.0-x64.exe.blockmap" \
+            > "$checksum_dir/SHA256SUMS.txt"
+          gh release upload "$RELEASE_TAG" "$checksum_dir/SHA256SUMS.txt" --clobber
+
+          actual="$(gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --jq '.assets[].name' | sort)"
+          expected="$(printf '%s\n' \
+            'OPC-Nexus-1.6.0-amd64.deb' \
+            'OPC-Nexus-1.6.0-x86_64.AppImage' \
+            'OPC-Nexus-Setup-1.6.0-x64.exe' \
+            'OPC-Nexus-Setup-1.6.0-x64.exe.blockmap' \
+            'SHA256SUMS.txt' | sort)"
+          [[ "$actual" == "$expected" ]]
