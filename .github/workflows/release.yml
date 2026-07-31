@@ -142,13 +142,39 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Normalize release filenames
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          while IFS= read -r -d '' asset; do
+            case "$asset" in
+              *.exe.blockmap) target="OPC-Nexus-Setup-${version}-x64.exe.blockmap" ;;
+              *.exe) target="OPC-Nexus-Setup-${version}-x64.exe" ;;
+              *.AppImage.blockmap) target="OPC-Nexus-${version}-x86_64.AppImage.blockmap" ;;
+              *.AppImage) target="OPC-Nexus-${version}-x86_64.AppImage" ;;
+              *.deb) target="OPC-Nexus-${version}-amd64.deb" ;;
+              */latest.yml|*/latest-linux.yml) continue ;;
+              *) echo "Unexpected release asset: $asset" >&2; exit 1 ;;
+            esac
+            mv -- "$asset" "release-assets/$target"
+          done < <(find release-assets -mindepth 1 -maxdepth 1 -type f -print0)
+
+          if [[ -f release-assets/latest.yml ]]; then
+            sed -i -E "s#^([[:space:]]*(url|path): ).*\.exe$#\1OPC-Nexus-Setup-${version}-x64.exe#" release-assets/latest.yml
+          fi
+          if [[ -f release-assets/latest-linux.yml ]]; then
+            sed -i -E "s#^([[:space:]]*(url|path): ).*\.AppImage$#\1OPC-Nexus-${version}-x86_64.AppImage#" release-assets/latest-linux.yml
+          fi
+
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
-          find release-assets -type f ! -name SHA256SUMS.txt -print0 \
+          pushd release-assets >/dev/null
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\0' \
             | sort -z \
-            | xargs -0 sha256sum > release-assets/SHA256SUMS.txt
-          cat release-assets/SHA256SUMS.txt
+            | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          popd >/dev/null
 
       - name: Create or update GitHub Release
         shell: bash
