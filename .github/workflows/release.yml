@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build, for example v1.6.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Verify tag matches package version
+        run: >-
+          node -e "const p=require('./package.json'); const expected='v'+p.version;
+          if(process.env.RELEASE_TAG!==expected){console.error('Expected tag '+expected+', got '+process.env.RELEASE_TAG); process.exit(1)}"
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+  build-windows:
+    name: Build Windows x64
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Package Windows installer
+        run: npm run pack:win -- --publish never
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ env.RELEASE_TAG }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+
+  build-linux:
+    name: Build Linux x64
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit
+
+      - name: Package Linux applications
+        run: npm run pack:linux -- --publish never
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ env.RELEASE_TAG }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.blockmap
+            release/latest-linux.yml
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - build-windows
+      - build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged applications
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          find release-assets -type f ! -name SHA256SUMS.txt -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > release-assets/SHA256SUMS.txt
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "OPC-Nexus ${RELEASE_TAG#v}"
+          fi

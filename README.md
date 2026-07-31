@@ -3,6 +3,8 @@
 > 本地优先的桌面 AI Agent 管理器，为单人公司提供 AI 数字员工统一智能枢纽。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![CI](https://github.com/h4dex/opc-nexus/actions/workflows/ci.yml/badge.svg)](https://github.com/h4dex/opc-nexus/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/h4dex/opc-nexus?display_name=tag)](https://github.com/h4dex/opc-nexus/releases)
 [![Electron](https://img.shields.io/badge/Electron-37-47848F?logo=electron)](https://www.electronjs.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript)](https://www.typescriptlang.org/)
@@ -109,7 +111,7 @@
 | 系统信息 | systeminformation |
 | 测试 | vitest 3 |
 | 打包 | electron-builder 26 |
-| CI/CD | CNB 云原生构建 |
+| CI/CD | GitHub Actions + CNB 云原生构建 |
 
 ## 目标平台
 
@@ -128,7 +130,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://cnb.cool/senke/innovation/opc-nexus.git
+git clone https://github.com/h4dex/opc-nexus.git
 cd opc-nexus
 
 # 安装依赖
@@ -206,6 +208,7 @@ opc-nexus/
 │   └── shared/                 # 跨进程共享类型（纯类型）
 │       └── types.ts
 ├── tests/                      # 单元测试（vitest）
+├── .github/workflows/          # GitHub CI 与跨平台 Release
 ├── .cnb.yml                    # CNB CI/CD 配置
 ├── electron-builder.yml        # 打包配置
 └── electron.vite.config.ts     # 构建配置
@@ -250,12 +253,15 @@ opc-nexus/
 
 ## CI/CD
 
-项目使用 [CNB 云原生构建](https://docs.cnb.cool/zh/build/) 进行持续集成：
+项目同时使用 GitHub Actions 与 [CNB 云原生构建](https://docs.cnb.cool/zh/build/)：
 
-- **Push 到 master**：自动执行 `typecheck` + `test`
-- **Pull Request**：自动执行 `typecheck` + `test`
-- 构建环境：`node:22` Docker 容器
-- 依赖安装使用 npmmirror 国内镜像加速
+- **Push 到 main / master**：在 Windows 与 Ubuntu 上执行 `typecheck`、`test` 和生产构建
+- **Pull Request 到 main**：执行同等的双平台质量门禁
+- **推送 `v*` 标签**：自动构建 Windows NSIS、Linux AppImage / DEB，并创建 GitHub Release
+- **手动重跑 Release**：可在 Actions 页面输入已有标签，重新生成并覆盖安装包
+- 构建环境统一使用 Node.js 22，Release 产物附带 SHA-256 校验文件
+
+完整发布步骤、代码签名和产物说明见 [GitHub Release 发布指南](./docs/RELEASING.md)。
 
 ## 文档
 
@@ -263,6 +269,7 @@ opc-nexus/
 |------|------|
 | [用户使用手册](./docs/USER-GUIDE.md) | 界面说明、操作指南、常见问题 |
 | [更新日志](./CHANGELOG.md) | 版本历史与变更记录 |
+| [GitHub Release 发布指南](./docs/RELEASING.md) | CI/CD、版本标签、代码签名与发布产物 |
 | [架构设计](./src/docs/architecture.md) | 系统架构、分层模型、安全基线 |
 | [功能文档](./src/docs/features.md) | 全部功能模块开发文档 |
 | [API 参考](./src/docs/api-reference.md) | IPC 接口与 Preload API 参考 |
