@@ -17,6 +17,10 @@ import { EventEmitter } from 'node:events';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
+// CliExecutor ensures the workspace exists before spawning. Keep this unit test
+// independent of host permissions (Linux CI cannot create /ws at filesystem root).
+vi.mock('node:fs', () => ({ mkdirSync: vi.fn() }));
+
 // 配置文件 mock：泛化 CLI 的 runArgs 覆写由用例控制
 const appCfg: { engines: Record<string, { runArgs?: string[] }> } = { engines: {} };
 vi.mock('../src/main/services/config.js', () => ({ loadConfig: () => appCfg }));

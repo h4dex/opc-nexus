@@ -21,6 +21,7 @@ vi.mock('node:fs', () => ({
 
 import { TeamEngine } from '../src/main/services/teamEngine.js';
 import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** 最小化 Orchestrator mock：控制流仅用到 cancelTask */
 function createMockOrchestrator() {
@@ -249,7 +250,7 @@ describe('TeamEngine 项目知识注入', () => {
 
     expect(knowledge.buildProjectContext).toHaveBeenCalledWith(projectId, '制定执行方案');
     expect(writeFileSync).toHaveBeenCalledWith(
-      expect.stringContaining('_aibox\\KNOWLEDGE.md'),
+      expect.stringContaining(join('_aibox', 'KNOWLEDGE.md')),
       '# 项目知识上下文\n\n既有执行手册',
       'utf8'
     );
