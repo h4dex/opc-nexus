@@ -88,13 +88,38 @@ export function resolveEngineEnv(db: Database, engineId: string): Record<string,
 }
 
 /**
+ * 供应商 baseUrl 特征 → 该供应商专属的 API key 变量名。
+ *
+ * 【为什么需要按家区分】实测 Hermes v0.19.0：它从模型名推断供应商，然后只认该供应商
+ * 专属的变量名，注入 OPENAI_API_KEY 无效 ——
+ *   provider=auto + deepseek 模型 → "No usable credentials found for
+ *                                    provider 'deepseek'. Set DEEPSEEK_API_KEY."
+ *   --provider custom             → 仍去连 openrouter，报 HTTP 401
+ * 因此必须同时注入专属名与 OpenAI 兼容名，才能覆盖不同 CLI 的取值习惯。
+ *
+ * 新增供应商时在此追加一行即可；未匹配的走纯 OpenAI 兼容变量。
+ */
+const PROVIDER_KEY_ALIASES: { test: RegExp; vars: string[] }[] = [
+  { test: /deepseek/i, vars: ['DEEPSEEK_API_KEY'] },
+  { test: /openrouter/i, vars: ['OPENROUTER_API_KEY'] },
+  { test: /moonshot|kimi/i, vars: ['KIMI_API_KEY', 'MOONSHOT_API_KEY'] },
+  { test: /bigmodel|zhipu|\bz\.ai\b/i, vars: ['GLM_API_KEY', 'ZHIPUAI_API_KEY'] },
+  { test: /dashscope|aliyun|qwen/i, vars: ['DASHSCOPE_API_KEY'] },
+  { test: /anthropic/i, vars: ['ANTHROPIC_API_KEY'] },
+  { test: /generativelanguage|googleapis/i, vars: ['GOOGLE_API_KEY', 'GEMINI_API_KEY'] },
+  { test: /minimax/i, vars: ['MINIMAX_API_KEY'] },
+  { test: /siliconflow/i, vars: ['SILICONFLOW_API_KEY'] }
+];
+
+/**
  * 把应用内配置的默认供应商翻译成第三方 CLI 认识的环境变量。
  *
  * 【为什么需要】Hermes / OpenCode / Codex 都读自己的配置或环境变量取模型凭据。
  * 用户在本应用配好了供应商（如 DeepSeek），第三方引擎却一无所知，
  * 于是启动成功但一调用就 401（实测 Hermes 报 "HTTP 401: Missing Authentication header"）。
  *
- * 这里按各家 CLI 的通用约定注入 OpenAI 兼容变量。仅在用户未自行设置同名变量时生效，
+ * 注入两组变量：① 供应商专属名（Hermes 等按供应商取值的 CLI 需要）；
+ * ② OpenAI 兼容名（多数 CLI 的通用约定）。仅在用户未自行设置同名变量时生效，
  * 保证「引擎配置页里手填的值」始终优先。
  *
  * 注：凭据只出现在子进程 env 中，不落盘、不进日志、不回传 Renderer。
@@ -105,12 +130,18 @@ export function providerEnvFor(db: Database): Record<string, string> {
   if (!key || !settings.baseUrl) return {};
 
   const baseUrl = settings.baseUrl.replace(/\/+$/, '');
-  // OpenAI 兼容约定：绝大多数 CLI（含 Hermes、OpenCode、Codex）均识别这组变量
   const env: Record<string, string> = {
     OPENAI_API_KEY: key,
     OPENAI_BASE_URL: baseUrl,
     OPENAI_API_BASE: baseUrl // 部分工具用旧名
   };
   if (settings.model) env.OPENAI_MODEL = settings.model;
+
+  // 供应商专属变量名：按 baseUrl 特征匹配（Hermes 只认这组）
+  for (const { test, vars } of PROVIDER_KEY_ALIASES) {
+    if (!test.test(baseUrl)) continue;
+    for (const v of vars) env[v] = key;
+    break;
+  }
   return env;
 }

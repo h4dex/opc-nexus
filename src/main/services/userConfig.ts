@@ -33,12 +33,25 @@ export interface UserConfig {
     /** 单任务最长运行分钟数（看门狗；0 = 不限制） */
     maxRunMinutes: number;
   };
+  /**
+   * 模型供应商（OpenAI 兼容）。填在此处即可同时供内置 Nexus Agent 与第三方 CLI 引擎使用：
+   * 启动时导入 providers 表与 safeStorage，第三方引擎 spawn 时按各家约定注入环境变量。
+   */
+  provider: {
+    /** API Key（启动时导入系统密钥库，导入后可改为占位符） */
+    apiKey: string;
+    /** 接口地址，如 https://api.deepseek.com/v1 */
+    baseUrl: string;
+    /** 默认模型名，如 deepseek-chat */
+    model: string;
+  };
 }
 
 export const USER_CONFIG_DEFAULTS: UserConfig = {
   wecom: { botId: '', secret: '', webhookUrl: '' },
   engine: { fallbackEngineId: 'eng-opencode', executionMode: 'production' },
-  task: { maxRunMinutes: 30 }
+  task: { maxRunMinutes: 30 },
+  provider: { apiKey: '', baseUrl: '', model: '' }
 };
 
 const TEMPLATE = `# =====================================================
@@ -61,6 +74,17 @@ engine:
 # 任务保护（防长任务卡死 / 死循环）
 task:
   maxRunMinutes: 30    # 单任务最长运行分钟数，超时自动中断；0 = 不限制
+
+# 模型供应商（OpenAI 兼容）
+# 填在这里即可，内置 Nexus Agent 与第三方 CLI 引擎（Hermes / OpenCode / Codex）共用：
+#  - 启动时导入系统密钥库与 providers 表（设置页会显示为已配置）
+#  - 第三方引擎启动时按各家约定注入环境变量（如 DeepSeek 注入 DEEPSEEK_API_KEY），
+#    无需再去改各引擎自己的配置文件
+# 导入成功后可把 apiKey 改为 "***"（占位符不会覆盖已存密钥），避免明文长期留在文件里。
+provider:
+  apiKey: ""           # 如 sk-xxxxxxxx
+  baseUrl: ""          # 如 https://api.deepseek.com/v1
+  model: ""            # 如 deepseek-chat
 `;
 
 let cached: UserConfig | null = null;
@@ -148,6 +172,7 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
   const wecom = (parsed.wecom ?? {}) as Record<string, unknown>;
   const engine = (parsed.engine ?? {}) as Record<string, unknown>;
   const task = (parsed.task ?? {}) as Record<string, unknown>;
+  const provider = (parsed.provider ?? {}) as Record<string, unknown>;
   const mode = str(engine.executionMode, d.engine.executionMode);
   const maxRun = typeof task.maxRunMinutes === 'number' && task.maxRunMinutes >= 0 ? task.maxRunMinutes : d.task.maxRunMinutes;
   return {
@@ -160,8 +185,28 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
       fallbackEngineId: str(engine.fallbackEngineId, d.engine.fallbackEngineId),
       executionMode: mode === 'production' ? 'production' : 'demo'
     },
-    task: { maxRunMinutes: maxRun }
+    task: { maxRunMinutes: maxRun },
+    provider: {
+      apiKey: str(provider.apiKey, ''),
+      baseUrl: sanitizeProviderBaseUrl(str(provider.baseUrl, '')),
+      model: str(provider.model, '')
+    }
   };
+}
+
+/**
+ * 供应商接口地址校验：仅接受 http/https，并去掉尾部斜杠。
+ * 允许 http 是因为本地模型服务（Ollama / LM Studio / vLLM）通常只提供 http。
+ */
+export function sanitizeProviderBaseUrl(value: string): string {
+  if (!value) return '';
+  try {
+    const u = new URL(value);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+    return u.toString().replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
 }
 
 /** webhook 地址校验：仅接受 https 的企微 webhook，防误配任意地址外发数据 */

@@ -16,7 +16,8 @@ import { app, safeStorage } from 'electron';
 import { join } from 'node:path';
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import type { Database } from './database.js';
-import { saveProviderConfig } from './provider.js';
+import { getProviderSettings, readProviderKey, saveProviderConfig } from './provider.js';
+import { loadUserConfig } from './userConfig.js';
 import { WECOM_BOTID_SETTING, WECOM_SECRET_REF } from './channels/wecomChannel.js';
 import { WEIXIN_URL_SETTING, WEIXIN_TOKEN_REF } from './channels/wechatChannel.js';
 import { FEISHU_APPID_SETTING, FEISHU_SECRET_REF } from './channels/feishuChannel.js';
@@ -33,6 +34,53 @@ interface BootstrapFile {
 
 function bootstrapPath(): string {
   return join(app.getPath('userData'), 'aibox-data', 'credentials.bootstrap.json');
+}
+
+/**
+ * 从 user/config.yaml 的 provider 段导入供应商配置（每次启动执行，幂等）。
+ *
+ * 设计意图：让「软件同目录的一个文件」成为个人部署的唯一配置入口 —— 填一次
+ * 即同时供内置 Nexus Agent 与第三方 CLI 引擎（Hermes / OpenCode / Codex）使用，
+ * 不必再去逐个修改各引擎自己的配置文件（那些文件动辄数万行且含用户自有设置）。
+ *
+ * 幂等与安全：
+ * - 占位符（*** 等）视为「沿用已存密钥」，不覆盖 safeStorage 中的值，
+ *   因此用户导入后可把明文换成占位符，避免长期留存
+ * - 与库中现有配置一致时跳过写入，不产生冗余审计记录
+ * - 明文 key 只在本函数内经过，落地即加密；不回传 Renderer、不进日志
+ *
+ * @returns 是否实际写入了配置
+ */
+export function importProviderFromUserConfig(db: Database): boolean {
+  const { provider } = loadUserConfig(true);
+  if (!provider.baseUrl) return false;
+  if (!safeStorage.isEncryptionAvailable()) return false;
+
+  const placeholder = !provider.apiKey || /^\*+$/.test(provider.apiKey);
+  const existing = getProviderSettings(db);
+  const hasKey = !!readProviderKey(db);
+
+  // 占位符且库中无密钥 → 无从获得凭据，不做半配置状态（baseUrl 有而 key 无会让引擎 401）
+  if (placeholder && !hasKey) return false;
+
+  const model = provider.model || existing.model || 'deepseek-chat';
+  const sameConfig = existing.baseUrl === provider.baseUrl && existing.model === model;
+  if (placeholder && sameConfig) return false; // 无变化，跳过
+
+  saveProviderConfig(db, {
+    baseUrl: provider.baseUrl,
+    model,
+    // 占位符时传空，saveProviderConfig 会保留已存密钥
+    apiKey: placeholder ? '' : provider.apiKey
+  });
+  db.audit({
+    id: randomUUID(),
+    actor: 'system',
+    action: 'bootstrap.providerFromUserConfig',
+    target: provider.baseUrl,
+    result: 'ok'
+  });
+  return true;
 }
 
 /** 启动时调用：检测并导入凭据引导文件（幂等，导入后重命名） */

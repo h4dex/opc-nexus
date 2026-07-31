@@ -17,7 +17,7 @@ import { ResourceMonitor } from './services/resourceMonitor.js';
 import { Scheduler } from './services/scheduler.js';
 import { notify } from './services/notifier.js';
 import { seedIfEmpty, seedMcpServers, seedSkills } from './services/seed.js';
-import { importCredentialsBootstrap } from './services/bootstrap.js';
+import { importCredentialsBootstrap, importProviderFromUserConfig } from './services/bootstrap.js';
 import { migrateLegacyProvider } from './services/provider.js';
 import { loadUserConfig } from './services/userConfig.js';
 import { WecomWebhookNotifier } from './services/wecomWebhook.js';
@@ -216,6 +216,9 @@ app.whenReady().then(async () => {
   importCredentialsBootstrap(db);
   // 旧版供应商配置（settings provider:hermes）→ providers 表（P0：单一数据源）
   migrateLegacyProvider(db);
+  // user/config.yaml 的 provider 段 → providers 表 + safeStorage
+  // 顺序在 migrateLegacyProvider 之后：文件是用户显式意图，优先级高于历史迁移值
+  importProviderFromUserConfig(db);
   // 用户配置文件 user/config.yaml（不存在则生成模板）：企微凭据导入 safeStorage
   const userCfg = loadUserConfig();
   if (userCfg.wecom.botId && userCfg.wecom.secret) {
