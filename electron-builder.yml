@@ -1,5 +1,6 @@
 appId: com.senke.aibox
 productName: 数字员工 AI Box
+icon: icon.png
 copyright: Copyright © 2026 Senke
 
 directories:

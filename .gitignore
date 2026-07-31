@@ -11,6 +11,7 @@ user/
 Thumbs.db
 /screenshots/
 *.png
+!build/icon.png
 !docs/screenshots/
 !docs/screenshots/*.png
 !.npmrc
