@@ -22,6 +22,9 @@
 - **数字员工快捷派单**：员工卡片、列表和操作菜单新增「安排任务」，可直接指定当前员工创建任务。
 - **Android 品牌资源**：Bridge 使用 OPC-Nexus 普通、圆形、自适应和 Android 13 单色图标，
   并提供 `npm run mobile:icons` 可复现生成脚本。
+- **统一 Release 流水线**：GitHub Actions 只构建一次生产签名 Android Bridge，并将同一 APK
+  内置到 Windows/Linux 桌面包；Windows NSIS、Linux AppImage/DEB、Android APK、签名清单
+  和统一 `SHA256SUMS.txt` 发布到同一个 GitHub Release。
 
 ### 修复
 
