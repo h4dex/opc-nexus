@@ -7,6 +7,25 @@ directories:
   output: release
   buildResources: build
 
+beforePack: scripts/mobile-apk-hook.cjs
+
+extraResources:
+  - from: mobile/dist
+    to: mobile/android
+    filter:
+      - "*.apk"
+      - apk-manifest.json
+  - from: mobile/hermes-plugin
+    to: mobile/hermes-plugin
+    filter:
+      - "**/*"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+  - from: mobile/tool-catalog.json
+    to: mobile/tool-catalog.json
+  - from: THIRD-PARTY-NOTICES.md
+    to: mobile/THIRD-PARTY-NOTICES.md
+
 files:
   - out/**
   - package.json
@@ -97,6 +116,8 @@ files:
   - node_modules/sharp/**
   - node_modules/@img/**
   - node_modules/playwright-core/**
+  - node_modules/@playwright/mcp/**
+  - node_modules/playwright/**
   # 上述三者的传递依赖
   - node_modules/adm-zip/**
   - node_modules/global-agent/**
@@ -128,11 +149,6 @@ asarUnpack:
   - "**/*.node"
 
 win:
-  # onnxruntime-node 自带 darwin/linux/win32 三平台二进制（约 260M）。
-  # Windows 包只需 win32 那份，剔除另两份可省约 132M。
-  files:
-    - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
-    - "!node_modules/onnxruntime-node/bin/napi-v6/linux/**"
   target:
     - target: nsis
       arch: [x64]
@@ -146,10 +162,6 @@ nsis:
   shortcutName: 数字员工 AI Box
 
 linux:
-  # 同理：Linux 包只保留 linux 那份 onnxruntime 二进制
-  files:
-    - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
-    - "!node_modules/onnxruntime-node/bin/napi-v6/win32/**"
   target:
     - target: AppImage
       arch: [x64]

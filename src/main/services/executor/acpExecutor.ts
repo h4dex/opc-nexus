@@ -14,6 +14,7 @@ import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { loadConfig } from '../config.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
+import { appendBoundedText, appendProcessOutput, boundedText, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
 
 const TIMEOUT_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
@@ -106,12 +107,16 @@ export class AcpExecutor implements ExecutorAdapter {
         send({ id, method, params });
       });
 
+    const fullParts: string[] = [];
+    const fullState = { length: 0, truncated: false };
     let full = '';
     let lastProgress = 5;
     const pushText = (text: string) => {
-      full += text;
-      cb.onOutput(task.id, text);
-      const pct = Math.min(90, 10 + Math.floor(full.length / 30));
+      const before = fullState.length;
+      appendBoundedText(fullParts, fullState, text);
+      const accepted = text.slice(0, Math.max(0, fullState.length - before));
+      if (accepted) cb.onOutput(task.id, accepted);
+      const pct = Math.min(90, 10 + Math.floor(fullState.length / 30));
       if (pct > lastProgress) {
         lastProgress = pct;
         cb.onProgress(task.id, pct);
@@ -176,8 +181,9 @@ export class AcpExecutor implements ExecutorAdapter {
 
     // ---------- stdout 逐行解析 ----------
     let buf = '';
+    const stdoutDecoder = createUtf8StreamDecoder();
     child.stdout?.on('data', (chunk: Buffer) => {
-      buf += chunk.toString('utf8');
+      buf += stdoutDecoder.write(chunk);
       let nl: number;
       while ((nl = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, nl).trim();
@@ -205,8 +211,9 @@ export class AcpExecutor implements ExecutorAdapter {
       }
     });
 
+    const stderrOutput = createProcessOutputBuffer();
     let stderrBuf = '';
-    child.stderr?.on('data', (c: Buffer) => { stderrBuf += c.toString('utf8'); });
+    child.stderr?.on('data', (c: Buffer) => appendProcessOutput(stderrOutput, c));
     child.on('error', (err) => {
       clearTimeout(run.timer);
       this.running.delete(task.id);
@@ -214,6 +221,8 @@ export class AcpExecutor implements ExecutorAdapter {
     });
     child.on('close', (code) => {
       clearTimeout(run.timer);
+      buf += stdoutDecoder.end();
+      stderrBuf = finishProcessOutput(stderrOutput);
       const wasRunning = this.running.delete(task.id);
       // 会话未正常结束就退出 → 如实报错（正常完成路径已在 prompt 返回时处理）
       if (wasRunning && !run.aborted) {
@@ -239,6 +248,7 @@ export class AcpExecutor implements ExecutorAdapter {
           prompt: [{ type: 'text', text: promptText }]
         });
         if (run.aborted) return;
+        full = boundedText(fullParts, fullState);
         this.running.delete(task.id);
         clearTimeout(run.timer);
         killQuietly(child);
@@ -298,8 +308,9 @@ export function probeAcpEngine(command: string[]): Promise<{ ok: boolean; messag
     };
     const timer = setTimeout(() => done(false, '握手超时（10s）'), 10_000);
     let buf = '';
+    const stdoutDecoder = createUtf8StreamDecoder();
     child.stdout?.on('data', (chunk: Buffer) => {
-      buf += chunk.toString('utf8');
+      buf += stdoutDecoder.write(chunk);
       let nl: number;
       while ((nl = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, nl).trim();
@@ -323,6 +334,7 @@ export function probeAcpEngine(command: string[]): Promise<{ ok: boolean; messag
     });
     child.on('close', () => {
       clearTimeout(timer);
+      buf += stdoutDecoder.end();
       done(false, '进程提前退出');
     });
     child.stdin?.write(

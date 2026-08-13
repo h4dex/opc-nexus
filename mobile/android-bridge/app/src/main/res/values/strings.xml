@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OPC-Nexus 手机桥</string>
+    <string name="accessibility_description">OPC-Nexus 手机桥无障碍服务，用于在明确授权后读取和操作 Android 界面。</string>
+</resources>

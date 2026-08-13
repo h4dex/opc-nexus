@@ -27,7 +27,7 @@ vi.mock('../src/main/services/provider.js', () => ({
   providerReady: () => providerIsReady
 }));
 
-const { EngineManager, ENGINE_CATALOG, RETIRED_ENGINE_IDS } = await import('../src/main/services/engineManager.js');
+const { EngineManager, ENGINE_CATALOG, RETIRED_ENGINE_IDS, CLI_FAILURE_BODY_PATTERN, cliLaunchProbeTimeoutMs } = await import('../src/main/services/engineManager.js');
 
 /** 内存 engines 表桩:支持状态读写,便于断言状态迁移 */
 function makeDb(engines: Record<string, Record<string, unknown>> = {}) {
@@ -102,6 +102,18 @@ describe('引擎目录收敛(E-1)', () => {
 });
 
 describe('鉴权探测状态迁移(H-4)', () => {
+  it('Hermes 员工 Profile 首次迁移获得更长的启动窗口', () => {
+    expect(cliLaunchProbeTimeoutMs('eng-hermes-cli', { HERMES_HOME: 'C:\\profiles\\employee' })).toBe(45_000);
+    expect(cliLaunchProbeTimeoutMs('eng-hermes-cli', {})).toBe(15_000);
+    expect(cliLaunchProbeTimeoutMs('eng-codex', { HERMES_HOME: 'ignored' })).toBe(15_000);
+  });
+
+  it('不把零退出码中的供应商错误正文当作健康结果', () => {
+    expect(CLI_FAILURE_BODY_PATTERN.test('HTTP 401: Missing Authentication header')).toBe(true);
+    expect(CLI_FAILURE_BODY_PATTERN.test('No usable credentials found for provider')).toBe(true);
+    expect(CLI_FAILURE_BODY_PATTERN.test('pong')).toBe(false);
+  });
+
   it('内置 Nexus:供应商就绪 → HEALTHY + authed', async () => {
     providerIsReady = true;
     const db = makeDb({ 'eng-hermes': { id: 'eng-hermes', status: 'SETUP_REQUIRED', auth_status: 'required' } });

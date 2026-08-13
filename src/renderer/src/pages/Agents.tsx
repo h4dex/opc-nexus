@@ -2,9 +2,10 @@
 import { useEffect, useState, useMemo } from 'react';
 import { useApp } from '../store';
 import { AgentEditor } from '../components/AgentEditor';
-import { ContextMenu, type CtxMenuItem } from '../components/common';
-import { IconPlay, IconStop, IconPlus } from '../components/icons';
-import type { Agent, AgentCardView, PermissionMode } from '@shared/types';
+import { ContextMenu, Modal, type CtxMenuItem } from '../components/common';
+import { IconPlay, IconStop, IconPlus, IconTask } from '../components/icons';
+import { toast } from '../components/Toast';
+import type { Agent, AgentCardView, Project } from '@shared/types';
 
 const PERM_LABEL: Record<string, { text: string; color: string }> = {
   readonly: { text: '只读', color: 'var(--text-3)' },
@@ -36,6 +37,10 @@ export function Agents() {
   const [batchMsg, setBatchMsg] = useState('');
   const [importMsg, setImportMsg] = useState('');
   const [detailAgent, setDetailAgent] = useState<Agent | null>(null);
+  const [taskAgent, setTaskAgent] = useState<Agent | null>(null);
+  const [taskTitle, setTaskTitle] = useState('');
+  const [taskProjectId, setTaskProjectId] = useState('');
+  const [taskBusy, setTaskBusy] = useState(false);
 
   useEffect(() => {
     if (!snapshot || navigationTarget?.entityType !== 'agent') return;
@@ -114,11 +119,43 @@ export function Agents() {
     URL.revokeObjectURL(url);
   };
 
+  const openTaskModal = (agent: Agent) => {
+    setTaskAgent(agent);
+    setTaskTitle('');
+    setTaskProjectId('');
+  };
+
+  const closeTaskModal = () => {
+    if (taskBusy) return;
+    setTaskAgent(null);
+    setTaskTitle('');
+    setTaskProjectId('');
+  };
+
+  const scheduleTask = async () => {
+    if (!taskAgent || !taskTitle.trim() || taskBusy) return;
+    setTaskBusy(true);
+    try {
+      await window.aibox.createTask(taskAgent.id, taskTitle.trim(), taskProjectId || undefined);
+      toast.ok(`任务已安排给「${taskAgent.name}」`);
+      // closeTaskModal intentionally refuses to close while a request is active;
+      // this path is already successful and should reset the form immediately.
+      setTaskAgent(null);
+      setTaskTitle('');
+      setTaskProjectId('');
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '任务安排失败');
+    } finally {
+      setTaskBusy(false);
+    }
+  };
+
   /** 右键菜单项 */
   const ctxItems = (card: AgentCardView): CtxMenuItem[] => {
     const agent = card.agent;
     const ready = agent.lifecycle === 'READY';
     return [
+      { label: '安排任务', icon: <IconTask size={13} />, onClick: () => openTaskModal(agent) },
       { label: '编辑 / 设置', onClick: () => setEditAgent(agent) },
       { label: '打开工作目录', onClick: () => void window.aibox.openAgentWorkspace(agent.id) },
       { label: '导出配置', onClick: () => void exportAgent(agent.id) },
@@ -259,6 +296,7 @@ export function Agents() {
                     </td>
                     <td style={{ padding: '12px', textAlign: 'center' }}>
                       <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                        <button className="btn small primary" onClick={() => openTaskModal(agent)} style={{ padding: '4px 9px', fontSize: 11.5 }}><IconTask size={12} />安排任务</button>
                         <button className="btn small" onClick={() => setEditAgent(agent)} style={{ padding: '4px 10px', fontSize: 11.5 }}>编辑</button>
                         {agent.lifecycle === 'READY' ? (
                           <button className="btn small" onClick={() => void window.aibox.stopAgent(agent.id)} style={{ padding: '4px 8px' }} title="停用"><IconStop size={12} /></button>
@@ -315,6 +353,7 @@ export function Agents() {
                   </div>
                 )}
                 <div style={{ display: 'flex', gap: 6 }}>
+                  <button className="btn small primary" onClick={(e) => { e.stopPropagation(); openTaskModal(agent); }} style={{ fontSize: 11 }}><IconTask size={12} />安排任务</button>
                   <button className="btn small" onClick={(e) => { e.stopPropagation(); setEditAgent(agent); }} style={{ fontSize: 11 }}>编辑</button>
                   {agent.lifecycle === 'READY' ? (
                     <button className="btn small" onClick={(e) => { e.stopPropagation(); void window.aibox.stopAgent(agent.id); }} style={{ fontSize: 11 }}>停用</button>
@@ -335,7 +374,65 @@ export function Agents() {
       {editAgent && <AgentEditor agent={editAgent} onClose={() => setEditAgent(null)} />}
       {detailAgent && <AgentDetailDrawer agent={detailAgent} onClose={() => setDetailAgent(null)} onEdit={() => { setEditAgent(detailAgent); setDetailAgent(null); }} />}
       {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.card)} onClose={() => setCtx(null)} />}
+      {taskAgent && <AgentTaskModal
+        agent={taskAgent}
+        projects={snapshot.projects}
+        title={taskTitle}
+        projectId={taskProjectId}
+        busy={taskBusy}
+        onTitleChange={setTaskTitle}
+        onProjectChange={setTaskProjectId}
+        onClose={closeTaskModal}
+        onSubmit={() => void scheduleTask()}
+      />}
     </>
+  );
+}
+
+function AgentTaskModal({
+  agent, projects, title, projectId, busy, onTitleChange, onProjectChange, onClose, onSubmit
+}: {
+  agent: Agent;
+  projects: Project[];
+  title: string;
+  projectId: string;
+  busy: boolean;
+  onTitleChange: (value: string) => void;
+  onProjectChange: (value: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const availableProjects = projects.filter((project) => !['completed', 'archived'].includes(project.status));
+  return (
+    <Modal title={`安排任务 · ${agent.name}`} onClose={onClose} width={560} footer={<>
+      <button className="btn" type="button" onClick={onClose} disabled={busy}>取消</button>
+      <button className="btn primary" type="button" onClick={onSubmit} disabled={busy || !title.trim()}>
+        <IconTask size={14} />{busy ? '安排中…' : '安排任务'}
+      </button>
+    </>}>
+      <div className="field">
+        <label>任务描述</label>
+        <textarea
+          autoFocus
+          rows={5}
+          maxLength={500}
+          value={title}
+          onChange={(event) => onTitleChange(event.target.value)}
+          onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') onSubmit(); }}
+          placeholder="说明目标、输入资料和预期结果"
+        />
+      </div>
+      <div className="field" style={{ marginTop: 14 }}>
+        <label>归属项目</label>
+        <select value={projectId} onChange={(event) => onProjectChange(event.target.value)}>
+          <option value="">未归项目</option>
+          {availableProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+        </select>
+      </div>
+      <div style={{ marginTop: 12, fontSize: 11.5, color: 'var(--text-3)' }}>
+        任务会进入任务中心，并按员工当前状态和并发限制执行。
+      </div>
+    </Modal>
   );
 }
 
@@ -347,10 +444,20 @@ function AgentDetailDrawer({ agent, onClose, onEdit }: { agent: Agent; onClose: 
     events: { id: string; eventType: string; createdAt: number }[];
   } | null>(null);
 
-  if (!detail) {
-    void window.aibox.getAgentDetail(agent.id).then(setDetail);
-    return null;
-  }
+  useEffect(() => {
+    let active = true;
+    setDetail(null);
+    void window.aibox.getAgentDetail(agent.id).then((value) => { if (active) setDetail(value); }).catch(() => { if (active) setDetail({ tasks: [], usage: { totalTokens: 0, inputTokens: 0, outputTokens: 0, calls: 0 }, events: [] }); });
+    return () => { active = false; };
+  }, [agent.id]);
+
+  if (!detail) return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.4)', zIndex: 900 }} onClick={onClose}>
+      <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: 420, background: 'var(--card)', borderLeft: '1px solid var(--border)', padding: 20 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ color: 'var(--text-3)', fontSize: 12 }}>正在加载员工详情…</div>
+      </div>
+    </div>
+  );
 
   const statusLabel = (s: string) => ({ QUEUED: '排队', RUNNING: '执行中', COMPLETED: '完成', FAILED: '失败', CANCELLED: '取消', PAUSED: '暂停' }[s] ?? s);
   const statusColor = (s: string) => s === 'COMPLETED' ? 'var(--success)' : s === 'FAILED' ? 'var(--danger)' : s === 'RUNNING' ? 'var(--accent)' : 'var(--text-3)';

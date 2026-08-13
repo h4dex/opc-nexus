@@ -1,0 +1,5 @@
+name: opcnexus-android
+version: 1.0.0
+description: "OPC-Nexus task-scoped Android control through the loopback Mobile Gateway"
+author: Senke (derived from raulvidis/hermes-android)
+requires_env: []

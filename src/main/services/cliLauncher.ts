@@ -20,8 +20,10 @@
  * @author liyingjie <y@senke.com>
  */
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 
 const isWin = process.platform === 'win32';
+const PROCESS_TREE_KILL_TIMEOUT_MS = 5_000;
 
 /**
  * cmd.exe / shell 在命令不存在时的输出特征。
@@ -36,17 +38,6 @@ const NOT_FOUND_PATTERN = /不是内部或外部命令|is not recognized as|comm
  * 导致错误信息无法阅读、也无法用中文特征匹配。这里先试 UTF-8，
  * 若出现替换字符（U+FFFD）则回退 GBK。
  */
-function decodeOutput(buf: Buffer): string {
-  const utf8 = buf.toString('utf8');
-  if (!utf8.includes('�')) return utf8;
-  try {
-    // Node 内置 ICU 支持 gbk；不可用时退回原始 UTF-8 结果
-    return new TextDecoder('gbk').decode(buf);
-  } catch {
-    return utf8;
-  }
-}
-
 /** 需要经 cmd.exe 间接拉起的可执行形态 */
 function needsCmdShim(binPath: string): boolean {
   if (!isWin) return false;
@@ -85,6 +76,50 @@ export function spawnCli(binPath: string, args: string[], opts: SpawnOptions = {
 }
 
 /**
+ * 终止一次 CLI 调用。
+ * Windows 的 npm/.cmd 入口会形成 cmd.exe -> CLI -> runtime 的进程树，单独
+ * child.kill() 只会结束最外层 cmd.exe，实际 CLI 会继续占用设备锁和应用退出流程。
+ */
+async function terminateCliProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  if (!isWin || !child.pid) {
+    try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(fallbackTimer);
+      resolve();
+    };
+    const fallbackTimer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+      done();
+    }, PROCESS_TREE_KILL_TIMEOUT_MS);
+
+    try {
+      const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+        shell: false,
+        windowsHide: true,
+        stdio: 'ignore'
+      });
+      killer.once('error', () => {
+        try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+        done();
+      });
+      killer.once('close', done);
+    } catch {
+      try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+      done();
+    }
+  });
+}
+
+/**
  * 一次性执行并收集输出（用于 --version / 最小任务探测）。
  * 不抛异常：启动失败也返回结构化结果，调用方据此判定，避免异常穿透到启动路径。
  */
@@ -104,31 +139,39 @@ export function runCli(
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let timedOut = false;
     const done = (r: { ok: boolean; code: number | null; stdout: string; stderr: string; error?: string }) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       resolve(r);
     };
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+    const timer = setTimeout(async () => {
+      timedOut = true;
+      await terminateCliProcess(child);
+      stdout = finishProcessOutput(outBuffer);
+      stderr = finishProcessOutput(errBuffer);
       done({ ok: false, code: null, stdout, stderr, error: `执行超时（${Math.round(timeoutMs / 1000)} 秒）` });
     }, timeoutMs);
 
     // 按块缓存后统一解码：避免多字节字符被 chunk 边界切断而解码失败
-    const outChunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
-    child.stdout?.on('data', (c: Buffer) => { outChunks.push(c); });
-    child.stderr?.on('data', (c: Buffer) => { errChunks.push(c); });
-    child.on('error', (err) => done({
-      ok: false, code: null,
-      stdout: decodeOutput(Buffer.concat(outChunks)),
-      stderr: decodeOutput(Buffer.concat(errChunks)),
-      error: err.message
-    }));
+    const outBuffer = createProcessOutputBuffer();
+    const errBuffer = createProcessOutputBuffer();
+    child.stdout?.on('data', (c: Buffer) => appendProcessOutput(outBuffer, c));
+    child.stderr?.on('data', (c: Buffer) => appendProcessOutput(errBuffer, c));
+    child.on('error', (err) => {
+      if (timedOut) return;
+      done({
+        ok: false, code: null,
+        stdout: finishProcessOutput(outBuffer),
+        stderr: finishProcessOutput(errBuffer),
+        error: err.message
+      });
+    });
     child.on('close', (code) => {
-      stdout = decodeOutput(Buffer.concat(outChunks));
-      stderr = decodeOutput(Buffer.concat(errChunks));
+      if (timedOut) return;
+      stdout = finishProcessOutput(outBuffer);
+      stderr = finishProcessOutput(errBuffer);
       // 经 cmd.exe 包装后，命令不存在不会触发 'error'，而是 cmd 自己以非 0 退出并在
       // stderr 写 "不是内部或外部命令" / "is not recognized"。若不识别这种情况，
       // 「进程起不来」会被误判成「起来了但执行失败」，四级探活的 launchable 就失去意义。

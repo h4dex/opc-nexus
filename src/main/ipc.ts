@@ -2,7 +2,7 @@
  * IPC 白名单（PRD 12.2：不允许 Renderer 透传任意命令）
  * Renderer 仅能调用此处显式注册的方法；密钥操作只通过 safeStorage 句柄。
  */
-import { BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, safeStorage, shell } from 'electron';
 import type { Database } from './services/database.js';
 import type { Orchestrator } from './services/orchestrator.js';
 import type { ExecutorRegistry } from './services/executor/index.js';
@@ -26,6 +26,10 @@ import type { KnowledgeManager } from './services/knowledgeManager.js';
 import type { DiscoveryManager } from './services/discoveryManager.js';
 import type { AutomationManager } from './services/automationManager.js';
 import type { CollabManager } from './services/collabManager.js';
+import type { MobileGatewayService } from './services/mobileGatewayService.js';
+import type { MobileAdbService } from './services/mobileAdbService.js';
+import { getMobileToolCatalog, isMobileToolName, MOBILE_TOOL_NAMES } from './services/mobileCatalog.js';
+import { createProvisionedAgent } from './services/mobileAgentProvisioning.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
 import { getProviderConfig, saveProviderConfig, testProvider } from './services/provider.js';
 import { loadConfig, saveConfig } from './services/config.js';
@@ -35,23 +39,66 @@ import type {
   AppConfig, CreateAgentInput, DeliverableMetaPatch, DeliverableReviewInput, DeliverableVersionInput,
   KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeVersionInput,
   ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge,
-  AutomationReportKind, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudgetInput
+  AutomationReportKind, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudgetInput,
+  MobileScriptDefinition, MobileToolName
 } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { app } from 'electron';
+import { decodeOptionalUtf8Text, decodeUtf8Text } from './services/textEncoding.js';
 
 /** 轻量级运行时参数校验（防御异常/恶意输入穿透） */
 function assertString(v: unknown, field: string, min = 1, max = 500): string {
-  if (typeof v !== 'string' || v.length < min || v.length > max) {
-    throw new Error(`参数 ${field} 无效（需 ${min}-${max} 字符）`);
-  }
-  return v;
+  return decodeUtf8Text(v, field, min, max);
 }
 function assertId(v: unknown, field = 'id'): string {
   return assertString(v, field, 1, 100);
+}
+
+function assertPort(v: unknown): number {
+  if (!Number.isInteger(v) || (v as number) < 1024 || (v as number) > 65535) throw new Error('端口必须为 1024-65535 的整数');
+  return v as number;
+}
+
+function assertMobileTool(v: unknown): MobileToolName {
+  if (!isMobileToolName(v)) throw new Error('未知 Android 工具');
+  return v;
+}
+
+function assertMobileTools(v: unknown): MobileToolName[] {
+  if (!Array.isArray(v) || v.length > MOBILE_TOOL_NAMES.length) throw new Error('Android 工具策略无效');
+  const tools = [...new Set(v.map(assertMobileTool))];
+  if (tools.length !== v.length) throw new Error('Android 工具策略包含重复项');
+  return tools;
+}
+
+function decodeAgentInput(input: CreateAgentInput): CreateAgentInput {
+  if (!input || typeof input !== 'object') throw new Error('员工配置无效');
+  return {
+    ...input,
+    name: assertString(input.name, 'name', 2, 30),
+    role: assertString(input.role, 'role', 2, 500),
+    systemPrompt: assertString(input.systemPrompt ?? '', 'systemPrompt', 0, 20_000),
+    soulMd: decodeOptionalUtf8Text(input.soulMd, 'soulMd', 100_000) ?? '',
+    agentsMd: decodeOptionalUtf8Text(input.agentsMd, 'agentsMd', 100_000) ?? '',
+    userMd: decodeOptionalUtf8Text(input.userMd, 'userMd', 100_000) ?? '',
+    workspace: decodeOptionalUtf8Text(input.workspace, 'workspace', 2_000) ?? ''
+  };
+}
+
+function decodePersonaPatch(patch: AgentPersonaPatch): AgentPersonaPatch {
+  if (!patch || typeof patch !== 'object') throw new Error('员工配置更新无效');
+  return {
+    ...patch,
+    name: decodeOptionalUtf8Text(patch.name, 'name', 30),
+    role: decodeOptionalUtf8Text(patch.role, 'role', 500),
+    systemPrompt: decodeOptionalUtf8Text(patch.systemPrompt, 'systemPrompt', 20_000),
+    soulMd: decodeOptionalUtf8Text(patch.soulMd, 'soulMd', 100_000),
+    agentsMd: decodeOptionalUtf8Text(patch.agentsMd, 'agentsMd', 100_000),
+    userMd: decodeOptionalUtf8Text(patch.userMd, 'userMd', 100_000),
+    modelOverride: decodeOptionalUtf8Text(patch.modelOverride, 'modelOverride', 200)
+  };
 }
 
 function safeFileSegment(value: string): string {
@@ -87,11 +134,13 @@ export interface IpcDeps {
   voice: import('./services/voiceService.js').VoiceService;
   apiBridge: import('./services/apiBridge.js').ApiBridge;
   webServer: import('./services/webServer.js').WebServer;
+  mobile: MobileGatewayService;
+  mobileAdb: MobileAdbService;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, voice, webServer, getMainWindow } = deps;
+  const { db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, voice, webServer, mobile, mobileAdb, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -124,6 +173,7 @@ export function registerIpc(deps: IpcDeps) {
   voice.onError((sessionId, message) => {
     broadcast('aibox:voiceError', { sessionId, message });
   });
+  mobile.onEvent((event) => broadcast('aibox:mobileEvent', event));
   // 资源样本 → 实时推送
   monitor.onSample(() => {
     broadcast('aibox:resources', {
@@ -282,19 +332,90 @@ export function registerIpc(deps: IpcDeps) {
   });
 
   // ---------- 数字员工 ----------
-  ipcMain.handle('aibox:createAgent', (_e, input: CreateAgentInput) => {
+  ipcMain.handle('aibox:createAgent', async (_e, input: CreateAgentInput) => {
+    input = decodeAgentInput(input);
     assertString(input?.name, 'name', 2, 30);
     assertString(input?.role, 'role', 2, 500);
     assertString(input?.engineId, 'engineId', 1, 100);
-    return orchestrator.createAgent(input);
+    const tools = input.kind === 'android_operator'
+      ? assertMobileTools(input.mobileAllowedTools ?? [...MOBILE_TOOL_NAMES])
+      : null;
+    if (input.deviceId) input = { ...input, deviceId: assertId(input.deviceId, 'deviceId') };
+    const agent = await createProvisionedAgent(orchestrator, mobile, input, tools);
+    pushSnapshot();
+    return agent;
   });
   ipcMain.handle('aibox:startAgent', (_e, id: string) => orchestrator.startAgent(assertId(id)));
   ipcMain.handle('aibox:stopAgent', (_e, id: string) => orchestrator.stopAgent(assertId(id)));
   // 助手人设编辑（soul.md / agents.md / user.md / 权限模式）
-  ipcMain.handle('aibox:updateAgentPersona', (_e, id: string, patch: AgentPersonaPatch) => {
+  ipcMain.handle('aibox:updateAgentPersona', async (_e, id: string, patch: AgentPersonaPatch) => {
+    patch = decodePersonaPatch(patch);
     const a = orchestrator.updateAgentPersona(id, patch);
+    if (a.kind === 'android_operator') {
+      const existing = mobile.getAgentConfig(a.id);
+      const tools = assertMobileTools(patch.mobileAllowedTools ?? existing?.allowedTools ?? [...MOBILE_TOOL_NAMES]);
+      await mobile.ensureAgentProfile(a, tools);
+      if (patch.deviceId === null) mobile.unbindAgent(a.id);
+      else if (patch.deviceId !== undefined) await mobile.bindAgent(a.id, assertId(patch.deviceId, 'deviceId'), tools, patch.mobileAuthorizationConfirmed === true);
+      else if (patch.mobileAllowedTools) mobile.updateToolPolicy(a.id, tools, patch.mobileAuthorizationConfirmed === true);
+    }
     pushSnapshot();
     return a;
+  });
+
+  // ---------- Android 手机员工 ----------
+  ipcMain.handle('aibox:mobile:getStatus', () => mobile.getStatus());
+  ipcMain.handle('aibox:mobile:listLanAddresses', () => mobile.getLanAddresses());
+  ipcMain.handle('aibox:mobile:startGateway', (_e, host: string, port?: number) =>
+    mobile.start(assertString(host, 'host', 7, 45), assertPort(port ?? 18765)));
+  ipcMain.handle('aibox:mobile:stopGateway', () => mobile.stop(true));
+  ipcMain.handle('aibox:mobile:resetCertificate', () => mobile.resetCertificate());
+  ipcMain.handle('aibox:mobile:createPairing', () => mobile.createPairing());
+  ipcMain.handle('aibox:mobile:copyPairingConfig', (_e, pairingId: string) => {
+    clipboard.writeText(mobile.getPairingConfigForCopy(assertId(pairingId, 'pairingId')));
+    return { ok: true as const };
+  });
+  ipcMain.handle('aibox:mobile:getToolCatalog', () => getMobileToolCatalog());
+  ipcMain.handle('aibox:mobile:listDevices', () => mobile.listDevices());
+  ipcMain.handle('aibox:mobile:getAgentConfig', (_e, agentId: string) => mobile.getAgentConfig(assertId(agentId, 'agentId')));
+  ipcMain.handle('aibox:mobile:bindAgent', (_e, input: { agentId: string; deviceId: string; allowedTools: MobileToolName[]; confirmAuthorization: boolean }) =>
+    mobile.bindAgent(assertId(input?.agentId, 'agentId'), assertId(input?.deviceId, 'deviceId'), assertMobileTools(input?.allowedTools), input?.confirmAuthorization === true));
+  ipcMain.handle('aibox:mobile:unbindAgent', (_e, agentId: string) => mobile.unbindAgent(assertId(agentId, 'agentId')));
+  ipcMain.handle('aibox:mobile:updateToolPolicy', (_e, input: { agentId: string; allowedTools: MobileToolName[]; confirmAuthorization: boolean }) =>
+    mobile.updateToolPolicy(assertId(input?.agentId, 'agentId'), assertMobileTools(input?.allowedTools), input?.confirmAuthorization === true));
+  ipcMain.handle('aibox:mobile:refreshPreview', (_e, deviceId: string) => mobile.refreshPreview(assertId(deviceId, 'deviceId')));
+  ipcMain.handle('aibox:mobile:readUiTree', (_e, deviceId: string) => mobile.readUiTree(assertId(deviceId, 'deviceId')));
+  ipcMain.handle('aibox:mobile:execute', (_e, input: { deviceId: string; toolName: MobileToolName; args: Record<string, unknown> }) => {
+    const toolName = assertMobileTool(input?.toolName);
+    if (!input?.args || typeof input.args !== 'object' || Array.isArray(input.args)) throw new Error('args 必须是对象');
+    return mobile.executeManual(assertId(input.deviceId, 'deviceId'), toolName, input.args);
+  });
+  ipcMain.handle('aibox:mobile:listCommands', (_e, deviceId?: string) => mobile.listCommands(deviceId ? assertId(deviceId, 'deviceId') : undefined));
+  ipcMain.handle('aibox:mobile:listArtifacts', (_e, deviceId?: string) => mobile.listArtifacts(deviceId ? assertId(deviceId, 'deviceId') : undefined));
+  ipcMain.handle('aibox:mobile:listScripts', () => mobile.listScripts());
+  ipcMain.handle('aibox:mobile:saveScript', (_e, input: Omit<MobileScriptDefinition, 'id' | 'createdAt' | 'updatedAt'>, id?: string) =>
+    mobile.saveScript(input, id ? assertId(id, 'scriptId') : undefined));
+  ipcMain.handle('aibox:mobile:deleteScript', (_e, id: string) => mobile.deleteScript(assertId(id, 'scriptId')));
+  ipcMain.handle('aibox:mobile:runScript', (_e, id: string) => mobile.runScript(assertId(id, 'scriptId')));
+  ipcMain.handle('aibox:mobile:emergencyStop', (_e, deviceId: string) => mobile.emergencyStop(assertId(deviceId, 'deviceId')));
+  ipcMain.handle('aibox:mobile:getApkInfo', () => mobileAdb.getApkInfo());
+  ipcMain.handle('aibox:mobile:listAdbDevices', () => mobileAdb.listDevices());
+  ipcMain.handle('aibox:mobile:installApk', (_e, serial: string) => mobileAdb.install(assertString(serial, 'serial', 1, 128)));
+  ipcMain.handle('aibox:mobile:exportApk', async () => {
+    const { apk, info } = await mobileAdb.verifyApk();
+    const options = {
+      title: '导出 OPC-Nexus 手机桥 APK',
+      defaultPath: `OPC-Nexus-Mobile-Bridge-${info.versionName}.apk`,
+      filters: [{ name: 'Android APK', extensions: ['apk'] }]
+    };
+    const parent = getMainWindow();
+    const result = parent
+      ? await dialog.showSaveDialog(parent, options)
+      : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true, message: '已取消' };
+    copyFileSync(apk, result.filePath);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'mobile.apk.export', target: info.sha256, result: 'ok' });
+    return { ok: true, canceled: false, message: 'APK 已导出' };
   });
   // AI 辅助生成人设：用已配置的 LLM 供应商生成 soul.md + agents.md + role
   ipcMain.handle('aibox:generatePersona', async (_e, description: string) => {
@@ -323,13 +444,13 @@ export function registerIpc(deps: IpcDeps) {
   // 会话（持续多轮对话）
   ipcMain.handle('aibox:listConversations', (_e, agentId: string) => orchestrator.listConversations(agentId));
   ipcMain.handle('aibox:chatWithAgent', (_e, agentId: string, message: string, conversationId?: string) => {
-    const r = orchestrator.chatWithAgent(agentId, message, conversationId);
+    const r = orchestrator.chatWithAgent(assertId(agentId, 'agentId'), assertString(message, 'message', 1, 20_000), conversationId ? assertId(conversationId, 'conversationId') : undefined);
     pushSnapshot();
     return r;
   });
   // 会话管理：重命名 / 删除
   ipcMain.handle('aibox:renameConversation', (_e, id: string, title: string) => {
-    db.raw.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, id);
+    db.raw.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(assertString(title, 'title', 1, 100), assertId(id, 'conversationId'));
   });
   ipcMain.handle('aibox:deleteConversation', (_e, id: string) => {
     db.raw.prepare('DELETE FROM conversations WHERE id = ?').run(id);
@@ -360,7 +481,29 @@ export function registerIpc(deps: IpcDeps) {
 
   // ---------- MCP 服务器管理 ----------
   ipcMain.handle('aibox:listMcpServers', () => mcp.list());
-  ipcMain.handle('aibox:createMcpServer', (_e, input: { name: string; command: string; args?: string[]; env?: Record<string, string> }) => mcp.create(input));
+  ipcMain.handle('aibox:createMcpServer', (_e, input: { name: string; command: string; args?: string[]; env?: Record<string, string>; scope?: string; capability?: 'browser' | '' }) => {
+    assertString(input?.name, 'name', 2, 80);
+    assertString(input?.command, 'command', 1, 500);
+    if (/[&|<>^%\r\n]/.test(input.command)) throw new Error('启动命令包含不允许的字符');
+    if (input.args?.some((arg) => typeof arg !== 'string' || arg.length > 1000 || /[&|<>^%\r\n]/.test(arg))) throw new Error('启动参数无效');
+    return mcp.create(input);
+  });
+  ipcMain.handle('aibox:createPlaywrightBrowser', async (_e, input: { agentId: string; extensionToken?: string }) => {
+    const agentId = assertId(input?.agentId, 'agentId');
+    if (input?.extensionToken !== undefined && typeof input.extensionToken !== 'string') throw new Error('扩展 Token 格式无效');
+    if (input?.extensionToken !== undefined && input.extensionToken.length > 500) throw new Error('扩展 Token 过长');
+    const agent = orchestrator.listAgents().find((item) => item.id === agentId);
+    if (!agent) throw new Error('数字员工不存在');
+    if (!executors.supportsMcp(agent.engineId)) throw new Error('浏览器 MCP 目前仅支持 Nexus Agent 数字员工');
+    const server = mcp.createPlaywrightBrowser({ agentId, extensionToken: input.extensionToken });
+    orchestrator.updateAgentPersona(agentId, { capabilities: { browser: true } });
+    skills.ensureBrowserOperator(agentId);
+    // MCP 子进程只在启动时读取环境变量，更新 Token 后必须重启才能生效。
+    if (input.extensionToken?.trim() && mcp.isRunning(server.id)) await mcp.stop(server.id);
+    const connection = await mcp.start(server.id);
+    pushSnapshot();
+    return { server, connection };
+  });
   ipcMain.handle('aibox:removeMcpServer', (_e, id: string) => mcp.remove(id));
   ipcMain.handle('aibox:toggleMcpServer', (_e, id: string, enabled: boolean) => mcp.toggle(id, enabled));
   ipcMain.handle('aibox:startMcpServer', (_e, id: string) => mcp.start(id));
@@ -471,7 +614,7 @@ export function registerIpc(deps: IpcDeps) {
     return { ok: true, message: `已对 ${count} 位员工执行「${action === 'start' ? '启用' : action === 'stop' ? '停用' : '删除'}」操作` };
   });
   ipcMain.handle('aibox:getAgentDetail', (_e, agentId: string) => {
-    const tasks = orchestrator.listTasks().filter((t) => t.agentId === agentId).slice(0, 10);
+    const tasks = orchestrator.listTasks({ includeResult: false }).filter((t) => t.agentId === agentId).slice(0, 10);
     const usage = db.raw.prepare('SELECT COALESCE(SUM(total_tokens),0) as total, COALESCE(SUM(input_tokens),0) as input, COALESCE(SUM(output_tokens),0) as output, COUNT(*) as calls FROM usage_records WHERE agent_id = ?').get(agentId) as { total: number; input: number; output: number; calls: number };
     const events = (db.raw.prepare("SELECT id, event_type, created_at FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = ? ORDER BY created_at DESC LIMIT 5) ORDER BY created_at DESC LIMIT 30").all(agentId) as { id: string; event_type: string; created_at: number }[]).map((e) => ({ id: e.id, eventType: e.event_type, createdAt: e.created_at }));
     return { tasks, usage: { totalTokens: usage.total, inputTokens: usage.input, outputTokens: usage.output, calls: usage.calls }, events };
@@ -569,7 +712,7 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:resumeTask', (_e, id: string) => orchestrator.resumeTask(assertId(id)));
   ipcMain.handle('aibox:decideApproval', (_e, id: string, approve: boolean) => orchestrator.decideApproval(assertId(id), approve === true));
   // 追问/续跑（P2b）：新任务继承会话锚点
-  ipcMain.handle('aibox:createFollowUpTask', (_e, parentTaskId: string, title: string) => orchestrator.createFollowUpTask(parentTaskId, title));
+  ipcMain.handle('aibox:createFollowUpTask', (_e, parentTaskId: string, title: string) => orchestrator.createFollowUpTask(assertId(parentTaskId, 'parentTaskId'), assertString(title, 'title', 1, 500)));
   // 任务详情：事件时间线 + 产物全文（13.2 审计可追溯）
   ipcMain.handle('aibox:getTaskEvents', (_e, taskId: string) => orchestrator.taskEvents(taskId));
   ipcMain.handle('aibox:getTaskResult', (_e, taskId: string) => orchestrator.taskResult(taskId));
@@ -921,7 +1064,9 @@ function buildSnapshot(deps: IpcDeps) {
     stats: deps.orchestrator.stats(),
     agentCards: deps.orchestrator.agentCards(),
     projects: deps.projects.list(),
-    tasks: deps.orchestrator.listTasks(),
+    // 结果正文由 getTaskResult 按需读取，避免每次状态变化都通过 IPC
+    // 克隆 200 份任务产物到 Renderer。
+    tasks: deps.orchestrator.listTasks({ includeResult: false }),
     todos: [...systemTodos, ...todos].slice(0, 12),
     approvals: deps.orchestrator.listApprovals(),
     engines: deps.engines.list(),

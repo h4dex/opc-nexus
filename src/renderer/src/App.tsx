@@ -1,28 +1,7 @@
 /** 应用骨架：侧边导航（分组）+ 顶栏 + 页面路由 + FAB + 全局Toast + 全局搜索 */
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { useApp, type RouteKey } from './store';
 import { Dashboard } from './pages/Dashboard';
-import { Office } from './pages/Office';
-import { Inbox } from './pages/Inbox';
-import { Projects } from './pages/Projects';
-import { Deliverables } from './pages/Deliverables';
-import { Knowledge } from './pages/Knowledge';
-import { Agents } from './pages/Agents';
-import { Automation } from './pages/Automation';
-import { Tasks } from './pages/Tasks';
-import { Console } from './pages/Console';
-import { Chat } from './pages/Chat';
-import { Market } from './pages/Market';
-import { Teams } from './pages/Teams';
-import { Collab } from './pages/Collab';
-import { Workflows } from './pages/Workflows';
-import { Usage } from './pages/Usage';
-import { Engines } from './pages/Engines';
-import { Channels } from './pages/Channels';
-import { Mcp } from './pages/Mcp';
-import { Skills } from './pages/Skills';
-import { System } from './pages/System';
-import { Settings } from './pages/Settings';
 import { CreateAgentWizard } from './wizard/CreateAgentWizard';
 import { ToastContainer } from './components/Toast';
 import { GlobalSearch } from './components/GlobalSearch';
@@ -30,8 +9,32 @@ import { VoicePanel } from './components/VoicePanel';
 import { todayText } from './components/common';
 import {
   IconAlert, IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconLayers, IconMonitor, IconMoon, IconPlug, IconPlus,
-  IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser, IconFolder, IconBook
+  IconSettings, IconSun, IconTask, IconPlay, IconMessage, IconUser, IconFolder, IconBook, IconPhone,
+  IconSearch, IconMic, IconFullscreen
 } from './components/icons';
+
+const Office = lazy(() => import('./pages/Office').then((module) => ({ default: module.Office })));
+const Inbox = lazy(() => import('./pages/Inbox').then((module) => ({ default: module.Inbox })));
+const Projects = lazy(() => import('./pages/Projects').then((module) => ({ default: module.Projects })));
+const Deliverables = lazy(() => import('./pages/Deliverables').then((module) => ({ default: module.Deliverables })));
+const Knowledge = lazy(() => import('./pages/Knowledge').then((module) => ({ default: module.Knowledge })));
+const Agents = lazy(() => import('./pages/Agents').then((module) => ({ default: module.Agents })));
+const Automation = lazy(() => import('./pages/Automation').then((module) => ({ default: module.Automation })));
+const Tasks = lazy(() => import('./pages/Tasks').then((module) => ({ default: module.Tasks })));
+const Console = lazy(() => import('./pages/Console').then((module) => ({ default: module.Console })));
+const Chat = lazy(() => import('./pages/Chat').then((module) => ({ default: module.Chat })));
+const Market = lazy(() => import('./pages/Market').then((module) => ({ default: module.Market })));
+const Teams = lazy(() => import('./pages/Teams').then((module) => ({ default: module.Teams })));
+const Collab = lazy(() => import('./pages/Collab').then((module) => ({ default: module.Collab })));
+const Workflows = lazy(() => import('./pages/Workflows').then((module) => ({ default: module.Workflows })));
+const Usage = lazy(() => import('./pages/Usage').then((module) => ({ default: module.Usage })));
+const Engines = lazy(() => import('./pages/Engines').then((module) => ({ default: module.Engines })));
+const Channels = lazy(() => import('./pages/Channels').then((module) => ({ default: module.Channels })));
+const Mcp = lazy(() => import('./pages/Mcp').then((module) => ({ default: module.Mcp })));
+const Skills = lazy(() => import('./pages/Skills').then((module) => ({ default: module.Skills })));
+const System = lazy(() => import('./pages/System').then((module) => ({ default: module.System })));
+const Settings = lazy(() => import('./pages/Settings').then((module) => ({ default: module.Settings })));
+const Mobile = lazy(() => import('./pages/Mobile').then((module) => ({ default: module.Mobile })));
 
 const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: React.ReactNode }[] }[] = [
   { group: '工作', items: [
@@ -60,6 +63,7 @@ const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: 
   ]},
   { group: '系统', items: [
     { key: 'console', label: '执行监控', icon: <IconPlay size={17} /> },
+    { key: 'mobile', label: '手机控制台', icon: <IconPhone size={17} /> },
     { key: 'usage', label: '用量统计', icon: <IconMonitor size={17} /> },
     { key: 'system', label: '系统状态', icon: <IconMonitor size={17} /> },
     { key: 'settings', label: '设置', icon: <IconSettings size={17} /> },
@@ -68,8 +72,8 @@ const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: 
 
 const ALL_NAV = NAV_GROUPS.flatMap((g) => g.items);
 
-/** 保活页面：切换后不销毁状态（对话/任务/专家团） */
-const KEEP_ALIVE: RouteKey[] = ['chat', 'tasks', 'teams'];
+/** 页面按路由挂载；长任务状态由主进程持久化，避免隐藏页继续占用内存和轮询。 */
+const KEEP_ALIVE: RouteKey[] = [];
 
 export function App() {
   const { route, setRoute, theme, setTheme, wizardOpen, setWizardOpen, snapshot, deviceName, online, appVersion, actionCenter, refreshActionCenter, init } = useApp();
@@ -110,6 +114,7 @@ export function App() {
       case 'schedules': return <Automation />;
       case 'workflows': return <Workflows />;
       case 'console': return <Console />;
+      case 'mobile': return <Mobile />;
       case 'chat': return <Chat />;
       case 'market': return <Market />;
       case 'teams': return <Teams />;
@@ -150,7 +155,7 @@ export function App() {
         </div>
         <div className="sidebar-footer">
           <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.7 }}>
-            本地优先 · 数据不出设备<br />Windows / Ubuntu
+            OPC-Nexus<br />www.apptq.com
           </div>
         </div>
       </aside>
@@ -162,14 +167,14 @@ export function App() {
           <span className="status-pill">{deviceName}</span>
           <div className="topbar-right">
             <button className="icon-btn" onClick={() => setSearchOpen(true)} aria-label="搜索" title="搜索 (Ctrl+K)">
-              🔍
+              <IconSearch size={16} />
             </button>
             <button className="icon-btn" onClick={() => setVoiceOpen(true)} aria-label="语音下达任务" title="语音下达任务">
-              🎤
+              <IconMic size={16} />
             </button>
             <span>{todayText()}</span>
             <button className="icon-btn" onClick={() => void window.aibox.toggleFullscreen()} aria-label="全屏" title="全屏 (F11)">
-              ⛶
+              <IconFullscreen size={16} />
             </button>
             <button className="icon-btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label="切换主题">
               {theme === 'dark' ? <IconSun size={16} /> : <IconMoon size={16} />}
@@ -188,7 +193,11 @@ export function App() {
             </div>
           ))}
           {/* 普通页面：条件渲染 */}
-          {!KEEP_ALIVE.includes(route) && renderPage(route)}
+          {!KEEP_ALIVE.includes(route) && (
+            <Suspense fallback={<div className="page-loading">正在加载...</div>}>
+              {renderPage(route)}
+            </Suspense>
+          )}
         </main>
       </div>
 

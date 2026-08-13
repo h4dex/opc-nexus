@@ -258,7 +258,7 @@ function AgentStrip({ cards, onOpen }: { cards: AgentCardView[]; onOpen: (c: Age
 
 function SystemUptime() {
   const [uptime, setUptime] = useState<number | null>(null);
-  useMemo(() => {
+  useEffect(() => {
     void window.aibox.getSystemInfo().then((i) => setUptime(i.uptimeSec));
     const t = setInterval(() => setUptime((u) => (u === null ? null : u + 2)), 2000);
     return () => clearInterval(t);

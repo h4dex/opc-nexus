@@ -1,5 +1,5 @@
 /**
- * Schema 迁移链路测试（v26 / v27 / v28）
+ * Schema 迁移链路测试（v26 - v31）
  *
  * 用真实 sql.js（非 mock）验证迁移，因为迁移本身就是 SQL 行为：
  * ALTER TABLE 是否冲突、回填 UPDATE 是否命中、事务是否完整提交，
@@ -51,9 +51,52 @@ CREATE TABLE tasks (
   stage TEXT NOT NULL DEFAULT '', error TEXT, workspace_override TEXT,
   created_at INTEGER NOT NULL, started_at INTEGER, ended_at INTEGER, deleted_at INTEGER
 );
+CREATE TABLE mcp_servers (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, command TEXT NOT NULL,
+  args TEXT NOT NULL DEFAULT '[]', env TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 1, scope TEXT NOT NULL DEFAULT 'global'
+);
 `;
 
-/** 本次三个迁移的核心 SQL（与 database.ts migrate() 中 prev<26/27/28 分支保持一致） */
+const MOBILE_DDL = `
+CREATE TABLE IF NOT EXISTS mobile_devices (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', manufacturer TEXT NOT NULL DEFAULT '',
+  android_version TEXT NOT NULL DEFAULT '', api_level INTEGER NOT NULL DEFAULT 0, app_version TEXT NOT NULL DEFAULT '',
+  protocol_version INTEGER NOT NULL, identity_public_key TEXT NOT NULL, identity_fingerprint TEXT NOT NULL UNIQUE,
+  certificate_fingerprint TEXT NOT NULL DEFAULT '', permissions_json TEXT NOT NULL DEFAULT '{}', capabilities_json TEXT NOT NULL DEFAULT '{}',
+  paired_at INTEGER NOT NULL, last_seen_at INTEGER, last_ip TEXT
+);
+CREATE TABLE IF NOT EXISTS mobile_agent_configs (
+  agent_id TEXT PRIMARY KEY REFERENCES agents(id), device_id TEXT UNIQUE REFERENCES mobile_devices(id),
+  hermes_profile TEXT NOT NULL UNIQUE, allowed_tools_json TEXT NOT NULL DEFAULT '[]', authorization_confirmed_at INTEGER,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mobile_control_sessions (
+  id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), device_id TEXT NOT NULL REFERENCES mobile_devices(id),
+  task_id TEXT REFERENCES tasks(id), status TEXT NOT NULL DEFAULT 'active', allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+  started_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, ended_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS mobile_commands (
+  id TEXT PRIMARY KEY, session_id TEXT REFERENCES mobile_control_sessions(id), agent_id TEXT REFERENCES agents(id),
+  device_id TEXT NOT NULL REFERENCES mobile_devices(id), task_id TEXT REFERENCES tasks(id), tool_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued', request_summary_json TEXT NOT NULL DEFAULT '{}', result_summary_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT, started_at INTEGER NOT NULL, ended_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS mobile_artifacts (
+  id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES mobile_devices(id), agent_id TEXT REFERENCES agents(id),
+  task_id TEXT REFERENCES tasks(id), command_id TEXT REFERENCES mobile_commands(id), kind TEXT NOT NULL, mime_type TEXT NOT NULL,
+  filename TEXT NOT NULL, storage_name TEXT NOT NULL UNIQUE, size INTEGER NOT NULL, sha256 TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mobile_scripts (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', agent_id TEXT REFERENCES agents(id),
+  device_id TEXT REFERENCES mobile_devices(id), steps_json TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_device_lease ON mobile_control_sessions(device_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_agent_lease ON mobile_control_sessions(agent_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_task_lease ON mobile_control_sessions(task_id) WHERE status = 'active';
+`;
+
+/** 本次迁移的核心 SQL（与 database.ts migrate() 中 v26-v31 分支保持一致） */
 function runMigrations(db: InstanceType<typeof SQL.Database>) {
   const addCol = (table: string, col: string, type: string) => {
     const cols = db.exec(`PRAGMA table_info(${table})`);
@@ -62,6 +105,7 @@ function runMigrations(db: InstanceType<typeof SQL.Database>) {
   };
   db.exec('BEGIN');
   try {
+    db.exec(MOBILE_DDL);
     // v26：引擎收敛，下线引擎的员工改绑 Nexus
     db.exec(`
       UPDATE agents SET engine_id = 'eng-hermes'
@@ -81,7 +125,15 @@ function runMigrations(db: InstanceType<typeof SQL.Database>) {
     `);
     // v28：任务级引擎覆盖
     addCol('tasks', 'engine_override', 'TEXT');
-    db.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '28')");
+    // v29-v30：MCP 能力分类与旧浏览器服务回填
+    addCol('mcp_servers', 'capability', "TEXT NOT NULL DEFAULT ''");
+    db.exec(`UPDATE mcp_servers SET capability = 'browser'
+      WHERE capability = '' AND command = 'npx' AND args LIKE '%@modelcontextprotocol/server-puppeteer%';`);
+    // v31：Android 手机员工身份与 Mobile Gateway 数据域
+    addCol('agents', 'agent_kind', "TEXT NOT NULL DEFAULT 'general'");
+    db.exec("UPDATE agents SET agent_kind = 'general' WHERE agent_kind IS NULL OR agent_kind = ''");
+    addCol('mobile_devices', 'certificate_fingerprint', "TEXT NOT NULL DEFAULT ''");
+    db.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '31')");
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
@@ -116,6 +168,10 @@ function makeV25Db() {
       ('task-demo', 'agent-demo', 'project-demo-operations', '例行任务 #1', 1),
       ('task-real', 'agent-real', 'project-real', '真实任务', 1),
       ('task-no-project', 'agent-real', NULL, '无项目任务', 1);
+
+    INSERT INTO mcp_servers(id, name, command, args) VALUES
+      ('mcp-browser', '浏览器自动化', 'npx', '["-y","@modelcontextprotocol/server-puppeteer"]'),
+      ('mcp-memory', '记忆', 'npx', '["-y","@modelcontextprotocol/server-memory"]');
   `);
   return db;
 }
@@ -124,11 +180,11 @@ const one = (db, sql: string) => db.exec(sql)[0]?.values[0]?.[0];
 const col = (db, table: string, name: string) =>
   db.exec(`PRAGMA table_info(${table})`)[0].values.some((r) => r[1] === name);
 
-describe('schema 迁移 v25 → v28（真实 sql.js）', () => {
-  it('迁移整体可执行且版本号推进到 28', () => {
+describe('schema 迁移 v25 → v31（真实 sql.js）', () => {
+  it('迁移整体可执行且版本号推进到 31', () => {
     const db = makeV25Db();
     expect(() => runMigrations(db)).not.toThrow();
-    expect(one(db, "SELECT value FROM schema_meta WHERE key = 'schema_version'")).toBe('28');
+    expect(one(db, "SELECT value FROM schema_meta WHERE key = 'schema_version'")).toBe('31');
   });
 
   it('v26：绑定已下线引擎的员工改绑 Nexus，不留悬空 engine_id', () => {
@@ -177,6 +233,53 @@ describe('schema 迁移 v25 → v28（真实 sql.js）', () => {
     runMigrations(db);
     expect(col(db, 'tasks', 'engine_override')).toBe(true);
     expect(one(db, "SELECT COUNT(*) FROM tasks WHERE engine_override IS NOT NULL")).toBe(0);
+  });
+
+  it('v29-v30：MCP 增加能力分类并只回填旧浏览器服务', () => {
+    const db = makeV25Db();
+    runMigrations(db);
+    expect(col(db, 'mcp_servers', 'capability')).toBe(true);
+    expect(one(db, "SELECT capability FROM mcp_servers WHERE id = 'mcp-browser'")).toBe('browser');
+    expect(one(db, "SELECT capability FROM mcp_servers WHERE id = 'mcp-memory'")).toBe('');
+  });
+
+  it('v31：旧员工回填 general 且六张手机表完整创建', () => {
+    const db = makeV25Db();
+    runMigrations(db);
+    expect(col(db, 'agents', 'agent_kind')).toBe(true);
+    expect(one(db, "SELECT COUNT(*) FROM agents WHERE agent_kind = 'general'")).toBe(4);
+    for (const table of ['mobile_devices', 'mobile_agent_configs', 'mobile_control_sessions', 'mobile_commands', 'mobile_artifacts', 'mobile_scripts']) {
+      expect(one(db, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '${table}'`)).toBe(1);
+    }
+  });
+
+  it('v31：数据库强制员工和设备一对一绑定', () => {
+    const db = makeV25Db();
+    runMigrations(db);
+    db.exec(`
+      INSERT INTO mobile_devices(id, protocol_version, identity_public_key, identity_fingerprint, paired_at) VALUES
+        ('phone-1', 1, 'pk1', 'fp1', 1), ('phone-2', 1, 'pk2', 'fp2', 1);
+      INSERT INTO mobile_agent_configs(agent_id, device_id, hermes_profile, created_at, updated_at)
+        VALUES('agent-real', 'phone-1', 'profile-1', 1, 1);
+    `);
+    expect(() => db.exec("INSERT INTO mobile_agent_configs(agent_id, device_id, hermes_profile, created_at, updated_at) VALUES('agent-demo','phone-1','profile-2',1,1)")).toThrow(/UNIQUE/);
+    expect(() => db.exec("INSERT INTO mobile_agent_configs(agent_id, device_id, hermes_profile, created_at, updated_at) VALUES('agent-real','phone-2','profile-3',1,1)")).toThrow(/UNIQUE/);
+  });
+
+  it('v31：设备、员工和任务活动租约唯一，结束后可创建下一条历史会话', () => {
+    const db = makeV25Db();
+    runMigrations(db);
+    db.exec(`
+      INSERT INTO mobile_devices(id, protocol_version, identity_public_key, identity_fingerprint, paired_at) VALUES
+        ('phone-1', 1, 'pk1', 'fp1', 1), ('phone-2', 1, 'pk2', 'fp2', 1);
+      INSERT INTO mobile_control_sessions(id, agent_id, device_id, task_id, status, started_at, expires_at)
+        VALUES('lease-1', 'agent-real', 'phone-1', 'task-real', 'active', 1, 999999);
+    `);
+    expect(() => db.exec("INSERT INTO mobile_control_sessions(id,agent_id,device_id,status,started_at,expires_at) VALUES('lease-device','agent-demo','phone-1','active',1,9)")).toThrow(/UNIQUE/);
+    expect(() => db.exec("INSERT INTO mobile_control_sessions(id,agent_id,device_id,status,started_at,expires_at) VALUES('lease-agent','agent-real','phone-2','active',1,9)")).toThrow(/UNIQUE/);
+    expect(() => db.exec("INSERT INTO mobile_control_sessions(id,agent_id,device_id,task_id,status,started_at,expires_at) VALUES('lease-task','agent-demo','phone-2','task-real','active',1,9)")).toThrow(/UNIQUE/);
+    db.exec("UPDATE mobile_control_sessions SET status='completed', ended_at=2 WHERE id='lease-1'");
+    expect(() => db.exec("INSERT INTO mobile_control_sessions(id,agent_id,device_id,task_id,status,started_at,expires_at) VALUES('lease-2','agent-real','phone-1','task-real','active',3,9)")).not.toThrow();
   });
 
   it('重复执行迁移不报错（addCol 幂等，覆盖异常重启后重跑）', () => {

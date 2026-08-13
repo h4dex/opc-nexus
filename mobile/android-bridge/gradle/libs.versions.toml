@@ -1,0 +1,18 @@
+[versions]
+agp = "8.3.0"
+kotlin = "1.9.22"
+coroutines = "1.7.3"
+gson = "2.10.1"
+junit = "4.13.2"
+mockk = "1.13.10"
+robolectric = "4.11.1"
+androidxCore = "1.10.1"
+
+[libraries]
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
+junit = { module = "junit:junit", version.ref = "junit" }
+mockk = { module = "io.mockk:mockk", version.ref = "mockk" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+androidx-core = { module = "androidx.core:core", version.ref = "androidxCore" }

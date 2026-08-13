@@ -203,6 +203,14 @@ describe('Orchestrator 状态机', () => {
       expect(row.status).toBe('COMPLETED');
     });
 
+    it('任务产物按需读取时限制为 16,000 字符', () => {
+      const agentId = seedAgent(db);
+      const task = orch.createTask(agentId, '超长产物任务');
+      db.tables.tasks.get(task.id)!.result = '中'.repeat(20_000);
+
+      expect(orch.taskResult(task.id)).toHaveLength(16_000);
+    });
+
     it('retryTask 保留员工、项目、工作区和父任务追溯', () => {
       const agentId = seedAgent(db);
       const projectId = seedProject(db);

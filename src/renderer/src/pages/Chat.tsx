@@ -4,6 +4,7 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { useApp } from '../store';
 import type { Conversation, TaskEvent } from '@shared/types';
+import { appendTaskOutput, compactTaskEvents } from '../utils/taskEvents';
 
 /** 表格规范化：在紧跟非表格文本的表格行前补空行，避免 GFM 解析失败（尤其含对齐标记 | :---: | 的表格） */
 function normalizeTables(md: string): string {
@@ -85,7 +86,7 @@ export function Chat() {
     if (task) {
       activeTaskRef.current = task.id;
       setActiveTaskId(task.id);
-      void window.aibox.getTaskEvents(task.id).then(setMessages);
+      void window.aibox.getTaskEvents(task.id).then((items) => setMessages(compactTaskEvents(items)));
     }
   }, []);
 
@@ -98,15 +99,12 @@ export function Chat() {
   useEffect(() => {
     const unsub = window.aibox.onTaskOutput(({ taskId, chunk }) => {
       if (taskId !== activeTaskRef.current) return;
-      setMessages((prev) => [...prev, {
-        id: `stream-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        taskId, eventType: 'output', payload: { chunk }, createdAt: Date.now()
-      } as TaskEvent]);
+      setMessages((prev) => appendTaskOutput(prev, taskId, chunk));
     });
     return unsub;
   }, []);
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'auto' }); }, [messages.length]);
 
   // 所有 hooks 必须在早退之前调用（保活页面在 snapshot 加载前即挂载，早退后置 hooks 会触发 hooks 数量不一致）
   if (!snapshot) return null;

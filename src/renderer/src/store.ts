@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { Snapshot, ResourcePayload } from '../../preload/index';
 import type { ActionCenterOverview, SearchEntityType, SearchRoute } from '../../shared/types';
 
-export type RouteKey = 'dashboard' | 'projects' | 'office' | 'inbox' | 'deliverables' | 'knowledge' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'chat' | 'teams' | 'collab' | 'market' | 'engines' | 'channels' | 'mcp' | 'skills' | 'usage' | 'system' | 'settings';
+export type RouteKey = 'dashboard' | 'projects' | 'office' | 'inbox' | 'deliverables' | 'knowledge' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'mobile' | 'chat' | 'teams' | 'collab' | 'market' | 'engines' | 'channels' | 'mcp' | 'skills' | 'usage' | 'system' | 'settings';
 
 export interface NavigationTarget {
   entityType: SearchEntityType;

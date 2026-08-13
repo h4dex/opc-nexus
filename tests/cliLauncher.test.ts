@@ -114,6 +114,21 @@ describe('runCli：不抛异常的一次性执行', () => {
     expect(r.error).toContain('超时');
   });
 
+  it.runIf(isWin)('Windows 超时会终止整棵进程树，不遗留 CLI runtime', async () => {
+    const parentScript = [
+      'const { spawn } = require("node:child_process")',
+      'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore" })',
+      'process.stdout.write(String(child.pid))',
+      'setInterval(() => {}, 60000)'
+    ].join(';');
+    const r = await runCli(process.execPath, ['-e', parentScript], { timeoutMs: 500 });
+    const descendantPid = Number(r.stdout.trim());
+
+    expect(r.error).toContain('超时');
+    expect(descendantPid).toBeGreaterThan(0);
+    expect(() => process.kill(descendantPid, 0)).toThrow();
+  }, 10_000);
+
   it.runIf(isWin)('中文 Windows 的 GBK 错误输出被正确解码（否则错误信息全乱码）', async () => {
     // cmd.exe 在中文系统下以 GBK 写 stderr；按 UTF-8 解码会得到 '�' 乱码，
     // 既无法阅读也无法用中文特征匹配「命令未找到」。

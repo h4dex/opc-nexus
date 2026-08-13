@@ -32,6 +32,8 @@ import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
 import { resolveEngineEnv } from '../engineEnv.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
+import type { MobileGatewayService } from '../mobileGatewayService.js';
+import { appendBoundedText, appendProcessOutput, boundedText, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
 
 const ENGINE_ID = 'eng-hermes-cli';
 const TIMEOUT_MS = 15 * 60_000;
@@ -56,10 +58,21 @@ interface HermesUsageReport {
   failure?: string;
 }
 
+const HERMES_FAILURE_TEXT = /HTTP\s+(?:400|401|403|408|409|422|429|5\d\d)\b|missing authentication header|no usable credentials|auth(?:entication)?[_\s-]?unavailable|invalid[_\s-]?(?:api[_\s-]?)?key|unauthorized|forbidden|rate limit|quota|billing|provider.*(?:failed|error)|api call failed/i;
+
+export function hermesFailureDetail(usage: HermesUsageReport | null, stdout: string, stderr: string): string | null {
+  const explicit = usage?.failure?.trim();
+  if (explicit) return explicit.slice(0, 500);
+  const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n');
+  if (usage?.failed === true) return (combined || 'Hermes usage report marked the request as failed').slice(0, 500);
+  return HERMES_FAILURE_TEXT.test(combined) ? combined.slice(0, 500) : null;
+}
+
 interface RunningChild {
   child: ChildProcess;
   timer: NodeJS.Timeout;
   usageFile: string;
+  mobile: boolean;
 }
 
 export class HermesAgentExecutor implements ExecutorAdapter {
@@ -67,8 +80,14 @@ export class HermesAgentExecutor implements ExecutorAdapter {
   private running = new Map<string, RunningChild>();
   /** 被用户主动取消的任务：close 回调中不再回报错误（状态已由 orchestrator 置 CANCELLED） */
   private abortedTasks = new Set<string>();
+  private preparingTasks = new Set<string>();
+  private mobileGateway: MobileGatewayService | null = null;
 
   constructor(private db: Database) {}
+
+  setMobileGateway(gateway: MobileGatewayService): void {
+    this.mobileGateway = gateway;
+  }
 
   /** 就绪 = 引擎表状态 HEALTHY（由 EngineManager.detect 真实探测 hermes 二进制后写入） */
   isReady(): boolean {
@@ -84,6 +103,12 @@ export class HermesAgentExecutor implements ExecutorAdapter {
 
   /** 构造 headless 参数；运行参数模板可被配置文件 engines['eng-hermes-cli'].runArgs 覆写 */
   private buildArgs(prompt: string, task: Task, agent: Agent, usageFile: string): string[] {
+    if (agent.kind === 'android_operator') {
+      const args = ['-z', prompt, '--usage-file', usageFile, '--accept-hooks', '-t', 'android'];
+      if (task.sessionId?.startsWith('hermes-')) args.push('-r', task.sessionId.slice('hermes-'.length), '--no-restore-cwd');
+      if (agent.modelOverride) args.push('-m', agent.modelOverride);
+      return args;
+    }
     const override = loadConfig().engines[ENGINE_ID]?.runArgs;
     if (override && override.length > 0) {
       // 用户完全接管参数模板：仅做 {prompt} 占位替换，不再叠加本应用的默认策略
@@ -111,11 +136,46 @@ export class HermesAgentExecutor implements ExecutorAdapter {
   }
 
   start(task: Task, agent: Agent, cb: ExecutorCallbacks): void {
+    if (agent.kind === 'android_operator') {
+      void this.startMobile(task, agent, cb);
+      return;
+    }
+    this.startProcess(task, agent, cb, null);
+  }
+
+  private async startMobile(task: Task, agent: Agent, cb: ExecutorCallbacks): Promise<void> {
+    const gateway = this.mobileGateway;
+    if (!gateway) {
+      cb.onError(task.id, 'OPC-Nexus Mobile Gateway 未初始化');
+      return;
+    }
+    this.preparingTasks.add(task.id);
+    try {
+      const mobile = await gateway.prepareTask(task, agent);
+      this.preparingTasks.delete(task.id);
+      if (this.abortedTasks.delete(task.id)) {
+        gateway.finishTask(task.id, 'cancelled');
+        return;
+      }
+      this.startProcess(task, agent, cb, {
+        HERMES_HOME: mobile.hermesHome,
+        OPCNEXUS_MOBILE_GATEWAY_URL: mobile.gatewayUrl,
+        OPCNEXUS_MOBILE_TASK_TOKEN: mobile.token
+      });
+    } catch (error) {
+      this.preparingTasks.delete(task.id);
+      gateway.finishTask(task.id, 'cancelled');
+      if (!this.abortedTasks.delete(task.id)) cb.onError(task.id, `手机任务准备失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private startProcess(task: Task, agent: Agent, cb: ExecutorCallbacks, mobileEnv: Record<string, string> | null): void {
     const workspace = task.workspaceOverride || agent.workspace || join(app.getPath('userData'), 'workspaces', agent.id);
     try {
       mkdirSync(workspace, { recursive: true });
     } catch (err) {
       cb.onError(task.id, `工作目录不可用：${workspace}（${err instanceof Error ? err.message : String(err)}）`);
+      if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'cancelled');
       return;
     }
 
@@ -132,9 +192,10 @@ export class HermesAgentExecutor implements ExecutorAdapter {
         cwd: workspace,
         shell: false,
         windowsHide: true,
-        env: { ...process.env, ...resolveEngineEnv(this.db, ENGINE_ID) }
+        env: { ...process.env, ...resolveEngineEnv(this.db, ENGINE_ID), ...mobileEnv }
       });
     } catch (err) {
+      if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'cancelled');
       cb.onError(task.id, `无法启动 ${bin}：${err instanceof Error ? err.message : String(err)}`);
       return;
     }
@@ -144,19 +205,24 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       this.running.delete(task.id);
       this.cleanupUsage(usageFile);
       killQuietly(child);
+      if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'expired');
       cb.onError(task.id, '执行超时（15 分钟），已终止 Hermes 进程');
     }, TIMEOUT_MS);
-    this.running.set(task.id, { child, timer, usageFile });
+    this.running.set(task.id, { child, timer, usageFile, mobile: !!mobileEnv });
 
     cb.onStage(task.id, '理解需求');
     cb.onProgress(task.id, 5);
 
     // -z 模式无事件流：按输出长度粗粒度推进进度，不伪造阶段细节
+    const fullParts: string[] = [];
+    const fullState = { length: 0, truncated: false };
     let full = '';
+    const stderrOutput = createProcessOutputBuffer();
     let stderrBuf = '';
     let outBuf = '';
     let lastFlush = Date.now();
     let lastProgress = 5;
+    const stdoutDecoder = createUtf8StreamDecoder();
 
     const flush = (force: boolean) => {
       if (outBuf && (force || Date.now() - lastFlush >= 300)) {
@@ -167,10 +233,12 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     };
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      full += text;
-      outBuf += text;
-      const pct = Math.min(90, 10 + Math.floor(full.length / 30));
+      const text = stdoutDecoder.write(chunk);
+      appendBoundedText(fullParts, fullState, text);
+      // Keep the live buffer bounded independently; fullParts remains the
+      // authoritative capped result assembled at process close.
+      if (text && outBuf.length < 32 * 1024) outBuf += text.slice(0, 32 * 1024 - outBuf.length);
+      const pct = Math.min(90, 10 + Math.floor(fullState.length / 30));
       if (pct > lastProgress) {
         lastProgress = pct;
         cb.onProgress(task.id, pct);
@@ -178,12 +246,13 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       }
       flush(false);
     });
-    child.stderr?.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString('utf8'); });
+    child.stderr?.on('data', (chunk: Buffer) => appendProcessOutput(stderrOutput, chunk));
 
     child.on('error', (err) => {
       clearTimeout(timer);
       this.running.delete(task.id);
       this.cleanupUsage(usageFile);
+      if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'cancelled');
       cb.onError(task.id, `启动失败：${err.message}（请确认 hermes 已安装并在 PATH 中）`);
     });
 
@@ -192,16 +261,28 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       this.running.delete(task.id);
       if (this.abortedTasks.delete(task.id)) {
         this.cleanupUsage(usageFile);
+        if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'cancelled');
         return; // 用户取消，状态已由 orchestrator 置 CANCELLED
       }
+      const tail = stdoutDecoder.end();
+      if (tail) appendBoundedText(fullParts, fullState, tail);
+      if (tail && outBuf.length < 32 * 1024) outBuf += tail.slice(0, 32 * 1024 - outBuf.length);
+      full = boundedText(fullParts, fullState);
+      stderrBuf = finishProcessOutput(stderrOutput);
       flush(true);
 
       // 用量报告：失败时同样写出，先读再按退出码分流
       const usage = this.readUsage(usageFile);
       if (usage?.session_id && !task.sessionId) cb.onSession?.(task.id, `hermes-${usage.session_id}`);
       if (usage) this.recordUsage(task, agent, usage);
+      const reportedFailure = hermesFailureDetail(usage, full, stderrBuf);
+      if (mobileEnv) this.mobileGateway?.finishTask(task.id, code === 0 && !reportedFailure ? 'completed' : 'failed');
 
       if (code === 0) {
+        if (reportedFailure) {
+          cb.onError(task.id, `Hermes 执行失败：${reportedFailure}`);
+          return;
+        }
         const result = full.trim();
         if (!result) {
           cb.onError(task.id, 'Hermes 执行完成但未产生文本输出');
@@ -233,6 +314,9 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       killQuietly(run.child);
       this.cleanupUsage(run.usageFile); // 中止路径同样要清理临时用量文件，避免 tmp 堆积
       this.running.delete(taskId);
+      if (run.mobile) this.mobileGateway?.finishTask(taskId, 'cancelled');
+    } else if (this.preparingTasks.has(taskId)) {
+      this.abortedTasks.add(taskId);
     }
   }
 

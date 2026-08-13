@@ -14,6 +14,7 @@ interface SeedMcpServer {
   args: string[];
   env: Record<string, string>;
   scope: string;
+  capability?: 'browser';
 }
 
 const SEED_MCP_SERVERS: SeedMcpServer[] = [
@@ -71,7 +72,8 @@ const SEED_MCP_SERVERS: SeedMcpServer[] = [
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-puppeteer'],
     env: {},
-    scope: 'global'
+    scope: 'global',
+    capability: 'browser'
   }
 ];
 
@@ -163,10 +165,10 @@ export function seedMcpServers(db: Database) {
 
   db.transaction(() => {
     const insert = db.raw.prepare(
-      'INSERT INTO mcp_servers(id, name, command, args, env, enabled, scope) VALUES(?,?,?,?,?,1,?)'
+      'INSERT INTO mcp_servers(id, name, command, args, env, enabled, scope, capability) VALUES(?,?,?,?,?,1,?,?)'
     );
     for (const s of SEED_MCP_SERVERS) {
-      insert.run(`mcp-${randomUUID().slice(0, 8)}`, s.name, s.command, JSON.stringify(s.args), JSON.stringify(s.env), s.scope);
+      insert.run(`mcp-${randomUUID().slice(0, 8)}`, s.name, s.command, JSON.stringify(s.args), JSON.stringify(s.env), s.scope, s.capability ?? '');
     }
   });
 }

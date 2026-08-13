@@ -18,9 +18,12 @@ import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
 import { resolveEngineEnv } from '../engineEnv.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
+import { appendProcessOutput, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
+import { appendBoundedText, boundedText } from '../textEncoding.js';
 
 const TIMEOUT_MS = 10 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
+const MAX_STREAM_BUFFER_CHARS = 1_024 * 1_024;
 
 interface RunningChild {
   child: ChildProcess;
@@ -123,8 +126,11 @@ export class CliExecutor implements ExecutorAdapter {
     cb.onStage(task.id, '理解需求');
     cb.onProgress(task.id, 5);
 
+    const fullParts: string[] = [];
+    const fullState = { length: 0, truncated: false };
     let full = '';
     let outBuf = '';
+    const stderrOutput = createProcessOutputBuffer();
     let stderrBuf = '';
     let lastFlush = Date.now();
     let lastProgress = 5;
@@ -145,9 +151,9 @@ export class CliExecutor implements ExecutorAdapter {
       }
     };
     const pushText = (text: string) => {
-      full += text;
-      outBuf += text;
-      bump(null, Math.min(90, 10 + Math.floor(full.length / 30)));
+      appendBoundedText(fullParts, fullState, text);
+      if (outBuf.length < 32 * 1024) outBuf += text.slice(0, 32 * 1024 - outBuf.length);
+      bump(null, Math.min(90, 10 + Math.floor(fullState.length / 30)));
       flush(false);
     };
 
@@ -198,15 +204,19 @@ export class CliExecutor implements ExecutorAdapter {
           if (ev.is_error) {
             this.abortedTasks.add(task.id); // 同上：防 close 分支覆盖为成功
             cb.onError(task.id, String(ev.result ?? 'Claude Code 执行错误'));
-          } else if (typeof ev.result === 'string' && ev.result && !full) pushText(ev.result);
+          } else if (typeof ev.result === 'string' && ev.result && fullState.length === 0) pushText(ev.result);
           bump('校验结果', 95);
         }
       }
     };
 
     let stdoutBuf = '';
+    const stdoutDecoder = createUtf8StreamDecoder();
     child.stdout?.on('data', (chunk: Buffer) => {
-      stdoutBuf += chunk.toString('utf8');
+      stdoutBuf += stdoutDecoder.write(chunk);
+      if (stdoutBuf.length > MAX_STREAM_BUFFER_CHARS) {
+        stdoutBuf = stdoutBuf.slice(-MAX_STREAM_BUFFER_CHARS);
+      }
       let nl: number;
       while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
         const line = stdoutBuf.slice(0, nl).trim();
@@ -214,9 +224,7 @@ export class CliExecutor implements ExecutorAdapter {
         if (line) handleLine(line);
       }
     });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderrBuf += chunk.toString('utf8');
-    });
+    child.stderr?.on('data', (chunk: Buffer) => appendProcessOutput(stderrOutput, chunk));
 
     child.on('error', (err) => {
       clearTimeout(timer);
@@ -229,7 +237,10 @@ export class CliExecutor implements ExecutorAdapter {
       clearTimeout(timer);
       this.running.delete(task.id);
       if (this.abortedTasks.delete(task.id)) return; // 用户取消，不回报
+      stdoutBuf += stdoutDecoder.end();
+      stderrBuf = finishProcessOutput(stderrOutput);
       if (stdoutBuf.trim()) handleLine(stdoutBuf.trim());
+      full = boundedText(fullParts, fullState);
       flush(true);
       if (code === 0) {
         bump('校验结果', 98);

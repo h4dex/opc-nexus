@@ -55,6 +55,20 @@ export class ExecutorRegistry {
     this.llm.setOcrService(svc);
   }
 
+  /** 注入 MCP 管理器，供内置 Nexus Agent 动态发现并调用受限工具。 */
+  setMcpManager(manager: import('../mcpManager.js').McpManager) {
+    this.llm.setMcpManager(manager);
+  }
+
+  setMobileGateway(gateway: import('../mobileGatewayService.js').MobileGatewayService) {
+    this.hermes.setMobileGateway(gateway);
+  }
+
+  /** Dynamic MCP tools currently run inside the built-in Nexus/LLM tool loop. */
+  supportsMcp(engineId: string): boolean {
+    return this.engineType(engineId) === 'hermes';
+  }
+
   private engineType(engineId: string): string {
     const row = this.db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as { type: string } | undefined;
     return row?.type ?? 'hermes';

@@ -332,7 +332,7 @@ export function Office() {
   const [clickCard, setClickCard] = useState<AgentCardView | null>(null);
   const [teams, setTeams] = useState<{ id: string; name: string; memberIds: string[] }[]>([]);
 
-  useMemo(() => {
+  useEffect(() => {
     void window.aibox.listTeams().then((ts) => setTeams(ts.map((t) => ({ id: t.id, name: t.name, memberIds: t.memberIds }))));
   }, []);
 

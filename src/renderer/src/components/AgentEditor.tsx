@@ -1,8 +1,11 @@
 /** 助手编辑弹窗：权限快捷切换 + 能力开关 + 人设配置 + 引擎/模型选择 + 预设模板 + 组合预览 */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
-import type { Agent, AgentCapabilities, PermissionMode } from '@shared/types';
+import { MobileToolPolicy } from './MobileToolPolicy';
+import type {
+  Agent, AgentCapabilities, AgentKind, MobileAgentConfig, MobileDevice, MobileToolCatalog, MobileToolName, PermissionMode
+} from '@shared/types';
 
 const PERM_OPTIONS: { value: PermissionMode; label: string; desc: string; color: string }[] = [
   { value: 'readonly', label: '只读', desc: '仅允许读取操作，写入/删除一律禁止', color: 'var(--text-3)' },
@@ -19,7 +22,7 @@ const SOUL_PRESETS: { name: string; content: string }[] = [
   { name: '自定义', content: '' }
 ];
 
-type TabKey = 'soul' | 'agents' | 'user' | 'basic' | 'model' | 'tags';
+type TabKey = 'soul' | 'agents' | 'user' | 'basic' | 'mobile' | 'model' | 'tags';
 
 export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => void }) {
   const [tab, setTab] = useState<TabKey>('soul');
@@ -29,27 +32,84 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
   const [systemPrompt, setSystemPrompt] = useState(agent.systemPrompt);
   const [role, setRole] = useState(agent.role);
   const [permMode, setPermMode] = useState<PermissionMode>(agent.permissionMode);
-  const [caps, setCaps] = useState<AgentCapabilities>(agent.capabilities ?? { network: false, shell: false, install: false, browser: false, computer: false });
+  const [caps, setCaps] = useState<AgentCapabilities>(agent.capabilities ?? { network: false, shell: false, install: false, browser: false, computer: false, mobile: false });
   const [tags, setTags] = useState<string[]>(agent.tags ?? []);
   const [tagInput, setTagInput] = useState('');
   const [modelOverrides, setModelOverrides] = useState<{ temperature?: number; topP?: number; maxTokens?: number }>(agent.modelOverrides ?? {});
   const [engineId, setEngineId] = useState(agent.engineId);
   const [modelOverride, setModelOverride] = useState(agent.modelOverride ?? '');
+  const [kind, setKind] = useState<AgentKind>(agent.kind ?? 'general');
+  const [mobileCatalog, setMobileCatalog] = useState<MobileToolCatalog | null>(null);
+  const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
+  const [mobileConfig, setMobileConfig] = useState<MobileAgentConfig | null>(null);
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [mobileTools, setMobileTools] = useState<MobileToolName[]>([]);
+  const [mobileAuthorizationConfirmed, setMobileAuthorizationConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
 
+  useEffect(() => {
+    let active = true;
+    void Promise.all([
+      window.aibox.getMobileToolCatalog(),
+      window.aibox.listMobileDevices(),
+      window.aibox.getMobileAgentConfig(agent.id)
+    ]).then(([catalog, devices, config]) => {
+      if (!active) return;
+      setMobileCatalog(catalog);
+      setMobileDevices(devices);
+      setMobileConfig(config);
+      setDeviceId(config?.deviceId ?? null);
+      setMobileTools(config?.allowedTools ?? catalog.tools.map((tool) => tool.name));
+      setMobileAuthorizationConfirmed(!!config?.authorizationConfirmedAt);
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [agent.id]);
+
+  const chooseKind = (next: AgentKind) => {
+    setKind(next);
+    if (next === 'android_operator') {
+      setEngineId('eng-hermes-cli');
+      setCaps({ network: false, shell: false, install: false, browser: false, computer: false, mobile: true });
+    } else {
+      setCaps((current) => ({ ...current, mobile: false }));
+      if (tab === 'mobile') setTab('basic');
+    }
+  };
+
   const save = async () => {
     setBusy(true);
     setSaved(false);
-    await window.aibox.updateAgentPersona(agent.id, {
-      role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps,
-      tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
-      engineId, modelOverride: modelOverride || undefined
-    });
-    setBusy(false);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    try {
+      const deviceChanged = deviceId !== (mobileConfig?.deviceId ?? null);
+      const toolsChanged = JSON.stringify(mobileTools) !== JSON.stringify(mobileConfig?.allowedTools ?? []);
+      if (kind === 'android_operator' && deviceId && deviceChanged && !mobileAuthorizationConfirmed) {
+        throw new Error('绑定新设备前必须确认完整手机工具授权');
+      }
+      const updated = await window.aibox.updateAgentPersona(agent.id, {
+        role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps,
+        tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
+        engineId: kind === 'android_operator' ? 'eng-hermes-cli' : engineId,
+        modelOverride: modelOverride || undefined,
+        kind,
+        ...(kind === 'android_operator' && deviceChanged ? { deviceId } : {}),
+        ...(kind === 'android_operator' && toolsChanged ? { mobileAllowedTools: mobileTools } : {}),
+        ...(kind === 'android_operator' && (deviceChanged || toolsChanged) ? { mobileAuthorizationConfirmed } : {})
+      });
+      setKind(updated.kind);
+      if (updated.kind === 'android_operator') {
+        const nextConfig = await window.aibox.getMobileAgentConfig(agent.id);
+        setMobileConfig(nextConfig);
+        setDeviceId(nextConfig?.deviceId ?? null);
+        setMobileTools(nextConfig?.allowedTools ?? mobileTools);
+        setMobileAuthorizationConfirmed(!!nextConfig?.authorizationConfirmedAt);
+      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } finally {
+      setBusy(false);
+    }
   };
 
   // 组合预览：模拟执行器拼装 system prompt 的逻辑
@@ -65,6 +125,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     { key: 'agents', label: 'agents.md' },
     { key: 'user', label: 'user.md' },
     { key: 'basic', label: '基础 / 权限' },
+    ...(kind === 'android_operator' ? [{ key: 'mobile' as const, label: '手机 / 工具' }] : []),
     { key: 'model', label: '模型参数' },
     { key: 'tags', label: '标签' }
   ];
@@ -157,6 +218,14 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
       {tab === 'basic' && (
         <>
           <div className="field">
+            <label>数字员工身份</label>
+            <div className="chip-row">
+              <button className={`chip ${kind === 'general' ? 'on' : ''}`} onClick={() => chooseKind('general')}>通用数字员工</button>
+              <button className={`chip ${kind === 'android_operator' ? 'on' : ''}`} onClick={() => chooseKind('android_operator')}>Android 手机操作员</button>
+            </div>
+            {kind === 'android_operator' && <div className="hint">固定 Hermes Agent CLI、并发 1，关闭网络、Shell、安装、浏览器和桌面操控能力。</div>}
+          </div>
+          <div className="field">
             <label>职责描述</label>
             <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="例如：全栈开发助手" />
           </div>
@@ -164,7 +233,9 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
           {/* 引擎选择 */}
           <div className="field">
             <label>执行引擎（该员工执行任务时使用的引擎）</label>
-            <EngineSelect value={engineId} onChange={setEngineId} />
+            {kind === 'android_operator'
+              ? <input value="Hermes Agent CLI（手机操作员固定）" readOnly />
+              : <EngineSelect value={engineId} onChange={setEngineId} />}
           </div>
 
           {/* 模型选择 */}
@@ -190,8 +261,8 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
                 { key: 'browser' as const, icon: '🖥️', label: '浏览器自动化（Playwright/CDP）', desc: '允许网页导航、点击、输入、截图、JS执行、CDP直连 Chrome' },
                 { key: 'computer' as const, icon: '🖱️', label: '桌面操控（Computer Use）', desc: '允许屏幕截图、鼠标点击、键盘输入、按键组合、滚轮操作' }
               ]).map((item) => (
-                <label key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', padding: '8px 12px', borderRadius: 8, background: caps[item.key] ? 'var(--accent-soft)' : 'var(--input-bg)', border: `1px solid ${caps[item.key] ? 'var(--accent)' : 'var(--border)'}` }}>
-                  <input type="checkbox" checked={caps[item.key]} onChange={(e) => setCaps((c) => ({ ...c, [item.key]: e.target.checked }))}
+                <label key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: kind === 'android_operator' ? 'not-allowed' : 'pointer', opacity: kind === 'android_operator' ? 0.55 : 1, padding: '8px 12px', borderRadius: 8, background: caps[item.key] ? 'var(--accent-soft)' : 'var(--input-bg)', border: `1px solid ${caps[item.key] ? 'var(--accent)' : 'var(--border)'}` }}>
+                  <input type="checkbox" disabled={kind === 'android_operator'} checked={caps[item.key]} onChange={(e) => setCaps((c) => ({ ...c, [item.key]: e.target.checked }))}
                     style={{ width: 16, height: 16, accentColor: 'var(--accent)' }} />
                   <span style={{ fontSize: 16 }}>{item.icon}</span>
                   <div style={{ flex: 1 }}>
@@ -210,6 +281,44 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
             权限模式已在顶部设置。当前：<b style={{ color: PERM_OPTIONS.find((p) => p.value === permMode)?.color }}>{PERM_OPTIONS.find((p) => p.value === permMode)?.label}</b>
             <br />能力开关独立于权限模式：即使权限为“完全自主”，未开启的能力对应工具也不会注册给模型。
           </div>
+        </>
+      )}
+
+      {tab === 'mobile' && kind === 'android_operator' && (
+        <>
+          <div className="field">
+            <label>绑定 Android 设备（一台设备只能绑定一个手机员工）</label>
+            <select value={deviceId ?? ''} onChange={(event) => {
+              setDeviceId(event.target.value || null);
+              setMobileAuthorizationConfirmed(false);
+            }}>
+              <option value="">暂不绑定</option>
+              {mobileDevices.map((device) => (
+                <option key={device.id} value={device.id} disabled={!!device.boundAgentId && device.boundAgentId !== agent.id}>
+                  {device.name || device.model} · {device.status}{device.boundAgentId && device.boundAgentId !== agent.id ? '（已绑定）' : ''}
+                </option>
+              ))}
+            </select>
+            <div className="hint">新设备请先在“手机控制台”启动 Gateway 并扫码配对。</div>
+          </div>
+          <div className="field">
+            <label>Hermes Profile</label>
+            <input readOnly value={mobileConfig?.hermesProfile ?? `opcnexus-mobile-${agent.id.slice(0, 12)}`} />
+          </div>
+          <div className="field">
+            <label>Android 工具策略</label>
+            <MobileToolPolicy catalog={mobileCatalog} selected={mobileTools} onChange={(tools) => {
+              setMobileTools(tools);
+              setMobileAuthorizationConfirmed(false);
+            }} />
+          </div>
+          {deviceId && <label className="mobile-auth-confirm">
+            <input type="checkbox" checked={mobileAuthorizationConfirmed} onChange={(event) => setMobileAuthorizationConfirmed(event.target.checked)} />
+            <span>
+              <b>确认向该数字员工授予以上 {mobileTools.length} 个手机工具</b>
+              <small>更换设备或工具策略后需要重新确认；短信、电话、输入、隐私读取和媒体操作均会写入审计。</small>
+            </span>
+          </label>}
         </>
       )}
 

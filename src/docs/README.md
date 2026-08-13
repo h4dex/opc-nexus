@@ -34,6 +34,7 @@ OPC-Nexus（One Person Company Nexus）— 本地优先的桌面 Agent 管理器
 | [architecture.md](./architecture.md) | 系统架构设计、分层模型、安全基线 |
 | [features.md](./features.md) | 全部功能模块开发文档 |
 | [api-reference.md](./api-reference.md) | IPC 接口与 preload API 参考 |
+| [../../docs/ANDROID-DEVICE-OPERATIONS.md](../../docs/ANDROID-DEVICE-OPERATIONS.md) | Android Bridge、手机控制台、设备操作与安全说明 |
 
 ## 快速开始
 

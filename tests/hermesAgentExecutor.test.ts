@@ -23,7 +23,7 @@ vi.mock('../src/main/services/config.js', () => ({
   loadConfig: () => appCfg
 }));
 
-const { HermesAgentExecutor } = await import('../src/main/services/executor/hermesAgentExecutor.js');
+const { HermesAgentExecutor, hermesFailureDetail } = await import('../src/main/services/executor/hermesAgentExecutor.js');
 
 function makeDb(status = 'HEALTHY', path: string | null = null) {
   return {
@@ -168,5 +168,18 @@ describe('HermesAgentExecutor 会话续接', () => {
 
   it('无 sessionId 时不传续接参数', () => {
     expect(buildArgs(new HermesAgentExecutor(makeDb()), baseTask, baseAgent)).not.toContain('-r');
+  });
+});
+
+describe('HermesAgentExecutor 失败判定', () => {
+  it('usage-file 标记失败时不接受零退出码', () => {
+    expect(hermesFailureDetail({ failed: true }, 'HTTP 401: Missing Authentication header', ''))
+      .toContain('HTTP 401');
+  });
+
+  it('usage-file 缺失时仍识别鉴权错误文本', () => {
+    expect(hermesFailureDetail(null, 'No usable credentials found for provider', ''))
+      .toContain('No usable credentials');
+    expect(hermesFailureDetail(null, '正常任务结果', '')).toBeNull();
   });
 });

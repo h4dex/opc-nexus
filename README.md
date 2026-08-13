@@ -18,6 +18,13 @@
 
 所有数据存储在本地（SQLite WASM），密钥通过 Electron safeStorage 加密，**无需云端依赖**，保障数据主权与隐私安全。
 
+| 组件 | 当前版本 | 说明 |
+|------|----------|------|
+| OPC-Nexus 桌面端 | `1.7.0` | Windows / Linux Agent 管理与手机控制中心 |
+| OPC-Nexus 手机桥 | `0.4.3` | Android 8.0+、无需 Root，重点验证 API 34 |
+
+桌面端与手机桥独立维护版本号。每次功能变更验证通过后递增受影响组件的版本；用户指定版本时以指定版本为准。
+
 ## 界面预览
 
 ### 工作台
@@ -41,6 +48,16 @@
 - 四层状态机驱动（Agent / Task / Engine / Channel）
 - 独立工作区隔离，支持人设 / 权限 / 模型绑定
 - Agent 克隆、市场模板一键部署
+- 员工列表直接安排任务，支持通用员工与 Android 手机操作员身份
+
+### Android 手机员工
+- 无 Root Android 8.0+ Bridge，通过局域网 WSS 与桌面端配对
+- Hermes Agent 独立 Profile，按设备和员工授权 42 个 `android_*` 工具
+- 屏幕预览、Accessibility UI Tree、点击/输入/滑动、应用与系统操作
+- 受限控制脚本、脱敏命令日志、截图/录屏/WAV 媒体产物
+- 二维码、完整配置复制/粘贴和逐项手动配置三种配对方式
+
+![OPC-Nexus 手机控制台](./docs/screenshots/mobile-console.png)
 
 ### 任务编排与执行
 - 队列调度、优先级管理、并发控制
@@ -125,6 +142,7 @@
 - **Node.js** >= 20.x
 - **npm** >= 10.x
 - **Git** >= 2.x（多机协同功能需要）
+- **Android 开发工具（可选）** Java 17 + Android SDK / Build Tools（仅构建或 ADB 安装手机桥时需要）
 
 ## 快速开始
 
@@ -164,6 +182,11 @@ npm run pack:linux
 | `npm run typecheck` | TypeScript 全量类型检查 |
 | `npm test` | 运行单元测试（vitest） |
 | `npm run test:watch` | 监听模式测试 |
+| `npm run mobile:icons` | 重新生成 Android Launcher 图标资源 |
+| `npm run mobile:apk:debug` | 构建并校验 Android Debug APK |
+| `npm run mobile:apk:release` | 使用仓库外生产 keystore 构建 Android Release APK |
+| `npm run mobile:apk:verify` | 校验内置 APK 的包名、版本、摘要与签名 |
+| `npm run mobile:e2e` | 在 Android 模拟器执行 Mobile Gateway 端到端验证 |
 | `npm run pack:win` | 打包 Windows x64 安装程序 |
 | `npm run pack:linux` | 打包 Linux x64 |
 
@@ -268,6 +291,7 @@ opc-nexus/
 | 文档 | 说明 |
 |------|------|
 | [用户使用手册](./docs/USER-GUIDE.md) | 界面说明、操作指南、常见问题 |
+| [Android 设备操作文档](./docs/ANDROID-DEVICE-OPERATIONS.md) | Android Bridge、手机控制台、设备操作、脚本、日志、媒体与安全说明 |
 | [更新日志](./CHANGELOG.md) | 版本历史与变更记录 |
 | [GitHub Release 发布指南](./docs/RELEASING.md) | CI/CD、版本标签、代码签名与发布产物 |
 | [架构设计](./src/docs/architecture.md) | 系统架构、分层模型、安全基线 |

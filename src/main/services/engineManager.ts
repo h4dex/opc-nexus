@@ -20,6 +20,7 @@ import { loadConfig, sanitizeRegistry } from './config.js';
 import { runCli } from './cliLauncher.js';
 import { acpCommandFor, probeAcpEngine } from './executor/acpExecutor.js';
 import { engineEnvSecretRef, resolveEngineEnv, splitSecretEnv, SECRET_PLACEHOLDER } from './engineEnv.js';
+import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 import type { Engine, EngineHealthSignals, EngineInstallGuide, EngineInstallResult, EngineType } from '../../shared/types.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
@@ -498,11 +499,12 @@ export class EngineManager {
     return new Promise((resolve) => {
       try {
         const child = spawn(cmd, args, { shell: false, windowsHide: true });
-        let stderr = '';
-        child.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
+        const stderrBuffer = createProcessOutputBuffer();
+        child.stderr?.on('data', (c: Buffer) => appendProcessOutput(stderrBuffer, c));
         const timer = setTimeout(() => { child.kill(); resolve({ ok: false, message: '安装超时（5分钟）' }); }, 5 * 60_000);
         child.on('close', (code) => {
           clearTimeout(timer);
+          const stderr = finishProcessOutput(stderrBuffer);
           resolve(code === 0 ? { ok: true, message: `${name} 安装成功，请重新检测` } : { ok: false, message: `安装失败（退出码 ${code}）：${stderr.slice(0, 200)}` });
         });
         child.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, message: `无法启动安装程序：${err.message}` }); });
@@ -621,7 +623,7 @@ function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }
   const bin = isWin ? 'cmd.exe' : 'npm';
   const args = isWin ? ['/d', '/s', '/c', 'npm', ...npmArgs] : npmArgs;
   return new Promise((resolve) => {
-    let stderr = '';
+    const stderrBuffer = createProcessOutputBuffer();
     let settled = false;
     const done = (ok: boolean, message: string) => {
       if (!settled) {
@@ -640,7 +642,7 @@ function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }
       child.kill();
       done(false, '安装超时（10 分钟），请检查网络或更换下载源');
     }, INSTALL_TIMEOUT_MS);
-    child.stderr?.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+    child.stderr?.on('data', (c: Buffer) => appendProcessOutput(stderrBuffer, c));
     child.on('error', (err) => {
       clearTimeout(timer);
       done(false, `无法启动 npm：${err.message}（请确认已安装 Node.js 且 npm 在 PATH 中）`);
@@ -648,7 +650,7 @@ function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }
     child.on('close', (code) => {
       clearTimeout(timer);
       if (code === 0) done(true, 'ok');
-      else done(false, `npm 退出码 ${code ?? 'null'}：${(stderr || '无错误输出').slice(0, 400)}`);
+      else done(false, `npm 退出码 ${code ?? 'null'}：${(finishProcessOutput(stderrBuffer) || '无错误输出').slice(0, 400)}`);
     });
   });
 }
@@ -694,8 +696,17 @@ const AUTH_PROBE_ARGS: Record<string, string[]> = {
 /** 鉴权失败特征：命中则判定为待登录，而非通用错误 */
 const AUTH_ERROR_PATTERN = /401|403|unauthorized|forbidden|not\s*logged\s*in|login|auth|api[_\s-]?key|credential|token|鉴权|登录|未授权/i;
 
+/** Some CLIs, including Hermes v0.19.0, can return exit code 0 while the
+ * final response body is an upstream error. Do not promote that to HEALTHY. */
+export const CLI_FAILURE_BODY_PATTERN = /HTTP\s+(?:400|401|403|408|409|422|429|5\d\d)\b|missing authentication header|no usable credentials|auth(?:entication)?[_\s-]?unavailable|invalid[_\s-]?(?:api[_\s-]?)?key|unauthorized|forbidden|rate limit|quota|billing|api call failed/i;
+
 /** 参数/用法类错误特征：命中说明进程能起但调用方式不对（我方 bug，非用户凭据问题） */
 const USAGE_ERROR_PATTERN = /unrecognized arguments|unknown (option|argument|flag)|invalid choice|did not contain any valid|usage:|no such option/i;
+
+/** A newly-created Hermes profile may run config/plugin migrations on first use. */
+export function cliLaunchProbeTimeoutMs(engineId: string, env: NodeJS.ProcessEnv): number {
+  return engineId === 'eng-hermes-cli' && Boolean(env.HERMES_HOME?.trim()) ? 45_000 : 15_000;
+}
 
 /**
  * CLI 引擎四级探活（发布要求）：把「健康」拆成可解释的独立信号，
@@ -724,7 +735,7 @@ async function probeCliAuth(
   const env = { ...process.env, ...resolveEngineEnv(db, engineId) };
 
   // 第 1 级：launchable —— 用 --version 验证进程真能起来（最轻量、不消耗额度）
-  const ver = await runCli(binPath, ['--version'], { timeoutMs: 15_000, env });
+  const ver = await runCli(binPath, ['--version'], { timeoutMs: cliLaunchProbeTimeoutMs(engineId, env), env });
   if (ver.error && !ver.stdout && !ver.stderr) {
     signals.detail = `进程无法启动：${ver.error}`;
     return {
@@ -758,7 +769,7 @@ async function probeCliAuth(
     };
   }
 
-  if (run.code === 0 && run.stdout.trim()) {
+  if (run.code === 0 && run.stdout.trim() && !CLI_FAILURE_BODY_PATTERN.test(detail)) {
     signals.authenticated = true;
     signals.taskVerified = true;
     signals.detail = run.stdout.trim().slice(0, 200);

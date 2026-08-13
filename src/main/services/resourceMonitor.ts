@@ -8,22 +8,84 @@ import si from 'systeminformation';
 import { app } from 'electron';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
+import { statfs } from 'node:fs/promises';
+import { availableParallelism, networkInterfaces as osNetworkInterfaces } from 'node:os';
 import type { GpuSample, ResourceSample, ServiceHealth } from '../../shared/types.js';
 import type { Database } from './database.js';
 
-/** nvidia-smi 兑底：systeminformation 在 Windows+NVIDIA 下常拿不到利用率，直接查 nvidia-smi */
-function nvidiaSmiUtilization(): Promise<number | null> {
+const MIB = 1024 * 1024;
+
+/**
+ * Windows 上 systeminformation.graphics() 会并发启动多组 PowerShell/WMI 查询。
+ * 某些机器一次查询超过采样周期，最终堆叠出大量 powershell.exe。NVIDIA
+ * 指标改用一个受超时约束的 nvidia-smi 进程；无 NVIDIA 时明确返回 null。
+ */
+function nvidiaSmiSample(): Promise<GpuSample | null> {
   return new Promise((resolve) => {
-    execFile('nvidia-smi', ['--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'], { timeout: 5000, shell: false }, (err, stdout) => {
-      if (err) return resolve(null);
-      const val = parseFloat((stdout || '').trim().split(/\r?\n/)[0]);
-      resolve(Number.isFinite(val) ? Math.round(val * 10) / 10 : null);
-    });
+    execFile(
+      'nvidia-smi',
+      ['--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu', '--format=csv,noheader,nounits'],
+      { timeout: 5000, maxBuffer: 64 * 1024, shell: false, windowsHide: true, encoding: 'utf8' },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        resolve(parseNvidiaSmiSample(stdout));
+      }
+    );
   });
 }
 
-const HISTORY_LIMIT = 300; // 内存保留最近10分钟（实时图表）
+export function parseNvidiaSmiSample(stdout: string): GpuSample | null {
+  const line = stdout.trim().split(/\r?\n/).find(Boolean);
+  if (!line) return null;
+  const fields = line.split(',').map((value) => value.trim());
+  if (fields.length < 5 || !fields[0]) return null;
+  const numberAt = (index: number): number | null => {
+    const value = Number(fields[index]);
+    return Number.isFinite(value) ? value : null;
+  };
+  const utilization = numberAt(1);
+  const memoryUsedMiB = numberAt(2);
+  const memoryTotalMiB = numberAt(3);
+  return {
+    name: fields[0],
+    utilization: utilization === null ? null : Math.round(utilization * 10) / 10,
+    vramUsed: memoryUsedMiB === null ? null : memoryUsedMiB * MIB,
+    vramTotal: memoryTotalMiB === null ? null : memoryTotalMiB * MIB,
+    temperature: numberAt(4)
+  };
+}
+
+export async function collectGpuSample(platform: NodeJS.Platform): Promise<GpuSample | null> {
+  // Avoid systeminformation.graphics() on Windows: it launches eight concurrent
+  // PowerShell/WMI commands for controller and monitor metadata on every call.
+  if (platform === 'win32') return nvidiaSmiSample();
+
+  const graphics = await si.graphics();
+  const controller = graphics.controllers.find((item) => item.utilizationGpu !== undefined || item.memoryTotal) ?? null;
+  if (!controller) return null;
+  const fallback = controller.utilizationGpu == null ? await nvidiaSmiSample() : null;
+  return {
+    name: controller.model || fallback?.name || 'GPU',
+    utilization: typeof controller.utilizationGpu === 'number'
+      ? Math.round(controller.utilizationGpu * 10) / 10
+      : fallback?.utilization ?? null,
+    vramUsed: typeof controller.memoryUsed === 'number' ? controller.memoryUsed * MIB : fallback?.vramUsed ?? null,
+    vramTotal: typeof controller.memoryTotal === 'number' ? controller.memoryTotal * MIB : fallback?.vramTotal ?? null,
+    temperature: typeof controller.temperatureGpu === 'number' ? controller.temperatureGpu : fallback?.temperature ?? null
+  };
+}
+
+export function hasActiveNetworkInterface(
+  interfaces: NodeJS.Dict<ReturnType<typeof osNetworkInterfaces>[string]>
+): boolean {
+  return Object.values(interfaces).some((entries) => entries?.some((entry) =>
+    !entry.internal && (entry.family === 'IPv4' || entry.family === 'IPv6')
+  ));
+}
+
+const HISTORY_LIMIT = 300;
 const PERSIST_INTERVAL = 30_000; // 每 30s 持久化一次
+const SLOW_METRICS_INTERVAL = 30_000;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 保留 7 天
 
 export interface Thresholds {
@@ -40,6 +102,15 @@ export class ResourceMonitor {
   private history: ResourceSample[] = [];
   private timer: NodeJS.Timeout | null = null;
   private persistTimer: NodeJS.Timeout | null = null;
+  private running = false;
+  private sampleInFlight = false;
+  private slowSampleInFlight = false;
+  private lastSlowSampleAt = Number.NEGATIVE_INFINITY;
+  private slowMetrics: Pick<ResourceSample, 'gpu' | 'diskFree' | 'diskTotal'> = {
+    gpu: null,
+    diskFree: 0,
+    diskTotal: 0
+  };
   private listeners = new Set<(s: ResourceSample) => void>();
   private health: ServiceHealth = { runtime: 'healthy', gateway: 'healthy', database: 'healthy' };
   /** 阈值提供方（读 settings，由 main 注入） */
@@ -50,7 +121,11 @@ export class ResourceMonitor {
   private memOverSince: number | null = null;
   private activeAlerts = new Map<string, string>();
   private db: Database | null = null;
-  private lastPersistAt = 0;
+
+  constructor(
+    private readonly platform: NodeJS.Platform = process.platform,
+    private readonly gpuCollector: (platform: NodeJS.Platform) => Promise<GpuSample | null> = collectGpuSample
+  ) {}
 
   /** 注入数据库实例（由 main 装配后调用，启用持久化） */
   setDatabase(db: Database) {
@@ -115,17 +190,24 @@ export class ResourceMonitor {
 
   start(intervalMs = 2000) {
     if (this.timer) return;
-    void this.sampleOnce();
-    this.timer = setInterval(() => void this.sampleOnce(), intervalMs);
+    this.running = true;
+    this.requestSample();
+    this.timer = setInterval(() => this.requestSample(), intervalMs);
     // 持久化定时器：每 30s 写入 DB + 清理过期数据
     this.persistTimer = setInterval(() => this.persistAndCleanup(), PERSIST_INTERVAL);
   }
 
   stop() {
+    this.running = false;
     if (this.timer) clearInterval(this.timer);
     if (this.persistTimer) clearInterval(this.persistTimer);
     this.timer = null;
     this.persistTimer = null;
+  }
+
+  private requestSample(): void {
+    if (!this.running || this.sampleInFlight) return;
+    void this.sampleOnce();
   }
 
   onSample(fn: (s: ResourceSample) => void): () => void {
@@ -188,88 +270,89 @@ export class ResourceMonitor {
     }
   }
 
-  private async sampleOnce() {
-    const dataDir = join(app.getPath('userData'), 'aibox-data');
+  private async sampleOnce(): Promise<void> {
+    if (!this.running || this.sampleInFlight) return;
+    this.sampleInFlight = true;
     let cpu: number | null = null;
-    let cpuCores = 0;
+    let cpuCores = availableParallelism();
     let memoryUsed = 0;
     let memoryTotal = 0;
     let memoryPercent: number | null = null;
-    let gpu: GpuSample | null = null;
-    let diskFree = 0;
-    let diskTotal = 0;
     let networkOnline = false;
 
     try {
-      const [load, mem, graphics, fsSize, net] = await Promise.allSettled([
-        si.currentLoad(),
-        si.mem(),
-        si.graphics(),
-        si.fsSize(),
-        si.networkInterfaces('default')
-      ]);
-
-      if (load.status === 'fulfilled') {
-        cpu = Math.round(load.value.currentLoad * 10) / 10;
-        cpuCores = load.value.cpus?.length || 0;
-      }
-      if (mem.status === 'fulfilled') {
-        memoryUsed = mem.value.active;
-        memoryTotal = mem.value.total;
-        memoryPercent = mem.value.total > 0 ? Math.round((mem.value.active / mem.value.total) * 1000) / 10 : null;
-      }
-      if (graphics.status === 'fulfilled') {
-        const g = graphics.value.controllers.find((c) => c.utilizationGpu !== undefined || c.memoryTotal) ?? null;
-        if (g) {
-          gpu = {
-            name: g.model || 'GPU',
-            utilization: typeof g.utilizationGpu === 'number' ? Math.round(g.utilizationGpu * 10) / 10 : null,
-            vramUsed: typeof g.memoryUsed === 'number' && typeof g.memoryTotal === 'number' ? g.memoryUsed * 1024 * 1024 : null,
-            vramTotal: typeof g.memoryTotal === 'number' ? g.memoryTotal * 1024 * 1024 : null,
-            temperature: typeof g.temperatureGpu === 'number' ? g.temperatureGpu : null
-          };
-          // 利用率缺失时用 nvidia-smi 兑底（Windows+NVIDIA 常见）
-          if (gpu.utilization == null) {
-            gpu.utilization = await nvidiaSmiUtilization();
-          }
-        }
-      }
-      if (fsSize.status === 'fulfilled') {
-        // 数据目录所在盘
-        const mount = process.platform === 'win32' ? dataDir.slice(0, 2) : '/';
-        const fs = fsSize.value.find((f) => mount.length <= 2 ? f.fs.startsWith(mount) : f.mount === '/') ?? fsSize.value[0];
-        if (fs) {
-          diskFree = fs.available;
-          diskTotal = fs.size;
-        }
-      }
-      if (net.status === 'fulfilled' && net.value) {
-        networkOnline = net.value.operstate === 'up';
-      }
-    } catch {
-      /* 整体采集异常 → 各字段保持 null/默认 */
-    }
-
-    // 无独立计数信息时用 OS 核数兜底
-    if (!cpuCores) {
       try {
-        cpuCores = (await si.cpu()).cores;
-      } catch {
-        cpuCores = 0;
-      }
-    }
+        const now = Date.now();
+        if (now - this.lastSlowSampleAt >= SLOW_METRICS_INTERVAL) void this.refreshSlowMetrics(now);
 
-    this.emit({
-      timestamp: Date.now(),
-      cpu,
-      cpuCores,
-      memoryUsed,
-      memoryTotal,
-      memoryPercent,
-      gpu,
-      diskFree,
-      diskTotal,
-      networkOnline
-    });
+        const [load, mem] = await Promise.allSettled([
+          si.currentLoad(),
+          si.mem()
+        ]);
+
+        if (load.status === 'fulfilled') {
+          cpu = Math.round(load.value.currentLoad * 10) / 10;
+          cpuCores = load.value.cpus?.length || 0;
+        }
+        if (mem.status === 'fulfilled') {
+          memoryUsed = mem.value.active;
+          memoryTotal = mem.value.total;
+          memoryPercent = mem.value.total > 0 ? Math.round((mem.value.active / mem.value.total) * 1000) / 10 : null;
+        }
+        networkOnline = hasActiveNetworkInterface(osNetworkInterfaces());
+      } catch {
+        /* 整体采集异常 -> 各字段保持 null/默认 */
+      }
+
+      if (!this.running) return;
+      this.emit({
+        timestamp: Date.now(),
+        cpu,
+        cpuCores,
+        memoryUsed,
+        memoryTotal,
+        memoryPercent,
+        ...this.slowMetrics,
+        networkOnline
+      });
+    } finally {
+      this.sampleInFlight = false;
+    }
+  }
+
+  private async refreshSlowMetrics(startedAt: number): Promise<void> {
+    if (this.slowSampleInFlight) return;
+    this.slowSampleInFlight = true;
+    this.lastSlowSampleAt = startedAt;
+    const dataDir = join(app.getPath('userData'), 'aibox-data');
+    try {
+      const [disk, gpu] = await Promise.allSettled([
+        this.collectDiskSample(dataDir),
+        this.gpuCollector(this.platform)
+      ]);
+      let diskFree = this.slowMetrics.diskFree;
+      let diskTotal = this.slowMetrics.diskTotal;
+      if (disk.status === 'fulfilled') {
+        diskFree = disk.value.free;
+        diskTotal = disk.value.total;
+      }
+      this.slowMetrics = {
+        gpu: gpu.status === 'fulfilled' ? gpu.value : this.slowMetrics.gpu,
+        diskFree,
+        diskTotal
+      };
+    } finally {
+      this.slowSampleInFlight = false;
+    }
+  }
+
+  private async collectDiskSample(path: string): Promise<{ free: number; total: number }> {
+    // Node's native statfs avoids systeminformation.fsSize(), which starts a
+    // PowerShell/WMI process on Windows for every refresh.
+    const value = await statfs(path);
+    return {
+      free: Number(value.bavail) * Number(value.bsize),
+      total: Number(value.blocks) * Number(value.bsize)
+    };
   }
 }

@@ -1,0 +1,1035 @@
+{
+  "protocolVersion": 1,
+  "upstreamCommit": "5f2f8ab6a42b8b88a6588f5cda178af8b89f8311",
+  "tools": [
+    {
+      "name": "android_ping",
+      "description": "Check if the Android bridge is reachable. Call this first before any other android_ tools.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "management",
+      "permissions": [],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_read_screen",
+      "description": "Get the accessibility tree of the current Android screen. Returns visible app UI nodes with text, class names, node IDs, and interactability. System UI (status bar, nav bar) is excluded by default; set include_system_ui=true to include it. Use this to understand what's on screen before tapping.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "include_bounds": {
+            "type": "boolean",
+            "description": "Include pixel coordinates for each node. Default false.",
+            "default": false
+          },
+          "include_system_ui": {
+            "type": "boolean",
+            "description": "Include System UI nodes (status bar, navigation bar). Default false (excluded) to save tokens. Use android_press_key for back/home/recents.",
+            "default": false
+          }
+        },
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_tap",
+      "description": "Tap a UI element by node_id (preferred) or by screen coordinates (x, y). Always prefer node_id over coordinates \u2014 it's more reliable. Get node_ids from android_read_screen.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "X coordinate in pixels"
+          },
+          "y": {
+            "type": "integer",
+            "description": "Y coordinate in pixels"
+          },
+          "node_id": {
+            "type": "string",
+            "description": "Accessibility node ID from android_read_screen"
+          }
+        },
+        "required": []
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_tap_text",
+      "description": "Tap the first visible UI element matching the given text. Useful when you see text on screen and want to tap it without needing node IDs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to find and tap"
+          },
+          "exact": {
+            "type": "boolean",
+            "description": "Exact match (true) or contains match (false, default)",
+            "default": false
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [
+        "text"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_type",
+      "description": "Type text into the currently focused input field. Tap the field first using android_tap or android_tap_text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to type"
+          },
+          "clear_first": {
+            "type": "boolean",
+            "description": "Clear existing content before typing",
+            "default": false
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [
+        "text"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_swipe",
+      "description": "Perform a swipe gesture on screen.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "direction": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ]
+          },
+          "distance": {
+            "type": "string",
+            "enum": [
+              "short",
+              "medium",
+              "long"
+            ],
+            "default": "medium"
+          }
+        },
+        "required": [
+          "direction"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_open_app",
+      "description": "Launch an Android app by its package name. Use android_get_apps to find package names.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "package": {
+            "type": "string",
+            "description": "App package name e.g. com.ubercab"
+          }
+        },
+        "required": [
+          "package"
+        ]
+      },
+      "group": "interface",
+      "permissions": [],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_press_key",
+      "description": "Press a hardware or software key.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "enum": [
+              "back",
+              "home",
+              "recents",
+              "power",
+              "notifications",
+              "quick_settings",
+              "lock_screen",
+              "take_screenshot"
+            ]
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_screenshot",
+      "description": "Take a screenshot of the current Android screen. Returns base64 PNG. Use when the accessibility tree is missing context or the screen uses canvas/game rendering.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "media",
+      "permissions": [
+        "screen_capture"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false,
+      "artifactKind": "screenshot"
+    },
+    {
+      "name": "android_scroll",
+      "description": "Scroll the screen or a specific scrollable element.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "direction": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ]
+          },
+          "node_id": {
+            "type": "string",
+            "description": "Node ID of scrollable container (optional, defaults to screen scroll)"
+          }
+        },
+        "required": [
+          "direction"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_wait",
+      "description": "Wait for a UI element to appear on screen. Use after actions that trigger loading or navigation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Wait for element with this text"
+          },
+          "class_name": {
+            "type": "string",
+            "description": "Wait for element of this class"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "description": "Max wait time in milliseconds",
+            "default": 5000
+          }
+        },
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_get_apps",
+      "description": "List all installed apps on the Android device with their package names and display labels.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "management",
+      "permissions": [],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_current_app",
+      "description": "Get the package name and activity name of the currently active (foreground) Android app.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_setup",
+      "description": "Return OPC-Nexus pairing, binding, and connection status. Pairing is managed by the desktop Mobile Console.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "group": "management",
+      "permissions": [],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_clipboard_read",
+      "description": "Read the current text content of the Android device clipboard. Returns the clipboard text or empty string if clipboard is empty.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "privacy",
+      "permissions": [
+        "clipboard"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_clipboard_write",
+      "description": "Write text to the Android device clipboard. Useful for pasting into input fields or sharing text between apps.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to copy to the clipboard"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "group": "privacy",
+      "permissions": [
+        "clipboard"
+      ],
+      "sensitiveFields": [
+        "text"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_notifications",
+      "description": "Read recent notifications from the Android device. Requires notification listener permission. Returns notifications with package name, title, text, and timestamp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "Max number of notifications to return (default 50)",
+            "default": 50
+          },
+          "since": {
+            "type": "integer",
+            "description": "Only return notifications after this Unix timestamp in milliseconds (default 0 = all)",
+            "default": 0
+          }
+        },
+        "required": []
+      },
+      "group": "privacy",
+      "permissions": [
+        "notification_access"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_long_press",
+      "description": "Long press a UI element to trigger context menus, text selection, or widget moving. Supports coordinates or node_id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "X coordinate in pixels"
+          },
+          "y": {
+            "type": "integer",
+            "description": "Y coordinate in pixels"
+          },
+          "node_id": {
+            "type": "string",
+            "description": "Accessibility node ID from android_read_screen"
+          },
+          "duration": {
+            "type": "integer",
+            "description": "Press duration in milliseconds (default 500)",
+            "default": 500
+          }
+        },
+        "required": []
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_drag",
+      "description": "Drag from one point to another. Useful for rearranging apps, pulling notification shade, map pin dragging, and scrollable content.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "start_x": {
+            "type": "integer",
+            "description": "Start X coordinate"
+          },
+          "start_y": {
+            "type": "integer",
+            "description": "Start Y coordinate"
+          },
+          "end_x": {
+            "type": "integer",
+            "description": "End X coordinate"
+          },
+          "end_y": {
+            "type": "integer",
+            "description": "End Y coordinate"
+          },
+          "duration": {
+            "type": "integer",
+            "description": "Drag duration in milliseconds (default 500)",
+            "default": 500
+          }
+        },
+        "required": [
+          "start_x",
+          "start_y",
+          "end_x",
+          "end_y"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_describe_node",
+      "description": "Get detailed properties of a specific UI node. Returns all properties including checked state, hint text, bounds, child count, viewIdResourceName, etc.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "description": "Accessibility node ID from android_read_screen"
+          }
+        },
+        "required": [
+          "node_id"
+        ]
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_screen_hash",
+      "description": "Get a lightweight hash of the current screen content. Use for change detection in polling loops instead of repeatedly calling android_read_screen.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_macro",
+      "description": "Execute a sequence of android tool calls in order. Each step is a dict with 'tool' and 'args'. Stops on first failure. Use for automating repeated multi-step workflows.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tool": {
+                  "type": "string",
+                  "description": "Tool name e.g. android_tap"
+                },
+                "args": {
+                  "type": "object",
+                  "description": "Arguments for the tool"
+                }
+              },
+              "required": [
+                "tool"
+              ]
+            },
+            "description": "Ordered list of tool calls to execute"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name for this macro (for logging)",
+            "default": "unnamed"
+          }
+        },
+        "required": [
+          "steps"
+        ]
+      },
+      "group": "interface",
+      "permissions": [],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_location",
+      "description": "Get the phone's current GPS location. Returns latitude, longitude, accuracy, and provider. Requires location services enabled.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "privacy",
+      "permissions": [
+        "location"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_send_sms",
+      "description": "Send an SMS message directly without navigating the messaging app. Requires SMS permission.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "Phone number to send SMS to"
+          },
+          "body": {
+            "type": "string",
+            "description": "SMS message text"
+          }
+        },
+        "required": [
+          "to",
+          "body"
+        ]
+      },
+      "group": "communication",
+      "permissions": [
+        "sms"
+      ],
+      "sensitiveFields": [
+        "to",
+        "body"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_call",
+      "description": "Initiate a phone call. Opens the phone call UI on the device.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "description": "Phone number to call"
+          }
+        },
+        "required": [
+          "number"
+        ]
+      },
+      "group": "communication",
+      "permissions": [
+        "phone"
+      ],
+      "sensitiveFields": [
+        "number"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_speak",
+      "description": "Speak text aloud through the phone speaker using text-to-speech. Useful for voice feedback, reading messages aloud, or agent personality.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to speak aloud"
+          },
+          "flush": {
+            "type": "boolean",
+            "description": "Interrupt current speech and speak immediately (default false)",
+            "default": false
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "group": "media",
+      "permissions": [
+        "tts"
+      ],
+      "sensitiveFields": [
+        "text"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_speak_stop",
+      "description": "Stop any ongoing text-to-speech playback on the phone.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "media",
+      "permissions": [
+        "tts"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_events",
+      "description": "Read recent accessibility events (clicks, text changes, window transitions, scrolls) from the phone. Real-time UI change detection.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "description": "Max events to return (default 50)",
+            "default": 50
+          },
+          "since": {
+            "type": "integer",
+            "description": "Only events after this Unix timestamp in ms (default 0 = all)",
+            "default": 0
+          }
+        },
+        "required": []
+      },
+      "group": "privacy",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_event_stream",
+      "description": "Enable/disable accessibility event streaming. When enabled, events are captured for retrieval via android_events.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable (true) or disable (false) event streaming",
+            "default": true
+          }
+        },
+        "required": []
+      },
+      "group": "privacy",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_screen_record",
+      "description": "Record a short video clip of the Android screen (default 5 seconds). Returns MP4 video file. Useful for animated UIs, debugging, and demos.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "description": "Recording duration in milliseconds (default 5000)",
+            "default": 5000
+          }
+        },
+        "required": []
+      },
+      "group": "media",
+      "permissions": [
+        "media_projection"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true,
+      "artifactKind": "screen_recording"
+    },
+    {
+      "name": "android_mic_record",
+      "description": "Start a 16 kHz mono WAV microphone recording on the Android device.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "duration": {
+            "type": "integer",
+            "description": "Seconds to record (0 records until android_mic_stop, capped at 1800; maximum 1800)",
+            "minimum": 0,
+            "maximum": 1800,
+            "default": 0
+          }
+        },
+        "required": []
+      },
+      "group": "media",
+      "permissions": [
+        "microphone"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_mic_stop",
+      "description": "Stop the active microphone recording and finalize its WAV file.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "media",
+      "permissions": [
+        "microphone"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_mic_status",
+      "description": "Get microphone recorder state and latest completed WAV metadata.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "microphone"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_mic_fetch",
+      "description": "Download the latest or named microphone WAV as a local MEDIA file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "remote_path": {
+            "type": "string",
+            "description": "Optional WAV filename returned by android_mic_status; paths are rejected",
+            "default": ""
+          }
+        },
+        "required": []
+      },
+      "group": "media",
+      "permissions": [
+        "microphone"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false,
+      "artifactKind": "audio"
+    },
+    {
+      "name": "android_read_widgets",
+      "description": "Read home screen widgets (weather, calendar, tasks, etc.). Goes to home screen and reads widget content without opening apps.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_find_nodes",
+      "description": "Search the current screen for UI nodes matching text, class name, or clickability. Returns matching nodes without dumping the full tree. Faster than android_read_screen for finding specific elements.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to search for (case-insensitive contains match)"
+          },
+          "class_name": {
+            "type": "string",
+            "description": "Android class name to filter by (e.g. android.widget.Button)"
+          },
+          "clickable": {
+            "type": "boolean",
+            "description": "Filter by clickability"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max results to return (default 20)",
+            "default": 20
+          }
+        },
+        "required": []
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_diff_screen",
+      "description": "Compare current screen against a previous hash. Returns changed status and new hash. Use with android_screen_hash for efficient polling.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "previous_hash": {
+            "type": "string",
+            "description": "Previous screen hash from android_screen_hash()"
+          }
+        },
+        "required": [
+          "previous_hash"
+        ]
+      },
+      "group": "management",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_pinch",
+      "description": "Pinch gesture at a point. scale > 1.0 zooms in, scale < 1.0 zooms out. Use for maps and photo galleries.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "description": "Center X coordinate"
+          },
+          "y": {
+            "type": "integer",
+            "description": "Center Y coordinate"
+          },
+          "scale": {
+            "type": "number",
+            "description": "Zoom scale factor (>1 zoom in, <1 zoom out, default 1.5)",
+            "default": 1.5
+          },
+          "duration": {
+            "type": "integer",
+            "description": "Gesture duration in ms (default 300)",
+            "default": 300
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ]
+      },
+      "group": "interface",
+      "permissions": [
+        "accessibility"
+      ],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_media",
+      "description": "Control media playback (play, pause, toggle, next, previous). Works system-wide without opening media apps.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "play",
+              "pause",
+              "toggle",
+              "next",
+              "previous"
+            ],
+            "description": "Media action"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "group": "communication",
+      "permissions": [],
+      "sensitiveFields": [],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_search_contacts",
+      "description": "Search phone contacts by name. Returns contact names and phone numbers. Use before android_call or android_send_sms.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Name to search for"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max results (default 20)",
+            "default": 20
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "group": "privacy",
+      "permissions": [
+        "contacts"
+      ],
+      "sensitiveFields": [
+        "query"
+      ],
+      "nonIdempotent": false
+    },
+    {
+      "name": "android_send_intent",
+      "description": "Send an Android intent to start an activity. Enables deep linking, settings, and app-specific APIs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Intent action e.g. android.settings.WIFI_SETTINGS"
+          },
+          "data_uri": {
+            "type": "string",
+            "description": "Optional data URI e.g. tel:+1234567890"
+          },
+          "extras": {
+            "type": "object",
+            "description": "Optional string extras as key-value pairs"
+          },
+          "package": {
+            "type": "string",
+            "description": "Optional target package name"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "group": "communication",
+      "permissions": [],
+      "sensitiveFields": [
+        "data",
+        "extras"
+      ],
+      "nonIdempotent": true
+    },
+    {
+      "name": "android_broadcast",
+      "description": "Send an Android broadcast intent. Triggers system events or app-specific receivers.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Broadcast action e.g. android.intent.action.AIRPLANE_MODE"
+          },
+          "extras": {
+            "type": "object",
+            "description": "Optional string extras as key-value pairs"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "group": "communication",
+      "permissions": [],
+      "sensitiveFields": [
+        "extras"
+      ],
+      "nonIdempotent": true
+    }
+  ]
+}

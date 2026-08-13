@@ -12,6 +12,7 @@ import type { Database } from './database.js';
 import type { ProviderManager } from './providerManager.js';
 import type { WfPlatformManager } from './wfPlatformManager.js';
 import type { WfNode, WfEdge, WorkflowDef, WfNodeConfig, WfNodeEvent, WfValidationResult, WfRunRecord, WfVariable } from '../../shared/types.js';
+import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 
 type NodeStatus = 'pending' | 'running' | 'completed' | 'failed';
 
@@ -548,11 +549,13 @@ export class WorkflowEngine {
         timeout,
         env: { ...process.env }
       });
-      let stdout = '';
-      let stderr = '';
-      proc.stdout?.on('data', (d: Buffer) => { stdout += d.toString('utf8'); });
-      proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString('utf8'); });
+      const stdoutBuffer = createProcessOutputBuffer();
+      const stderrBuffer = createProcessOutputBuffer();
+      proc.stdout?.on('data', (d: Buffer) => appendProcessOutput(stdoutBuffer, d));
+      proc.stderr?.on('data', (d: Buffer) => appendProcessOutput(stderrBuffer, d));
       proc.on('close', (code) => {
+        const stdout = finishProcessOutput(stdoutBuffer);
+        const stderr = finishProcessOutput(stderrBuffer);
         if (code === 0) resolve(stdout.slice(0, 16000));
         else reject(new Error(`退出码 ${code}: ${stderr.slice(0, 500)}`));
       });

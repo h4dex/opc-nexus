@@ -2,7 +2,7 @@
  * Electron 主进程入口
  * 跨平台：Windows 10/11 + Ubuntu 22.04+（PRD 4.1 首发 Windows，Linux 同架构兼容）
  */
-import { app, BrowserWindow, Menu, nativeImage, screen, shell, Tray } from 'electron';
+import { app, BrowserWindow, Menu, nativeImage, protocol, screen, shell, Tray } from 'electron';
 import { join } from 'node:path';
 import { Database } from './services/database.js';
 import { Orchestrator } from './services/orchestrator.js';
@@ -35,7 +35,14 @@ import { AutomationManager } from './services/automationManager.js';
 import { CollabManager } from './services/collabManager.js';
 import { WebServer } from './services/webServer.js';
 import { ApiBridge } from './services/apiBridge.js';
+import { MobileGatewayService } from './services/mobileGatewayService.js';
+import { MobileAdbService } from './services/mobileAdbService.js';
 import { registerIpc } from './ipc.js';
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'aibox-mobile',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+}]);
 
 // 单实例锁：防止多开导致 SQLite 争用与重复调度
 const gotLock = app.requestSingleInstanceLock();
@@ -55,10 +62,42 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let dbRef: Database | null = null;
+let mcpRef: McpManager | null = null;
+let browserRef: import('./services/browserManager.js').BrowserManager | null = null;
+let mobileRef: MobileGatewayService | null = null;
+let webServerRef: WebServer | null = null;
+let monitorRef: ResourceMonitor | null = null;
 /** 语音服务引用：退出时需关闭活跃会话，避免麦克风与云端连接残留 */
 let voiceRef: import('./services/voiceService.js').VoiceService | null = null;
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL;
+
+function registerMobileProtocol(mobile: MobileGatewayService): void {
+  void protocol.handle('aibox-mobile', (request) => {
+    if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+    let url: URL;
+    try { url = new URL(request.url); } catch { return new Response('Bad request', { status: 400 }); }
+    const id = decodeURIComponent(url.pathname.replace(/^\//, ''));
+    if (!/^[a-zA-Z0-9-]{1,100}$/.test(id)) return new Response('Not found', { status: 404 });
+    const value = url.hostname === 'pairing'
+      ? mobile.getPairingImage(id)
+      : url.hostname === 'preview'
+        ? mobile.getPreview(id)
+        : url.hostname === 'artifact'
+          ? mobile.getArtifactFile(id)
+          : null;
+    if (!value) return new Response('Not found', { status: 404, headers: { 'cache-control': 'no-store' } });
+    return new Response(new Uint8Array(value.data), {
+      status: 200,
+      headers: {
+        'content-type': value.mimeType,
+        'content-length': String(value.data.length),
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff'
+      }
+    });
+  });
+}
 
 function createWindow() {
   // 窗口状态记忆：从 settings 恢复上次位置/大小/全屏
@@ -158,10 +197,26 @@ app.whenReady().then(async () => {
   const providerManager = new ProviderManager(db);
   const executors = new ExecutorRegistry(db, broker, providerManager);
   const orchestrator = new Orchestrator(db, executors, broker);
+  const mobile = new MobileGatewayService(db);
+  const mobileAdb = new MobileAdbService();
+  mobileRef = mobile;
+  registerMobileProtocol(mobile);
+  executors.setMobileGateway(mobile);
+  orchestrator.setMobileDispatchPolicy({
+    canDispatch: (agentId) => mobile.canDispatch(agentId),
+    releaseAgent: (agentId) => mobile.unbindAgent(agentId)
+  });
+  mobile.onEvent((event) => {
+    if (event.agentId && ['device_connected', 'binding_changed', 'session_ended'].includes(event.type)) {
+      orchestrator.wakeAgentQueue(event.agentId);
+    }
+  });
   const monitor = new ResourceMonitor();
+  monitorRef = monitor;
   monitor.setDatabase(db);
   const scheduler = new Scheduler(db, orchestrator);
   const mcpManager = new McpManager(db);
+  mcpRef = mcpManager;
   const skillManager = new SkillManager(db);
   const wfPlatformMgr = new WfPlatformManager(db);
   const workflowEngine = new WorkflowEngine(db, providerManager, wfPlatformMgr);
@@ -183,9 +238,11 @@ app.whenReady().then(async () => {
 
   // 工具循环的委派能力（P3b）与调度保护门禁（11.2）注入
   executors.setToolHost(orchestrator.toolHost());
+  executors.setMcpManager(mcpManager);
   // 浏览器自动化管理器（Playwright/CDP）注入
   const { BrowserManager } = await import('./services/browserManager.js');
   const browserMgr = new BrowserManager();
+  browserRef = browserMgr;
   executors.setBrowserManager(browserMgr);
   // OCR 服务（PaddleOCR WASM）注入
   const { OcrService } = await import('./services/ocrService.js');
@@ -238,6 +295,12 @@ app.whenReady().then(async () => {
   });
   monitor.start(4000);
   scheduler.start();
+  const mobileGatewayConfig = db.getSetting<{ enabled?: boolean; host?: string; port?: number }>('mobile:gateway', {});
+  if (mobileGatewayConfig.enabled && mobileGatewayConfig.host) {
+    void mobile.start(mobileGatewayConfig.host, mobileGatewayConfig.port).catch((error) => {
+      console.error('[MobileGateway] 自动启动失败:', error);
+    });
+  }
   // 真实渠道凭据已配置且非停用 → 启动时自动重连（飞书 / 企微长连接 / 个微桥接）
   {
     const reconnectable = ['ONLINE', 'CONNECTING', 'RECONNECTING'];
@@ -264,8 +327,9 @@ app.whenReady().then(async () => {
 
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
+  webServerRef = webServer;
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, getMainWindow: () => mainWindow });
+  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, mobile, mobileAdb, getMainWindow: () => mainWindow });
 
   webServer.start();
 
@@ -279,6 +343,15 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  try {
+    mcpRef?.dispose();
+    browserRef?.dispose();
+    mobileRef?.dispose();
+    webServerRef?.stop();
+    monitorRef?.stop();
+  } catch {
+    /* 关闭失败不阻塞退出 */
+  }
   try {
     voiceRef?.stopAll(); // 关闭活跃语音会话，停止拾音与云端连接
   } catch {

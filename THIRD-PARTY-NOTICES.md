@@ -21,6 +21,14 @@
 | ws | ^8.21.1 | MIT | https://github.com/websockets/ws |
 | zustand | ^5.0.6 | MIT | https://github.com/pmndrs/zustand |
 
+### Android Bridge Dependencies
+
+| Component | Version | License | Repository |
+|---|---:|---|---|
+| AndroidX Core | 1.10.1 | Apache-2.0 | https://github.com/androidx/androidx |
+| ZXing Android Embedded | 4.3.0 | Apache-2.0 | https://github.com/journeyapps/zxing-android-embedded |
+| ZXing Core | 3.4.1 | Apache-2.0 | https://github.com/zxing/zxing |
+
 ## 开发依赖 (Dev Dependencies)
 
 | 组件 | 版本 | 许可证 | 仓库 |
@@ -92,6 +100,14 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 ---
 
 ## 致谢
+
+### hermes-android
+
+`mobile/android-bridge` 与 `mobile/hermes-plugin` 基于
+[raulvidis/hermes-android](https://github.com/raulvidis/hermes-android) 提交
+`5f2f8ab6a42b8b88a6588f5cda178af8b89f8311` 改造。上游声明采用 MIT License；
+原作者版权与 MIT 许可条款随本仓库和安装包保留。上游在该提交中未包含根目录 LICENSE 文件，
+来源、固定提交及其公开授权信息因此在此单独记录。
 
 感谢以上所有开源项目的贡献者，正是他们的工作使本项目得以实现。
 各组件的完整版权声明和许可证文本可在对应的 GitHub 仓库中找到。

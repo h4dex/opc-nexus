@@ -45,6 +45,9 @@ export type DerivedAgentStatus = 'error' | 'running' | 'paused' | 'starting' | '
 /** readonly=只读 / standard=写入需审批 / trusted=全信任 / autonomous=完全自主（无需任何审批） */
 export type PermissionMode = 'readonly' | 'standard' | 'trusted' | 'autonomous';
 
+/** 数字员工身份。Android 操作员由 Hermes CLI + Mobile Gateway 专用执行链路驱动。 */
+export type AgentKind = 'general' | 'android_operator';
+
 /** 数字员工能力开关（独立于权限模式，控制是否注册对应工具） */
 export interface AgentCapabilities {
   /** 允许发起 HTTP/HTTPS 网络请求（web_search / http_request / MCP 远程调用） */
@@ -57,6 +60,202 @@ export interface AgentCapabilities {
   browser: boolean;
   /** 允许桌面操控（Computer Use：屏幕截图、鼠标点击、键盘输入、滚动） */
   computer: boolean;
+  /** 允许使用经 OPC-Nexus Mobile Gateway 授权的 Android 工具。 */
+  mobile: boolean;
+}
+
+// ---------- Android 手机员工 ----------
+
+export type MobileToolGroup = 'management' | 'interface' | 'privacy' | 'communication' | 'media';
+
+/** 与 mobile/tool-catalog.json 一一对应；Catalog 是运行时注册与 Schema 的唯一来源。 */
+export type MobileToolName =
+  | 'android_setup' | 'android_ping' | 'android_read_screen' | 'android_screenshot'
+  | 'android_tap' | 'android_tap_text' | 'android_type' | 'android_swipe'
+  | 'android_scroll' | 'android_open_app' | 'android_press_key' | 'android_wait'
+  | 'android_get_apps' | 'android_current_app' | 'android_long_press' | 'android_drag'
+  | 'android_pinch' | 'android_find_nodes' | 'android_describe_node' | 'android_screen_hash'
+  | 'android_diff_screen' | 'android_location' | 'android_search_contacts' | 'android_send_sms'
+  | 'android_call' | 'android_media' | 'android_send_intent' | 'android_broadcast'
+  | 'android_clipboard_read' | 'android_clipboard_write' | 'android_notifications' | 'android_events'
+  | 'android_event_stream' | 'android_screen_record' | 'android_mic_record' | 'android_mic_stop'
+  | 'android_mic_status' | 'android_mic_fetch' | 'android_read_widgets' | 'android_speak'
+  | 'android_speak_stop' | 'android_macro';
+
+export type MobilePermissionName =
+  | 'accessibility' | 'screen_capture' | 'media_projection' | 'notification_access'
+  | 'location' | 'contacts' | 'sms' | 'phone' | 'microphone' | 'clipboard' | 'tts';
+
+export type MobilePermissionState = 'granted' | 'denied' | 'restricted' | 'not_available' | 'unknown';
+export type MobileDeviceStatus = 'offline' | 'pairing' | 'authenticating' | 'online' | 'busy' | 'error';
+
+export interface MobileToolCatalogEntry {
+  name: MobileToolName;
+  description: string;
+  group: MobileToolGroup;
+  parameters: Record<string, unknown>;
+  permissions: MobilePermissionName[];
+  sensitiveFields: string[];
+  nonIdempotent: boolean;
+  artifactKind?: MobileArtifactKind;
+}
+
+export interface MobileToolCatalog {
+  protocolVersion: number;
+  upstreamCommit: string;
+  tools: MobileToolCatalogEntry[];
+}
+
+export interface MobileDevice {
+  id: string;
+  name: string;
+  model: string;
+  manufacturer: string;
+  androidVersion: string;
+  apiLevel: number;
+  appVersion: string;
+  protocolVersion: number;
+  identityPublicKey: string;
+  identityFingerprint: string;
+  status: MobileDeviceStatus;
+  permissions: Partial<Record<MobilePermissionName, MobilePermissionState>>;
+  capabilities: Record<string, boolean>;
+  pairedAt: number;
+  lastSeenAt: number | null;
+  lastIp: string | null;
+  boundAgentId: string | null;
+  activeTaskId: string | null;
+}
+
+export interface MobileAgentConfig {
+  agentId: string;
+  deviceId: string | null;
+  hermesProfile: string;
+  allowedTools: MobileToolName[];
+  authorizationConfirmedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type MobileControlSessionStatus = 'active' | 'completed' | 'failed' | 'cancelled' | 'expired' | 'disconnected';
+
+export interface MobileControlSession {
+  id: string;
+  agentId: string;
+  deviceId: string;
+  /** 控制台和脚本会话不属于 Hermes 任务，因此允许为空。 */
+  taskId: string | null;
+  status: MobileControlSessionStatus;
+  allowedTools: MobileToolName[];
+  startedAt: number;
+  expiresAt: number;
+  endedAt: number | null;
+}
+
+export type MobileCommandStatus = 'queued' | 'running' | 'completed' | 'failed' | 'restricted' | 'not_available' | 'permission_denied' | 'unknown_after_disconnect';
+
+export interface MobileCommandLog {
+  id: string;
+  sessionId: string | null;
+  agentId: string | null;
+  deviceId: string;
+  taskId: string | null;
+  toolName: MobileToolName;
+  status: MobileCommandStatus;
+  requestSummary: Record<string, unknown>;
+  resultSummary: Record<string, unknown>;
+  error: string | null;
+  startedAt: number;
+  endedAt: number | null;
+}
+
+export type MobileArtifactKind = 'screenshot' | 'screen_recording' | 'audio';
+
+export interface MobileArtifact {
+  id: string;
+  deviceId: string;
+  agentId: string | null;
+  taskId: string | null;
+  commandId: string | null;
+  kind: MobileArtifactKind;
+  mimeType: string;
+  filename: string;
+  size: number;
+  sha256: string;
+  uri: string;
+  createdAt: number;
+}
+
+export type MobileScriptFailurePolicy = 'stop' | 'continue';
+
+export interface MobileScriptStep {
+  tool: Exclude<MobileToolName, 'android_macro' | 'android_setup'>;
+  args: Record<string, unknown>;
+  delayAfterMs?: number;
+  onFailure?: MobileScriptFailurePolicy;
+}
+
+export interface MobileScriptDefinition {
+  id: string;
+  name: string;
+  description: string;
+  agentId: string | null;
+  deviceId: string | null;
+  steps: MobileScriptStep[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MobilePairingOffer {
+  id: string;
+  protocolVersion: number;
+  host: string;
+  port: number;
+  certificateFingerprint: string;
+  expiresAt: number;
+  qrUri: string;
+}
+
+export type MobileEventType =
+  | 'gateway_started' | 'gateway_stopped' | 'pairing_created' | 'device_paired'
+  | 'device_connected' | 'device_disconnected' | 'device_updated' | 'binding_changed'
+  | 'session_started' | 'session_ended' | 'command_started' | 'command_finished'
+  | 'preview_updated' | 'artifact_created' | 'emergency_stop';
+
+export interface MobileEvent {
+  type: MobileEventType;
+  deviceId?: string;
+  agentId?: string;
+  taskId?: string;
+  payload: Record<string, unknown>;
+  timestamp: number;
+}
+
+export interface MobileGatewayStatus {
+  running: boolean;
+  host: string | null;
+  wssPort: number | null;
+  pluginPort: number | null;
+  certificateFingerprint: string | null;
+  error: string | null;
+}
+
+export interface MobileAdbDevice {
+  serial: string;
+  state: 'device' | 'offline' | 'unauthorized' | 'unknown';
+  model: string;
+  product: string;
+  transportId: string | null;
+}
+
+export interface MobileApkInfo {
+  available: boolean;
+  packageName: string;
+  versionName: string;
+  sha256: string;
+  signerSha256: string;
+  releaseSigned: boolean;
+  error: string | null;
 }
 
 /** 引擎类型（四引擎收敛）：hermes = 内置 Nexus Agent 自研 Runtime；hermes-cli = 真实 Hermes Agent CLI；
@@ -169,6 +368,7 @@ export interface ProjectOperationsOverview {
 
 export interface Agent {
   id: string;
+  kind: AgentKind;
   name: string;
   role: string;             // 职责描述
   systemPrompt: string;
@@ -432,6 +632,8 @@ export interface Task {
   stage: string;            // 当前阶段描述
   error: string | null;
   result: string | null;    // 执行产物全文（截断 16KB）
+  /** 列表快照不携带结果正文时，用此标记保留“已有产物”语义。 */
+  hasResult?: boolean;
   quality: TaskQuality;     // 人工质量标记（成果管理）
   sessionId: string | null; // 会话锚点（CLI resume / LLM 上下文重建，追问时继承）
   workspaceOverride: string | null; // 任务级工作空间覆盖（团队共享工作空间）
@@ -872,6 +1074,16 @@ export interface CreateAgentInput {
   permissionMode: PermissionMode;
   concurrencyLimit: number;
   channelIds: string[];
+  kind?: AgentKind;
+  deviceId?: string | null;
+  mobileAllowedTools?: MobileToolName[];
+  mobileAuthorizationConfirmed?: boolean;
+}
+
+/** Renderer -> Main 的显式 UTF-8 文本载荷。普通字符串仍兼容内部调用。 */
+export interface Utf8TextPayload {
+  encoding: 'utf8-base64';
+  data: string;
 }
 
 /** 助手人设更新载荷 */
@@ -893,6 +1105,10 @@ export interface AgentPersonaPatch {
   engineId?: string;
   /** 模型名覆盖 */
   modelOverride?: string;
+  kind?: AgentKind;
+  deviceId?: string | null;
+  mobileAllowedTools?: MobileToolName[];
+  mobileAuthorizationConfirmed?: boolean;
 }
 
 /** 会话（每个助手可持续多轮对话，上下文跨任务保持） */

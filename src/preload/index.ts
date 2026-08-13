@@ -15,7 +15,9 @@ import type {
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
   TeamCollaborationOverview, TeamRun,
-  VoiceConfig, VoiceConfigInput, VoiceCommandDraft, VoiceTestResult
+  VoiceConfig, VoiceConfigInput, VoiceCommandDraft, VoiceTestResult,
+  MobileAdbDevice, MobileAgentConfig, MobileApkInfo, MobileArtifact, MobileCommandLog, MobileDevice, MobileEvent,
+  MobileGatewayStatus, MobilePairingOffer, MobileScriptDefinition, MobileToolCatalog, MobileToolName, Utf8TextPayload
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -37,6 +39,46 @@ export interface Snapshot {
 export interface ResourcePayload {
   history: ResourceSample[];
   health: ServiceHealth;
+}
+
+/** Explicit UTF-8 transport for text entered in Renderer forms. */
+function encodeText(value: string): Utf8TextPayload {
+  const bytes = new TextEncoder().encode(value.normalize('NFC'));
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return { encoding: 'utf8-base64', data: btoa(binary) };
+}
+
+function encodeOptionalText(value: string | undefined): Utf8TextPayload | undefined {
+  return value === undefined ? undefined : encodeText(value);
+}
+
+function encodeAgentInput(input: CreateAgentInput): CreateAgentInput & Record<string, unknown> {
+  return {
+    ...input,
+    name: encodeText(input.name),
+    role: encodeText(input.role),
+    systemPrompt: encodeText(input.systemPrompt),
+    soulMd: encodeText(input.soulMd ?? ''),
+    agentsMd: encodeText(input.agentsMd ?? ''),
+    userMd: encodeText(input.userMd ?? ''),
+    workspace: encodeText(input.workspace)
+  } as unknown as CreateAgentInput & Record<string, unknown>;
+}
+
+function encodePersonaPatch(patch: AgentPersonaPatch): AgentPersonaPatch & Record<string, unknown> {
+  return {
+    ...patch,
+    name: encodeOptionalText(patch.name),
+    role: encodeOptionalText(patch.role),
+    systemPrompt: encodeOptionalText(patch.systemPrompt),
+    soulMd: encodeOptionalText(patch.soulMd),
+    agentsMd: encodeOptionalText(patch.agentsMd),
+    userMd: encodeOptionalText(patch.userMd),
+    modelOverride: encodeOptionalText(patch.modelOverride)
+  } as unknown as AgentPersonaPatch & Record<string, unknown>;
 }
 
 const api = {
@@ -80,20 +122,48 @@ const api = {
   addKnowledgeVersion: (id: string, input: KnowledgeVersionInput): Promise<KnowledgeDetail | null> => ipcRenderer.invoke('aibox:addKnowledgeVersion', id, input),
 
   // 数字员工
-  createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', input),
+  createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', encodeAgentInput(input)),
   startAgent: (id: string): Promise<void> => ipcRenderer.invoke('aibox:startAgent', id),
   stopAgent: (id: string): Promise<void> => ipcRenderer.invoke('aibox:stopAgent', id),
   /** 助手人设编辑（soul.md / agents.md / user.md / 权限模式） */
-  updateAgentPersona: (id: string, patch: AgentPersonaPatch): Promise<Agent> => ipcRenderer.invoke('aibox:updateAgentPersona', id, patch),
+  updateAgentPersona: (id: string, patch: AgentPersonaPatch): Promise<Agent> => ipcRenderer.invoke('aibox:updateAgentPersona', id, encodePersonaPatch(patch)),
+  // Android 手机员工
+  getMobileStatus: (): Promise<MobileGatewayStatus> => ipcRenderer.invoke('aibox:mobile:getStatus'),
+  listMobileLanAddresses: (): Promise<string[]> => ipcRenderer.invoke('aibox:mobile:listLanAddresses'),
+  startMobileGateway: (host: string, port?: number): Promise<MobileGatewayStatus> => ipcRenderer.invoke('aibox:mobile:startGateway', host, port),
+  stopMobileGateway: (): Promise<void> => ipcRenderer.invoke('aibox:mobile:stopGateway'),
+  resetMobileCertificate: (): Promise<void> => ipcRenderer.invoke('aibox:mobile:resetCertificate'),
+  createMobilePairing: (): Promise<MobilePairingOffer> => ipcRenderer.invoke('aibox:mobile:createPairing'),
+  copyMobilePairingConfig: (pairingId: string): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:mobile:copyPairingConfig', pairingId),
+  getMobileToolCatalog: (): Promise<MobileToolCatalog> => ipcRenderer.invoke('aibox:mobile:getToolCatalog'),
+  listMobileDevices: (): Promise<MobileDevice[]> => ipcRenderer.invoke('aibox:mobile:listDevices'),
+  getMobileAgentConfig: (agentId: string): Promise<MobileAgentConfig | null> => ipcRenderer.invoke('aibox:mobile:getAgentConfig', agentId),
+  bindMobileAgent: (input: { agentId: string; deviceId: string; allowedTools: MobileToolName[]; confirmAuthorization: boolean }): Promise<MobileAgentConfig> => ipcRenderer.invoke('aibox:mobile:bindAgent', input),
+  unbindMobileAgent: (agentId: string): Promise<void> => ipcRenderer.invoke('aibox:mobile:unbindAgent', agentId),
+  updateMobileToolPolicy: (input: { agentId: string; allowedTools: MobileToolName[]; confirmAuthorization: boolean }): Promise<MobileAgentConfig> => ipcRenderer.invoke('aibox:mobile:updateToolPolicy', input),
+  refreshMobilePreview: (deviceId: string): Promise<string> => ipcRenderer.invoke('aibox:mobile:refreshPreview', deviceId),
+  readMobileUiTree: (deviceId: string): Promise<Record<string, unknown>> => ipcRenderer.invoke('aibox:mobile:readUiTree', deviceId),
+  executeMobileTool: (input: { deviceId: string; toolName: MobileToolName; args: Record<string, unknown> }): Promise<Record<string, unknown>> => ipcRenderer.invoke('aibox:mobile:execute', input),
+  listMobileCommands: (deviceId?: string): Promise<MobileCommandLog[]> => ipcRenderer.invoke('aibox:mobile:listCommands', deviceId),
+  listMobileArtifacts: (deviceId?: string): Promise<MobileArtifact[]> => ipcRenderer.invoke('aibox:mobile:listArtifacts', deviceId),
+  listMobileScripts: (): Promise<MobileScriptDefinition[]> => ipcRenderer.invoke('aibox:mobile:listScripts'),
+  saveMobileScript: (input: Omit<MobileScriptDefinition, 'id' | 'createdAt' | 'updatedAt'>, id?: string): Promise<MobileScriptDefinition> => ipcRenderer.invoke('aibox:mobile:saveScript', input, id),
+  deleteMobileScript: (id: string): Promise<void> => ipcRenderer.invoke('aibox:mobile:deleteScript', id),
+  runMobileScript: (id: string): Promise<{ completed: number; results: Record<string, unknown>[] }> => ipcRenderer.invoke('aibox:mobile:runScript', id),
+  emergencyStopMobile: (deviceId: string): Promise<void> => ipcRenderer.invoke('aibox:mobile:emergencyStop', deviceId),
+  getMobileApkInfo: (): Promise<MobileApkInfo> => ipcRenderer.invoke('aibox:mobile:getApkInfo'),
+  listMobileAdbDevices: (): Promise<MobileAdbDevice[]> => ipcRenderer.invoke('aibox:mobile:listAdbDevices'),
+  installMobileApk: (serial: string): Promise<{ ok: true; message: string }> => ipcRenderer.invoke('aibox:mobile:installApk', serial),
+  exportMobileApk: (): Promise<{ ok: boolean; canceled: boolean; message: string }> => ipcRenderer.invoke('aibox:mobile:exportApk'),
   /** AI 辅助生成人设（输入描述，返回生成的配置） */
   generatePersona: (description: string): Promise<{ name: string; role: string; soulMd: string; agentsMd: string; systemPrompt: string; permissionMode: string }> => ipcRenderer.invoke('aibox:generatePersona', description),
   /** 会话列表（按助手） */
   listConversations: (agentId: string): Promise<Conversation[]> => ipcRenderer.invoke('aibox:listConversations', agentId),
   /** 发送消息给助手（创建/继续会话） */
   chatWithAgent: (agentId: string, message: string, conversationId?: string): Promise<{ conversationId: string; task: Task }> =>
-    ipcRenderer.invoke('aibox:chatWithAgent', agentId, message, conversationId),
+    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId),
   /** 会话重命名 */
-  renameConversation: (id: string, title: string): Promise<void> => ipcRenderer.invoke('aibox:renameConversation', id, title),
+  renameConversation: (id: string, title: string): Promise<void> => ipcRenderer.invoke('aibox:renameConversation', id, encodeText(title)),
   /** 删除会话 */
   deleteConversation: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteConversation', id),
   /** Token / 模型调用统计 */
@@ -103,13 +173,14 @@ const api = {
     ipcRenderer.invoke('aibox:getUsageStatsEnhanced', since),
 
   // MCP 服务器管理
-  listMcpServers: (): Promise<{ id: string; name: string; command: string; args: string[]; env: Record<string, string>; enabled: boolean; scope: string }[]> => ipcRenderer.invoke('aibox:listMcpServers'),
-  createMcpServer: (input: { name: string; command: string; args?: string[]; env?: Record<string, string> }): Promise<unknown> => ipcRenderer.invoke('aibox:createMcpServer', input),
+  listMcpServers: (): Promise<{ id: string; name: string; command: string; args: string[]; env: Record<string, string>; enabled: boolean; scope: string; capability: 'browser' | ''; running: boolean; hasSecrets: boolean }[]> => ipcRenderer.invoke('aibox:listMcpServers'),
+  createMcpServer: (input: { name: string; command: string; args?: string[]; env?: Record<string, string>; scope?: string; capability?: 'browser' | '' }): Promise<unknown> => ipcRenderer.invoke('aibox:createMcpServer', input),
+  createPlaywrightBrowser: (input: { agentId: string; extensionToken?: string }): Promise<{ server: { id: string }; connection: { ok: boolean; message: string } }> => ipcRenderer.invoke('aibox:createPlaywrightBrowser', input),
   removeMcpServer: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeMcpServer', id),
   toggleMcpServer: (id: string, enabled: boolean): Promise<void> => ipcRenderer.invoke('aibox:toggleMcpServer', id, enabled),
   startMcpServer: (id: string): Promise<{ ok: boolean; message: string; tools?: { name: string; description: string }[] }> => ipcRenderer.invoke('aibox:startMcpServer', id),
   stopMcpServer: (id: string): Promise<void> => ipcRenderer.invoke('aibox:stopMcpServer', id),
-  getMcpTools: (): Promise<{ name: string; description: string; serverId: string; serverName: string }[]> => ipcRenderer.invoke('aibox:getMcpTools'),
+  getMcpTools: (): Promise<{ name: string; description: string; serverId: string; serverName: string; capability: 'browser' | '' }[]> => ipcRenderer.invoke('aibox:getMcpTools'),
 
   // Skills 管理
   listSkills: (): Promise<{ id: string; name: string; description: string; content: string; enabled: boolean; createdAt: number }[]> => ipcRenderer.invoke('aibox:listSkills'),
@@ -194,14 +265,14 @@ const api = {
   removeTeamTemplate: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeamTemplate', id),
 
   // 任务
-  createTask: (agentId: string, title: string, projectId?: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, title, projectId),
+  createTask: (agentId: string, title: string, projectId?: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, encodeText(title), projectId),
   cancelTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:cancelTask', id),
   retryTask: (id: string): Promise<Task> => ipcRenderer.invoke('aibox:retryTask', id),
   deleteTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteTask', id),
   pauseTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:pauseTask', id),
   resumeTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:resumeTask', id),
   decideApproval: (id: string, approve: boolean): Promise<void> => ipcRenderer.invoke('aibox:decideApproval', id, approve),
-  createFollowUpTask: (parentTaskId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createFollowUpTask', parentTaskId, title),
+  createFollowUpTask: (parentTaskId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createFollowUpTask', parentTaskId, encodeText(title)),
   getTaskEvents: (taskId: string): Promise<TaskEvent[]> => ipcRenderer.invoke('aibox:getTaskEvents', taskId),
   getTaskResult: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getTaskResult', taskId),
   setTaskQuality: (taskId: string, quality: 'accepted' | 'rejected' | 'rework' | null): Promise<Task | null> => ipcRenderer.invoke('aibox:setTaskQuality', taskId, quality),
@@ -323,6 +394,11 @@ const api = {
     ipcRenderer.on('aibox:taskOutput', handler);
     return () => ipcRenderer.removeListener('aibox:taskOutput', handler);
   },
+  onMobileEvent: (fn: (event: MobileEvent) => void): (() => void) => {
+    const handler = (_: unknown, event: MobileEvent) => fn(event);
+    ipcRenderer.on('aibox:mobileEvent', handler);
+    return () => ipcRenderer.removeListener('aibox:mobileEvent', handler);
+  },
 
   // ---------- 语音任务下达 ----------
   getVoiceConfig: (): Promise<VoiceConfig> => ipcRenderer.invoke('aibox:getVoiceConfig'),
@@ -335,10 +411,10 @@ const api = {
     ipcRenderer.invoke('aibox:pushVoiceAudio', sessionId, chunk),
   stopVoiceSession: (sessionId: string): Promise<void> => ipcRenderer.invoke('aibox:stopVoiceSession', sessionId),
   /** 解析语音文本为任务草稿（不派发） */
-  parseVoiceCommand: (text: string): Promise<VoiceCommandDraft> => ipcRenderer.invoke('aibox:parseVoiceCommand', text),
+  parseVoiceCommand: (text: string): Promise<VoiceCommandDraft> => ipcRenderer.invoke('aibox:parseVoiceCommand', encodeText(text)),
   /** 用户确认后派发（source='voice'） */
   dispatchVoiceTask: (agentId: string, title: string): Promise<Task> =>
-    ipcRenderer.invoke('aibox:dispatchVoiceTask', agentId, title),
+    ipcRenderer.invoke('aibox:dispatchVoiceTask', agentId, encodeText(title)),
   /** 识别结果流式订阅（边说边出字） */
   onVoiceTranscript: (fn: (p: { sessionId: string; text: string; isFinal: boolean; timestamp: number }) => void): (() => void) => {
     const handler = (_: unknown, p: { sessionId: string; text: string; isFinal: boolean; timestamp: number }) => fn(p);

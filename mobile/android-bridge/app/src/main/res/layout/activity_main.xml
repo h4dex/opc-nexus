@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="#111318">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:layout_marginBottom="18dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="OPC-Nexus 手机桥"
+                android:textColor="#F2F4F8"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvVersion"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#7F8795"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card_rounded"
+            android:padding="16dp"
+            android:layout_marginBottom="12dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+                <View
+                    android:id="@+id/indicatorConnection"
+                    android:layout_width="10dp"
+                    android:layout_height="10dp"
+                    android:background="@drawable/bg_status_dot_grey" />
+                <TextView
+                    android:id="@+id/tvConnectionStatus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="10dp"
+                    android:text="未连接"
+                    android:textColor="#AAAAAA"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+                <Switch
+                    android:id="@+id/switchConnection"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:contentDescription="连接开关" />
+            </LinearLayout>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="网关" android:textColor="#737B89" android:textSize="11sp" />
+            <TextView android:id="@+id/tvGatewayValue" android:layout_width="match_parent" android:layout_height="wrap_content" android:ellipsize="middle" android:maxLines="1" android:text="未配对" android:textColor="#D6DAE2" android:textIsSelectable="true" android:textSize="12sp" android:fontFamily="monospace" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="设备 ID" android:textColor="#737B89" android:textSize="11sp" />
+            <TextView android:id="@+id/tvDeviceIdValue" android:layout_width="match_parent" android:layout_height="wrap_content" android:ellipsize="middle" android:maxLines="1" android:text="-" android:textColor="#D6DAE2" android:textIsSelectable="true" android:textSize="11sp" android:fontFamily="monospace" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="固定 SPKI 指纹" android:textColor="#737B89" android:textSize="11sp" />
+            <TextView android:id="@+id/tvFingerprintValue" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="-" android:textColor="#D6DAE2" android:textIsSelectable="true" android:textSize="10sp" android:fontFamily="monospace" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnScanQr"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:text="扫描 OPC-Nexus 配对二维码"
+            android:textAllCaps="false"
+            android:textColor="#111318"
+            android:textStyle="bold"
+            android:background="@drawable/bg_button_orange"
+            android:layout_marginBottom="12dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card_rounded"
+            android:padding="16dp"
+            android:layout_marginBottom="12dp">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="手动配对" android:textColor="#F2F4F8" android:textSize="14sp" android:textStyle="bold" android:layout_marginBottom="10dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="完整配置 JSON" android:textColor="#9AA1AD" android:textSize="11sp" android:layout_marginBottom="6dp" />
+            <EditText
+                android:id="@+id/etPairingConfig"
+                android:layout_width="match_parent"
+                android:layout_height="120dp"
+                android:gravity="top|start"
+                android:hint="粘贴 OPC-Nexus 复制的完整配对配置"
+                android:inputType="textMultiLine|textNoSuggestions"
+                android:maxLines="8"
+                android:scrollbars="vertical"
+                android:textColor="#E4E7ED"
+                android:textColorHint="#5C6370"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:background="@drawable/bg_input_dark"
+                android:padding="12dp"
+                android:layout_marginBottom="8dp" />
+            <Button
+                android:id="@+id/btnParsePairingConfig"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:text="解析完整配置并配对"
+                android:textAllCaps="false"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/bg_button_orange"
+                android:layout_marginBottom="14dp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="逐项输入" android:textColor="#9AA1AD" android:textSize="11sp" android:layout_marginBottom="6dp" />
+            <EditText android:id="@+id/etGatewayUrl" android:layout_width="match_parent" android:layout_height="46dp" android:hint="wss://192.168.1.10:18765/v1/device" android:inputType="textUri" android:singleLine="true" android:textColor="#E4E7ED" android:textColorHint="#5C6370" android:textSize="12sp" android:background="@drawable/bg_input_dark" android:paddingStart="12dp" android:paddingEnd="12dp" android:layout_marginBottom="7dp" />
+            <EditText android:id="@+id/etPairingId" android:layout_width="match_parent" android:layout_height="46dp" android:hint="配对 ID" android:inputType="text" android:singleLine="true" android:textColor="#E4E7ED" android:textColorHint="#5C6370" android:textSize="12sp" android:background="@drawable/bg_input_dark" android:paddingStart="12dp" android:paddingEnd="12dp" android:layout_marginBottom="7dp" />
+            <EditText android:id="@+id/etPairingSecret" android:layout_width="match_parent" android:layout_height="46dp" android:hint="一次性配对密钥" android:inputType="textPassword" android:singleLine="true" android:textColor="#E4E7ED" android:textColorHint="#5C6370" android:textSize="12sp" android:background="@drawable/bg_input_dark" android:paddingStart="12dp" android:paddingEnd="12dp" android:layout_marginBottom="7dp" />
+            <EditText android:id="@+id/etSpki" android:layout_width="match_parent" android:layout_height="46dp" android:hint="sha256/... SPKI 指纹" android:inputType="text" android:singleLine="true" android:textColor="#E4E7ED" android:textColorHint="#5C6370" android:textSize="12sp" android:background="@drawable/bg_input_dark" android:paddingStart="12dp" android:paddingEnd="12dp" android:layout_marginBottom="9dp" />
+            <Button android:id="@+id/btnManualPair" android:layout_width="match_parent" android:layout_height="46dp" android:text="手动配对" android:textAllCaps="false" android:textColor="#FFFFFF" android:background="@drawable/bg_button_orange" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card_rounded"
+            android:padding="16dp"
+            android:layout_marginBottom="12dp">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="系统权限" android:textColor="#F2F4F8" android:textSize="14sp" android:textStyle="bold" android:layout_marginBottom="8dp" />
+            <LinearLayout android:layout_width="match_parent" android:layout_height="48dp" android:gravity="center_vertical" android:orientation="horizontal"><TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="无障碍服务" android:textColor="#C9CED8" android:textSize="13sp" /><TextView android:id="@+id/tvAccessibilityStatus" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="未授权" android:textColor="#888888" android:textSize="12sp" /><Button android:id="@+id/btnAccessibility" android:layout_width="90dp" android:layout_height="40dp" android:layout_marginStart="8dp" android:text="设置" android:textAllCaps="false" /></LinearLayout>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="48dp" android:gravity="center_vertical" android:orientation="horizontal"><TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="通知访问" android:textColor="#C9CED8" android:textSize="13sp" /><TextView android:id="@+id/tvNotificationStatus" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="未授权" android:textColor="#888888" android:textSize="12sp" /><Button android:id="@+id/btnNotificationAccess" android:layout_width="90dp" android:layout_height="40dp" android:layout_marginStart="8dp" android:text="设置" android:textAllCaps="false" /></LinearLayout>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="48dp" android:gravity="center_vertical" android:orientation="horizontal"><TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="屏幕读取" android:textColor="#C9CED8" android:textSize="13sp" /><TextView android:id="@+id/tvScreenCaptureStatus" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="未授权" android:textColor="#888888" android:textSize="12sp" /><Button android:id="@+id/btnScreenCapture" android:layout_width="90dp" android:layout_height="40dp" android:layout_marginStart="8dp" android:text="授权" android:textAllCaps="false" /></LinearLayout>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="48dp" android:gravity="center_vertical" android:orientation="horizontal"><TextView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="麦克风 / 定位 / 通信" android:textColor="#C9CED8" android:textSize="13sp" /><TextView android:id="@+id/tvRuntimeStatus" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="0 / 5" android:textColor="#888888" android:textSize="12sp" /><Button android:id="@+id/btnRuntimePermissions" android:layout_width="90dp" android:layout_height="40dp" android:layout_marginStart="8dp" android:text="授权" android:textAllCaps="false" /></LinearLayout>
+            <Button android:id="@+id/btnOverlay" android:layout_width="match_parent" android:layout_height="42dp" android:text="切换连接状态悬浮标记" android:textAllCaps="false" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnEmergencyDisconnect"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:text="紧急断开"
+            android:textAllCaps="false"
+            android:textColor="#FFFFFF"
+            android:textStyle="bold"
+            android:background="@drawable/bg_button_disconnect"
+            android:layout_marginBottom="8dp" />
+        <Button
+            android:id="@+id/btnForgetPairing"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:text="清除网关绑定"
+            android:textAllCaps="false" />
+    </LinearLayout>
+</ScrollView>

@@ -9,6 +9,7 @@ import { useApp } from '../store';
 import { TASK_STATUS_META, ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconCheck, IconX, IconPlay } from '../components/icons';
 import type { Task, TaskEvent, Approval } from '@shared/types';
+import { appendTaskOutput, compactTaskEvents } from '../utils/taskEvents';
 
 /** 事件类型 → 图标颜色 */
 const EVENT_COLOR: Record<string, string> = {
@@ -24,9 +25,11 @@ export function Console() {
   const [result, setResult] = useState<string | null>(null);
   const [ctx, setCtx] = useState<{ x: number; y: number; task: Task } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const selectedIdRef = useRef<string | null>(null);
 
-  if (!snapshot) return null;
-  const { tasks, approvals, agentCards } = snapshot;
+  const tasks = snapshot?.tasks ?? [];
+  const approvals = snapshot?.approvals ?? [];
+  const agentCards = snapshot?.agentCards ?? [];
 
   // 活跃任务优先，再按时间倒序
   const sorted = [...tasks].sort((a, b) => {
@@ -52,10 +55,12 @@ export function Console() {
   };
 
   // 加载选中任务的事件流（初始全量 + 流式追加 + 5s 低频补全）
-  const selectedIdRef = useRef<string | null>(null);
   const loadEvents = useCallback(() => {
     if (!selectedIdRef.current) return;
-    void window.aibox.getTaskEvents(selectedIdRef.current).then(setEvents);
+    const taskId = selectedIdRef.current;
+    void window.aibox.getTaskEvents(taskId).then((items) => {
+      if (selectedIdRef.current === taskId) setEvents(compactTaskEvents(items));
+    });
     void window.aibox.getTaskResult(selectedIdRef.current).then(setResult);
   }, []);
 
@@ -67,10 +72,7 @@ export function Console() {
     // 流式输出实时追加（无需等待轮询）
     const unsub = window.aibox.onTaskOutput(({ taskId, chunk }) => {
       if (taskId !== selectedIdRef.current) return;
-      setEvents((prev) => [...prev, {
-        id: `rt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        taskId, eventType: 'output', payload: { chunk }, createdAt: Date.now()
-      } as TaskEvent]);
+      setEvents((prev) => appendTaskOutput(prev, taskId, chunk));
     });
     // 5s 低频轮询补全 stage/progress/tool_call 等非 output 事件
     const timer = setInterval(loadEvents, 5000);
@@ -79,8 +81,10 @@ export function Console() {
 
   // 自动滚动到底部
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [events.length]);
+
+  if (!snapshot) return null;
 
   const agentName = (id: string) => agentCards.find((c) => c.agent.id === id)?.agent.name ?? '—';
   const taskApprovals = approvals.filter((a) => a.taskId === selected?.id && a.status === 'pending');

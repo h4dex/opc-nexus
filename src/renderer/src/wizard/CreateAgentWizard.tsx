@@ -1,9 +1,10 @@
 /** 唤起数字员工向导（PRD 7.1 创建流程 / 7.2 配置字段校验） */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconFolder } from '../components/icons';
-import type { CreateAgentInput, PermissionMode } from '@shared/types';
+import { MobileToolPolicy } from '../components/MobileToolPolicy';
+import type { AgentKind, CreateAgentInput, MobileDevice, MobileToolCatalog, PermissionMode } from '@shared/types';
 
 const TEMPLATES = [
   { key: 'blank', name: '空白创建', role: '', prompt: '' },
@@ -32,6 +33,8 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState('');
   const [aiDesc, setAiDesc] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
+  const [mobileCatalog, setMobileCatalog] = useState<MobileToolCatalog | null>(null);
+  const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
   const [form, setForm] = useState<CreateAgentInput>({
     name: '',
     role: '',
@@ -46,9 +49,29 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
     channelIds: []
   });
 
+  useEffect(() => {
+    void Promise.all([window.aibox.getMobileToolCatalog(), window.aibox.listMobileDevices()]).then(([catalog, devices]) => {
+      setMobileCatalog(catalog);
+      setMobileDevices(devices);
+      setForm((current) => ({ ...current, mobileAllowedTools: current.mobileAllowedTools ?? catalog.tools.map((tool) => tool.name) }));
+    }).catch(() => {});
+  }, []);
+
   // 与后端校验一致：HEALTHY / SETUP_REQUIRED / AUTH_REQUIRED 均可选（未就绪引擎以演示模式执行）
   const selectableEngines = snapshot?.engines.filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)) ?? [];
   const onlineChannels = snapshot?.channels.filter((c) => c.status === 'ONLINE') ?? [];
+  const androidOperator = form.kind === 'android_operator';
+
+  const setKind = (kind: AgentKind) => {
+    setForm((current) => ({
+      ...current,
+      kind,
+      engineId: kind === 'android_operator' ? 'eng-hermes-cli' : (snapshot?.engines.find((engine) => engine.isDefault)?.id ?? current.engineId),
+      concurrencyLimit: kind === 'android_operator' ? 1 : current.concurrencyLimit,
+      deviceId: kind === 'android_operator' ? current.deviceId : null,
+      mobileAuthorizationConfirmed: kind === 'android_operator' ? current.mobileAuthorizationConfirmed : false
+    }));
+  };
 
   const applyTemplate = (key: string) => {
     const t = TEMPLATES.find((x) => x.key === key)!;
@@ -87,7 +110,9 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
     }
     if (step === 1) {
       if (!form.engineId) return setError('请选择已安装且健康的默认引擎');
-      if (!form.workspace) return setError('必须选择工作目录（进入允许列表）');
+      if (!androidOperator && !form.workspace) return setError('必须选择工作目录（进入允许列表）');
+      if (androidOperator && form.deviceId && !form.mobileAuthorizationConfirmed) return setError('首次绑定设备前必须确认完整手机工具授权');
+      if (androidOperator && (form.mobileAllowedTools?.length ?? 0) < 1) return setError('Android 手机操作员至少需要启用一个工具');
     }
     if (step < STEPS.length - 1) return setStep(step + 1);
     void submit();
@@ -117,6 +142,14 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
 
       {step === 0 && (
         <>
+          <div className="field">
+            <label>数字员工身份</label>
+            <div className="chip-row">
+              <button className={`chip ${!androidOperator ? 'on' : ''}`} onClick={() => setKind('general')}>通用数字员工</button>
+              <button className={`chip ${androidOperator ? 'on' : ''}`} onClick={() => setKind('android_operator')}>Android 手机操作员</button>
+            </div>
+            {androidOperator && <div className="hint">固定使用 Hermes Agent、并发 1；只开放所选 Android 工具，其他系统能力关闭。</div>}
+          </div>
           {/* AI 辅助生成人设 */}
           <div className="field" style={{ background: 'var(--accent-soft)', padding: '14px 16px', borderRadius: 10, marginBottom: 16 }}>
             <label style={{ color: 'var(--accent)', fontWeight: 650 }}>✨ AI 辅助生成（描述你想要的助手，AI 自动填写全部配置）</label>
@@ -156,17 +189,19 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
       {step === 1 && (
         <>
           <div className="field">
-            <label>默认执行引擎（未就绪引擎将以演示模式执行，配置完成后自动切换真实执行）*</label>
-            <div className="chip-row">
-              {selectableEngines.map((e) => (
-                <button key={e.id} className={`chip ${form.engineId === e.id ? 'on' : ''}`} onClick={() => setForm({ ...form, engineId: e.id })}>
-                  {e.name} {e.status !== 'HEALTHY' ? '（演示模式）' : e.version ? `v${e.version}` : ''}
-                </button>
-              ))}
-              {selectableEngines.length === 0 && <span style={{ color: 'var(--warning)', fontSize: 12 }}>暂无可用引擎，请先到引擎中心安装</span>}
-            </div>
+            <label>{androidOperator ? '执行引擎（手机操作员固定）' : '默认执行引擎（未就绪引擎将以演示模式执行，配置完成后自动切换真实执行）*'}</label>
+            {androidOperator
+              ? <div className="chip-row"><button className="chip on" disabled>Hermes Agent CLI</button></div>
+              : <div className="chip-row">
+                {selectableEngines.map((e) => (
+                  <button key={e.id} className={`chip ${form.engineId === e.id ? 'on' : ''}`} onClick={() => setForm({ ...form, engineId: e.id })}>
+                    {e.name} {e.status !== 'HEALTHY' ? '（演示模式）' : e.version ? `v${e.version}` : ''}
+                  </button>
+                ))}
+                {selectableEngines.length === 0 && <span style={{ color: 'var(--warning)', fontSize: 12 }}>暂无可用引擎，请先到引擎中心安装</span>}
+              </div>}
           </div>
-          <div className="field">
+          {!androidOperator && <div className="field">
             <label>工作目录（必须由用户选择并进入允许列表）*</label>
             <div style={{ display: 'flex', gap: 8 }}>
               <input readOnly value={form.workspace} placeholder="点击右侧按钮选择目录" />
@@ -174,7 +209,7 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
                 <IconFolder size={14} />选择
               </button>
             </div>
-          </div>
+          </div>}
           <div className="field">
             <label>权限模式</label>
             <div className="chip-row">
@@ -186,11 +221,28 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
             </div>
             <div className="hint">标准审批：写入工作目录逐任务授权；目录外访问、删除、网络、安装必须审批。</div>
           </div>
-          <div className="field">
+          {!androidOperator && <div className="field">
             <label>并发上限（默认 1，受系统资源策略限制）</label>
             <input type="number" min={1} max={10} value={form.concurrencyLimit}
               onChange={(e) => setForm({ ...form, concurrencyLimit: Math.max(1, Math.min(10, Number(e.target.value))) })} />
-          </div>
+          </div>}
+          {androidOperator && <>
+            <div className="field">
+              <label>绑定设备</label>
+              <select value={form.deviceId ?? ''} onChange={(event) => setForm((current) => ({ ...current, deviceId: event.target.value || null, mobileAuthorizationConfirmed: false }))}>
+                <option value="">暂不绑定，稍后在手机控制台配对</option>
+                {mobileDevices.map((device) => <option key={device.id} value={device.id} disabled={!!device.boundAgentId}>{device.name || device.model} · {device.status}{device.boundAgentId ? '（已绑定）' : ''}</option>)}
+              </select>
+            </div>
+            <div className="field">
+              <label>Android 工具策略</label>
+              <MobileToolPolicy catalog={mobileCatalog} selected={form.mobileAllowedTools ?? []} onChange={(mobileAllowedTools) => setForm((current) => ({ ...current, mobileAllowedTools, mobileAuthorizationConfirmed: false }))} />
+            </div>
+            {form.deviceId && <label className="mobile-auth-confirm">
+              <input type="checkbox" checked={form.mobileAuthorizationConfirmed === true} onChange={(event) => setForm((current) => ({ ...current, mobileAuthorizationConfirmed: event.target.checked }))} />
+              <span><b>确认向该数字员工授予以上 {form.mobileAllowedTools?.length ?? 0} 个手机工具</b><small>工具可能读取界面、隐私数据或执行短信、电话、录音等操作；所有调用将进入审计日志。</small></span>
+            </label>}
+          </>}
         </>
       )}
 
@@ -218,8 +270,10 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
           <tbody>
             <tr><td style={{ color: 'var(--text-2)', width: 110 }}>名称</td><td>{form.name}</td></tr>
             <tr><td style={{ color: 'var(--text-2)' }}>职责</td><td>{form.role}</td></tr>
-            <tr><td style={{ color: 'var(--text-2)' }}>引擎</td><td>{selectableEngines.find((e) => e.id === form.engineId)?.name}</td></tr>
-            <tr><td style={{ color: 'var(--text-2)' }}>工作目录</td><td style={{ fontFamily: 'monospace', fontSize: 12 }}>{form.workspace}</td></tr>
+            <tr><td style={{ color: 'var(--text-2)' }}>身份</td><td>{androidOperator ? 'Android 手机操作员' : '通用数字员工'}</td></tr>
+            <tr><td style={{ color: 'var(--text-2)' }}>引擎</td><td>{androidOperator ? 'Hermes Agent CLI' : selectableEngines.find((e) => e.id === form.engineId)?.name}</td></tr>
+            <tr><td style={{ color: 'var(--text-2)' }}>{androidOperator ? '设备' : '工作目录'}</td><td style={{ fontFamily: 'monospace', fontSize: 12 }}>{androidOperator ? (mobileDevices.find((device) => device.id === form.deviceId)?.name ?? '暂未绑定') : form.workspace}</td></tr>
+            {androidOperator && <tr><td style={{ color: 'var(--text-2)' }}>手机工具</td><td>{form.mobileAllowedTools?.length ?? 0} / {mobileCatalog?.tools.length ?? 42} 个</td></tr>}
             <tr><td style={{ color: 'var(--text-2)' }}>权限模式</td><td>{form.permissionMode === 'readonly' ? '只读' : form.permissionMode === 'trusted' ? '受信任' : '标准审批'}</td></tr>
             <tr><td style={{ color: 'var(--text-2)' }}>渠道</td><td>{form.channelIds.length ? `${form.channelIds.length} 个` : '未绑定'}</td></tr>
           </tbody>

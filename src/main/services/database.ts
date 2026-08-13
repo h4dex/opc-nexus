@@ -8,7 +8,7 @@ import initSqlJs, { type Database as SqlJsDatabase, type SqlValue } from 'sql.js
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { app } from 'electron';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync, openSync, closeSync, fsyncSync } from 'node:fs';
 import { validateDatabaseBackup } from './backupValidator.js';
 
@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 28;
+const SCHEMA_VERSION = 31;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -200,7 +200,8 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   args TEXT NOT NULL DEFAULT '[]',
   env TEXT NOT NULL DEFAULT '{}',
   enabled INTEGER NOT NULL DEFAULT 1,
-  scope TEXT NOT NULL DEFAULT 'global'
+  scope TEXT NOT NULL DEFAULT 'global',
+  capability TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS skills (
@@ -445,6 +446,88 @@ CREATE TABLE IF NOT EXISTS collab_agents (
   connected_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS mobile_devices (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  manufacturer TEXT NOT NULL DEFAULT '',
+  android_version TEXT NOT NULL DEFAULT '',
+  api_level INTEGER NOT NULL DEFAULT 0,
+  app_version TEXT NOT NULL DEFAULT '',
+  protocol_version INTEGER NOT NULL,
+  identity_public_key TEXT NOT NULL,
+  identity_fingerprint TEXT NOT NULL UNIQUE,
+  certificate_fingerprint TEXT NOT NULL,
+  permissions_json TEXT NOT NULL DEFAULT '{}',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  paired_at INTEGER NOT NULL,
+  last_seen_at INTEGER,
+  last_ip TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mobile_agent_configs (
+  agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+  device_id TEXT UNIQUE REFERENCES mobile_devices(id),
+  hermes_profile TEXT NOT NULL UNIQUE,
+  allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+  authorization_confirmed_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mobile_control_sessions (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  device_id TEXT NOT NULL REFERENCES mobile_devices(id),
+  task_id TEXT REFERENCES tasks(id),
+  status TEXT NOT NULL DEFAULT 'active',
+  allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+  started_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  ended_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS mobile_commands (
+  id TEXT PRIMARY KEY,
+  session_id TEXT REFERENCES mobile_control_sessions(id),
+  agent_id TEXT REFERENCES agents(id),
+  device_id TEXT NOT NULL REFERENCES mobile_devices(id),
+  task_id TEXT REFERENCES tasks(id),
+  tool_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  request_summary_json TEXT NOT NULL DEFAULT '{}',
+  result_summary_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS mobile_artifacts (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES mobile_devices(id),
+  agent_id TEXT REFERENCES agents(id),
+  task_id TEXT REFERENCES tasks(id),
+  command_id TEXT REFERENCES mobile_commands(id),
+  kind TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  storage_name TEXT NOT NULL UNIQUE,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mobile_scripts (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  agent_id TEXT REFERENCES agents(id),
+  device_id TEXT REFERENCES mobile_devices(id),
+  steps_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
@@ -461,6 +544,12 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_versions_parent ON knowledge_versions(k
 CREATE INDEX IF NOT EXISTS idx_action_dismissed_at ON action_dismissals(dismissed_at);
 CREATE INDEX IF NOT EXISTS idx_automation_reports_project ON automation_reports(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_customer_deliveries_project ON customer_deliveries(project_id, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_device_lease ON mobile_control_sessions(device_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_agent_lease ON mobile_control_sessions(agent_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_task_lease ON mobile_control_sessions(task_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_mobile_commands_device_time ON mobile_commands(device_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mobile_artifacts_device_time ON mobile_artifacts(device_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mobile_scripts_agent ON mobile_scripts(agent_id, updated_at DESC);
 `;
 
 type Row = Record<string, SqlValue>;
@@ -895,6 +984,23 @@ export class Database {
         // 子任务仍归属原员工（保留归属与审计链路），仅执行引擎不同。
         addCol('tasks', 'engine_override', 'TEXT');
       }
+      if (prev < 29) {
+        // v29：MCP 能力分类，用于按数字员工能力开关过滤浏览器等高权限工具。
+        addCol('mcp_servers', 'capability', "TEXT NOT NULL DEFAULT ''");
+      }
+      if (prev < 30) {
+        // v30：为旧版预置 Puppeteer 服务补齐浏览器权限分类，防止绕过员工能力开关。
+        this.inner.exec(`
+          UPDATE mcp_servers SET capability = 'browser'
+          WHERE capability = '' AND command = 'npx' AND args LIKE '%@modelcontextprotocol/server-puppeteer%';
+        `);
+      }
+      if (prev < 31) {
+        // v31：Android 手机员工身份与 Mobile Gateway 数据域。
+        addCol('agents', 'agent_kind', "TEXT NOT NULL DEFAULT 'general'");
+        addCol('mobile_devices', 'certificate_fingerprint', "TEXT NOT NULL DEFAULT ''");
+        this.inner.exec("UPDATE agents SET agent_kind = 'general' WHERE agent_kind IS NULL OR agent_kind = ''");
+      }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');
     } catch (err) {
@@ -1007,6 +1113,8 @@ export class Database {
     const d90 = now - 90 * 86_400_000;
     const d7 = now - 7 * 86_400_000;
     const d365 = now - 365 * 86_400_000;
+    const expiredArtifacts = this.raw.prepare('SELECT storage_name FROM mobile_artifacts WHERE created_at < ?')
+      .all(now - 30 * 86_400_000) as { storage_name: string }[];
     this.transaction(() => {
       // 已结束任务超保留期：级联清理事件/消息/运行记录后删除任务本身
       const sub = "SELECT id FROM tasks WHERE ended_at IS NOT NULL AND ended_at < ?";
@@ -1016,8 +1124,16 @@ export class Database {
       this.raw.prepare(`DELETE FROM approvals WHERE task_id IN (${sub})`).run(d90);
       this.raw.prepare('DELETE FROM tasks WHERE ended_at IS NOT NULL AND ended_at < ?').run(d90);
       this.raw.prepare('DELETE FROM resource_samples WHERE created_at < ?').run(d7);
+      this.raw.prepare('DELETE FROM mobile_commands WHERE started_at < ?').run(d90);
+      this.raw.prepare('DELETE FROM mobile_artifacts WHERE created_at < ?').run(now - 30 * 86_400_000);
+      this.raw.prepare("UPDATE mobile_control_sessions SET status = 'expired', ended_at = COALESCE(ended_at, ?) WHERE status = 'active' AND expires_at < ?").run(now, now);
       this.raw.prepare('DELETE FROM audit_logs WHERE created_at < ?').run(d365);
     });
+    const artifactDir = join(app.getPath('userData'), 'aibox-data', 'mobile-artifacts');
+    for (const row of expiredArtifacts) {
+      if (basename(row.storage_name) !== row.storage_name) continue;
+      try { rmSync(join(artifactDir, row.storage_name), { force: true }); } catch { /* 下次清理重试孤立文件 */ }
+    }
   }
 
   /** 数据库完整性检查：PRAGMA integrity_check + 孤立记录修复（设置页可手动触发） */

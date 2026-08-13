@@ -82,7 +82,7 @@ export function Projects() {
     };
     const scoped = tasks.filter((task) => task.projectId === project.id);
     const completed = scoped.filter((task) => task.status === 'COMPLETED').length;
-    const deliverables = scoped.filter((task) => task.status === 'COMPLETED' && task.result?.trim()).length;
+    const deliverables = scoped.filter((task) => task.status === 'COMPLETED' && (task.hasResult || task.result?.trim())).length;
     const active = scoped.filter((task) => ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'].includes(task.status)).length;
     return { tasks: scoped, completed, deliverables, active, progress: scoped.length ? Math.round((completed / scoped.length) * 100) : 0, acceptanceRate: 0, health: 'on_track' as ProjectHealth };
   };

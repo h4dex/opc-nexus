@@ -11,7 +11,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmdirSync } from 'node:fs';
 import { app } from 'electron';
 import type { Database } from './database.js';
 import type { ExecutorRegistry } from './executor/index.js';
@@ -20,12 +20,19 @@ import type { ApprovalBroker } from './approvalBroker.js';
 import type { ToolHost } from './executor/tools.js';
 import { notify } from './notifier.js';
 import { loadUserConfig } from './userConfig.js';
+import { MAX_TASK_OUTPUT_CHARS } from './textEncoding.js';
 import type {
   Agent, AgentCardView, Approval, CreateAgentInput, DashboardStats, DerivedAgentStatus,
   ExecutorKind, Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
 } from '../../shared/types.js';
 
 type Row = Record<string, unknown>;
+
+export interface AgentCreationCheckpoint {
+  existing: Row | null;
+  autoWorkspacePath: string | null;
+  autoWorkspaceExisted: boolean;
+}
 
 const STAGES = ['理解需求', '规划步骤', '调用工具', '生成产物', '校验结果'];
 
@@ -38,11 +45,25 @@ const DEMO_TASK_POOL = [
 
 /** 默认演示水位：0 = 生产默认不自动补位（演示需显式设置 settings.demoTargetRunning > 0） */
 const DEFAULT_TARGET_RUNNING = 0;
+const MAX_TASK_OUTPUT_EVENTS = 512;
+const MAX_TASK_EVENTS_QUERY = 1000;
+const MAX_TASK_RESULT_CHARS = 16_000;
+const OUTPUT_STATE_TTL_MS = 60_000;
+
+interface TaskOutputState {
+  chars: number;
+  events: number;
+  truncated: boolean;
+  closed: boolean;
+}
 
 export class Orchestrator {
   private listeners = new Set<() => void>();
   /** 任务输出流式订阅（推送到渲染进程逐字显示） */
   private outputListeners = new Set<(taskId: string, chunk: string) => void>();
+  /** Per-task output budget. Prevents a verbose CLI from filling SQLite and
+   * the renderer with one event per token forever. */
+  private outputStates = new Map<string, TaskOutputState>();
   /** 任务终态订阅（webhook 通知等；status 仅 COMPLETED/FAILED/INTERRUPTED） */
   private finishListeners = new Set<(info: { taskId: string; agentId: string; status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; title: string; result: string | null; error: string | null }) => void>();
   private schedulerTimer: NodeJS.Timeout | null = null;
@@ -50,11 +71,22 @@ export class Orchestrator {
   private emitTimer: NodeJS.Timeout | null = null;
   /** 调度保护门禁（由 main 注入，基于资源监控）：返回非空字符串 = 阻止派发的原因 */
   private dispatchGuard: () => string | null = () => null;
+  private mobileDispatchPolicy: {
+    canDispatch(agentId: string): { bound: boolean; ready: boolean; reason: string };
+    releaseAgent?(agentId: string): void;
+  } | null = null;
 
   constructor(private db: Database, private executors: ExecutorRegistry, private broker: ApprovalBroker) {}
 
   setDispatchGuard(fn: () => string | null) {
     this.dispatchGuard = fn;
+  }
+
+  setMobileDispatchPolicy(policy: {
+    canDispatch(agentId: string): { bound: boolean; ready: boolean; reason: string };
+    releaseAgent?(agentId: string): void;
+  }) {
+    this.mobileDispatchPolicy = policy;
   }
 
   /** delegate_task 工具的编排能力（P3b A2A 内部委派） */
@@ -238,7 +270,7 @@ export class Orchestrator {
   // ---------- 查询 ----------
 
   private mapAgent(r: Row): Agent {
-    let capabilities = { network: false, shell: false, install: false, browser: false, computer: false };
+    let capabilities = { network: false, shell: false, install: false, browser: false, computer: false, mobile: false };
     try {
       const raw = r.capabilities_json as string | undefined;
       if (raw) capabilities = { ...capabilities, ...(JSON.parse(raw) as Partial<typeof capabilities>) };
@@ -249,6 +281,7 @@ export class Orchestrator {
     try { const raw = r.model_overrides_json as string | undefined; if (raw) modelOverrides = JSON.parse(raw); } catch { /* empty */ }
     return {
       id: r.id as string, name: r.name as string, role: r.role as string,
+      kind: ((r.agent_kind as string) || 'general') as Agent['kind'],
       systemPrompt: r.system_prompt as string,
       soulMd: (r.soul_md as string) ?? '', agentsMd: (r.agents_md as string) ?? '', userMd: (r.user_md as string) ?? '',
       lifecycle: r.lifecycle as Agent['lifecycle'],
@@ -268,6 +301,9 @@ export class Orchestrator {
       source: r.source as Task['source'], parentId: r.parent_id as string | null,
       status: r.status as TaskStatus, priority: r.priority as number, progress: r.progress as number,
       stage: r.stage as string, error: r.error as string | null, result: (r.result as string | null) ?? null,
+      hasResult: typeof r.has_result === 'number'
+        ? (r.has_result as number) === 1
+        : Boolean((r.result as string | null | undefined)?.trim()),
       quality: (r.quality as TaskQuality) ?? null,
       sessionId: (r.session_id as string | null) ?? null,
       workspaceOverride: (r.workspace_override as string | null) ?? null,
@@ -293,12 +329,23 @@ export class Orchestrator {
 
   /** 任务事件时间线（详情弹窗实时流；output 为增量文本事件） */
   taskEvents(taskId: string): TaskEvent[] {
-    const rows = this.db.raw.prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at, rowid').all(taskId) as Row[];
-    return rows.map((r) => ({
+    // Read the newest bounded window and restore chronological order. A task
+    // can legitimately have many tool/progress events, but the UI must never
+    // receive an unbounded history in one IPC response.
+    const rows = this.db.raw
+      .prepare(`SELECT id, task_id, event_type,
+        CASE WHEN event_type = 'result' THEN '{}' ELSE payload END AS payload,
+        created_at
+        FROM task_events WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`)
+      .all(taskId, MAX_TASK_EVENTS_QUERY) as Row[];
+    return rows.reverse().map((r) => ({
       id: r.id as string,
       taskId: r.task_id as string,
       eventType: r.event_type as string,
-      payload: JSON.parse((r.payload as string) || '{}') as Record<string, unknown>,
+      payload: (() => {
+        try { return JSON.parse((r.payload as string) || '{}') as Record<string, unknown>; }
+        catch { return { error: '事件数据损坏' }; }
+      })(),
       createdAt: r.created_at as number
     }));
   }
@@ -306,7 +353,7 @@ export class Orchestrator {
   /** 任务产物全文（tasks.result，截断 16KB） */
   taskResult(taskId: string): string | null {
     const r = this.db.raw.prepare('SELECT result FROM tasks WHERE id = ?').get(taskId) as { result: string | null } | undefined;
-    return r?.result ?? null;
+    return typeof r?.result === 'string' ? r.result.slice(0, MAX_TASK_RESULT_CHARS) : null;
   }
 
   /** 解析任务产物目录：task.workspaceOverride > agent.workspace > userData/workspaces/agentId */
@@ -336,6 +383,49 @@ export class Orchestrator {
     this.emit();
   }
 
+  checkpointAgentCreation(input: CreateAgentInput): AgentCreationCheckpoint {
+    const existing = this.db.raw.prepare('SELECT * FROM agents WHERE name = ?').get(input.name) as Row | undefined;
+    const safeName = input.name.replace(/[<>:"/\\|?*]/g, '_').slice(0, 30);
+    const autoWorkspacePath = !existing && !input.workspace
+      ? join(app.getPath('userData'), 'aibox-data', 'workspaces', safeName)
+      : null;
+    return {
+      existing: existing ? { ...existing } : null,
+      autoWorkspacePath,
+      autoWorkspaceExisted: autoWorkspacePath ? existsSync(autoWorkspacePath) : false
+    };
+  }
+
+  rollbackAgentCreation(checkpoint: AgentCreationCheckpoint, agentId: string): void {
+    if (checkpoint.existing) {
+      const columns = Object.keys(checkpoint.existing).filter((column) => column !== 'id');
+      const assignments = columns.map((column) => `${column} = ?`).join(', ');
+      this.db.raw.prepare(`UPDATE agents SET ${assignments} WHERE id = ?`)
+        .run(...columns.map((column) => checkpoint.existing![column] as string | number | null), checkpoint.existing.id as string);
+      this.db.audit({ id: randomUUID(), actor: 'system', action: 'agent.create.rollback', target: agentId, result: 'restored-existing' });
+      this.emit();
+      return;
+    }
+    this.discardNewAgent(agentId);
+    const workspace = checkpoint.autoWorkspacePath;
+    if (workspace && !checkpoint.autoWorkspaceExisted && existsSync(workspace) && readdirSync(workspace).length === 0) {
+      rmdirSync(workspace);
+    }
+  }
+
+  discardNewAgent(id: string): void {
+    const activeTasks = (this.db.raw.prepare('SELECT COUNT(*) AS count FROM tasks WHERE agent_id = ?').get(id) as { count: number } | undefined)?.count ?? 0;
+    if (activeTasks > 0) throw new Error('Cannot discard an agent after tasks have been created');
+    this.db.transaction(() => {
+      this.db.raw.prepare('DELETE FROM channel_routes WHERE agent_id = ?').run(id);
+      this.db.raw.prepare('DELETE FROM agent_skills WHERE agent_id = ?').run(id);
+      this.db.raw.prepare('DELETE FROM mobile_agent_configs WHERE agent_id = ?').run(id);
+      this.db.raw.prepare('DELETE FROM agents WHERE id = ?').run(id);
+    });
+    this.db.audit({ id: randomUUID(), actor: 'system', action: 'agent.create.rollback', target: id, result: 'profile-failed' });
+    this.emit();
+  }
+
   /** 更新助手人设（soul.md / agents.md / user.md / 基础 prompt / 权限模式） */
   updateAgentPersona(id: string, patch: import('../../shared/types.js').AgentPersonaPatch): Agent {
     const agent = this.getAgent(id);
@@ -349,18 +439,32 @@ export class Orchestrator {
     if (patch.agentsMd !== undefined) { fields.push('agents_md = ?'); values.push(patch.agentsMd); }
     if (patch.userMd !== undefined) { fields.push('user_md = ?'); values.push(patch.userMd); }
     if (patch.permissionMode !== undefined) { fields.push('permission_mode = ?'); values.push(patch.permissionMode); }
-    if (patch.capabilities !== undefined) {
+    const nextKind = patch.kind ?? agent.kind;
+    if (patch.kind !== undefined) {
+      fields.push('agent_kind = ?'); values.push(patch.kind);
+      fields.push('engine_id = ?'); values.push(patch.kind === 'android_operator' ? 'eng-hermes-cli' : (patch.engineId ?? agent.engineId));
+      fields.push('concurrency_limit = ?'); values.push(patch.kind === 'android_operator' ? 1 : agent.concurrencyLimit);
+    }
+    if (patch.capabilities !== undefined || patch.kind !== undefined) {
       const merged = { ...agent.capabilities, ...patch.capabilities };
+      if (nextKind === 'android_operator') Object.assign(merged, { network: false, shell: false, install: false, browser: false, computer: false, mobile: true });
+      else merged.mobile = false;
       fields.push('capabilities_json = ?'); values.push(JSON.stringify(merged));
     }
     if (patch.tags !== undefined) { fields.push('tags_json = ?'); values.push(JSON.stringify(patch.tags)); }
     if (patch.modelOverrides !== undefined) { fields.push('model_overrides_json = ?'); values.push(JSON.stringify(patch.modelOverrides)); }
-    if (patch.engineId !== undefined) { fields.push('engine_id = ?'); values.push(patch.engineId); }
+    if (patch.engineId !== undefined && patch.kind === undefined) {
+      if (agent.kind === 'android_operator' && patch.engineId !== 'eng-hermes-cli') throw new Error('Android 手机操作员固定使用 Hermes Agent 引擎');
+      fields.push('engine_id = ?'); values.push(patch.engineId);
+    }
     if (patch.modelOverride !== undefined) { fields.push('model_override = ?'); values.push(patch.modelOverride || ''); }
     if (fields.length === 0) return agent;
     fields.push('updated_at = ?'); values.push(Date.now());
     values.push(id);
     this.db.raw.prepare(`UPDATE agents SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    if (agent.kind === 'android_operator' && nextKind === 'general') {
+      this.mobileDispatchPolicy?.releaseAgent?.(id);
+    }
     this.emit();
     return this.getAgent(id)!;
   }
@@ -407,8 +511,14 @@ export class Orchestrator {
     return { total: { input: total.i, output: total.o, total: total.t }, byModel, recent };
   }
 
-  listTasks(): Task[] {
-    return (this.db.raw.prepare('SELECT * FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200').all() as Row[]).map((r) => this.mapTask(r));
+  listTasks(options: { includeResult?: boolean } = {}): Task[] {
+    const select = options.includeResult === false
+      ? `id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error,
+         NULL AS result, CASE WHEN result IS NOT NULL AND LENGTH(TRIM(result)) > 0 THEN 1 ELSE 0 END AS has_result,
+         quality, session_id, workspace_override, engine_override, created_at, started_at, ended_at`
+      : '*';
+    return (this.db.raw.prepare(`SELECT ${select} FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200`).all() as Row[])
+      .map((r) => this.mapTask(r));
   }
 
   listApprovals(): Approval[] {
@@ -554,7 +664,10 @@ export class Orchestrator {
   createAgent(input: CreateAgentInput): Agent {
     if (input.name.length < 2 || input.name.length > 30) throw new Error('名称需为 2—30 字');
     if (input.role.length < 2 || input.role.length > 500) throw new Error('职责描述需为 2—500 字');
-    const engine = this.db.raw.prepare("SELECT status FROM engines WHERE id = ?").get(input.engineId) as { status: string } | undefined;
+    const kind = input.kind ?? 'general';
+    const engineId = kind === 'android_operator' ? 'eng-hermes-cli' : input.engineId;
+    if (kind === 'android_operator' && input.concurrencyLimit !== 1) throw new Error('Android 手机操作员并发数必须为 1');
+    const engine = this.db.raw.prepare("SELECT status FROM engines WHERE id = ?").get(engineId) as { status: string } | undefined;
     if (!engine || !['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(engine.status)) {
       throw new Error('只能选择已安装或待配置的引擎（未就绪引擎将以演示模式执行）');
     }
@@ -564,8 +677,8 @@ export class Orchestrator {
       if (existing.archived === 1) {
         // 已归档的同名员工：重新激活并更新配置
         this.db.raw.prepare(
-          `UPDATE agents SET archived = 0, role = ?, system_prompt = ?, soul_md = ?, agents_md = ?, user_md = ?, engine_id = ?, permission_mode = ?, lifecycle = 'READY', updated_at = ? WHERE id = ?`
-        ).run(input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '', input.engineId, input.permissionMode, Date.now(), existing.id);
+          `UPDATE agents SET archived = 0, role = ?, system_prompt = ?, soul_md = ?, agents_md = ?, user_md = ?, engine_id = ?, permission_mode = ?, agent_kind = ?, concurrency_limit = ?, lifecycle = 'READY', updated_at = ? WHERE id = ?`
+        ).run(input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '', engineId, input.permissionMode, kind, kind === 'android_operator' ? 1 : input.concurrencyLimit, Date.now(), existing.id);
         this.emit();
         return this.listAgents().find((a) => a.id === existing.id)!;
       }
@@ -585,9 +698,16 @@ export class Orchestrator {
     }
     this.db.transaction(() => {
       this.db.raw.prepare(
-        `INSERT INTO agents(id, name, role, system_prompt, soul_md, agents_md, user_md, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, 0, ?, ?, ?)`
-      ).run(id, input.name, input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '', input.engineId, input.workspace, input.permissionMode, input.concurrencyLimit, color, now, now);
+        `INSERT INTO agents(id, name, role, system_prompt, soul_md, agents_md, user_md, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, agent_kind, capabilities_json, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+      ).run(
+        id, input.name, input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '',
+        engineId, workspace, input.permissionMode, kind === 'android_operator' ? 1 : input.concurrencyLimit, color, kind,
+        JSON.stringify(kind === 'android_operator'
+          ? { network: false, shell: false, install: false, browser: false, computer: false, mobile: true }
+          : { network: false, shell: false, install: false, browser: false, computer: false, mobile: false }),
+        now, now
+      );
       for (const chId of input.channelIds) {
         this.db.raw.prepare('INSERT INTO channel_routes(id, channel_id, conversation_key, agent_id, policy) VALUES(?, ?, ?, ?, ?)')
           .run(randomUUID(), chId, '*', id, '{}');
@@ -628,11 +748,15 @@ export class Orchestrator {
     const id = randomUUID();
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error('员工不存在');
+    const mobileState = agent.kind === 'android_operator'
+      ? this.mobileDispatchPolicy?.canDispatch(agentId) ?? { bound: false, ready: false, reason: '手机控制服务尚未启动' }
+      : null;
+    if (mobileState && !mobileState.bound) throw new Error('Android 手机操作员尚未绑定设备');
     // 引擎路由规则（settings.engine_routing）：按任务来源指定优先引擎。
     // 显式 engineOverride（编码委派）优先级最高；路由规则仅在引擎健康时生效，
     // 避免把任务路由到未安装的引擎上。
-    let engineOverride = opts.engineOverride ?? null;
-    if (!engineOverride) {
+    let engineOverride = agent.kind === 'android_operator' ? null : opts.engineOverride ?? null;
+    if (agent.kind === 'general' && !engineOverride) {
       const routed = this.db.getSetting<Record<string, string>>('engine_routing', {})[source];
       if (routed && routed !== agent.engineId) {
         const row = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(routed) as { status: string } | undefined;
@@ -650,11 +774,12 @@ export class Orchestrator {
     }
     const active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
     const guardReason = this.dispatchGuard();
-    const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null;
+    const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null && (!mobileState || mobileState.ready);
+    const queuedStage = guardReason ?? mobileState?.reason ?? '排队中';
     this.db.transaction(() => {
       this.db.raw.prepare(
         'INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, engine_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, ?, NULL)'
-      ).run(id, agentId, projectId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : guardReason ?? '排队中', opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride, now, canRun ? now : null);
+      ).run(id, agentId, projectId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : queuedStage, opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride, now, canRun ? now : null);
       if (canRun) {
         this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
           .run(randomUUID(), agentId, id, process.pid, randomUUID(), 'RUNNING', now);
@@ -662,7 +787,8 @@ export class Orchestrator {
       this.db.raw.prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
         .run(randomUUID(), id, canRun ? 'started' : 'queued', '{}', now);
     });
-    const task = this.listTasks().find((t) => t.id === id)!;
+    const created = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row;
+    const task = this.mapTask(created);
     if (canRun) this.dispatchTask(task, agent);
     this.emit();
     return task;
@@ -740,10 +866,23 @@ export class Orchestrator {
       .run(randomUUID(), taskId, eventType, JSON.stringify(payload), now);
   }
 
+  /** Ignore output arriving after cancellation/timeout and release the small
+   * per-task accounting entry after late child-process callbacks settle. */
+  private closeOutputState(taskId: string) {
+    const state = this.outputStates.get(taskId) ?? { chars: 0, events: 0, truncated: false, closed: false };
+    state.closed = true;
+    this.outputStates.set(taskId, state);
+    setTimeout(() => {
+      if (this.outputStates.get(taskId) === state) this.outputStates.delete(taskId);
+    }, OUTPUT_STATE_TTL_MS);
+  }
+
   /** 执行器回调：统一走“状态更新 + task_events 同事务”模式；终态触发该员工 FIFO 补位 */
   private makeCallbacks(taskId: string, agentId: string, engineId: string, kind: ExecutorKind): ExecutorCallbacks {
     const finish = (status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED', info: { result?: string; error?: string }) => {
       const now = Date.now();
+      this.closeOutputState(taskId);
+      const boundedResult = typeof info.result === 'string' ? info.result.slice(0, MAX_TASK_RESULT_CHARS) : undefined;
       // 真实执行鉴权失败：如实把引擎标为 AUTH_REQUIRED，不掩盖
       const authFailed = kind !== 'simulated' && !!info.error && /401|403|unauthorized|auth|鉴权|登录/i.test(info.error);
       // 终态守卫（数据层最后防线）：只有非终态任务才能落终态。
@@ -754,9 +893,10 @@ export class Orchestrator {
       this.db.transaction(() => {
         if (status === 'COMPLETED') {
           applied = this.db.raw.prepare(`UPDATE tasks SET status = 'COMPLETED', progress = 100, stage = '完成', result = ?, ended_at = ? WHERE id = ? AND status IN ${LIVE}`)
-            .run(info.result ?? null, now, taskId).changes > 0;
+            .run(boundedResult ?? null, now, taskId).changes > 0;
           if (!applied) return;
-          this.recordEvent(taskId, 'result', { result: info.result ?? '' }, now);
+          const result = boundedResult ?? '';
+          this.recordEvent(taskId, 'result', { available: result.length > 0, chars: result.length }, now);
           this.recordEvent(taskId, 'completed', { progress: 100 }, now);
         } else {
           applied = this.db.raw.prepare(`UPDATE tasks SET status = ?, error = ?, ended_at = ? WHERE id = ? AND status IN ${LIVE}`)
@@ -785,7 +925,7 @@ export class Orchestrator {
         const t = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(taskId) as { title: string } | undefined;
         for (const fn of this.finishListeners) {
           try {
-            fn({ taskId, agentId, status, title: t?.title ?? taskId, result: info.result ?? null, error: info.error ?? null });
+            fn({ taskId, agentId, status, title: t?.title ?? taskId, result: boundedResult ?? null, error: info.error ?? null });
           } catch { /* 通知失败不影响调度 */ }
         }
       }
@@ -810,9 +950,21 @@ export class Orchestrator {
         this.emit();
       },
       onOutput: (id, chunk) => {
-        // 高频增量文本：落事件库 + 流式推送到渲染进程（逐字显示）
-        this.recordEvent(id, 'output', { chunk }, Date.now());
-        for (const fn of this.outputListeners) fn(id, chunk);
+        // 高频增量文本：保留有限预算后再落事件库/推送，避免长任务
+        // 造成 SQLite、IPC 和 React 状态同时线性增长。
+        const state = this.outputStates.get(id) ?? { chars: 0, events: 0, truncated: false, closed: false };
+        this.outputStates.set(id, state);
+        if (state.closed || !chunk || state.events >= MAX_TASK_OUTPUT_EVENTS || state.chars >= MAX_TASK_OUTPUT_CHARS) return;
+        const remaining = MAX_TASK_OUTPUT_CHARS - state.chars;
+        const accepted = chunk.slice(0, remaining);
+        if (!accepted) return;
+        state.chars += accepted.length;
+        state.events += 1;
+        this.recordEvent(id, 'output', { chunk: accepted }, Date.now());
+        for (const fn of this.outputListeners) fn(id, accepted);
+        if (accepted.length < chunk.length || state.events >= MAX_TASK_OUTPUT_EVENTS || state.chars >= MAX_TASK_OUTPUT_CHARS) {
+          state.truncated = true;
+        }
       },
       onSession: (id, sessionId) => {
         // P2b：会话锚点落库（仅首次），追问时继承
@@ -828,6 +980,7 @@ export class Orchestrator {
     const agent = this.getAgent(agentId);
     if (!agent || agent.lifecycle !== 'READY') return;
     if (this.dispatchGuard() !== null) return;
+    if (agent.kind === 'android_operator' && !this.mobileDispatchPolicy?.canDispatch(agentId).ready) return;
     const active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
     if (active >= Math.max(1, agent.concurrencyLimit)) return;
     const row = this.db.raw.prepare("SELECT * FROM tasks WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at LIMIT 1").get(agentId) as Row | undefined;
@@ -845,7 +998,13 @@ export class Orchestrator {
     this.emit();
   }
 
+  /** 设备上线或控制租约释放后，唤醒对应手机员工的 FIFO 队列。 */
+  wakeAgentQueue(agentId: string): void {
+    this.scheduleNext(agentId);
+  }
+
   private cancelTaskInternal(taskId: string, now: number) {
+    this.closeOutputState(taskId);
     this.db.raw.prepare("UPDATE tasks SET status = 'CANCELLED', ended_at = ? WHERE id = ? AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").run(now, taskId);
     this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'CANCELLED' WHERE task_id = ? AND ended_at IS NULL").run(now, taskId);
     this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE task_id = ? AND status = 'pending'").run(now, taskId);

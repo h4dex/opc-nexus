@@ -2,6 +2,48 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.7.0] - 2026-08-14
+
+> 配套 Android Bridge 版本：`0.4.3`（`versionCode 5`）。桌面端与 Android Bridge
+> 独立维护版本号；功能变更验证通过后必须递增对应版本，用户指定版本时以指定版本为准。
+
+### 新增
+
+- **Android 手机员工**：新增 `android_operator` 员工身份，固定使用独立 Hermes Agent
+  Profile、并发数 1，并可一对一绑定无 Root Android 8.0+ 设备。
+- **局域网 Mobile Gateway**：提供 WSS 设备通道、5 分钟一次性配对、TLS SPKI 固定、
+  Android Keystore ECDSA 身份认证、设备租约、短期任务令牌和紧急停止。
+- **42 个 Android 工具**：覆盖界面观察与操作、应用管理、通知/联系人/位置、通信、截图、
+  录屏、录音和 TTS；工具参数统一由版本化 JSON Catalog 校验并按员工策略授权。
+- **手机控制台**：新增设备、控制、脚本、日志、媒体和安装视图，支持固定比例屏幕预览、
+  独立滚动 UI Tree、ADB 安装内置 APK、媒体校验归档和受限 JSON 脚本。
+- **双路配对配置**：桌面端可复制完整配置和查看非敏感详情；Android Bridge 支持扫码、
+  粘贴完整 JSON 或逐项手动配置，便于摄像头不可用的设备接入。
+- **数字员工快捷派单**：员工卡片、列表和操作菜单新增「安排任务」，可直接指定当前员工创建任务。
+- **Android 品牌资源**：Bridge 使用 OPC-Nexus 普通、圆形、自适应和 Android 13 单色图标，
+  并提供 `npm run mobile:icons` 可复现生成脚本。
+
+### 修复
+
+- 修复中文任务在 IPC、CLI 参数和流式输出链路中的乱码问题，改用 UTF-8 Base64 传递并支持
+  跨 chunk 解码。
+- 修复 Android 扫码入口依赖不完整时闪退的问题，并为二维码/手动配置解析补充错误处理。
+- 修复手机预览与 UI Tree 互相挤压的问题：投影区域保持稳定尺寸，树形框可独立上下滚动。
+- 修复应用侧栏品牌文案和顶部工具图标，统一为 `OPC-Nexus`、`www.apptq.com` 和 SVG 图标。
+
+### 性能与安全
+
+- Renderer 页面改为懒加载，并限制任务输出、手机预览和事件缓存，降低长时间运行时的内存增长。
+- 资源采样增加互斥和缓存；Windows 磁盘采样改用 Node 原生 `statfs`，避免周期性启动
+  PowerShell/WMI 子进程。
+- 手机命令按 Schema、工具白名单、设备能力和 Android 权限逐次校验；敏感输入、短信、
+  剪贴板和 UI 数据默认不持久化，媒体采用分块长度与 SHA-256 校验。
+
+### 验证
+
+- 通过 TypeScript 类型检查、Vitest 全量测试、Electron 生产构建、Android Gradle 单元测试和
+  Debug APK 构建/签名/包名校验。
+
 ## [1.6.0] - 2026-07-30
 
 ### 修复（第三方引擎全部无法执行任务）

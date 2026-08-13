@@ -866,3 +866,33 @@ api_key = <bridge_key>
 | `aibox:hasSecret` | 检查密钥是否存在 |
 | `aibox:pickDirectory` | 选择工作目录 |
 | `aibox:toggleFullscreen` | 全屏切换 |
+
+---
+
+## 23. Android 设备操作
+
+**前端页面**: `src/renderer/src/pages/Mobile.tsx`
+
+**主进程服务**: `src/main/services/mobileGatewayService.ts`、`mobileAdbService.ts`、`mobileCatalog.ts`
+
+### 23.1 功能概述
+
+通过 Android Bridge + 局域网 Mobile Gateway 接入 Android 设备，为人工控制台和 `android_operator` Agent 提供受策略约束的设备操作能力。当前协议版本为 `1`，工具目录包含 42 个工具，目录源文件为 `mobile/tool-catalog.json`。
+
+### 23.2 核心能力
+
+- ADB 设备发现、APK 构建/校验/安装/导出。
+- WSS Gateway、一次性二维码配对、TLS 证书指纹和设备身份认证。
+- 屏幕预览、Accessibility UI Tree、节点观察、点击、输入、滑动、滚动和应用启动。
+- 通知、联系人、位置、剪贴板、事件流、SMS、电话、Intent、Broadcast、媒体和 TTS。
+- 截图、MP4 屏幕录制、WAV 麦克风录音和媒体产物下载。
+- 最多 100 步的控制脚本，步骤 Schema 校验、等待预算和失败策略。
+- 命令/会话审计、敏感字段脱敏、媒体大小与 SHA-256 校验、紧急停止。
+
+### 23.3 状态与权限
+
+设备状态：`offline`、`pairing`、`authenticating`、`online`、`busy`、`error`。工具调用还受到 Agent `capabilities.mobile`、Agent `allowedTools` 和 Android 系统权限三重限制。
+
+### 23.4 详细文档与截图
+
+安装、配对、权限映射、实时控制、脚本、日志、媒体、故障排查和安全设计见 [Android 设备操作功能文档](../../docs/ANDROID-DEVICE-OPERATIONS.md)。

@@ -32,6 +32,11 @@ export const dialog = {
   showMessageBox: vi.fn().mockResolvedValue({ response: 0 })
 };
 
+export const clipboard = {
+  writeText: vi.fn(),
+  readText: vi.fn().mockReturnValue('')
+};
+
 export const safeStorage = {
   isEncryptionAvailable: () => true,
   encryptString: (s: string) => Buffer.from(`enc:${s}`),

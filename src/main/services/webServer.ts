@@ -91,6 +91,7 @@ function safeEqual(a: string, b: string): boolean {
 export class WebServer {
   private app: ReturnType<typeof express> | null = null;
   private server: ReturnType<ReturnType<typeof express>['listen']> | null = null;
+  private cleanupTimer: NodeJS.Timeout | null = null;
   /** 活跃会话 Token 池（内存，重启后失效需重新登录） */
   private sessions = new Map<string, SessionEntry>();
   /** 频率限制桶（key = ip 或 ip:auth） */
@@ -145,7 +146,8 @@ export class WebServer {
 
   /** 清理过期会话和频率桶（每 5 分钟） */
   private startCleanup() {
-    setInterval(() => {
+    if (this.cleanupTimer) return;
+    this.cleanupTimer = setInterval(() => {
       const now = Date.now();
       for (const [k, v] of this.sessions) { if (now >= v.expiresAt) this.sessions.delete(k); }
       for (const [k, v] of this.rateBuckets) { if (now >= v.resetAt) this.rateBuckets.delete(k); }
@@ -153,6 +155,7 @@ export class WebServer {
   }
 
   start() {
+    if (this.server) return;
     const { db, orchestrator, engines, channels, providers, mcp, skills, teams } = this.deps;
     this.ensureToken();
     const app = express();
@@ -221,7 +224,7 @@ export class WebServer {
     app.get('/api/snapshot', (_req, res) => {
       res.json({
         agents: orchestrator.agentCards(),
-        tasks: orchestrator.listTasks(),
+        tasks: orchestrator.listTasks({ includeResult: false }),
         engines: engines.list(),
         channels: channels.list(),
         approvals: orchestrator.listApprovals()
@@ -270,7 +273,7 @@ export class WebServer {
     });
 
     // 任务
-    app.get('/api/tasks', (_req, res) => res.json(orchestrator.listTasks()));
+    app.get('/api/tasks', (_req, res) => res.json(orchestrator.listTasks({ includeResult: false })));
     app.post('/api/tasks', (req, res) => {
       const t = orchestrator.createTask(req.body.agentId, req.body.title);
       res.json(t);
@@ -344,5 +347,12 @@ export class WebServer {
   stop() {
     this.server?.close();
     this.server = null;
+    this.app = null;
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+    this.sessions.clear();
+    this.rateBuckets.clear();
   }
 }

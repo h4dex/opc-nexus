@@ -5,6 +5,17 @@
 import { randomUUID } from 'node:crypto';
 import type { Database } from './database.js';
 
+const BROWSER_SKILL_ID = 'skill-browser-operator';
+const BROWSER_SKILL_CONTENT = `# 浏览器操作规范
+
+- 开始操作前先获取当前页面快照，确认页面、账号和目标对象。
+- 优先使用页面快照中的可访问角色、名称或稳定引用定位元素，不猜测选择器。
+- 每次导航、点击或填写后重新观察页面，验证操作确实生效。
+- 不读取、输出或保存 Cookie、密码、Token、localStorage 等认证材料。
+- 涉及提交、发送、发布、购买、删除、授权或其他外部副作用时，遵循任务审批结果。
+- 遇到登录、验证码、双因素认证或浏览器连接授权时暂停，等待用户完成后继续。
+- 完成后汇报实际操作结果；无法确认成功时明确说明当前页面状态。`;
+
 export interface Skill {
   id: string;
   name: string;
@@ -59,6 +70,20 @@ export class SkillManager {
 
   unbindAgent(agentId: string, skillId: string) {
     this.db.raw.prepare('DELETE FROM agent_skills WHERE agent_id = ? AND skill_id = ?').run(agentId, skillId);
+  }
+
+  /** Ensure the built-in browser operating rules exist and are bound to one agent. */
+  ensureBrowserOperator(agentId: string): Skill {
+    const existing = this.db.raw.prepare('SELECT id FROM skills WHERE id = ?').get(BROWSER_SKILL_ID) as { id: string } | undefined;
+    if (!existing) {
+      this.db.raw.prepare('INSERT INTO skills(id, name, description, content, enabled, created_at) VALUES(?,?,?,?,1,?)')
+        .run(BROWSER_SKILL_ID, '浏览器操作', '通过快照、验证和审批约束安全地操作网页', BROWSER_SKILL_CONTENT, Date.now());
+    } else {
+      this.db.raw.prepare('UPDATE skills SET name = ?, description = ?, content = ?, enabled = 1 WHERE id = ?')
+        .run('浏览器操作', '通过快照、验证和审批约束安全地操作网页', BROWSER_SKILL_CONTENT, BROWSER_SKILL_ID);
+    }
+    this.bindAgent(agentId, BROWSER_SKILL_ID);
+    return this.list().find((skill) => skill.id === BROWSER_SKILL_ID)!;
   }
 
   /** 获取助手绑定的 skills */

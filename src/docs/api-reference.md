@@ -346,6 +346,29 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 
 ---
 
+## Android 手机控制台
+
+| Channel | 参数 | 返回值 | 说明 |
+|---|---|---|---|
+| `aibox:mobile:getStatus` | 无 | `MobileGatewayStatus` | 获取 Gateway 状态 |
+| `aibox:mobile:listLanAddresses` | 无 | `string[]` | 获取可绑定的局域网 IPv4 |
+| `aibox:mobile:startGateway` / `stopGateway` | `host, port?` / 无 | 状态 / `void` | 启停 WSS Gateway |
+| `aibox:mobile:createPairing` / `resetCertificate` | 无 | `MobilePairingOffer` / `void` | 创建二维码配对或重置 TLS 身份 |
+| `aibox:mobile:getToolCatalog` | 无 | `MobileToolCatalog` | 获取 42 个 Android 工具及 Schema |
+| `aibox:mobile:listDevices` | 无 | `MobileDevice[]` | 列出已配对设备 |
+| `aibox:mobile:bindAgent` / `unbindAgent` | 绑定输入 / `agentId` | 配置 / `void` | 绑定或解绑 Android 操作员 Agent |
+| `aibox:mobile:updateToolPolicy` | Agent 策略输入 | 配置 | 更新 Android 工具白名单 |
+| `aibox:mobile:refreshPreview` / `readUiTree` | `deviceId` | URI / UI Tree | 刷新屏幕预览或读取 Accessibility Tree |
+| `aibox:mobile:execute` | `{ deviceId, toolName, args }` | `Record<string, unknown>` | 执行已校验的 Android 工具 |
+| `aibox:mobile:listCommands` / `listArtifacts` | `deviceId?` | 日志 / 媒体列表 | 查看命令日志和媒体产物 |
+| `aibox:mobile:saveScript` / `deleteScript` / `runScript` | 脚本输入 / `id` | 脚本 / `void` / 执行结果 | 控制脚本生命周期 |
+| `aibox:mobile:getApkInfo` / `listAdbDevices` | 无 | APK 信息 / ADB 设备列表 | 检测桌面端 APK 和 ADB |
+| `aibox:mobile:installApk` / `exportApk` | `serial` / 无 | 结果 | 安装或导出 Bridge APK |
+| `aibox:mobile:emergencyStop` | `deviceId` | `void` | 终止设备控制会话 |
+| `aibox:mobileEvent` | `MobileEvent` | Main → Renderer | Gateway、设备、命令和媒体事件 |
+
+---
+
 ## 实时推送事件（Main → Renderer）
 
 | Channel | 载荷 | 说明 |

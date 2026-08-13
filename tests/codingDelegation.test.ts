@@ -139,4 +139,15 @@ describe('engine_routing 规则消费', () => {
     const { orch, agentId } = setup();
     expect(orch.createTask(agentId, '任务', 'desktop').engineOverride).toBeNull();
   });
+
+  it('Android 手机员工忽略全局路由和显式 override，始终使用 Hermes CLI', () => {
+    const { db, orch, agentId } = setup();
+    seedEngine(db, 'eng-hermes-cli');
+    Object.assign(db.tables.agents.get(agentId), { agent_kind: 'android_operator', engine_id: 'eng-hermes-cli' });
+    db.tables.settings.set('engine_routing', { channel: 'eng-opencode' });
+    orch.setMobileDispatchPolicy({ canDispatch: () => ({ bound: true, ready: true, reason: '' }) });
+    const task = orch.createTask(agentId, '操作手机', 'channel', { engineOverride: 'eng-opencode' });
+    expect(task.engineOverride).toBeNull();
+    expect(db.tables.agents.get(agentId)?.engine_id).toBe('eng-hermes-cli');
+  });
 });
