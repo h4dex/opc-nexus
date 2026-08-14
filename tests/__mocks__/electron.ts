@@ -4,6 +4,8 @@
 import { vi } from 'vitest';
 
 export const app = {
+  isPackaged: false,
+  getAppPath: () => process.cwd(),
   getPath: (name: string) => `/tmp/test-${name}`,
   getName: () => 'aibox-test',
   getVersion: () => '1.0.0'

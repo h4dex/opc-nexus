@@ -291,9 +291,10 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 
 | Channel | 参数 | 返回值 | 说明 |
 |---------|------|--------|------|
-| `aibox:getBridgeStatus` | 无 | `BridgeStatus` | 状态 |
-| `aibox:toggleBridge` | `enabled: boolean` | `BridgeStatus` | 开关 |
-| `aibox:regenerateBridgeKey` | 无 | `BridgeStatus` | 重新生成 Key |
+| `aibox:getBridgeStatus` | 无 | `ApiBridgeStatus` | 状态（不含 Key） |
+| `aibox:toggleBridge` | `enabled: boolean` | `ApiBridgeStatus` | 开关 |
+| `aibox:regenerateBridgeKey` | 无 | `ApiBridgeStatus` | 重新生成 Key（不回传明文） |
+| `aibox:copyBridgeKey` | 无 | `{ ok: true }` | 由 Main 进程复制 Key 到剪贴板 |
 
 ---
 
@@ -329,20 +330,23 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 
 | Channel | 参数 | 返回值 | 说明 |
 |---------|------|--------|------|
-| `aibox:getSetting` | `key: string` | `unknown` | 获取设置 |
-| `aibox:setSetting` | `key, value` | `void` | 保存设置 |
+| `aibox:getSetting` | `key: RendererSettingKey` | 对应设置值或 `null` | 获取 Renderer 设置白名单中的值 |
+| `aibox:setSetting` | `key: RendererSettingKey, value` | `void` | 保存经类型与范围校验的 Renderer 设置 |
 | `aibox:getAppConfig` | 无 | `AppConfig` | 应用配置 |
 | `aibox:setAppConfig` | `patch` | `AppConfig` | 保存配置 |
 | `aibox:integrityCheck` | 无 | `{ ok, message }` | 完整性检查 |
 | `aibox:manualCleanup` | 无 | `{ ok, message }` | 数据清理 |
-| `aibox:storeSecret` | `ref, secret` | `void` | 存储密钥 |
-| `aibox:hasSecret` | `ref: string` | `boolean` | 检查密钥 |
+| `aibox:getWebAdminStatus` | 无 | `WebAdminStatus` | Web 管理状态（不含 Token） |
+| `aibox:regenerateWebToken` | 无 | `WebAdminStatus` | 重新生成 Token（不回传明文） |
+| `aibox:copyWebToken` | 无 | `{ ok: true }` | 由 Main 进程复制 Token 到剪贴板 |
 | `aibox:pickDirectory` | 无 | `string \| null` | 选择目录 |
 | `aibox:toggleFullscreen` | 无 | `boolean` | 全屏切换 |
 | `aibox:isFullscreen` | 无 | `boolean` | 全屏状态 |
 | `aibox:openExternal` | `url: string` | `void` | 打开外链 |
 | `aibox:openTaskWorkspace` | `taskId` | `{ ok, message }` | 打开产物目录 |
 | `aibox:openAgentWorkspace` | `agentId` | `{ ok, message }` | 打开工作目录 |
+
+`RendererSettingKey` 仅允许 `theme`、`thresholds`、`notifications`、`demoAutoTasks`。内部设置、健康状态和 `secret:*` 条目均不可通过 Renderer 或 Web 设置接口访问。
 
 ---
 

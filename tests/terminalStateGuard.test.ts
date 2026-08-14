@@ -28,6 +28,7 @@ function setup() {
     dispatch: vi.fn(),
     abort: vi.fn(),
     isExecuting: vi.fn().mockReturnValue(false),
+    activeTaskIdsForAgent: vi.fn().mockReturnValue([]),
     kindFor: vi.fn().mockReturnValue('generic-cli')
   };
   const broker = { decide: vi.fn().mockReturnValue(false), abandonTask: vi.fn(), onChange: vi.fn() };

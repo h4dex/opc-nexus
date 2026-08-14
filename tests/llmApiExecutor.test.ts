@@ -66,13 +66,16 @@ function mockFetchSequence(...responses: string[][]) {
 }
 
 /** 最小 db:task_messages / task_events / usage_records 落库,skills 查询返回空 */
-function makeDb() {
+function makeDb(agentProvider: { providerId?: string | null; modelOverride?: string | null } = {}) {
   const inserts: Record<string, unknown[][]> = { task_messages: [], task_events: [], usage_records: [] };
   return {
     _inserts: inserts,
     raw: {
       prepare: (sql: string) => ({
-        get: () => undefined,
+        get: () => ({
+          provider_id: agentProvider.providerId ?? null,
+          model_override: agentProvider.modelOverride ?? null
+        }),
         all: () => (/FROM skills/.test(sql) ? [] : []),
         run: (...args: unknown[]) => {
           const m = sql.match(/INSERT INTO (\w+)/);
@@ -130,6 +133,11 @@ describe('就绪判定', () => {
     expect(new LlmApiExecutor(makeDb(), broker()).isReady()).toBe(false);
   });
 
+  it('空白 key 不就绪', () => {
+    providerKey = '   ';
+    expect(new LlmApiExecutor(makeDb(), broker()).isReady()).toBe(false);
+  });
+
   it('缺 model 不就绪', () => {
     providerCfg = { baseUrl: 'https://api.test/v1', model: '' };
     expect(new LlmApiExecutor(makeDb(), broker()).isReady()).toBe(false);
@@ -141,6 +149,15 @@ describe('就绪判定', () => {
     new LlmApiExecutor(makeDb(), broker()).start(task(), agent(), c);
     expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('API Key 未配置'));
     expect(c.onDone).not.toHaveBeenCalled();
+  });
+
+  it('显式绑定的供应商无效时不回退全局默认供应商', () => {
+    const c = cb();
+    const providers = { resolveForAgent: vi.fn(() => null) };
+    new LlmApiExecutor(makeDb({ providerId: 'provider-missing' }), broker(), providers as never)
+      .start(task(), agent(), c);
+    expect(providers.resolveForAgent).toHaveBeenCalledWith('provider-missing', null);
+    expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('API Key 未配置'));
   });
 });
 

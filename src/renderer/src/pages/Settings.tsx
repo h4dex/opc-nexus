@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconMoon, IconSun } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { SystemInfo, VoiceConfig, VoiceConfigInput } from '@shared/types';
+import type { ApiBridgeStatus, SystemInfo, VoiceConfig, VoiceConfigInput, WebAdminStatus } from '@shared/types';
 
 export function Settings() {
   const { theme, setTheme } = useApp();
@@ -315,7 +315,7 @@ function ProviderCard() {
   };
 
   const save = async () => {
-    if (!name.trim() || !baseUrl.trim()) return;
+    if (!name.trim() || !baseUrl.trim() || !model.trim()) return;
     if (editId) {
       await window.aibox.updateProvider(editId, { name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
     } else {
@@ -378,7 +378,7 @@ function ProviderCard() {
               <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="DeepSeek / OpenAI / Ollama" />
             </div>
             <div>
-              <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>模型</label>
+              <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>模型 *</label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <input style={{ ...inputStyle, flex: 1 }} value={model} onChange={(e) => setModel(e.target.value)} placeholder="deepseek-chat" list="model-presets" />
                 {editId && <button className="btn small" disabled={fetchingModels} onClick={() => { setFetchingModels(true); void window.aibox.fetchProviderModels(editId).then((r) => { if (r.ok) setFetchedModels(r.models); setFetchingModels(false); }); }}>{fetchingModels ? '获取中' : '获取模型'}</button>}
@@ -399,7 +399,7 @@ function ProviderCard() {
               <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} style={{ accentColor: 'var(--accent)' }} />
               设为默认供应商
             </label>
-            <button className="btn primary" disabled={!name.trim() || !baseUrl.trim()} onClick={() => void save()}>{editId ? '保存修改' : '添加'}</button>
+            <button className="btn primary" disabled={!name.trim() || !baseUrl.trim() || !model.trim()} onClick={() => void save()}>{editId ? '保存修改' : '添加'}</button>
             <button className="btn" onClick={resetForm}>取消</button>
             {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
           </div>
@@ -450,26 +450,39 @@ function RegistryCard() {
 
 /** API Bridge 反向代理卡片 */
 function BridgeCard() {
-  const [status, setStatus] = useState<{ running: boolean; port: number; bridgeKey: string; enabled: boolean } | null>(null);
+  const [status, setStatus] = useState<ApiBridgeStatus | null>(null);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => { void window.aibox.getBridgeStatus().then(setStatus); }, []);
 
   const toggle = async (enabled: boolean) => {
-    const s = await window.aibox.toggleBridge(enabled);
-    setStatus(s);
+    try {
+      const s = await window.aibox.toggleBridge(enabled);
+      setStatus(s);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : 'API Bridge 状态更新失败');
+    }
   };
 
   const regen = async () => {
-    const s = await window.aibox.regenerateBridgeKey();
-    setStatus(s);
+    try {
+      const s = await window.aibox.regenerateBridgeKey();
+      setStatus(s);
+      toast.ok('Bridge API Key 已重新生成');
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '重新生成 Bridge API Key 失败');
+    }
   };
 
-  const copyKey = () => {
+  const copyKey = async () => {
     if (!status) return;
-    void navigator.clipboard.writeText(status.bridgeKey);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await window.aibox.copyBridgeKey();
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '复制 Bridge API Key 失败');
+    }
   };
 
   if (!status) return null;
@@ -497,8 +510,8 @@ function BridgeCard() {
             <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)' }}>
               <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>Bridge API Key</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{status.bridgeKey.slice(0, 20)}...</code>
-                <button className="btn small" onClick={copyKey}>{copied ? '✓ 已复制' : '复制'}</button>
+                <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{status.keyConfigured ? '已安全存储' : '未配置'}</code>
+                <button className="btn small" onClick={copyKey} disabled={!status.keyConfigured}>{copied ? '✓ 已复制' : '复制'}</button>
                 <button className="btn small" onClick={() => void regen()}>重新生成</button>
               </div>
             </div>
@@ -506,7 +519,7 @@ function BridgeCard() {
           <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
             <b>使用方法：</b>在 Claude Code / Codex / OpenCode 等工具中配置：<br />
             <code style={{ fontSize: 11.5 }}>OPENAI_BASE_URL=http://127.0.0.1:{status.port}/v1</code><br />
-            <code style={{ fontSize: 11.5 }}>OPENAI_API_KEY={status.bridgeKey.slice(0, 16)}...</code><br />
+            <code style={{ fontSize: 11.5 }}>OPENAI_API_KEY=&lt;从 OPC-Nexus 复制&gt;</code><br />
             请求将自动转发到系统内配置的模型供应商（按 model 名路由）。
           </div>
         </>
@@ -517,34 +530,37 @@ function BridgeCard() {
 
 /** 局域网 Web 管理面板卡片：访问 Token 管理（安全加固） */
 function WebServerCard() {
-  const [token, setToken] = useState('');
-  const [port, setPort] = useState(28889);
+  const [status, setStatus] = useState<WebAdminStatus | null>(null);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    void window.aibox.getSetting('webToken').then((v) => setToken(typeof v === 'string' ? v : ''));
-    void window.aibox.getSetting('webPort').then((v) => setPort(typeof v === 'number' ? v : 28889));
+    void window.aibox.getWebAdminStatus().then(setStatus);
   }, []);
 
-  const isWeak = token === 'aibox-admin';
-
   const regen = async () => {
-    const r = await window.aibox.regenerateWebToken();
-    setToken(r.token);
-    toast.ok('已重新生成访问 Token，旧会话已失效');
+    try {
+      setStatus(await window.aibox.regenerateWebToken());
+      toast.ok('已重新生成访问 Token，旧会话已失效');
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '重新生成访问 Token 失败');
+    }
   };
 
-  const copy = () => {
-    if (!token) return;
-    void navigator.clipboard.writeText(token);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const copy = async () => {
+    if (!status?.tokenConfigured) return;
+    try {
+      await window.aibox.copyWebToken();
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '复制访问 Token 失败');
+    }
   };
 
   return (
     <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title">局域网 Web 管理面板<span className="sub">工控机无人值守远程管理 · 监听 0.0.0.0:{port}</span></div>
-      {isWeak && (
+      <div className="card-title">局域网 Web 管理面板<span className="sub">工控机无人值守远程管理 · 端口 {status?.port ?? 28889}</span></div>
+      {status?.weakToken && (
         <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--danger-soft, rgba(248,113,113,.1))', color: 'var(--danger)', fontSize: 12.5 }}>
           ⚠️ 当前仍在使用默认弱口令「aibox-admin」，局域网内任何人可完全控制本系统！请立即重新生成。
         </div>
@@ -552,13 +568,13 @@ function WebServerCard() {
       <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)', marginBottom: 12 }}>
         <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>访问 Token（Bearer）</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{token ? `${token.slice(0, 12)}••••••••` : '（未生成）'}</code>
-          <button className="btn small" onClick={copy} disabled={!token}>{copied ? '✓ 已复制' : '复制'}</button>
+          <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{status?.tokenConfigured ? '已安全存储' : '（未生成）'}</code>
+          <button className="btn small" onClick={copy} disabled={!status?.tokenConfigured}>{copied ? '✓ 已复制' : '复制'}</button>
           <button className="btn small primary" onClick={() => void regen()}>重新生成</button>
         </div>
       </div>
       <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
-        <b>访问地址：</b><code style={{ fontSize: 11.5 }}>http://&lt;本机局域网IP&gt;:{port}</code>，请求头携带 <code style={{ fontSize: 11.5 }}>Authorization: Bearer &lt;Token&gt;</code>。<br />
+        <b>访问地址：</b><code style={{ fontSize: 11.5 }}>http://&lt;本机局域网IP&gt;:{status?.port ?? 28889}</code>，请求头携带 <code style={{ fontSize: 11.5 }}>Authorization: Bearer &lt;Token&gt;</code>。<br />
         首次启动已自动生成强随机 Token；重新生成会使所有已登录会话失效。
       </div>
     </div>

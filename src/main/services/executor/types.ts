@@ -31,6 +31,8 @@ export interface ExecutorCallbacks {
   onOutput(taskId: string, chunk: string): void;
   /** 会话锚点（P2b：CLI thread/session id 或自生成，用于追问续跑） */
   onSession?(taskId: string, sessionId: string): void;
+  /** 中止后执行器已释放其进程资源；不代表任务成功或失败。 */
+  onReleased?(taskId: string): void;
   /** 正常完成：result 为产物全文（调用方负责截断落库） */
   onDone(taskId: string, result: string): void;
   /** 失败：message 为真实错误信息（不伪装 COMPLETED） */

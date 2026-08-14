@@ -324,7 +324,8 @@ export const TOOLS: ToolDef[] = [
         method,
         headers: { 'User-Agent': 'AiBoxDash-Agent/1.0', ...headers },
         body: method !== 'GET' ? body : undefined,
-        signal: AbortSignal.timeout(30_000)
+        signal: AbortSignal.timeout(30_000),
+        redirect: Object.keys(headers).some((key) => key.toLowerCase() === 'authorization') ? 'error' : 'follow'
       });
       const text = await res.text();
       const truncated = text.length > 16_000 ? `${text.slice(0, 16_000)}\n…（已截断，共 ${text.length} 字符）` : text;

@@ -34,11 +34,16 @@ export class ApprovalBroker {
   }
 
   private emit() {
-    for (const fn of this.listeners) fn();
+    for (const fn of this.listeners) {
+      try { fn(); } catch { /* Listener failures must not orphan an approval. */ }
+    }
   }
 
   /** 发起审批：写库 + 任务挂起，返回用户决策（true=批准）。任务被取消时 resolve(false)。 */
   request(req: ApprovalRequest): Promise<boolean> {
+    if (this.byTask.has(req.taskId)) {
+      throw new Error(`任务 ${req.taskId} 已有待处理审批`);
+    }
     const id = randomUUID();
     const now = Date.now();
     this.db.transaction(() => {
@@ -50,9 +55,7 @@ export class ApprovalBroker {
         .prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
         .run(randomUUID(), req.taskId, 'approval_required', JSON.stringify({ approvalId: id, request: req.request, risk: req.risk }), now);
     });
-    notify(this.db, '数字员工请求审批', req.request);
-    this.emit();
-    return new Promise<boolean>((resolve) => {
+    const decision = new Promise<boolean>((resolve) => {
       this.pending.set(id, (approved) => {
         this.pending.delete(id);
         this.byTask.delete(req.taskId);
@@ -60,6 +63,9 @@ export class ApprovalBroker {
       });
       this.byTask.set(req.taskId, id);
     });
+    notify(this.db, '数字员工请求审批', req.request);
+    this.emit();
+    return decision;
   }
 
   /** 用户决策：命中活跃执行器返回 true（仅唤醒，不重派发） */
@@ -74,7 +80,12 @@ export class ApprovalBroker {
   abandonTask(taskId: string) {
     const approvalId = this.byTask.get(taskId);
     if (!approvalId) return;
-    this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE id = ? AND status = 'pending'").run(Date.now(), approvalId);
-    this.pending.get(approvalId)?.(false);
+    try {
+      this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE id = ? AND status = 'pending'").run(Date.now(), approvalId);
+    } finally {
+      const wake = this.pending.get(approvalId);
+      if (wake) wake(false);
+      else this.byTask.delete(taskId);
+    }
   }
 }

@@ -791,6 +791,7 @@ api_key = <bridge_key>
 | `aibox:getBridgeStatus` | 获取状态 |
 | `aibox:toggleBridge` | 启用/停用 |
 | `aibox:regenerateBridgeKey` | 重新生成 Key |
+| `aibox:copyBridgeKey` | 由 Main 进程复制 Key，明文不进入 Renderer |
 
 ---
 
@@ -806,10 +807,10 @@ api_key = <bridge_key>
 
 - **复用前端**: 与桌面端完全一致的 UI
 - **REST API**: 镜像关键 IPC 通道
-- **Token 认证**: Bearer Token（默认 `aibox-admin`）
+- **Token 认证**: 首次启动自动生成强随机 Bearer Token；历史弱口令会触发告警
 - **会话管理**: 登录后颁发 session token，24h 过期
 - **频率限制**: 单 IP 每分钟 120 次，认证接口 10 次
-- **监听**: `0.0.0.0:28889`（可配置）
+- **监听**: 默认 `127.0.0.1:28889`；需显式开启后才监听局域网
 - **自动启动**: 主进程启动时自动开启
 
 ---
@@ -856,14 +857,15 @@ api_key = <bridge_key>
 
 | Channel | 说明 |
 |---------|------|
-| `aibox:getSetting` | 获取设置 |
-| `aibox:setSetting` | 保存设置 |
+| `aibox:getSetting` | 获取白名单设置（仅主题、阈值、通知、演示任务） |
+| `aibox:setSetting` | 保存并校验白名单设置 |
 | `aibox:getAppConfig` | 获取应用配置 |
 | `aibox:setAppConfig` | 保存应用配置 |
 | `aibox:integrityCheck` | 数据库完整性检查 |
 | `aibox:manualCleanup` | 手动数据清理 |
-| `aibox:storeSecret` | 存储密钥 |
-| `aibox:hasSecret` | 检查密钥是否存在 |
+| `aibox:getWebAdminStatus` | 获取 Web 管理状态，不含 Token |
+| `aibox:regenerateWebToken` | 重新生成 Token，不回传明文 |
+| `aibox:copyWebToken` | 由 Main 进程复制 Token 到剪贴板 |
 | `aibox:pickDirectory` | 选择工作目录 |
 | `aibox:toggleFullscreen` | 全屏切换 |
 

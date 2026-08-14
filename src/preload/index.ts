@@ -6,6 +6,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
+  ApiBridgeStatus, RendererSettingKey, RendererSettingMap, WebAdminStatus,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
   KnowledgeDetail, KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeSummary, KnowledgeVersionInput,
   ActionCenterOverview, GlobalSearchResult,
@@ -206,9 +207,10 @@ const api = {
   testProviderById: (id: string): Promise<{ ok: boolean; latencyMs: number; error: string | null }> => ipcRenderer.invoke('aibox:testProviderById', id),
   fetchProviderModels: (id: string): Promise<{ ok: boolean; models: string[]; error?: string }> => ipcRenderer.invoke('aibox:fetchProviderModels', id),
   // API Bridge
-  getBridgeStatus: (): Promise<{ running: boolean; port: number; bridgeKey: string; enabled: boolean }> => ipcRenderer.invoke('aibox:getBridgeStatus'),
-  toggleBridge: (enabled: boolean): Promise<{ running: boolean; port: number; bridgeKey: string; enabled: boolean }> => ipcRenderer.invoke('aibox:toggleBridge', enabled),
-  regenerateBridgeKey: (): Promise<{ running: boolean; port: number; bridgeKey: string; enabled: boolean }> => ipcRenderer.invoke('aibox:regenerateBridgeKey'),
+  getBridgeStatus: (): Promise<ApiBridgeStatus> => ipcRenderer.invoke('aibox:getBridgeStatus'),
+  toggleBridge: (enabled: boolean): Promise<ApiBridgeStatus> => ipcRenderer.invoke('aibox:toggleBridge', enabled),
+  regenerateBridgeKey: (): Promise<ApiBridgeStatus> => ipcRenderer.invoke('aibox:regenerateBridgeKey'),
+  copyBridgeKey: (): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:copyBridgeKey'),
 
   // Prompt 模板
   listTemplates: (): Promise<{ id: string; name: string; content: string; category: string }[]> => ipcRenderer.invoke('aibox:listTemplates'),
@@ -334,14 +336,18 @@ const api = {
   bindChannel: (channelId: string, agentId: string): Promise<void> => ipcRenderer.invoke('aibox:bindChannel', channelId, agentId),
   unbindChannel: (channelId: string, agentId: string): Promise<void> => ipcRenderer.invoke('aibox:unbindChannel', channelId, agentId),
 
-  // 设置 / 目录 / 凭据
-  getSetting: (key: string): Promise<unknown> => ipcRenderer.invoke('aibox:getSetting', key),
-  setSetting: (key: string, value: unknown): Promise<void> => ipcRenderer.invoke('aibox:setSetting', key, value),
+  // 设置 / 目录
+  getSetting: <K extends RendererSettingKey>(key: K): Promise<RendererSettingMap[K] | null> =>
+    ipcRenderer.invoke('aibox:getSetting', key),
+  setSetting: <K extends RendererSettingKey>(key: K, value: RendererSettingMap[K]): Promise<void> =>
+    ipcRenderer.invoke('aibox:setSetting', key, value),
   /** 演示数据残留量（H-3：演示与真实数据同表，需可查可清） */
   getDemoDataStats: (): Promise<{ agents: number; tasks: number; projects: number }> => ipcRenderer.invoke('aibox:getDemoDataStats'),
   /** 清空演示数据：只删 is_demo=1 行，真实数据不受影响 */
   purgeDemoData: (): Promise<{ agents: number; tasks: number; projects: number }> => ipcRenderer.invoke('aibox:purgeDemoData'),
-  regenerateWebToken: (): Promise<{ token: string }> => ipcRenderer.invoke('aibox:regenerateWebToken'),
+  getWebAdminStatus: (): Promise<WebAdminStatus> => ipcRenderer.invoke('aibox:getWebAdminStatus'),
+  regenerateWebToken: (): Promise<WebAdminStatus> => ipcRenderer.invoke('aibox:regenerateWebToken'),
+  copyWebToken: (): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:copyWebToken'),
 
   // OCR 文字识别服务
   getOcrStatus: (): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:getOcrStatus'),
@@ -359,9 +365,6 @@ const api = {
   restoreData: (): Promise<{ ok: boolean; message: string; restartRequired: boolean }> => ipcRenderer.invoke('aibox:restoreData'),
   restartApp: (): Promise<void> => ipcRenderer.invoke('aibox:restartApp'),
   reportError: (payload: { message: string; stack?: string; componentStack?: string }): Promise<void> => ipcRenderer.invoke('aibox:reportError', payload),
-  storeSecret: (ref: string, secret: string): Promise<void> => ipcRenderer.invoke('aibox:storeSecret', ref, secret),
-  hasSecret: (ref: string): Promise<boolean> => ipcRenderer.invoke('aibox:hasSecret', ref),
-
   // 多机协同
   collabCheckGit: (): Promise<{ name: string; installed: boolean; version: string | null; path: string | null }> => ipcRenderer.invoke('aibox:collab:checkGit'),
   collabInstallGit: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:collab:installGit'),

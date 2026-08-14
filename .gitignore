@@ -1,6 +1,9 @@
 node_modules/
 out/
 dist/
+/runtime/deepseek-harness/dist/
+/runtime/deepseek-harness/.dist-stage-*/
+/runtime/deepseek-harness/.dist-backup-*/
 release/
 .qoder/
 .superpowers/

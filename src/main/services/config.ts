@@ -43,12 +43,15 @@ export function loadConfig(): AppConfig {
   return cached;
 }
 
-/** 保存配置（仅允许白名单字段；registry 必须是 http/https URL，防注入） */
+/**
+ * 保存来自 Renderer/Web 的应用配置。外部 ACP 命令只能经 EngineManager 注册并落库；
+ * 这里保留磁盘中已有的 engines，避免远程配置接口变成任意进程启动入口。
+ */
 export function saveConfig(patch: Partial<AppConfig>): AppConfig {
   const current = loadConfig();
   const next: AppConfig = {
     npmRegistry: sanitizeRegistry(patch.npmRegistry) ?? current.npmRegistry,
-    engines: patch.engines ?? current.engines
+    engines: current.engines
   };
   writeFileSync(configPath(), JSON.stringify(next, null, 2), 'utf8');
   cached = next;

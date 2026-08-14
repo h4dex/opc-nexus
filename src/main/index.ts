@@ -3,6 +3,7 @@
  * 跨平台：Windows 10/11 + Ubuntu 22.04+（PRD 4.1 首发 Windows，Linux 同架构兼容）
  */
 import { app, BrowserWindow, Menu, nativeImage, protocol, screen, shell, Tray } from 'electron';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { Database } from './services/database.js';
 import { Orchestrator } from './services/orchestrator.js';
@@ -194,7 +195,7 @@ app.whenReady().then(async () => {
   const broker = new ApprovalBroker(db);
   const engines = new EngineManager(db);
   const channels = new ChannelManager(db);
-  const providerManager = new ProviderManager(db);
+  const providerManager = new ProviderManager(db, () => engines.invalidateHarnessProviderVerification());
   const executors = new ExecutorRegistry(db, broker, providerManager);
   const orchestrator = new Orchestrator(db, executors, broker);
   const mobile = new MobileGatewayService(db);
@@ -288,11 +289,6 @@ app.whenReady().then(async () => {
   // 数据保留策略：启动 + 每 24h 清理（任务 90 天 / 资源 7 天 / 审计 1 年）
   db.cleanupRetention();
   setInterval(() => db.cleanupRetention(), 24 * 3_600_000);
-  // 启动时真实检测本机 CLI（where/which + --version）与供应商配置，完成后再接管/调度任务，并续跑中断的团队流水线
-  void engines.detect().then(() => {
-    orchestrator.startScheduler();
-    teamEngine.recoverOrResume(); // 引擎就绪后续跑中断的专家团流水线（可恢复状态机）
-  });
   monitor.start(4000);
   scheduler.start();
   const mobileGatewayConfig = db.getSetting<{ enabled?: boolean; host?: string; port?: number }>('mobile:gateway', {});
@@ -323,15 +319,37 @@ app.whenReady().then(async () => {
 
   // 本地 API Bridge（反向代理，供 Claude Code/Codex 等引擎使用）
   const apiBridge = new ApiBridge(db, providerManager);
-  if (db.getSetting<string>('bridge_enabled', 'false') === 'true') apiBridge.start();
+  if (db.getSetting<string>('bridge_enabled', 'false') === 'true') {
+    try {
+      await apiBridge.toggle(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[ApiBridge] 自动启动失败，服务保持关闭: ${message}`);
+      db.audit({ id: randomUUID(), actor: 'system', action: 'bridge.start', target: 'api-bridge', result: 'start-error' });
+    }
+  }
 
   // 局域网 Web 管理服务器（工控机远程管理）
   const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
   webServerRef = webServer;
 
-  registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, mobile, mobileAdb, getMainWindow: () => mainWindow });
+  const { pushSnapshot } = registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, mobile, mobileAdb, getMainWindow: () => mainWindow });
 
-  webServer.start();
+  // Detect after IPC registration so the completed engine state is pushed to
+  // an already-open Renderer instead of remaining at the seeded placeholder.
+  void engines.detect().then(() => {
+    pushSnapshot();
+    orchestrator.startScheduler();
+    teamEngine.recoverOrResume(); // 引擎就绪后续跑中断的专家团流水线（可恢复状态机）
+  });
+
+  try {
+    await webServer.start();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[WebServer] 启动失败，服务保持关闭: ${message}`);
+    db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.start', target: 'web-admin', result: 'failed' });
+  }
 
   createWindow();
   createTray();

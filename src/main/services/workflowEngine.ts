@@ -435,7 +435,8 @@ export class WorkflowEngine {
         temperature: cfg.temperature ?? 0.7,
         max_tokens: 4096
       }),
-      signal: AbortSignal.timeout(timeout)
+      signal: AbortSignal.timeout(timeout),
+      redirect: 'error'
     });
     if (!res.ok) throw new Error(`LLM 请求失败: HTTP ${res.status}`);
     const data = await res.json() as { choices?: { message?: { content?: string } }[] };
@@ -473,7 +474,8 @@ export class WorkflowEngine {
       method,
       headers: { 'Content-Type': 'application/json', ...headers },
       body: method !== 'GET' ? body : undefined,
-      signal: AbortSignal.timeout(timeout)
+      signal: AbortSignal.timeout(timeout),
+      redirect: Object.keys(headers).some((key) => key.toLowerCase() === 'authorization') ? 'error' : 'follow'
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -496,7 +498,8 @@ export class WorkflowEngine {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ parameters }),
-      signal: AbortSignal.timeout(timeout)
+      signal: AbortSignal.timeout(timeout),
+      redirect: 'error'
     });
     const data = await res.json() as { code?: number; msg?: string; data?: string };
     if (data.code !== 0) throw new Error(`Coze 错误 [${data.code}]: ${data.msg ?? '未知'}`);
@@ -521,7 +524,8 @@ export class WorkflowEngine {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeout)
+      signal: AbortSignal.timeout(timeout),
+      redirect: 'error'
     });
     const data = await res.json() as { data?: { outputs?: Record<string, unknown>; status?: string; error?: string } };
     if (data.data?.status === 'failed') throw new Error(`Dify 执行失败: ${data.data.error ?? '未知'}`);

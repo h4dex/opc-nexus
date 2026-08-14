@@ -5,11 +5,15 @@
  * 请求验证 bridge key 后转发到系统内配置的供应商（按 model 路由），支持 SSE 流式透传。
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { safeStorage } from 'electron';
 import type { Database } from './database.js';
 import type { ProviderManager } from './providerManager.js';
+import type { ApiBridgeStatus } from '../../shared/types.js';
 
 const DEFAULT_PORT = 29998;
+export const BRIDGE_KEY_SECRET_REF = 'secret:bridge:key';
+const LEGACY_BRIDGE_KEY_SETTING = 'bridge_key';
 /** 请求体上限：chat/completions 的正常体量远低于此，超限即拒绝以免被单请求打满内存 */
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
@@ -33,67 +37,279 @@ function safeEqual(a: string, b: string): boolean {
 
 export class ApiBridge {
   private server: Server | null = null;
+  private startAttempt: {
+    server: Server;
+    promise: Promise<void>;
+    cancel: () => void;
+  } | null = null;
+  private stopAttempt: Promise<void> | null = null;
   private port = DEFAULT_PORT;
 
   constructor(private db: Database, private providers: ProviderManager) {}
 
-  /** 获取当前 bridge key（不存在则自动生成） */
-  getBridgeKey(): string {
-    let key = this.db.getSetting<string | null>('bridge_key', null);
-    if (!key) {
-      key = `sk-bridge-${randomBytes(24).toString('hex')}`;
-      this.db.setSetting('bridge_key', key);
+  private closeServer(candidate: Server): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        candidate.removeListener('close', finish);
+        resolve();
+      };
+      candidate.once('close', finish);
+      try {
+        candidate.close(finish);
+        candidate.closeAllConnections();
+      } catch {
+        finish();
+      }
+    });
+  }
+
+  private trackServerClose(candidate: Server): Promise<void> {
+    const closing = this.closeServer(candidate);
+    this.stopAttempt = closing;
+    void closing.then(() => {
+      if (this.stopAttempt === closing) this.stopAttempt = null;
+    });
+    return closing;
+  }
+
+  private decryptBridgeKey(encrypted: unknown): string {
+    if (typeof encrypted !== 'string' || !encrypted || !safeStorage.isEncryptionAvailable()) {
+      throw new Error('系统密钥库不可用，无法读取 Bridge API Key');
     }
+    try {
+      const key = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
+      if (!key) throw new Error('empty key');
+      return key;
+    } catch {
+      throw new Error('Bridge API Key 无法解密，请重新生成');
+    }
+  }
+
+  private storeBridgeKey(key: string, action: string, actor: 'admin' | 'system'): void {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用，无法保存 Bridge API Key');
+    const encrypted = safeStorage.encryptString(key).toString('base64');
+    this.db.transaction(() => {
+      this.db.setSetting(BRIDGE_KEY_SECRET_REF, encrypted);
+      this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(LEGACY_BRIDGE_KEY_SETTING);
+      this.db.audit({ id: randomUUID(), actor, action, target: BRIDGE_KEY_SECRET_REF, result: 'ok' });
+    });
+  }
+
+  private readStoredBridgeKey(): string | null {
+    const encrypted = this.db.getSetting<unknown>(BRIDGE_KEY_SECRET_REF, null);
+    if (encrypted !== null) {
+      const key = this.decryptBridgeKey(encrypted);
+      if (this.db.getSetting<unknown>(LEGACY_BRIDGE_KEY_SETTING, null) !== null) {
+        this.db.transaction(() => {
+          this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(LEGACY_BRIDGE_KEY_SETTING);
+          this.db.audit({
+            id: randomUUID(), actor: 'system', action: 'bridge.key.legacy_cleanup',
+            target: LEGACY_BRIDGE_KEY_SETTING, result: 'deleted'
+          });
+        });
+      }
+      return key;
+    }
+
+    const legacy = this.db.getSetting<unknown>(LEGACY_BRIDGE_KEY_SETTING, null);
+    if (legacy === null) return null;
+    if (typeof legacy !== 'string' || !legacy) throw new Error('旧版 Bridge API Key 无效，请重新生成');
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用，无法迁移 Bridge API Key');
+    const encryptedLegacy = safeStorage.encryptString(legacy).toString('base64');
+    this.db.transaction(() => {
+      this.db.setSetting(BRIDGE_KEY_SECRET_REF, encryptedLegacy);
+      this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(LEGACY_BRIDGE_KEY_SETTING);
+      this.db.audit({
+        id: randomUUID(), actor: 'system', action: 'bridge.key.migrate',
+        target: BRIDGE_KEY_SECRET_REF, result: 'ok'
+      });
+    });
+    return legacy;
+  }
+
+  /** 获取当前 bridge key（不存在则安全生成） */
+  getBridgeKey(): string {
+    const existing = this.readStoredBridgeKey();
+    if (existing) return existing;
+    const key = `sk-bridge-${randomBytes(24).toString('hex')}`;
+    this.storeBridgeKey(key, 'bridge.key.generate', 'system');
     return key;
   }
 
   /** 重新生成 bridge key */
   regenerateKey(): string {
     const key = `sk-bridge-${randomBytes(24).toString('hex')}`;
-    this.db.setSetting('bridge_key', key);
+    this.storeBridgeKey(key, 'bridge.key.rotate', 'admin');
     return key;
   }
 
-  /** 获取状态 */
-  getStatus(): { running: boolean; port: number; bridgeKey: string; enabled: boolean } {
+  /** Renderer-visible status never contains the bearer credential. */
+  getStatus(): ApiBridgeStatus {
+    let keyConfigured = false;
+    try {
+      keyConfigured = this.getBridgeKey().length > 0;
+    } catch {
+      // Keep status readable so the Renderer can offer credential rotation.
+    }
     return {
-      running: this.server !== null,
+      running: this.server?.listening === true,
       port: this.port,
-      bridgeKey: this.getBridgeKey(),
+      keyConfigured,
       enabled: this.db.getSetting<string>('bridge_enabled', 'false') === 'true'
     };
   }
 
   /** 启用/停用 */
-  toggle(enabled: boolean) {
-    this.db.setSetting('bridge_enabled', enabled ? 'true' : 'false');
-    if (enabled) this.start();
-    else this.stop();
+  async toggle(enabled: boolean): Promise<void> {
+    if (enabled) {
+      try {
+        await this.start();
+        if (!this.server?.listening) throw new Error('API Bridge failed to reach listening state');
+        this.db.setSetting('bridge_enabled', 'true');
+      } catch (error) {
+        this.db.setSetting('bridge_enabled', 'false');
+        throw error;
+      }
+    } else {
+      await this.stop();
+      this.db.setSetting('bridge_enabled', 'false');
+    }
   }
 
-  start() {
-    if (this.server) return;
-    const port = Number(this.db.getSetting<string>('bridge_port', String(DEFAULT_PORT))) || DEFAULT_PORT;
+  async start(): Promise<void> {
+    if (this.server?.listening) return;
+    if (this.startAttempt) return this.startAttempt.promise;
+    if (this.stopAttempt) {
+      await this.stopAttempt;
+      return this.start();
+    }
+    this.getBridgeKey();
+    const configuredPort = Number(this.db.getSetting<string>('bridge_port', String(DEFAULT_PORT)));
+    const port = Number.isInteger(configuredPort) && configuredPort >= 0 && configuredPort <= 65535
+      ? configuredPort
+      : DEFAULT_PORT;
     this.port = port;
 
-    this.server = createServer((req, res) => {
-      void this.handleRequest(req, res);
+    const candidate = createServer((req, res) => {
+      void this.handleRequest(req, res).catch((error) => this.failRequest(res, error));
+    });
+    let settled = false;
+    let resolveStart!: () => void;
+    let rejectStart!: (error: Error) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveStart = resolve;
+      rejectStart = reject;
+    });
+    const attempt = {
+      server: candidate,
+      promise,
+      cancel: () => {
+        if (settled) return;
+        settled = true;
+        rejectStart(new Error('API Bridge start cancelled'));
+      }
+    };
+
+    this.server = candidate;
+    this.startAttempt = attempt;
+
+    candidate.once('listening', () => {
+      if (settled) {
+        void this.closeServer(candidate);
+        return;
+      }
+      if (this.server !== candidate) {
+        settled = true;
+        void this.closeServer(candidate);
+        rejectStart(new Error('API Bridge start superseded'));
+        return;
+      }
+      const address = candidate.address();
+      if (address && typeof address !== 'string') this.port = address.port;
+      settled = true;
+      if (this.startAttempt === attempt) this.startAttempt = null;
+      console.log(`[ApiBridge] 本地 API 代理已启动: http://127.0.0.1:${this.port}/v1`);
+      resolveStart();
     });
 
-    this.server.listen(port, '127.0.0.1', () => {
-      console.log(`[ApiBridge] 本地 API 代理已启动: http://127.0.0.1:${port}/v1`);
-    });
-    this.server.on('error', (err) => {
-      console.error(`[ApiBridge] 启动失败:`, err.message);
-      this.server = null;
-    });
+    const failStart = (error: Error) => {
+      const active = this.server === candidate;
+      if (active) {
+        this.server = null;
+        try { this.db.setSetting('bridge_enabled', 'false'); } catch { /* best-effort state repair */ }
+        this.trackServerClose(candidate);
+        try {
+          this.db.audit({
+            id: randomUUID(), actor: 'system', action: 'bridge.server',
+            target: 'api-bridge', result: 'fail-closed'
+          });
+        } catch {
+          /* Server errors remain controlled even if audit persistence fails. */
+        }
+      } else {
+        void this.closeServer(candidate);
+      }
+      if (this.startAttempt === attempt) this.startAttempt = null;
+      if (!settled) {
+        settled = true;
+        rejectStart(error);
+      }
+      if (active) console.error('[ApiBridge] 启动或运行失败');
+    };
+    candidate.on('error', failStart);
+
+    try {
+      candidate.listen(port, '127.0.0.1');
+    } catch (error) {
+      failStart(error instanceof Error ? error : new Error(String(error)));
+    }
+
+    return promise;
   }
 
-  stop() {
-    if (this.server) {
-      this.server.close();
-      this.server = null;
-      console.log('[ApiBridge] 已停止');
+  async stop(): Promise<void> {
+    if (this.stopAttempt) return this.stopAttempt;
+    const candidate = this.server;
+    if (!candidate) return;
+    if (this.server === candidate) this.server = null;
+    if (this.startAttempt?.server === candidate) {
+      const attempt = this.startAttempt;
+      this.startAttempt = null;
+      attempt.cancel();
+    }
+    await this.trackServerClose(candidate);
+    console.log('[ApiBridge] 已停止');
+  }
+
+  private failRequest(res: ServerResponse, error: unknown): void {
+    console.error('[ApiBridge] 请求处理失败，已按不可用状态拒绝请求');
+    try {
+      this.db.audit({
+        id: randomUUID(), actor: 'system', action: 'bridge.request',
+        target: 'api-bridge', result: 'fail-closed'
+      });
+    } catch {
+      /* Audit failure must not turn a controlled request failure into an unhandled rejection. */
+    }
+    if (res.writableEnded || res.destroyed) return;
+    try {
+      if (!res.headersSent) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: {
+            message: 'API Bridge temporarily unavailable',
+            type: 'service_unavailable',
+            code: 'bridge_unavailable'
+          }
+        }));
+      } else {
+        res.destroy();
+      }
+    } catch {
+      try { res.destroy(); } catch { /* socket already unusable */ }
     }
   }
 
@@ -189,7 +405,8 @@ export class ApiBridge {
           'Content-Type': 'application/json',
           ...(resolved.key ? { Authorization: `Bearer ${resolved.key}` } : {})
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        redirect: 'error'
       });
 
       // 透传状态码和 headers

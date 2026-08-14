@@ -20,6 +20,16 @@ import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
 import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
 
+interface ResolvedExecutor {
+  adapter: ExecutorAdapter;
+  engineId: string;
+}
+
+interface RunningExecutor {
+  adapter: ExecutorAdapter;
+  agentId: string;
+}
+
 export class ExecutorRegistry {
   private llm: LlmApiExecutor;
   private acp: AcpExecutor;
@@ -29,7 +39,7 @@ export class ExecutorRegistry {
   /** 引擎类型 → CLI 执行器 */
   private cliByType = new Map<string, CliExecutor>();
   /** taskId → 正在执行它的适配器（用于 abort） */
-  private running = new Map<string, ExecutorAdapter>();
+  private running = new Map<string, RunningExecutor>();
 
   constructor(private db: Database, broker: ApprovalBroker, providerMgr?: import('../providerManager.js').ProviderManager) {
     this.llm = new LlmApiExecutor(db, broker, providerMgr);
@@ -94,16 +104,16 @@ export class ExecutorRegistry {
   }
 
   /** 主辅解析：主引擎 → 辅助引擎 →（demo 模式）模拟器 / （production 模式）null */
-  private resolve(engineId: string): ExecutorAdapter | null {
+  private resolve(engineId: string): ResolvedExecutor | null {
     const primary = this.adapterFor(engineId);
-    if (primary) return primary;
+    if (primary) return { adapter: primary, engineId };
     const cfg = loadUserConfig();
     // 辅助引擎仅在与主引擎不同且就绪时生效（基础设施级回退，业务失败不换引擎）
     if (cfg.engine.fallbackEngineId && cfg.engine.fallbackEngineId !== engineId) {
       const fallback = this.adapterFor(cfg.engine.fallbackEngineId);
-      if (fallback) return fallback;
+      if (fallback) return { adapter: fallback, engineId: cfg.engine.fallbackEngineId };
     }
-    return cfg.engine.executionMode === 'production' ? null : this.sim;
+    return cfg.engine.executionMode === 'production' ? null : { adapter: this.sim, engineId };
   }
 
   /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 unavailable） */
@@ -113,30 +123,40 @@ export class ExecutorRegistry {
       const cfg = loadUserConfig();
       return cfg.engine.executionMode === 'production' ? 'unavailable' : 'simulated';
     }
-    return adapter.kind;
+    return adapter.adapter.kind;
   }
 
   /** 派发任务执行；production 模式无可用引擎 → 直接回报错误（任务 FAILED，不伪装成功） */
   dispatch(task: Task, agent: Agent, cb: ExecutorCallbacks): ExecutorKind {
     // P1 修复：编码委派优先 —— task.engineOverride 覆盖 agent.engineId
     const targetEngineId = task.engineOverride || agent.engineId;
-    const adapter = this.resolve(targetEngineId);
-    if (!adapter) {
+    const resolved = this.resolve(targetEngineId);
+    if (!resolved) {
       cb.onError(task.id, '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
       return 'unavailable';
     }
-    this.running.set(task.id, adapter);
-    adapter.start(task, agent, {
+    const { adapter, engineId } = resolved;
+    const running: RunningExecutor = { adapter, agentId: agent.id };
+    this.running.set(task.id, running);
+    const release = (id: string): boolean => {
+      if (this.running.get(id) !== running) return false;
+      this.running.delete(id);
+      return true;
+    };
+    adapter.start(task, { ...agent, engineId }, {
       onStage: (id, stage) => cb.onStage(id, stage),
       onProgress: (id, pct) => cb.onProgress(id, pct),
       onOutput: (id, chunk) => cb.onOutput(id, chunk),
       onSession: (id, sessionId) => cb.onSession?.(id, sessionId),
+      onReleased: (id) => {
+        if (release(id)) cb.onReleased?.(id);
+      },
       onDone: (id, result) => {
-        this.running.delete(id);
+        if (adapter.kind !== 'acp') release(id);
         cb.onDone(id, result);
       },
       onError: (id, message) => {
-        this.running.delete(id);
+        if (adapter.kind !== 'acp') release(id);
         cb.onError(id, message);
       }
     });
@@ -144,11 +164,21 @@ export class ExecutorRegistry {
   }
 
   abort(taskId: string): void {
-    this.running.get(taskId)?.abort(taskId);
-    this.running.delete(taskId);
+    const current = this.running.get(taskId);
+    current?.adapter.abort(taskId);
+    if (current?.adapter.kind !== 'acp' && this.running.get(taskId) === current) {
+      this.running.delete(taskId);
+    }
   }
 
   isExecuting(taskId: string): boolean {
     return this.running.has(taskId);
+  }
+
+  /** Includes ACP children that have a terminal task state but have not closed yet. */
+  activeTaskIdsForAgent(agentId: string): string[] {
+    return [...this.running.entries()]
+      .filter(([, current]) => current.agentId === agentId)
+      .map(([taskId]) => taskId);
   }
 }

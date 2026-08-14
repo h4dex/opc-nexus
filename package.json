@@ -23,8 +23,12 @@
     "mobile:apk:verify": "node scripts/mobile-apk.cjs verify",
     "mobile:apk:verify-release": "node scripts/mobile-apk.cjs verify --require-release",
     "mobile:e2e": "node scripts/mobile-e2e.cjs",
-    "pack:win": "npm run mobile:apk:release && npm run build && electron-builder --win --x64",
-    "pack:linux": "npm run mobile:apk:release && npm run build && electron-builder --linux --x64"
+    "harness:prepare": "node scripts/prepare-deepseek-harness.cjs",
+    "harness:verify": "node scripts/prepare-deepseek-harness.cjs --verify",
+    "harness:verify:electron": "node scripts/verify-deepseek-harness-electron.cjs",
+    "harness:verify:packaged": "node scripts/verify-packaged-deepseek-harness.cjs",
+    "pack:win": "npm run mobile:apk:release && npm run harness:prepare && npm run build && electron-builder --win --x64",
+    "pack:linux": "npm run mobile:apk:release && npm run harness:prepare && npm run build && electron-builder --linux --x64"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
@@ -49,6 +53,7 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
+    "@electron/fuses": "1.8.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.15.0",

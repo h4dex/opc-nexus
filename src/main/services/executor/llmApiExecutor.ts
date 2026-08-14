@@ -77,26 +77,36 @@ export class LlmApiExecutor implements ExecutorAdapter {
 
   isReady(): boolean {
     const c = this.config();
-    return !!c.baseUrl && !!c.model && this.apiKey() !== null;
+    return !!c.baseUrl.trim() && !!c.model.trim() && !!this.apiKey()?.trim();
   }
 
   start(task: Task, agent: Agent, cb: ExecutorCallbacks): void {
     // 多供应商：优先用助手绑定的供应商，否则回退全局默认
-    let baseUrl: string, model: string, key: string | null;
+    let baseUrl = '', model = '', key: string | null = null;
+    const row = this.db.raw.prepare('SELECT provider_id, model_override FROM agents WHERE id = ?').get(agent.id) as
+      | { provider_id: string | null; model_override: string | null }
+      | undefined;
+    const providerId = row?.provider_id ?? null;
+    const modelOverride = agent.modelOverride ?? row?.model_override ?? null;
     const resolved = this.providerMgr?.resolveForAgent(
-      (agent as unknown as { providerId?: string }).providerId ?? null,
-      (agent as unknown as { modelOverride?: string }).modelOverride ?? null
+      providerId,
+      modelOverride
     );
-    if (resolved && resolved.key) {
+    if (resolved) {
       baseUrl = resolved.baseUrl;
       model = resolved.model;
       key = resolved.key;
-    } else {
+    } else if (!providerId) {
+      const providerCount = (this.db.raw.prepare('SELECT COUNT(*) c FROM providers').get() as { c?: number } | undefined)?.c ?? 0;
+      if (providerCount > 0) {
+        cb.onError(task.id, '模型供应商配置不完整，请检查默认供应商的 Base URL、模型和 API Key');
+        return;
+      }
       const cfg = this.config();
       baseUrl = cfg.baseUrl;
       model = cfg.model;
-      key = this.apiKey();
-    }
+      key = this.apiKey()?.trim() || null;
+    } else key = null;
     if (!key) {
       cb.onError(task.id, 'API Key 未配置，请在设置中完成模型供应商配置');
       return;
@@ -349,7 +359,8 @@ export class LlmApiExecutor implements ExecutorAdapter {
         tools: toOpenAiTools(tools),
         tool_choice: 'auto'
       }),
-      signal: opts.signal
+      signal: opts.signal,
+      redirect: 'error'
     }).catch((err) => {
       if (isAbort(err)) throw err;
       throw new Error(`网络请求失败：${errMessage(err)}`);

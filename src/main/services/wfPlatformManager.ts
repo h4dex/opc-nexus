@@ -67,7 +67,8 @@ export class WfPlatformManager {
         // Coze: 尝试获取空间信息验证 Token
         const res = await fetch(`${meta.baseUrl}/v1/workspaces`, {
           headers: { Authorization: `Bearer ${token}` },
-          signal: AbortSignal.timeout(10_000)
+          signal: AbortSignal.timeout(10_000),
+          redirect: 'error'
         });
         if (res.ok) return { ok: true, message: 'Coze 连接成功' };
         return { ok: false, message: `Coze 返回 HTTP ${res.status}` };
@@ -75,7 +76,8 @@ export class WfPlatformManager {
         // Dify: GET /info
         const res = await fetch(`${meta.baseUrl}/v1/info`, {
           headers: { Authorization: `Bearer ${token}` },
-          signal: AbortSignal.timeout(10_000)
+          signal: AbortSignal.timeout(10_000),
+          redirect: 'error'
         });
         if (res.ok) {
           const data = await res.json() as { name?: string };

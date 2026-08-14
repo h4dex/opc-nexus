@@ -27,6 +27,7 @@ function createMockExecutors() {
     dispatch: vi.fn(),
     abort: vi.fn(),
     isExecuting: vi.fn().mockReturnValue(false),
+    activeTaskIdsForAgent: vi.fn().mockReturnValue([]),
     kindFor: vi.fn().mockReturnValue('simulated')
   };
 }
@@ -131,6 +132,28 @@ describe('看门狗 watchdogSweep', () => {
     expect(row.status).toBe('INTERRUPTED');
     expect(row.error).toContain('看门狗超时');
     expect(executors.abort).toHaveBeenCalledWith(task.id);
+  });
+
+  it('watchdog 中断 ACP 后，FIFO replacement 等 child close 才运行', () => {
+    const { db, orch, agentId, executors } = setup();
+    executors.kindFor.mockReturnValue('acp');
+    const task = orch.createTask(agentId, '超时 ACP 任务');
+    const replacement = orch.createTask(agentId, '等待补位任务');
+    const firstDispatch = executors.dispatch.mock.calls[0];
+    const occupied = new Set([task.id]);
+    executors.isExecuting.mockImplementation((taskId) => occupied.has(taskId));
+    executors.activeTaskIdsForAgent.mockImplementation((id) => id === agentId ? [...occupied] : []);
+    db.tables.tasks.get(task.id).started_at = Date.now() - 31 * 60_000;
+
+    orch['watchdogSweep']();
+
+    expect(db.tables.tasks.get(task.id).status).toBe('INTERRUPTED');
+    expect(db.tables.tasks.get(replacement.id).status).toBe('QUEUED');
+
+    occupied.delete(task.id);
+    firstDispatch[2].onReleased?.(task.id);
+
+    expect(db.tables.tasks.get(replacement.id).status).toBe('RUNNING');
   });
 
   it('未超时任务不受影响', () => {

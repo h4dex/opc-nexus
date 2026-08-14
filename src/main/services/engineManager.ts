@@ -18,9 +18,21 @@ import type { Database } from './database.js';
 import { providerReady } from './provider.js';
 import { loadConfig, sanitizeRegistry } from './config.js';
 import { runCli } from './cliLauncher.js';
-import { acpCommandFor, probeAcpEngine } from './executor/acpExecutor.js';
+import { acpCommandFor, probeAcpEngine, probeAcpTask } from './executor/acpExecutor.js';
 import { engineEnvSecretRef, resolveEngineEnv, splitSecretEnv, SECRET_PLACEHOLDER } from './engineEnv.js';
 import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
+import {
+  DEEPSEEK_HARNESS_ENGINE_ID,
+  DEEPSEEK_HARNESS_VERSION,
+  deepseekHarnessCommand,
+  deepseekHarnessProbeEnv,
+  deepseekHarnessRuntimePaths
+} from './deepseekHarnessRuntime.js';
+import {
+  harnessProviderFingerprint,
+  harnessProviderVerificationIsCurrent,
+  saveHarnessProviderFingerprint
+} from './harnessProviderVerification.js';
 import type { Engine, EngineHealthSignals, EngineInstallGuide, EngineInstallResult, EngineType } from '../../shared/types.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
@@ -40,9 +52,10 @@ interface EngineRow {
   auth_status: string;
   is_default: number;
   data_boundary: string;
+  config_json?: string | null;
 }
 
-/** 引擎目录：bin / npm 包名可被配置文件 engines[id] 覆写 */
+/** 引擎目录：bin 可被配置文件 engines[id] 覆写；npm 包名固定为内置可信值 */
 export interface CatalogEntry {
   id: string;
   type: EngineType;
@@ -54,9 +67,8 @@ export interface CatalogEntry {
 }
 
 /**
- * 引擎目录（四引擎收敛，见 src/docs/architecture-review.md E-1）：
- * Nexus Agent（内置自研 Runtime）/ Hermes Agent（默认主引擎，真实 CLI）/
- * OpenCode（编码专家）/ Codex CLI（备选编码引擎）。
+ * 引擎目录：Nexus Agent（内置自研 Runtime）/ DeepSeek Harness（受管 ACP sidecar）/
+ * Hermes Agent（真实 CLI）/ OpenCode（编码专家）/ Codex CLI（备选编码引擎）。
  * ZCode / Kimi Code / Claude Code 已下线：清单膨胀且缺乏验证，由 v26 迁移改绑到 Nexus。
  */
 export const ENGINE_CATALOG: CatalogEntry[] = [
@@ -64,6 +76,11 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
     id: 'eng-hermes', type: 'hermes', name: 'Nexus Agent', bin: null, npmPackage: null,
     dataBoundary: '本地运行；模型请求发送至所配置模型提供商',
     guide: { guide: '内置引擎无需安装，在设置页完成模型供应商配置即可启用', url: null }
+  },
+  {
+    id: DEEPSEEK_HARNESS_ENGINE_ID, type: 'external', name: 'DeepSeek Harness', bin: null, npmPackage: null,
+    dataBoundary: 'Harness 与会话在本机 sidecar 运行；模型请求发送至所配置的 DeepSeek/OpenAI 兼容供应商',
+    guide: { guide: 'DeepSeek Harness 随 OPC-Nexus 安装包分发；开发环境请运行 npm run harness:prepare', url: 'https://github.com/deepseek-ai/deepseek-harness' }
   },
   {
     id: 'eng-hermes-cli', type: 'hermes-cli', name: 'Hermes Agent', bin: 'hermes', npmPackage: null,
@@ -85,8 +102,14 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
 /** 已下线引擎：v26 迁移把绑定它们的员工改绑 Nexus，并从 engines 表清理 */
 export const RETIRED_ENGINE_IDS = ['eng-claude', 'eng-zcode', 'eng-kimi'] as const;
 
-/** 外部 ACP 引擎（P2a）：配置文件 engines 中带 acpCommand 的非内置条目，新增即接入引擎中心 */
-function externalAcpEntries(): { id: string; name: string; command: string[] }[] {
+interface ExternalAcpEntry {
+  id: string;
+  name: string;
+  command: string[] | null;
+}
+
+/** 旧配置文件中的 ACP 条目仅用于升级导入，运行时状态与命令以 SQLite 为准。 */
+function legacyExternalAcpEntries(): { id: string; name: string; command: string[] }[] {
   const builtin = new Set(ENGINE_CATALOG.map((e) => e.id));
   const out: { id: string; name: string; command: string[] }[] = [];
   for (const [id, cfg] of Object.entries(loadConfig().engines)) {
@@ -98,14 +121,22 @@ function externalAcpEntries(): { id: string; name: string; command: string[] }[]
   return out;
 }
 
-/** 配置覆写后的 bin / npm 包名 */
+/** 从 SQLite 枚举外部 ACP 引擎；命令解析会兼容旧 path/runArgs 和旧应用配置。 */
+function externalAcpEntries(db: Database): ExternalAcpEntry[] {
+  const builtin = new Set(ENGINE_CATALOG.map((e) => e.id));
+  const rows = db.raw.prepare(
+    "SELECT id, type, name, path, config_json, data_boundary FROM engines WHERE type = 'external'"
+  ).all() as unknown as EngineRow[];
+  return rows
+    .filter((row) => row.type === 'external' && !builtin.has(row.id))
+    .map((row) => ({ id: row.id, name: row.name, command: acpCommandFor(db, row.id) }));
+}
+
+/** 配置覆写后的可执行名；npm 包固定取可信内置目录值。 */
 function effective(entry: CatalogEntry): { bin: string | null; npmPackage: string | null } {
   const override = loadConfig().engines[entry.id] ?? {};
   const bin = override.bin && /^[\w.-]+$/.test(override.bin) ? override.bin : entry.bin;
-  const pkg = override.npmPackage && /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/.test(override.npmPackage)
-    ? override.npmPackage
-    : entry.npmPackage;
-  return { bin, npmPackage: pkg };
+  return { bin, npmPackage: entry.npmPackage };
 }
 
 export class EngineManager {
@@ -114,7 +145,29 @@ export class EngineManager {
 
   constructor(private db: Database) {}
 
-  /** 目录中的引擎逐个补齐（旧库升级时新增引擎行不丢已有状态）；外部 ACP 引擎随配置文件同步 */
+  /** Provider mutations invalidate the real-task proof until a new probe succeeds. */
+  invalidateHarnessProviderVerification(): void {
+    const configured = providerReady(this.db);
+    const commandAvailable = deepseekHarnessCommand() !== null;
+    const previousSignals = this.getHealthSignals(DEEPSEEK_HARNESS_ENGINE_ID);
+    this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?').run(
+      commandAvailable ? (configured ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED') : 'NOT_INSTALLED',
+      'required',
+      DEEPSEEK_HARNESS_ENGINE_ID
+    );
+    this.saveHealthSignals(DEEPSEEK_HARNESS_ENGINE_ID, {
+      detected: commandAvailable,
+      launchable: commandAvailable && previousSignals?.launchable === true,
+      authenticated: false,
+      taskVerified: false,
+      detail: configured
+        ? '模型供应商配置已变化；请重新运行“验证登录”完成真实模型任务探测'
+        : '请先配置可用的模型供应商和 API Key'
+    });
+    saveHarnessProviderFingerprint(this.db, null);
+  }
+
+  /** 目录中的引擎逐个补齐；旧配置文件里的 ACP 条目只在数据库尚无该 ID 时导入。 */
   ensureBuiltinEngines() {
     const stmt = this.db.raw.prepare(
       `INSERT INTO engines(id, type, name, version, path, status, auth_status, is_default, data_boundary)
@@ -122,11 +175,23 @@ export class EngineManager {
        ON CONFLICT(id) DO UPDATE SET name = excluded.name, data_boundary = excluded.data_boundary`
     );
     for (const e of ENGINE_CATALOG) {
-      const initial = e.bin === null ? 'SETUP_REQUIRED' : 'NOT_INSTALLED';
+      const initial = e.id === 'eng-hermes' ? 'SETUP_REQUIRED' : 'NOT_INSTALLED';
       stmt.run(e.id, e.type, e.name, initial, e.id === 'eng-hermes' ? 1 : 0, e.dataBoundary);
     }
-    for (const ext of externalAcpEntries()) {
-      stmt.run(ext.id, 'external', ext.name, 'NOT_INSTALLED', 0, '外部 ACP 引擎；数据发送目标取决于该引擎自身配置');
+
+    const legacyStmt = this.db.raw.prepare(
+      `INSERT INTO engines(id, type, name, version, path, status, auth_status, is_default, data_boundary, config_json)
+       VALUES(?, 'external', ?, NULL, ?, 'NOT_INSTALLED', 'unknown', 0, ?, ?)
+       ON CONFLICT(id) DO NOTHING`
+    );
+    for (const ext of legacyExternalAcpEntries()) {
+      legacyStmt.run(
+        ext.id,
+        ext.name,
+        ext.command[0],
+        '外部 ACP 引擎；数据发送目标取决于该引擎自身配置',
+        JSON.stringify({ acpCommand: ext.command })
+      );
     }
   }
 
@@ -166,8 +231,8 @@ export class EngineManager {
   installGuide(id: string): EngineInstallGuide | null {
     const builtin = ENGINE_CATALOG.find((e) => e.id === id)?.guide;
     if (builtin) return builtin;
-    if (externalAcpEntries().some((e) => e.id === id)) {
-      return { guide: '外部 ACP 引擎：请按该引擎官方方式安装，确保配置文件 acpCommand 可执行后点击重新检测', url: null };
+    if (externalAcpEntries(this.db).some((e) => e.id === id)) {
+      return { guide: '外部 ACP 引擎：请按该引擎官方方式安装，确保已注册的 acpCommand 可执行后点击重新检测', url: null };
     }
     return null;
   }
@@ -192,8 +257,54 @@ export class EngineManager {
    * 已 HEALTHY 的引擎重新检测时保留 HEALTHY，避免把验证过的引擎打回未验证。
    */
   async detect(): Promise<Engine[]> {
-    this.ensureBuiltinEngines(); // 配置文件新增的外部引擎随检测同步入库
+    this.ensureBuiltinEngines(); // 兼容导入旧配置后，外部引擎统一从数据库发现
+    const harnessCommand = deepseekHarnessCommand();
+    if (!harnessCommand) {
+      this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?")
+        .run(DEEPSEEK_HARNESS_ENGINE_ID);
+      this.db.setSetting(healthSignalsKey(DEEPSEEK_HARNESS_ENGINE_ID), {
+        detected: false, launchable: false, authenticated: false, taskVerified: false,
+        detail: '未找到已准备的 DeepSeek Harness sidecar；开发环境请运行 npm run harness:prepare', checkedAt: Date.now()
+      });
+      saveHarnessProviderFingerprint(this.db, null);
+    } else {
+      const probe = await probeAcpEngine(
+        harnessCommand,
+        deepseekHarnessProbeEnv(this.db),
+        { managedHarness: true }
+      );
+      const configured = providerReady(this.db);
+      const previous = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?')
+        .get(DEEPSEEK_HARNESS_ENGINE_ID) as { status: string } | undefined;
+      const alreadyVerified = previous?.status === 'HEALTHY'
+        && this.getHealthSignals(DEEPSEEK_HARNESS_ENGINE_ID)?.taskVerified === true
+        && harnessProviderVerificationIsCurrent(this.db);
+      const status = probe.ok
+        ? (configured ? (alreadyVerified ? 'HEALTHY' : 'AUTH_REQUIRED') : 'SETUP_REQUIRED')
+        : 'ERROR';
+      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
+        status,
+        status === 'HEALTHY' ? 'authed' : 'required',
+        probe.ok ? DEEPSEEK_HARNESS_VERSION : null,
+        deepseekHarnessRuntimePaths().root,
+        DEEPSEEK_HARNESS_ENGINE_ID
+      );
+      if (!alreadyVerified || status !== 'HEALTHY') {
+        this.db.setSetting(healthSignalsKey(DEEPSEEK_HARNESS_ENGINE_ID), {
+          detected: true,
+          launchable: probe.ok,
+          authenticated: false,
+          taskVerified: false,
+          detail: probe.ok
+            ? (configured ? 'Harness 可启动；请运行“验证登录”完成真实模型任务探测' : 'Harness 可启动；请先配置模型供应商凭据')
+            : `ACP 握手失败：${probe.message}`,
+          checkedAt: Date.now()
+        });
+        saveHarnessProviderFingerprint(this.db, null);
+      }
+    }
     for (const entry of ENGINE_CATALOG) {
+      if (entry.id === DEEPSEEK_HARNESS_ENGINE_ID) continue;
       if (!entry.bin) continue;
       if (this.installing.has(entry.id)) continue; // 安装中不覆盖 INSTALLING 状态
       const { bin } = effective(entry);
@@ -237,16 +348,25 @@ export class EngineManager {
         });
       }
     }
-    // 外部 ACP 引擎：spawn + initialize 握手成功 = HEALTHY（P2a）
-    for (const ext of externalAcpEntries()) {
-      const command = acpCommandFor(ext.id);
-      if (!command) {
+    // 外部 ACP 引擎：握手只证明可启动，不能证明凭据或真实任务可用。
+    for (const ext of externalAcpEntries(this.db)) {
+      if (!ext.command) {
         this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED' WHERE id = ?").run(ext.id);
         continue;
       }
-      const probe = await probeAcpEngine(command);
+      const probe = await probeAcpEngine(ext.command, resolveEngineEnv(this.db, ext.id));
+      const previous = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(ext.id) as { status: string } | undefined;
+      const alreadyVerified = previous?.status === 'HEALTHY' && this.getHealthSignals(ext.id)?.taskVerified === true;
+      const status = probe.ok ? (alreadyVerified ? 'HEALTHY' : 'AUTH_REQUIRED') : 'NOT_INSTALLED';
       this.db.raw.prepare("UPDATE engines SET status = ?, version = ? WHERE id = ?")
-        .run(probe.ok ? 'HEALTHY' : 'NOT_INSTALLED', probe.ok ? 'acp' : null, ext.id);
+        .run(status, probe.ok ? 'acp' : null, ext.id);
+      if (!alreadyVerified || status !== 'HEALTHY') {
+        this.db.setSetting(healthSignalsKey(ext.id), {
+          detected: true, launchable: probe.ok, authenticated: false, taskVerified: false,
+          detail: probe.ok ? 'ACP 握手通过；请运行“验证登录”完成真实任务探测' : probe.message,
+          checkedAt: Date.now()
+        });
+      }
     }
     // Nexus Agent：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED（演示模式，UI 必须标注）
     this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
@@ -255,7 +375,7 @@ export class EngineManager {
 
   /**
    * 自动安装：npm install -g <官方包> --registry <配置文件下载地址>
-   * 安装来源固定为目录内官方包名（配置文件可覆写但需通过包名校验，9.3 供应链基线）。
+   * 安装来源固定为目录内官方包名，配置文件不可覆写（9.3 供应链基线）。
    * 完成后重新检测该引擎，如实回写 HEALTHY / NOT_INSTALLED。
    */
   async install(id: string): Promise<EngineInstallResult> {
@@ -305,7 +425,80 @@ export class EngineManager {
    */
   async probeAuth(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
-    if (!entry) return { ok: false, message: '未知引擎' };
+    if (!entry) {
+      const ext = externalAcpEntries(this.db).find((candidate) => candidate.id === id);
+      if (!ext) return { ok: false, message: '未知引擎' };
+      if (!ext.command) {
+        this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', auth_status = 'unknown' WHERE id = ?").run(id);
+        return { ok: false, message: '引擎命令未配置' };
+      }
+
+      const probe = await probeAcpTask(ext.command, resolveEngineEnv(this.db, id));
+      const status = probe.ok ? 'HEALTHY' : (AUTH_ERROR_PATTERN.test(probe.message) ? 'AUTH_REQUIRED' : 'DEGRADED');
+      const authStatus = probe.ok ? 'authed' : (status === 'AUTH_REQUIRED' ? 'required' : 'unknown');
+      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+        .run(status, authStatus, id);
+      this.saveHealthSignals(id, {
+        detected: true,
+        launchable: probe.initialized,
+        authenticated: probe.ok,
+        taskVerified: probe.ok,
+        detail: probe.ok ? probe.output.slice(0, 200) : probe.message
+      });
+      this.db.audit({
+        id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id,
+        result: probe.ok ? 'authed' : probe.message.slice(0, 80)
+      });
+      this.addLog(id, probe.ok ? 'info' : 'warn', `ACP 最小任务探测：${probe.message}`);
+      return probe;
+    }
+
+    if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
+      const command = deepseekHarnessCommand();
+      if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备，请先运行 harness:prepare 或重新安装应用' };
+      if (!providerReady(this.db)) {
+        this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required' WHERE id = ?").run(id);
+        this.saveHealthSignals(id, {
+          detected: true, launchable: true, authenticated: false, taskVerified: false,
+          detail: '请先配置可用的模型供应商和 API Key'
+        });
+        saveHarnessProviderFingerprint(this.db, null);
+        return { ok: false, message: '请先配置可用的模型供应商和 API Key' };
+      }
+      const providerFingerprint = harnessProviderFingerprint(this.db);
+      const probe = await probeAcpTask(
+        command,
+        deepseekHarnessProbeEnv(this.db),
+        deepseekHarnessRuntimePaths().root,
+        60_000,
+        { managedHarness: true }
+      );
+      const providerUnchanged = providerFingerprint === harnessProviderFingerprint(this.db);
+      const verified = probe.ok && providerUnchanged;
+      const probeMessage = providerUnchanged
+        ? probe.message
+        : '模型供应商配置在验证过程中发生变化，请重新验证';
+      const status = verified
+        ? 'HEALTHY'
+        : (!providerUnchanged || AUTH_ERROR_PATTERN.test(probeMessage) ? 'AUTH_REQUIRED' : 'DEGRADED');
+      const authStatus = verified ? 'authed' : (status === 'AUTH_REQUIRED' ? 'required' : 'unknown');
+      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+        .run(status, authStatus, id);
+      this.saveHealthSignals(id, {
+        detected: true,
+        launchable: probe.initialized,
+        authenticated: verified,
+        taskVerified: verified,
+        detail: verified ? probe.output.slice(0, 200) : probeMessage
+      });
+      saveHarnessProviderFingerprint(this.db, verified ? providerFingerprint : null);
+      this.db.audit({
+        id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id,
+        result: verified ? 'authed-and-task-verified' : probeMessage.slice(0, 80)
+      });
+      this.addLog(id, verified ? 'info' : 'warn', `Harness 最小任务探测：${probeMessage}`);
+      return { ok: verified, message: verified ? 'DeepSeek Harness 已完成真实模型任务验证' : `DeepSeek Harness 最小任务失败：${probeMessage}` };
+    }
 
     // 内置 Nexus：凭据即供应商配置
     if (entry.bin === null) {
@@ -381,6 +574,29 @@ export class EngineManager {
    *  用于修改配置后刷新引擎状态，无需重启整个应用。 */
   async restart(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
+      const command = deepseekHarnessCommand();
+      if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备' };
+      const probe = await probeAcpEngine(
+        command,
+        deepseekHarnessProbeEnv(this.db),
+        { managedHarness: true }
+      );
+      const configured = providerReady(this.db);
+      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
+        probe.ok ? (configured ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED') : 'ERROR',
+        'required',
+        probe.ok ? DEEPSEEK_HARNESS_VERSION : null,
+        deepseekHarnessRuntimePaths().root,
+        id
+      );
+      this.saveHealthSignals(id, {
+        detected: true, launchable: probe.ok, authenticated: false, taskVerified: false,
+        detail: probe.ok ? 'Harness 已重新加载；请运行“验证登录”完成真实模型任务探测' : probe.message
+      });
+      saveHarnessProviderFingerprint(this.db, null);
+      return { ok: probe.ok, message: probe.ok ? 'DeepSeek Harness 已重新加载，请继续验证登录' : `DeepSeek Harness 连接失败：${probe.message}` };
+    }
     if (id === 'eng-hermes') {
       // Nexus Agent：重新检测供应商配置是否就绪
       this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
@@ -389,12 +605,12 @@ export class EngineManager {
     }
     if (!entry) {
       // 外部 ACP 引擎
-      const ext = externalAcpEntries().find((e) => e.id === id);
+      const ext = externalAcpEntries(this.db).find((e) => e.id === id);
       if (!ext) return { ok: false, message: '未知引擎' };
-      const command = acpCommandFor(id);
-      if (!command) return { ok: false, message: '引擎命令未配置' };
-      const probe = await probeAcpEngine(command);
-      this.db.raw.prepare('UPDATE engines SET status = ?, version = ? WHERE id = ?').run(probe.ok ? 'HEALTHY' : 'NOT_INSTALLED', probe.ok ? 'acp' : null, id);
+      if (!ext.command) return { ok: false, message: '引擎命令未配置' };
+      const probe = await probeAcpEngine(ext.command, resolveEngineEnv(this.db, id));
+      this.db.raw.prepare('UPDATE engines SET status = ?, version = ? WHERE id = ?').run(probe.ok ? 'AUTH_REQUIRED' : 'NOT_INSTALLED', probe.ok ? 'acp' : null, id);
+      this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.restart', target: id, result: probe.ok ? 'ok' : probe.message.slice(0, 80) });
       return { ok: probe.ok, message: probe.ok ? `${ext.name} 重新连接成功` : `${ext.name} 连接失败，请检查引擎进程` };
     }
     // CLI 引擎：重新定位二进制 + 取版本
@@ -604,8 +820,10 @@ export class EngineManager {
     this.db.raw.prepare(
       `INSERT INTO engines(id, type, name, version, path, status, auth_status, is_default, data_boundary) VALUES(?, 'external', ?, NULL, ?, 'NOT_INSTALLED', 'unknown', 0, ?)`
     ).run(id, input.name.trim(), input.command.trim(), input.dataBoundary || '自定义引擎；数据发送目标取决于配置');
-    // 保存命令配置
-    const config = { runArgs: input.args ? input.args.split(' ').filter(Boolean) : [] };
+    // acpCommand 是外部引擎的完整可执行入口；path 保留给旧版本兼容读取。
+    const command = input.command.trim();
+    const args = input.args?.split(/\s+/).filter(Boolean) ?? [];
+    const config = { acpCommand: [command, ...args] };
     this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(config), id);
     this.addLog(id, 'info', `自定义引擎「${input.name}」已注册，命令: ${input.command}`);
     return { ok: true, message: `已注册自定义引擎「${input.name}」`, id };

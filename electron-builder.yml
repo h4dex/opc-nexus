@@ -7,7 +7,11 @@ directories:
   output: release
   buildResources: build
 
-beforePack: scripts/mobile-apk-hook.cjs
+electronFuses:
+  runAsNode: true
+
+beforePack: scripts/before-pack.cjs
+afterPack: scripts/after-pack.cjs
 
 extraResources:
   - from: mobile/dist
@@ -25,6 +29,21 @@ extraResources:
     to: mobile/tool-catalog.json
   - from: THIRD-PARTY-NOTICES.md
     to: mobile/THIRD-PARTY-NOTICES.md
+  - from: runtime/deepseek-harness/dist
+    to: runtime/deepseek-harness
+    filter:
+      - package.json
+      - package-lock.json
+      - opc-acp-entry.mjs
+      - README.md
+      - THIRD-PARTY-NOTICES.md
+      - config/**/*
+  # electron-builder intentionally skips a source-root directory named
+  # node_modules. Make it the FileSet root so the pinned sidecar is copied.
+  - from: runtime/deepseek-harness/dist/node_modules
+    to: runtime/deepseek-harness/node_modules
+    filter:
+      - "**/*"
 
 files:
   - out/**

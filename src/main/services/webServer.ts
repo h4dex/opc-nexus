@@ -2,12 +2,12 @@
  * 本地 Web 管理服务器：支持局域网远程访问，用于工控机无人值守场景。
  * - 复用 renderer 构建产物作为前端页面（与桌面端完全一致的 UI）
  * - REST API 镜像关键 IPC 通道（供应商/员工/渠道/引擎/设置）
- * - Token 认证（Bearer token，可在设置页配置，默认 aibox-admin）
+ * - Token 认证（Bearer token，首次启动安全生成并经 safeStorage 加密）
  * - 会话 Token 过期机制：登录后颁发 session token，默认 24h 过期
  * - 请求频率限制：单 IP 每分钟最多 120 次请求，认证接口每分钟 10 次
  * - 监听地址默认 127.0.0.1:PORT（默认 28889）；需局域网访问时显式开启 webExposeLan
  *   才绑 0.0.0.0，避免默认把管理界面暴露到局域网
- * - 访问 Token 不写入 console/日志，仅经 IPC 回传给本机 Renderer
+ * - 访问 Token 不写入 console/日志，也不作为 IPC/REST 响应返回 Renderer
  *
  * @author liyingjie <y@senke.com>
  * - 主进程启动时自动开启，与桌面窗口并行运行
@@ -16,6 +16,7 @@ import express from 'express';
 import cors from 'cors';
 import { join } from 'node:path';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { safeStorage } from 'electron';
 import type { Database } from './database.js';
 import type { Orchestrator } from './orchestrator.js';
 import type { EngineManager } from './engineManager.js';
@@ -27,6 +28,8 @@ import type { TeamEngine } from './teamEngine.js';
 import { getProviderConfig, saveProviderConfig } from './provider.js';
 import { loadConfig, saveConfig } from './config.js';
 import { notify } from './notifier.js';
+import { readRendererSetting, writeRendererSetting } from './rendererSettings.js';
+import type { WebAdminStatus } from '../../shared/types.js';
 
 export interface WebServerDeps {
   db: Database;
@@ -42,6 +45,8 @@ export interface WebServerDeps {
 const DEFAULT_PORT = 28889;
 /** 历史默认弱口令：仅用于检测用户是否仍在使用它，不再作为新生成 Token 的来源 */
 const LEGACY_DEFAULT_TOKEN = 'aibox-admin';
+export const WEB_TOKEN_SECRET_REF = 'secret:webserver:token';
+const LEGACY_WEB_TOKEN_SETTING = 'webToken';
 /** 会话 Token 过期时间（默认 24 小时） */
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** 通用接口频率限制：单 IP 每分钟最多请求数 */
@@ -91,6 +96,9 @@ function safeEqual(a: string, b: string): boolean {
 export class WebServer {
   private app: ReturnType<typeof express> | null = null;
   private server: ReturnType<ReturnType<typeof express>['listen']> | null = null;
+  private pendingServer: ReturnType<ReturnType<typeof express>['listen']> | null = null;
+  private startPromise: Promise<void> | null = null;
+  private cancelPendingStart: (() => void) | null = null;
   private cleanupTimer: NodeJS.Timeout | null = null;
   /** 活跃会话 Token 池（内存，重启后失效需重新登录） */
   private sessions = new Map<string, SessionEntry>();
@@ -103,21 +111,90 @@ export class WebServer {
     return this.deps.db.getSetting<number>('webPort', DEFAULT_PORT);
   }
 
+  private decryptToken(encrypted: unknown): string {
+    if (typeof encrypted !== 'string' || !encrypted || !safeStorage.isEncryptionAvailable()) {
+      throw new Error('系统密钥库不可用，无法读取 Web 管理 Token');
+    }
+    try {
+      const token = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
+      if (!token) throw new Error('empty token');
+      return token;
+    } catch {
+      throw new Error('Web 管理 Token 无法解密，请重新生成');
+    }
+  }
+
+  private storeToken(token: string, action: string, actor: 'admin' | 'system'): void {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用，无法保存 Web 管理 Token');
+    const encrypted = safeStorage.encryptString(token).toString('base64');
+    this.deps.db.transaction(() => {
+      this.deps.db.setSetting(WEB_TOKEN_SECRET_REF, encrypted);
+      this.deps.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(LEGACY_WEB_TOKEN_SETTING);
+      this.deps.db.audit({ id: randomUUID(), actor, action, target: WEB_TOKEN_SECRET_REF, result: 'ok' });
+    });
+  }
+
+  private readStoredToken(): string | null {
+    const encrypted = this.deps.db.getSetting<unknown>(WEB_TOKEN_SECRET_REF, null);
+    if (encrypted !== null) {
+      const token = this.decryptToken(encrypted);
+      if (this.deps.db.getSetting<unknown>(LEGACY_WEB_TOKEN_SETTING, null) !== null) {
+        this.deps.db.transaction(() => {
+          this.deps.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(LEGACY_WEB_TOKEN_SETTING);
+          this.deps.db.audit({
+            id: randomUUID(), actor: 'system', action: 'webserver.token.legacy_cleanup',
+            target: LEGACY_WEB_TOKEN_SETTING, result: 'deleted'
+          });
+        });
+      }
+      return token;
+    }
+
+    const legacy = this.deps.db.getSetting<unknown>(LEGACY_WEB_TOKEN_SETTING, null);
+    if (legacy === null) return null;
+    if (typeof legacy !== 'string' || !legacy) throw new Error('旧版 Web 管理 Token 无效，请重新生成');
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用，无法迁移 Web 管理 Token');
+    const encryptedLegacy = safeStorage.encryptString(legacy).toString('base64');
+    this.deps.db.transaction(() => {
+      this.deps.db.setSetting(WEB_TOKEN_SECRET_REF, encryptedLegacy);
+      this.deps.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(LEGACY_WEB_TOKEN_SETTING);
+      this.deps.db.audit({
+        id: randomUUID(), actor: 'system', action: 'webserver.token.migrate',
+        target: WEB_TOKEN_SECRET_REF, result: 'ok'
+      });
+    });
+    return legacy;
+  }
+
   get token(): string {
-    // ensureToken() 在 start() 时已保证存在强随机 Token；此处保留弱回退仅为防御性（正常不会命中）
-    return this.deps.db.getSetting<string>('webToken', '') || LEGACY_DEFAULT_TOKEN;
+    const token = this.readStoredToken();
+    if (!token) throw new Error('Web 管理 Token 尚未初始化');
+    return token;
+  }
+
+  getStatus(): WebAdminStatus {
+    let token: string | null = null;
+    try {
+      token = this.readStoredToken();
+    } catch {
+      // Keep status readable so the Renderer can offer credential rotation.
+    }
+    return {
+      port: this.port,
+      tokenConfigured: token !== null,
+      weakToken: token === LEGACY_DEFAULT_TOKEN
+    };
   }
 
   /** 确保存在强随机 Token：首次启动自动生成并持久化；若仍为历史弱口令则告警 */
   ensureToken(): void {
-    const existing = this.deps.db.getSetting<string>('webToken', '');
+    const existing = this.readStoredToken();
     if (!existing) {
       const generated = randomBytes(16).toString('hex');
-      this.deps.db.setSetting('webToken', generated);
-      this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.auto_token', target: 'webToken', result: 'ok' });
-      console.log('[WebServer] 已自动生成强随机访问 Token（设置页可查看/重新生成）');
+      this.storeToken(generated, 'webserver.token.generate', 'system');
+      console.log('[WebServer] 已自动生成强随机访问 Token（设置页可复制/重新生成）');
     } else if (existing === LEGACY_DEFAULT_TOKEN) {
-      this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.weak_token', target: 'webToken', result: 'warn' });
+      this.deps.db.audit({ id: randomUUID(), actor: 'system', action: 'webserver.weak_token', target: WEB_TOKEN_SECRET_REF, result: 'warn' });
       console.warn('[WebServer] ⚠️ 检测到仍在使用默认弱口令「aibox-admin」，若开启局域网暴露将极不安全！请尽快在设置页重新生成 Token。');
       notify(this.deps.db, '安全提醒', 'Web 管理面板仍在使用默认弱口令，请尽快在设置页重新生成访问 Token');
     }
@@ -126,9 +203,8 @@ export class WebServer {
   /** 重新生成访问 Token（设置页调用）：同时失效所有旧会话 */
   regenerateToken(): string {
     const generated = randomBytes(16).toString('hex');
-    this.deps.db.setSetting('webToken', generated);
+    this.storeToken(generated, 'webserver.token.rotate', 'admin');
     this.sessions.clear();
-    this.deps.db.audit({ id: randomUUID(), actor: 'admin', action: 'webserver.regenerate_token', target: 'webToken', result: 'ok' });
     return generated;
   }
 
@@ -154,13 +230,30 @@ export class WebServer {
     }, 5 * 60_000);
   }
 
-  start() {
-    if (this.server) return;
+  private stopCleanup(): void {
+    if (!this.cleanupTimer) return;
+    clearInterval(this.cleanupTimer);
+    this.cleanupTimer = null;
+  }
+
+  start(): Promise<void> {
+    if (this.server?.listening) return Promise.resolve();
+    if (this.startPromise) return this.startPromise;
+
+    const attempt = this.startOnce();
+    this.startPromise = attempt;
+    void attempt.finally(() => {
+      if (this.startPromise === attempt) this.startPromise = null;
+    }).catch(() => {
+      // The caller observes the original attempt; suppress the finally-chain copy.
+    });
+    return attempt;
+  }
+
+  private async startOnce(): Promise<void> {
     const { db, orchestrator, engines, channels, providers, mcp, skills, teams } = this.deps;
     this.ensureToken();
     const app = express();
-    this.app = app;
-    this.startCleanup();
 
     // CORS：不放行任意来源。管理面板由本服务自身托管（同源），
     // 无需跨源；开放 * 会让任意网页在用户浏览器里调用本 API（Token 若被读到即可控台）。
@@ -250,6 +343,7 @@ export class WebServer {
     app.get('/api/provider', (_req, res) => res.json(getProviderConfig(db)));
     app.post('/api/provider', (req, res) => {
       saveProviderConfig(db, req.body);
+      engines.invalidateHarnessProviderVerification();
       res.json({ ok: true });
     });
 
@@ -316,24 +410,127 @@ export class WebServer {
     app.get('/api/config', (_req, res) => res.json(loadConfig()));
     app.put('/api/config', (req, res) => res.json(saveConfig(req.body)));
 
-    // 设置
-    app.get('/api/settings/:key', (req, res) => res.json({ value: db.getSetting(req.params.key, null) }));
+    // Only non-sensitive Renderer preferences are exposed through the remote UI.
+    app.get('/api/settings/:key', (req, res) => {
+      try {
+        res.json({ value: readRendererSetting(db, req.params.key) });
+      } catch {
+        res.status(400).json({ error: 'Setting key is not allowed' });
+      }
+    });
     app.put('/api/settings/:key', (req, res) => {
-      db.setSetting(req.params.key, req.body.value);
-      res.json({ ok: true });
+      try {
+        writeRendererSetting(db, req.params.key, req.body.value);
+        res.json({ ok: true });
+      } catch {
+        res.status(400).json({ error: 'Setting value is invalid' });
+      }
     });
 
     // 启动监听：默认仅绑本机回环，避免管理面板暴露到局域网；
     // 需要局域网访问时由用户显式开启 settings.webExposeLan（并强制使用强 Token）
     const port = this.port;
     const host = this.bindHost();
-    this.server = app.listen(port, host, () => {
+    const candidate = app.listen(port, host);
+    this.pendingServer = candidate;
+    let ownedCancel: (() => void) | null = null;
+
+    try {
+      await new Promise<void>((resolveStart, rejectStart) => {
+        let settled = false;
+        let cancelled = false;
+        const cleanupStartup = () => {
+          candidate.off('listening', onListening);
+        };
+        const rejectOnce = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanupStartup();
+          rejectStart(error);
+        };
+        const clearOwnedState = () => {
+          if (this.pendingServer === candidate) this.pendingServer = null;
+          if (this.server === candidate) {
+            this.server = null;
+            if (this.app === app) this.app = null;
+            this.stopCleanup();
+          }
+        };
+        const auditFailure = (result: string) => {
+          try {
+            this.deps.db.audit({
+              id: randomUUID(), actor: 'system', action: 'webserver.runtime',
+              target: 'web-admin', result
+            });
+          } catch {
+            // Network failure handling must not throw from an EventEmitter callback.
+          }
+        };
+        const onListening = () => {
+          if (cancelled || this.pendingServer !== candidate) {
+            if (!settled) rejectOnce(new Error('Web server startup was cancelled'));
+            try { candidate.close(); } catch { /* The candidate never became active. */ }
+            return;
+          }
+          if (settled) return;
+          settled = true;
+          cleanupStartup();
+          this.pendingServer = null;
+          this.server = candidate;
+          this.app = app;
+          this.startCleanup();
+          resolveStart();
+        };
+        const onError = (error: Error) => {
+          const owned = this.pendingServer === candidate || this.server === candidate;
+          clearOwnedState();
+          rejectOnce(error);
+          if (owned) {
+            console.error('[WebServer] 监听或运行失败:', error.message);
+            auditFailure('error');
+            try { candidate.close(); } catch { /* It may already be closed. */ }
+          }
+        };
+        const onClose = () => {
+          const wasPending = this.pendingServer === candidate;
+          const wasActive = this.server === candidate;
+          clearOwnedState();
+          if (wasPending) rejectOnce(new Error('Web server closed before listening'));
+          if (wasActive) auditFailure('closed');
+        };
+        candidate.once('listening', onListening);
+        // Keep these listeners for the whole Server lifetime. A late 'error'
+        // without a listener would otherwise terminate the Electron process.
+        candidate.on('error', onError);
+        candidate.on('close', onClose);
+        ownedCancel = () => {
+          cancelled = true;
+          if (this.pendingServer === candidate) this.pendingServer = null;
+          rejectOnce(new Error('Web server startup was cancelled'));
+          try {
+            candidate.close();
+          } catch {
+            // If listen has not allocated its handle yet, onListening will
+            // observe the cancelled ownership and close it immediately.
+          }
+        };
+        this.cancelPendingStart = ownedCancel;
+      });
+
       // 不打印 Token：凭据不得进入日志，设置页可查看
       console.log(`[WebServer] 管理面板已启动: http://${host === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1'}:${port}`);
       if (host === '0.0.0.0') {
         console.warn('[WebServer] ⚠️ 已监听所有网卡，局域网内可访问管理面板，请确认 Token 为强随机值');
       }
-    });
+    } catch (error) {
+      if (this.pendingServer === candidate) this.pendingServer = null;
+      if (this.server === candidate) this.server = null;
+      if (this.app === app) this.app = null;
+      if (candidate.listening) candidate.close();
+      throw error;
+    } finally {
+      if (this.cancelPendingStart === ownedCancel) this.cancelPendingStart = null;
+    }
   }
 
   /** 监听地址：默认 127.0.0.1（仅本机）；settings.webExposeLan = true 时才绑 0.0.0.0 */
@@ -345,13 +542,19 @@ export class WebServer {
   }
 
   stop() {
+    const cancelStart = this.cancelPendingStart;
+    this.cancelPendingStart = null;
+    this.startPromise = null;
+    const pending = this.pendingServer;
+    this.pendingServer = null;
+    cancelStart?.();
+    if (pending?.listening) {
+      try { pending.close(); } catch { /* It may already be closing. */ }
+    }
     this.server?.close();
     this.server = null;
     this.app = null;
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
+    this.stopCleanup();
     this.sessions.clear();
     this.rateBuckets.clear();
   }

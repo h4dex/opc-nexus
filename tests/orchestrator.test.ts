@@ -20,6 +20,7 @@ function createMockExecutors(): ExecutorRegistry {
     dispatch: vi.fn(),
     abort: vi.fn(),
     isExecuting: vi.fn().mockReturnValue(false),
+    activeTaskIdsForAgent: vi.fn().mockReturnValue([]),
     kindFor: vi.fn().mockReturnValue('simulated')
   } as unknown as ExecutorRegistry;
 }
@@ -179,6 +180,26 @@ describe('Orchestrator 状态机', () => {
       expect(t2After?.status).toBe('RUNNING');
     });
 
+    it('cancelTask waits for an ACP child to close before FIFO replacement', () => {
+      const agentId = seedAgent(db, { concurrency_limit: 1 });
+      vi.mocked(executors.kindFor).mockReturnValue('acp');
+      const t1 = orch.createTask(agentId, 'ACP 任务1');
+      const t2 = orch.createTask(agentId, 'ACP 任务2');
+      const occupied = new Set([t1.id]);
+      vi.mocked(executors.isExecuting).mockImplementation((taskId) => occupied.has(taskId));
+      vi.mocked(executors.activeTaskIdsForAgent).mockImplementation((id) => id === agentId ? [...occupied] : []);
+
+      orch.cancelTask(t1.id);
+
+      expect(db.tables.tasks.get(t1.id)?.status).toBe('CANCELLED');
+      expect(db.tables.tasks.get(t2.id)?.status).toBe('QUEUED');
+
+      const firstDispatch = vi.mocked(executors.dispatch).mock.calls[0];
+      occupied.delete(t1.id);
+      firstDispatch[2].onReleased?.(t1.id);
+      expect(db.tables.tasks.get(t2.id)?.status).toBe('RUNNING');
+    });
+
     it('取消等待审批任务时同步关闭待审批记录', () => {
       const agentId = seedAgent(db);
       const task = orch.createTask(agentId, '等待审批任务');
@@ -273,15 +294,40 @@ describe('Orchestrator 状态机', () => {
       expect(executors.dispatch).toHaveBeenCalled();
     });
 
+    it('pause 后立即 resume 要等旧 ACP child release 才重新派发', () => {
+      const agentId = seedAgent(db);
+      vi.mocked(executors.kindFor).mockReturnValue('acp');
+      const task = orch.createTask(agentId, 'ACP 暂停恢复');
+      const firstDispatch = vi.mocked(executors.dispatch).mock.calls[0];
+      const occupied = new Set([task.id]);
+      vi.mocked(executors.isExecuting).mockImplementation((taskId) => occupied.has(taskId));
+      vi.mocked(executors.activeTaskIdsForAgent).mockImplementation((id) => id === agentId ? [...occupied] : []);
+
+      orch.pauseTask(task.id);
+      vi.mocked(executors.dispatch).mockClear();
+      orch.resumeTask(task.id);
+
+      expect(db.tables.tasks.get(task.id)?.status).toBe('PAUSED');
+      expect(executors.dispatch).not.toHaveBeenCalled();
+
+      occupied.delete(task.id);
+      firstDispatch[2].onReleased?.(task.id);
+
+      expect(db.tables.tasks.get(task.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+    });
+
     it('pauseTask 对 QUEUED 任务无效', () => {
       const agentId = seedAgent(db, { concurrency_limit: 1 });
       orch.createTask(agentId, '占位');
       const t2 = orch.createTask(agentId, '排队中');
       expect(t2.status).toBe('QUEUED');
 
+      vi.mocked(executors.abort).mockClear();
       orch.pauseTask(t2.id);
       // QUEUED 不应变为 PAUSED
       expect(db.tables.tasks.get(t2.id)?.status).toBe('QUEUED');
+      expect(executors.abort).not.toHaveBeenCalled();
     });
   });
 
@@ -301,6 +347,30 @@ describe('Orchestrator 状态机', () => {
       expect(db.tables.agents.get(agentId)?.lifecycle).toBe('DISABLED');
       expect(db.tables.tasks.get(task.id)?.status).toBe('CANCELLED');
       expect(executors.abort).toHaveBeenCalledWith(task.id);
+    });
+
+    it('stop/start 后创建任务仍等待旧 ACP child release', () => {
+      const agentId = seedAgent(db, { concurrency_limit: 1 });
+      vi.mocked(executors.kindFor).mockReturnValue('acp');
+      const oldTask = orch.createTask(agentId, '停止前的 ACP 任务');
+      const firstDispatch = vi.mocked(executors.dispatch).mock.calls[0];
+      const occupied = new Set([oldTask.id]);
+      vi.mocked(executors.isExecuting).mockImplementation((taskId) => occupied.has(taskId));
+      vi.mocked(executors.activeTaskIdsForAgent).mockImplementation((id) => id === agentId ? [...occupied] : []);
+
+      orch.stopAgent(agentId);
+      orch.startAgent(agentId);
+      const replacement = orch.createTask(agentId, '重启后的任务');
+
+      expect(db.tables.tasks.get(oldTask.id)?.status).toBe('CANCELLED');
+      expect(replacement.status).toBe('QUEUED');
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+
+      occupied.delete(oldTask.id);
+      firstDispatch[2].onReleased?.(oldTask.id);
+
+      expect(db.tables.tasks.get(replacement.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledTimes(2);
     });
   });
 

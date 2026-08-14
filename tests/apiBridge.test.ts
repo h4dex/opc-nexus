@@ -9,9 +9,11 @@
 // @ts-nocheck
 /* eslint-disable */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { createServer } from 'node:http';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
+const { safeStorage } = await import('electron');
 const { ApiBridge, pathOf } = await import('../src/main/services/apiBridge.js');
 
 function makeDb(settings: Record<string, unknown> = {}) {
@@ -31,22 +33,20 @@ const providers = (list = [], resolved = null) => ({
   resolveByModel: () => resolved
 }) as never;
 
-/**
- * 启动 bridge 并返回基址。
- * 注：`bridge_port='0'` 会被 `Number('0') || DEFAULT_PORT` 判假回退为默认端口，
- * 故这里显式指定高位随机端口，避免与本机可能在跑的真实 bridge 抢占 29998。
- */
+/** 启动 bridge 并返回操作系统分配的临时端口基址。 */
 async function boot(db, prov) {
   const b = new ApiBridge(db, prov);
-  const port = 31000 + Math.floor(Math.random() * 3000);
-  db.setSetting('bridge_port', String(port));
-  b.start();
-  for (let i = 0; i < 50 && !b.server?.listening; i++) await new Promise((r) => setTimeout(r, 10));
+  db.setSetting('bridge_port', '0');
+  await b.start();
   return { bridge: b, base: `http://127.0.0.1:${b.server.address().port}` };
 }
 
-let running: { stop: () => void }[] = [];
-afterEach(() => { for (const b of running) b.stop(); running = []; });
+let running: { stop: () => Promise<void> }[] = [];
+afterEach(async () => {
+  await Promise.all(running.map((bridge) => bridge.stop()));
+  running = [];
+  vi.restoreAllMocks();
+});
 
 describe('pathOf：剥离 query 与 fragment', () => {
   it('无 query 时原样返回', () => {
@@ -259,22 +259,125 @@ describe('启停与状态', () => {
     const b = new ApiBridge(db, providers());
     expect(b.getStatus().running).toBe(false);
     expect(b.getStatus().enabled).toBe(false);
+    expect(b.getStatus().keyConfigured).toBe(true);
+    expect(b.getStatus()).not.toHaveProperty('bridgeKey');
 
     db.setSetting('bridge_enabled', 'true');
     expect(b.getStatus().enabled).toBe(true);
+  });
+
+  it('启动完成前不报告 running，toggle 仅在监听成功后持久化 enabled', async () => {
+    const db = makeDb({ bridge_port: '0' });
+    const bridge = new ApiBridge(db, providers());
+    const enabling = bridge.toggle(true);
+
+    expect(bridge.getStatus()).toMatchObject({ running: false, enabled: false });
+    await enabling;
+    running.push(bridge);
+    expect(bridge.getStatus()).toMatchObject({ running: true, enabled: true });
+    expect(bridge.getStatus().port).toBeGreaterThan(0);
   });
 
   it('重复 start 不重复监听', async () => {
     const { bridge } = await boot(makeDb(), providers());
     running.push(bridge);
     const first = bridge.server;
-    bridge.start();
+    await bridge.start();
     expect(bridge.server).toBe(first);
   });
 
   it('stop 后 server 置空，可再次启动', async () => {
     const { bridge } = await boot(makeDb(), providers());
-    bridge.stop();
+    await bridge.stop();
     expect(bridge.server).toBeNull();
+  });
+
+  it('端口占用时启动失败并保持 disabled/stopped', async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(0, '127.0.0.1', resolve);
+    });
+    const address = blocker.address();
+    if (!address || typeof address === 'string') throw new Error('blocker did not listen');
+    const db = makeDb({ bridge_port: String(address.port) });
+    const bridge = new ApiBridge(db, providers());
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await expect(bridge.toggle(true)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      expect(bridge.getStatus()).toMatchObject({ running: false, enabled: false });
+      expect(bridge.server).toBeNull();
+      expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'bridge.server', target: 'api-bridge', result: 'fail-closed'
+      }));
+    } finally {
+      await bridge.stop();
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it('快速 stop/start 等待旧监听关闭，旧实例错误不清空新实例', async () => {
+    const db = makeDb();
+    const bridge = new ApiBridge(db, providers());
+    db.setSetting('bridge_port', '0');
+
+    const firstStart = bridge.start();
+    const first = bridge.server;
+    const firstRejected = expect(firstStart).rejects.toThrow(/cancelled/);
+    const stopping = bridge.stop();
+    const restarting = bridge.start();
+    await firstRejected;
+    await stopping;
+    await restarting;
+    running.push(bridge);
+
+    const second = bridge.server;
+    expect(second).not.toBe(first);
+    expect(first.listening).toBe(false);
+    expect(bridge.getStatus().running).toBe(true);
+    first.emit('error', new Error('late error from old server'));
+    expect(bridge.server).toBe(second);
+    expect(bridge.getStatus().running).toBe(true);
+  });
+
+  it('多个 start 同时等待 stop 时只创建一个新监听实例', async () => {
+    const db = makeDb();
+    const { bridge } = await boot(db, providers());
+    const stopping = bridge.stop();
+
+    const restartA = bridge.start();
+    const restartB = bridge.start();
+    await stopping;
+    await Promise.all([restartA, restartB]);
+    running.push(bridge);
+
+    expect(bridge.getStatus().running).toBe(true);
+    expect(bridge.server?.listening).toBe(true);
+  });
+
+  it('运行中凭据不可解密时返回 fail-closed 503 并审计', async () => {
+    const db = makeDb();
+    const { bridge, base } = await boot(db, providers());
+    running.push(bridge);
+    const key = bridge.getBridgeKey();
+    vi.spyOn(safeStorage, 'isEncryptionAvailable').mockReturnValue(false);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await fetch(`${base}/v1/models`, {
+      headers: { Authorization: `Bearer ${key}` }
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: {
+        message: 'API Bridge temporarily unavailable',
+        type: 'service_unavailable',
+        code: 'bridge_unavailable'
+      }
+    });
+    expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'bridge.request', target: 'api-bridge', result: 'fail-closed'
+    }));
   });
 });

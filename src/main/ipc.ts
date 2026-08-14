@@ -2,7 +2,7 @@
  * IPC 白名单（PRD 12.2：不允许 Renderer 透传任意命令）
  * Renderer 仅能调用此处显式注册的方法；密钥操作只通过 safeStorage 句柄。
  */
-import { app, BrowserWindow, clipboard, dialog, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import type { Database } from './services/database.js';
 import type { Orchestrator } from './services/orchestrator.js';
 import type { ExecutorRegistry } from './services/executor/index.js';
@@ -47,6 +47,9 @@ import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { decodeOptionalUtf8Text, decodeUtf8Text } from './services/textEncoding.js';
+import { readRendererSetting, writeRendererSetting } from './services/rendererSettings.js';
+import { BRIDGE_KEY_SECRET_REF } from './services/apiBridge.js';
+import { WEB_TOKEN_SECRET_REF } from './services/webServer.js';
 
 /** 轻量级运行时参数校验（防御异常/恶意输入穿透） */
 function assertString(v: unknown, field: string, min = 1, max = 500): string {
@@ -432,7 +435,8 @@ export function registerIpc(deps: IpcDeps) {
     const res = await fetch(`${settings.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: settings.model, messages: [{ role: 'user', content: prompt }], max_tokens: 1000 })
+      body: JSON.stringify({ model: settings.model, messages: [{ role: 'user', content: prompt }], max_tokens: 1000 }),
+      redirect: 'error'
     });
     if (!res.ok) throw new Error(`LLM 请求失败: HTTP ${res.status}`);
     const data = await res.json() as { choices?: { message?: { content?: string } }[] };
@@ -548,15 +552,38 @@ export function registerIpc(deps: IpcDeps) {
 
   // ---------- 多供应商管理 ----------
   ipcMain.handle('aibox:listProviders', () => providers.list());
-  ipcMain.handle('aibox:createProvider', (_e, input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }) => providers.create(input));
-  ipcMain.handle('aibox:updateProvider', (_e, id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }) => providers.update(id, patch));
-  ipcMain.handle('aibox:removeProvider', (_e, id: string) => providers.remove(id));
+  ipcMain.handle('aibox:createProvider', (_e, input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }) => {
+    const provider = providers.create(input);
+    pushSnapshot();
+    return provider;
+  });
+  ipcMain.handle('aibox:updateProvider', (_e, id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }) => {
+    providers.update(id, patch);
+    pushSnapshot();
+  });
+  ipcMain.handle('aibox:removeProvider', (_e, id: string) => {
+    providers.remove(id);
+    pushSnapshot();
+  });
   ipcMain.handle('aibox:testProviderById', (_e, id: string) => providers.testById(id));
   ipcMain.handle('aibox:fetchProviderModels', (_e, id: string) => providers.fetchModels(id));
   // ---------- API Bridge ----------
   ipcMain.handle('aibox:getBridgeStatus', () => deps.apiBridge.getStatus());
-  ipcMain.handle('aibox:toggleBridge', (_e, enabled: boolean) => { deps.apiBridge.toggle(enabled); return deps.apiBridge.getStatus(); });
-  ipcMain.handle('aibox:regenerateBridgeKey', () => { deps.apiBridge.regenerateKey(); return deps.apiBridge.getStatus(); });
+  ipcMain.handle('aibox:toggleBridge', async (_e, enabled: boolean) => {
+    await deps.apiBridge.toggle(enabled);
+    return deps.apiBridge.getStatus();
+  });
+  ipcMain.handle('aibox:regenerateBridgeKey', async () => {
+    deps.apiBridge.regenerateKey();
+    const status = deps.apiBridge.getStatus();
+    if (status.enabled && !status.running) await deps.apiBridge.start();
+    return deps.apiBridge.getStatus();
+  });
+  ipcMain.handle('aibox:copyBridgeKey', () => {
+    clipboard.writeText(deps.apiBridge.getBridgeKey());
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'bridge.key.copy', target: BRIDGE_KEY_SECRET_REF, result: 'clipboard' });
+    return { ok: true as const };
+  });
 
   // ---------- Prompt 模板 ----------
   ipcMain.handle('aibox:listTemplates', () => (db.raw.prepare('SELECT * FROM prompt_templates ORDER BY created_at DESC').all() as unknown as { id: string; name: string; content: string; category: string; created_at: number }[]).map((r) => ({ id: r.id, name: r.name, content: r.content, category: r.category, createdAt: r.created_at })));
@@ -882,8 +909,8 @@ export function registerIpc(deps: IpcDeps) {
   });
 
   // ---------- 设置 ----------
-  ipcMain.handle('aibox:getSetting', (_e, key: string) => db.getSetting(key, null));
-  ipcMain.handle('aibox:setSetting', (_e, key: string, value: unknown) => db.setSetting(key, value));
+  ipcMain.handle('aibox:getSetting', (_e, key: unknown) => readRendererSetting(db, key));
+  ipcMain.handle('aibox:setSetting', (_e, key: unknown, value: unknown) => writeRendererSetting(db, key, value));
   // 演示数据（H-3）：查询库中残留量 / 一键清空（只删 is_demo=1 行，真实数据不受影响）
   ipcMain.handle('aibox:getDemoDataStats', () => demoDataStats(db));
   ipcMain.handle('aibox:purgeDemoData', () => {
@@ -891,8 +918,18 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return removed;
   });
-  // Web 管理面板访问 Token：重新生成强随机 Token（同时失效旧会话）
-  ipcMain.handle('aibox:regenerateWebToken', () => ({ token: webServer.regenerateToken() }));
+  // Web token remains in Main; Renderer can inspect state and request a clipboard copy.
+  ipcMain.handle('aibox:getWebAdminStatus', () => webServer.getStatus());
+  ipcMain.handle('aibox:regenerateWebToken', async () => {
+    webServer.regenerateToken();
+    await webServer.start();
+    return webServer.getStatus();
+  });
+  ipcMain.handle('aibox:copyWebToken', () => {
+    clipboard.writeText(webServer.token);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'webserver.token.copy', target: WEB_TOKEN_SECRET_REF, result: 'clipboard' });
+    return { ok: true as const };
+  });
 
   // ---------- OCR 文字识别服务 ----------
   ipcMain.handle('aibox:getOcrStatus', () => ocr.getStatus());
@@ -993,15 +1030,6 @@ export function registerIpc(deps: IpcDeps) {
     app.exit(0);
   });
 
-  // ---------- 凭据（15.1：密钥不进入 Renderer/localStorage，仅存系统密钥库） ----------
-  ipcMain.handle('aibox:storeSecret', (_e, ref: string, secret: string) => {
-    if (!safeStorage.isEncryptionAvailable()) throw new Error('系统密钥库不可用');
-    const buf = safeStorage.encryptString(secret);
-    db.setSetting(`secret:${ref}`, buf.toString('base64'));
-    db.audit({ id: randomUUID(), actor: 'admin', action: 'secret.store', target: ref, result: 'ok' });
-  });
-  ipcMain.handle('aibox:hasSecret', (_e, ref: string) => db.getSetting<string | null>(`secret:${ref}`, null) !== null);
-
   // ---------- 前端异常上报（ErrorBoundary 捕获的渲染异常写入审计日志） ----------
   ipcMain.handle('aibox:reportError', (_e, payload: { message: string; stack?: string; componentStack?: string }) => {
     db.audit({
@@ -1040,6 +1068,8 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:collab:updateRules', (_e, id: string, patch: { conventions?: string; gitRules?: string }) => {
     collab.updateRules(assertId(id), patch);
   });
+
+  return { pushSnapshot };
 }
 
 let snapshotVersion = 0;

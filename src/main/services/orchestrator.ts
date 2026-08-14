@@ -64,6 +64,8 @@ export class Orchestrator {
   /** Per-task output budget. Prevents a verbose CLI from filling SQLite and
    * the renderer with one event per token forever. */
   private outputStates = new Map<string, TaskOutputState>();
+  /** Resume requests made while an aborted ACP child is still closing. */
+  private resumeAfterRelease = new Set<string>();
   /** 任务终态订阅（webhook 通知等；status 仅 COMPLETED/FAILED/INTERRUPTED） */
   private finishListeners = new Set<(info: { taskId: string; agentId: string; status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; title: string; result: string | null; error: string | null }) => void>();
   private schedulerTimer: NodeJS.Timeout | null = null;
@@ -721,6 +723,7 @@ export class Orchestrator {
   startAgent(id: string) {
     this.db.raw.prepare("UPDATE agents SET lifecycle = 'READY', updated_at = ? WHERE id = ?").run(Date.now(), id);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'agent.start', target: id, result: 'ok' });
+    this.scheduleNext(id);
     this.emit();
   }
 
@@ -730,6 +733,7 @@ export class Orchestrator {
       this.db.raw.prepare("UPDATE agents SET lifecycle = 'DISABLED', updated_at = ? WHERE id = ?").run(now, id);
       const active = this.db.raw.prepare("SELECT id FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','QUEUED','PAUSED','WAITING_APPROVAL')").all(id) as { id: string }[];
       for (const t of active) {
+        this.resumeAfterRelease.delete(t.id);
         this.broker.abandonTask(t.id);
         this.executors.abort(t.id);
         this.cancelTaskInternal(t.id, now);
@@ -772,7 +776,7 @@ export class Orchestrator {
       const project = this.db.raw.prepare("SELECT id FROM projects WHERE id = ? AND status != 'archived'").get(projectId) as { id: string } | undefined;
       if (!project) throw new Error('项目不存在或已归档');
     }
-    const active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
+    const active = this.agentOccupancy(agentId);
     const guardReason = this.dispatchGuard();
     const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null && (!mobileState || mobileState.ready);
     const queuedStage = guardReason ?? mobileState?.reason ?? '排队中';
@@ -970,9 +974,57 @@ export class Orchestrator {
         // P2b：会话锚点落库（仅首次），追问时继承
         this.db.raw.prepare('UPDATE tasks SET session_id = ? WHERE id = ? AND session_id IS NULL').run(sessionId, id);
       },
+      onReleased: () => {
+        if (this.resumeAfterRelease.delete(taskId)) this.resumePausedTask(taskId);
+        this.emit();
+        this.scheduleNext(agentId);
+      },
       onDone: (id, result) => finish('COMPLETED', { result }),
       onError: (id, message) => finish(/超时|中断/.test(message) ? 'INTERRUPTED' : 'FAILED', { error: message })
     };
+  }
+
+  /**
+   * Count occupied Agent slots across durable task state and executor resources.
+   * ACP children remain present in the registry after their task reaches a
+   * terminal state, so the union must be counted without double-counting a
+   * PAUSED child that is represented in both places.
+   */
+  private agentOccupancy(agentId: string, excludeTaskId?: string): number {
+    const occupying = ['RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
+    let active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
+
+    if (excludeTaskId) {
+      const excluded = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(excludeTaskId) as Row | undefined;
+      if (excluded?.agent_id === agentId && occupying.includes(excluded.status as string)) {
+        active = Math.max(0, active - 1);
+      }
+    }
+
+    for (const taskId of this.executors.activeTaskIdsForAgent(agentId)) {
+      if (taskId === excludeTaskId) continue;
+      const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+      if (!row || !occupying.includes(row.status as string)) active += 1;
+    }
+    return active;
+  }
+
+  private resumePausedTask(taskId: string): boolean {
+    const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+    if (!row || row.status !== 'PAUSED') return false;
+    const agentId = row.agent_id as string;
+    const agent = this.getAgent(agentId);
+    if (!agent || agent.lifecycle !== 'READY') return false;
+    if (this.agentOccupancy(agentId, taskId) >= Math.max(1, agent.concurrencyLimit)) return false;
+
+    // Watchdog time is measured per running segment; the paused interval does
+    // not count toward maxRunMinutes.
+    const changed = this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'PAUSED'").run(Date.now(), taskId).changes;
+    if (changed === 0) return false;
+    const resumed = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+    if (!resumed) return false;
+    this.dispatchTask(this.mapTask(resumed), agent);
+    return true;
   }
 
   /** FIFO 调度：任务到达终态后，启动该员工最早的 QUEUED 任务（6.2 基础调度；资源保护时暂停） */
@@ -981,7 +1033,7 @@ export class Orchestrator {
     if (!agent || agent.lifecycle !== 'READY') return;
     if (this.dispatchGuard() !== null) return;
     if (agent.kind === 'android_operator' && !this.mobileDispatchPolicy?.canDispatch(agentId).ready) return;
-    const active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
+    const active = this.agentOccupancy(agentId);
     if (active >= Math.max(1, agent.concurrencyLimit)) return;
     const row = this.db.raw.prepare("SELECT * FROM tasks WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at LIMIT 1").get(agentId) as Row | undefined;
     if (!row) return;
@@ -1004,6 +1056,7 @@ export class Orchestrator {
   }
 
   private cancelTaskInternal(taskId: string, now: number) {
+    this.resumeAfterRelease.delete(taskId);
     this.closeOutputState(taskId);
     this.db.raw.prepare("UPDATE tasks SET status = 'CANCELLED', ended_at = ? WHERE id = ? AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").run(now, taskId);
     this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'CANCELLED' WHERE task_id = ? AND ended_at IS NULL").run(now, taskId);
@@ -1023,19 +1076,20 @@ export class Orchestrator {
   }
 
   pauseTask(taskId: string) {
-    this.executors.abort(taskId);
-    this.db.raw.prepare("UPDATE tasks SET status = 'PAUSED' WHERE id = ? AND status = 'RUNNING'").run(taskId);
+    const changed = this.db.raw.prepare("UPDATE tasks SET status = 'PAUSED' WHERE id = ? AND status = 'RUNNING'").run(taskId).changes;
+    if (changed > 0) this.executors.abort(taskId);
     this.emit();
   }
 
   resumeTask(taskId: string) {
-    // 重置 started_at：看门狗按“本段运行时长”计时，暂停等待期不计入（否则恢复即被误杀）
-    const changed = this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'PAUSED'").run(Date.now(), taskId).changes;
-    if (changed > 0) {
-      const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
-      const agent = row ? this.getAgent(row.agent_id as string) : null;
-      if (row && agent) this.dispatchTask(this.mapTask(row), agent);
+    const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+    if (!row || row.status !== 'PAUSED') return;
+    if (this.executors.isExecuting(taskId)) {
+      this.resumeAfterRelease.add(taskId);
+      this.emit();
+      return;
     }
+    this.resumePausedTask(taskId);
     this.emit();
   }
 

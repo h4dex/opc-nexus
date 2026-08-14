@@ -113,7 +113,7 @@ ExecutorRegistry
 
 - 密钥绝不进入 Renderer 进程或 localStorage
 - 存储路径: `safeStorage.encryptString()` → base64 → SQLite settings 表（key 前缀 `secret:`）
-- Renderer 仅可调用 `storeSecret(ref, secret)` 和 `hasSecret(ref)`
+- Renderer 仅可调用各业务域的专用凭据方法；不暴露可选择任意命名空间的通用密钥接口
 - 每次密钥操作写入 AuditLog
 
 ### 5.4 工作目录安全

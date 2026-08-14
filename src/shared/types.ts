@@ -887,6 +887,29 @@ export interface ProviderTestResult {
   error: string | null;
 }
 
+/** Renderer-visible preferences. Internal settings and secret:* entries are excluded. */
+export interface RendererSettingMap {
+  theme: 'dark' | 'light';
+  thresholds: { cpu: number; mem: number; gpuTemp: number };
+  notifications: boolean;
+  demoAutoTasks: boolean;
+}
+
+export type RendererSettingKey = keyof RendererSettingMap;
+
+export interface ApiBridgeStatus {
+  running: boolean;
+  port: number;
+  keyConfigured: boolean;
+  enabled: boolean;
+}
+
+export interface WebAdminStatus {
+  port: number;
+  tokenConfigured: boolean;
+  weakToken: boolean;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
