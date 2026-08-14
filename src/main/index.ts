@@ -13,6 +13,7 @@ import { ChannelManager } from './services/channelManager.js';
 import { FeishuChannel } from './services/channels/feishuChannel.js';
 import { WecomChannel } from './services/channels/wecomChannel.js';
 import { WeixinChannel } from './services/channels/wechatChannel.js';
+import { ILINK_QUIT_CLEANUP_BUDGET_MS } from './services/channels/ilinkClient.js';
 import { ResourceMonitor } from './services/resourceMonitor.js';
 import { Scheduler } from './services/scheduler.js';
 import { notify } from './services/notifier.js';
@@ -67,6 +68,9 @@ let browserRef: import('./services/browserManager.js').BrowserManager | null = n
 let mobileRef: MobileGatewayService | null = null;
 let webServerRef: WebServer | null = null;
 let monitorRef: ResourceMonitor | null = null;
+let weixinRef: WeixinChannel | null = null;
+let feishuRef: FeishuChannel | null = null;
+let ocrRef: import('./services/ocrService.js').OcrService | null = null;
 /** 语音服务引用：退出时需关闭活跃会话，避免麦克风与云端连接残留 */
 let voiceRef: import('./services/voiceService.js').VoiceService | null = null;
 
@@ -233,8 +237,10 @@ app.whenReady().then(async () => {
   });
   const collabManager = new CollabManager(db);
   const feishu = new FeishuChannel(db, orchestrator);
-    const wecom = new WecomChannel(db, orchestrator, broker);
-    const weixin = new WeixinChannel(db, orchestrator, broker);
+  feishuRef = feishu;
+  const wecom = new WecomChannel(db, orchestrator, broker);
+  const weixin = new WeixinChannel(db, orchestrator, broker);
+  weixinRef = weixin;
 
   // 工具循环的委派能力（P3b）与调度保护门禁（11.2）注入
   executors.setToolHost(orchestrator.toolHost());
@@ -247,6 +253,7 @@ app.whenReady().then(async () => {
   // OCR 服务（PaddleOCR WASM）注入
   const { OcrService } = await import('./services/ocrService.js');
   const ocrService = new OcrService(db);
+  ocrRef = ocrService;
   executors.setOcrService(ocrService);
   // 语音任务下达服务（云端 NLS / 本地模型双路；凭据留在主进程）
   const { VoiceService } = await import('./services/voiceService.js');
@@ -301,7 +308,7 @@ app.whenReady().then(async () => {
       console.error('[MobileGateway] 自动启动失败:', error);
     });
   }
-  // 真实渠道凭据已配置且非停用 → 启动时自动重连（飞书 / 企微长连接 / 个微桥接）
+  // 真实渠道凭据已配置且非停用 → 启动时自动重连（飞书 / 企微长连接 / 微信 iLink 长轮询）
   {
     const reconnectable = ['ONLINE', 'CONNECTING', 'RECONNECTING'];
     const statusOf = (id: string) =>
@@ -341,12 +348,38 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on('before-quit', () => {
+let quitCleanupStarted = false;
+
+function waitForQuitCleanup(cleanup: Promise<void>): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, ILINK_QUIT_CLEANUP_BUDGET_MS);
+    void cleanup.then(finish, finish);
+  });
+}
+
+app.on('before-quit', (event) => {
   isQuitting = true;
+  if (!quitCleanupStarted) {
+    event.preventDefault();
+    quitCleanupStarted = true;
+    void waitForQuitCleanup(weixinRef?.dispose() ?? Promise.resolve()).finally(() => {
+      try { dbRef?.flush(); } catch { /* 退出前尽力落盘 */ }
+      app.quit();
+    });
+  }
   try {
     mcpRef?.dispose();
     browserRef?.dispose();
     mobileRef?.dispose();
+    feishuRef?.dispose();
+    ocrRef?.dispose();
     webServerRef?.stop();
     monitorRef?.stop();
   } catch {
@@ -358,7 +391,7 @@ app.on('before-quit', () => {
     /* 关闭失败不阻塞退出 */
   }
   try {
-    dbRef?.flush();
+    if (quitCleanupStarted && !event.defaultPrevented) dbRef?.flush();
   } catch {
     /* 退出前尽力落盘 */
   }

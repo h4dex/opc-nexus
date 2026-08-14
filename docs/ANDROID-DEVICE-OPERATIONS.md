@@ -1,6 +1,6 @@
 # Android 设备操作功能文档
 
-> 本文档描述 OPC-Nexus `1.7.0` / Android Bridge `0.4.3` 当前已经实现的 Android 设备接入、控制、脚本、媒体采集和安全边界。文中的桌面截图来自「手机控制台」实际运行页面；空设备截图用于展示未连接状态，Android Launcher 图标已在 API 34 模拟器验证。
+> 本文档描述 OPC-Nexus `1.7.1` / Android Bridge `0.4.3` 当前已经实现的 Android 设备接入、控制、脚本、媒体采集和安全边界。文中的桌面截图来自「手机控制台」实际运行页面；空设备截图用于展示未连接状态，Android Launcher 图标已在 API 34 模拟器验证。
 
 ## 1. 功能范围
 
@@ -24,7 +24,7 @@ OPC-Nexus 通过 Android Bridge App 把 Android 设备接入桌面端 Mobile Gat
 
 | 组件 | 版本 |
 |---|---|
-| OPC-Nexus 桌面端 | `1.7.0` |
+| OPC-Nexus 桌面端 | `1.7.1` |
 | Android Bridge | `0.4.3`（`versionCode 5`） |
 | Android 包名 | `com.senke.opcnexus.bridge` |
 

@@ -324,6 +324,17 @@ select option:hover, select option:checked {
 }
 
 .dash-grid .span2 { grid-column: span 2; }
+.app-memory-layout { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(320px, 1.2fr); gap: 24px; align-items: center; }
+.app-memory-processes { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 18px; font-size: 12.5px; min-width: 0; }
+
+@media (max-width: 1000px) {
+  .app-memory-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 760px) {
+  .dash-grid { grid-template-columns: minmax(0, 1fr); }
+  .dash-grid .span2 { grid-column: span 1; }
+}
 
 /* ---------- 统计圆环 & 数字 ---------- */
 

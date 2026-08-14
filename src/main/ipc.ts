@@ -47,6 +47,7 @@ import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { decodeOptionalUtf8Text, decodeUtf8Text } from './services/textEncoding.js';
+import { summarizeAppMemory } from './services/appMemory.js';
 
 /** 轻量级运行时参数校验（防御异常/恶意输入穿透） */
 function assertString(v: unknown, field: string, min = 1, max = 500): string {
@@ -54,6 +55,16 @@ function assertString(v: unknown, field: string, min = 1, max = 500): string {
 }
 function assertId(v: unknown, field = 'id'): string {
   return assertString(v, field, 1, 100);
+}
+
+export const MAX_VOICE_AUDIO_CHUNK_BYTES = 64 * 1024;
+
+export function assertVoiceAudioChunk(value: unknown): ArrayBuffer {
+  if (!(value instanceof ArrayBuffer)) throw new Error('语音音频片段必须为 ArrayBuffer');
+  if (value.byteLength === 0 || value.byteLength > MAX_VOICE_AUDIO_CHUNK_BYTES || value.byteLength % 2 !== 0) {
+    throw new Error(`语音音频片段必须是 1-${MAX_VOICE_AUDIO_CHUNK_BYTES} 字节的 16-bit PCM`);
+  }
+  return value;
 }
 
 function assertPort(v: unknown): number {
@@ -162,6 +173,7 @@ export function registerIpc(deps: IpcDeps) {
   // 编排器状态变化 → 推送全量快照（本地事件到 UI ≤ 2 秒）；审批挂起即时可见
   orchestrator.onChange(pushSnapshot);
   broker.onChange(pushSnapshot);
+  weixin.onStateChange(pushSnapshot);
   // 任务输出流式推送（逐字显示，无需轮询）
   orchestrator.onOutput((taskId, chunk) => {
     broadcast('aibox:taskOutput', { taskId, chunk });
@@ -175,9 +187,9 @@ export function registerIpc(deps: IpcDeps) {
   });
   mobile.onEvent((event) => broadcast('aibox:mobileEvent', event));
   // 资源样本 → 实时推送
-  monitor.onSample(() => {
+  monitor.onSample((sample) => {
     broadcast('aibox:resources', {
-      history: monitor.getHistory(),
+      sample,
       health: monitor.getHealth()
     });
   });
@@ -193,6 +205,7 @@ export function registerIpc(deps: IpcDeps) {
     uptimeSec: Math.floor(process.uptime()),
     appVersion: app.getVersion()
   }));
+  ipcMain.handle('aibox:getAppMemory', () => summarizeAppMemory(app.getAppMetrics(), process.memoryUsage()));
   ipcMain.handle('aibox:globalSearch', (_e, query: string) => discovery.search(assertString(query ?? '', 'query', 0, 100)));
   ipcMain.handle('aibox:getActionCenter', () => discovery.actions());
   ipcMain.handle('aibox:dismissAction', (_e, actionKey: string, fingerprint: string) => {
@@ -854,30 +867,43 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return r;
   });
-  // 个人微信真实接入：本地 Bot 桥接接口（回环 WebSocket，令牌走 safeStorage）
-  ipcMain.handle('aibox:configureWeixin', async (_e, bridgeUrl: string, token: string) => {
-    weixin.saveCredentials(bridgeUrl, token);
-    const r = await weixin.connect();
+  // 微信 iLink Bot：二维码、配对码和状态可见；Bot Token 永不返回 Renderer
+  ipcMain.handle('aibox:startWeixinLogin', async (_e, agentId?: string) => {
+    const selectedAgentId = agentId ? assertId(agentId, 'agentId') : null;
+    const r = await weixin.startLogin(() => {
+      db.raw.prepare('DELETE FROM channel_routes WHERE channel_id = ?').run('ch-weixin');
+      if (selectedAgentId) channels.bindAgent('ch-weixin', selectedAgentId);
+    });
     pushSnapshot();
     return r;
   });
+  ipcMain.handle('aibox:getWeixinLoginState', () => weixin.getLoginState());
+  ipcMain.handle('aibox:submitWeixinVerifyCode', (_e, code: string) =>
+    weixin.submitVerifyCode(assertString(code, 'verifyCode', 1, 12)));
+  ipcMain.handle('aibox:cancelWeixinLogin', () => weixin.cancelLogin());
   ipcMain.handle('aibox:setupChannel', (_e, id: string, accountName: string) => {
-    channels.setup(id, accountName);
+    channels.setup(assertId(id, 'channelId'), assertString(accountName, 'accountName', 1, 100));
     setTimeout(pushSnapshot, 1500);
   });
-  ipcMain.handle('aibox:disconnectChannel', (_e, id: string) => {
-    if (id === 'ch-feishu') feishu.disconnect();
-    if (id === 'ch-wecom') wecom.disconnect();
-    if (id === 'ch-weixin') weixin.disconnect();
-    channels.disconnect(id);
+  ipcMain.handle('aibox:disconnectChannel', async (_e, id: string) => {
+    id = assertId(id, 'channelId');
+    if (id === 'ch-weixin') {
+      // Revoke local routing synchronously; the remote notifystop call is best-effort and may take seconds.
+      channels.disconnect(id);
+      await weixin.disconnect();
+    } else {
+      if (id === 'ch-feishu') feishu.disconnect();
+      if (id === 'ch-wecom') wecom.disconnect();
+      channels.disconnect(id);
+    }
     pushSnapshot();
   });
   ipcMain.handle('aibox:bindChannel', (_e, channelId: string, agentId: string) => {
-    channels.bindAgent(channelId, agentId);
+    channels.bindAgent(assertId(channelId, 'channelId'), assertId(agentId, 'agentId'));
     pushSnapshot();
   });
   ipcMain.handle('aibox:unbindChannel', (_e, channelId: string, agentId: string) => {
-    channels.unbindAgent(channelId, agentId);
+    channels.unbindAgent(assertId(channelId, 'channelId'), assertId(agentId, 'agentId'));
     pushSnapshot();
   });
 
@@ -911,7 +937,7 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:testVoice', () => voice.test());
   ipcMain.handle('aibox:startVoiceSession', () => voice.start());
   ipcMain.handle('aibox:pushVoiceAudio', (_e, sessionId: string, chunk: ArrayBuffer) => {
-    voice.pushAudio(assertId(sessionId, 'sessionId'), Buffer.from(chunk));
+    voice.pushAudio(assertId(sessionId, 'sessionId'), Buffer.from(assertVoiceAudioChunk(chunk)));
   });
   ipcMain.handle('aibox:stopVoiceSession', (_e, sessionId: string) => {
     voice.stop(assertId(sessionId, 'sessionId'));
@@ -990,7 +1016,8 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:restartApp', () => {
     db.flush();
     app.relaunch();
-    app.exit(0);
+    // app.quit() 会经过 before-quit，等待微信长轮询 worker 停止并再次落盘。
+    app.quit();
   });
 
   // ---------- 凭据（15.1：密钥不进入 Renderer/localStorage，仅存系统密钥库） ----------

@@ -908,6 +908,24 @@ export interface Channel {
   limitation: string;       // 已知限制/风险（10.2，例如微信普通群不可用）
 }
 
+/** 微信 iLink Bot 扫码授权状态。二维码只在内存中短期存在，不含任何 Bot Token。 */
+export type WeixinLoginPhase =
+  | 'IDLE'
+  | 'WAITING_SCAN'
+  | 'SCANNED'
+  | 'VERIFY_REQUIRED'
+  | 'VERIFYING'
+  | 'CONNECTED'
+  | 'EXPIRED'
+  | 'ERROR';
+
+export interface WeixinLoginState {
+  phase: WeixinLoginPhase;
+  qrDataUrl: string | null;
+  message: string;
+  updatedAt: number;
+}
+
 export interface Approval {
   id: string;
   taskId: string;
@@ -1019,6 +1037,27 @@ export interface ServiceHealth {
   runtime: 'healthy' | 'degraded' | 'offline';
   gateway: 'healthy' | 'degraded' | 'offline';
   database: 'healthy' | 'degraded' | 'offline';
+}
+
+/** Electron 子进程的内存快照。数值统一为 bytes，避免 Renderer 依赖 Electron 类型。 */
+export interface AppProcessMemory {
+  pid: number;
+  type: string;
+  name: string | null;
+  memoryBytes: number;
+  workingSetBytes: number;
+  peakWorkingSetBytes: number;
+}
+
+/** 当前应用自身的内存，而非整机内存。 */
+export interface AppMemorySnapshot {
+  timestamp: number;
+  basis: 'private' | 'working-set';
+  totalBytes: number;
+  mainHeapUsedBytes: number;
+  mainHeapTotalBytes: number;
+  mainExternalBytes: number;
+  processes: AppProcessMemory[];
 }
 
 // ---------- 6.2 首页统计 ----------

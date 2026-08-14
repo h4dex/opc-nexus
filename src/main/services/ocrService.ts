@@ -7,7 +7,7 @@
  */
 import { app } from 'electron';
 import { join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import type { Database } from './database.js';
 
 // ---------- 类型 ----------
@@ -43,6 +43,9 @@ const DET_MODEL_FILE = 'ch_PP-OCRv4_det.onnx';
 const REC_MODEL_FILE = 'ch_PP-OCRv4_rec.onnx';
 const DICT_FILE = 'ppocr_keys_v1.txt';
 
+/** OCR is normally used in bursts; release native model memory after an idle period. */
+export const OCR_SESSION_IDLE_MS = 5 * 60_000;
+
 /** 模型下载地址（npmmirror CDN / GitHub 回退） */
 const MODEL_SOURCES = [
   'https://registry.npmmirror.com/@aspect-build/paddleocr-models/1.0.0/files',
@@ -55,7 +58,11 @@ export class OcrService {
   private detSession: import('onnxruntime-node').InferenceSession | null = null;
   private recSession: import('onnxruntime-node').InferenceSession | null = null;
   private dict: string[] = [];
-  private initializing = false;
+  private initialization: Promise<void> | null = null;
+  private releaseInProgress: Promise<void> | null = null;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeRecognitions = 0;
+  private releaseRequested = false;
 
   constructor(private db: Database) {}
 
@@ -86,8 +93,10 @@ export class OcrService {
     const dir = this.modelDir();
     let modelSize = '—';
     if (this.modelsExist()) {
-      const detSize = readFileSync(join(dir, DET_MODEL_FILE)).length;
-      const recSize = readFileSync(join(dir, REC_MODEL_FILE)).length;
+      // Status polling only needs metadata. Reading both model files would
+      // transiently allocate buffers as large as the ONNX models themselves.
+      const detSize = statSync(join(dir, DET_MODEL_FILE)).size;
+      const recSize = statSync(join(dir, REC_MODEL_FILE)).size;
       modelSize = `${((detSize + recSize) / 1024 / 1024).toFixed(1)} MB`;
     }
     return {
@@ -133,50 +142,80 @@ export class OcrService {
 
   /** 初始化 ONNX Runtime 会话（懒加载） */
   async ensureReady(): Promise<void> {
-    if (this.detSession && this.recSession) return;
-    if (this.initializing) {
-      // 等待另一个初始化完成
-      await new Promise((r) => setTimeout(r, 500));
+    this.clearIdleTimer();
+    if (!this.isEnabled()) throw new Error('OCR 服务未启用，请在设置中开启');
+    if (this.detSession && this.recSession) {
+      if (this.activeRecognitions === 0) this.scheduleIdleRelease();
+      return;
+    }
+    if (this.releaseInProgress) {
+      await this.releaseInProgress;
       return this.ensureReady();
     }
-    if (!this.isEnabled()) throw new Error('OCR 服务未启用，请在设置中开启');
-    if (!this.modelsExist()) {
-      const r = await this.downloadModels();
-      if (!r.ok) throw new Error(r.message);
+    if (this.initialization) {
+      await this.initialization;
+      if (!this.isEnabled()) throw new Error('OCR 服务未启用，请在设置中开启');
+      if (!this.detSession || !this.recSession) return this.ensureReady();
+      if (this.activeRecognitions === 0) this.scheduleIdleRelease();
+      return;
+    }
+    this.initialization = this.initializeSessions();
+    try {
+      await this.initialization;
+    } finally {
+      this.initialization = null;
+      if (this.releaseRequested) this.tryReleaseSessions();
     }
 
-    this.initializing = true;
+    if (!this.isEnabled()) {
+      this.requestSessionRelease();
+      throw new Error('OCR 服务未启用，请在设置中开启');
+    }
+    if (this.activeRecognitions === 0) this.scheduleIdleRelease();
+  }
+
+  private async initializeSessions(): Promise<void> {
+    if (!this.modelsExist()) {
+      const result = await this.downloadModels();
+      if (!result.ok) throw new Error(result.message);
+    }
+
+    const ort = await import('onnxruntime-node');
+    const dir = this.modelDir();
+    const sessOpts: import('onnxruntime-node').InferenceSession.SessionOptions = {
+      executionProviders: ['cpu'],
+      graphOptimizationLevel: 'all',
+      interOpNumThreads: 1,
+      intraOpNumThreads: 2
+    };
+    let detSession: import('onnxruntime-node').InferenceSession | null = null;
+    let recSession: import('onnxruntime-node').InferenceSession | null = null;
+
     try {
-      const ort = await import('onnxruntime-node');
-      const dir = this.modelDir();
-      const sessOpts: import('onnxruntime-node').InferenceSession.SessionOptions = {
-        executionProviders: ['cpu'],
-        graphOptimizationLevel: 'all',
-        interOpNumThreads: 1,
-        intraOpNumThreads: 2
-      };
+      detSession = await ort.InferenceSession.create(join(dir, DET_MODEL_FILE), sessOpts);
+      recSession = await ort.InferenceSession.create(join(dir, REC_MODEL_FILE), sessOpts);
 
-      this.detSession = await ort.InferenceSession.create(join(dir, DET_MODEL_FILE), sessOpts);
-      this.recSession = await ort.InferenceSession.create(join(dir, REC_MODEL_FILE), sessOpts);
-
-      // 加载字典
-      const dictPath = join(dir, DICT_FILE);
-      const dictContent = readFileSync(dictPath, 'utf8');
-      this.dict = dictContent.split('\n').map((l) => l.trim()).filter(Boolean);
-      // PP-OCR 字典：index 0 对应空格（blank），最后加一个空格字符
-      this.dict = [' ', ...this.dict, ' '];
-    } finally {
-      this.initializing = false;
+      const dictContent = readFileSync(join(dir, DICT_FILE), 'utf8');
+      const dict = dictContent.split('\n').map((l) => l.trim()).filter(Boolean);
+      this.detSession = detSession;
+      this.recSession = recSession;
+      this.dict = [' ', ...dict, ' '];
+    } catch (error) {
+      await this.releaseSessions([detSession, recSession]);
+      throw error;
     }
   }
 
   /** 识别图片中的文字 */
   async recognize(imagePath: string): Promise<OcrResult> {
     const start = Date.now();
+    if (!existsSync(imagePath)) {
+      return { ok: false, text: '', boxes: [], elapsed: 0, error: `文件不存在：${imagePath}` };
+    }
+
+    this.clearIdleTimer();
+    this.activeRecognitions++;
     try {
-      if (!existsSync(imagePath)) {
-        return { ok: false, text: '', boxes: [], elapsed: 0, error: `文件不存在：${imagePath}` };
-      }
       await this.ensureReady();
 
       const sharp = (await import('sharp')).default;
@@ -216,6 +255,12 @@ export class OcrService {
         ok: false, text: '', boxes: [], elapsed: Date.now() - start,
         error: err instanceof Error ? err.message : String(err)
       };
+    } finally {
+      this.activeRecognitions--;
+      if (this.activeRecognitions === 0) {
+        if (this.releaseRequested || !this.isEnabled()) this.requestSessionRelease();
+        else this.scheduleIdleRelease();
+      }
     }
   }
 
@@ -471,8 +516,53 @@ export class OcrService {
 
   /** 释放模型资源 */
   dispose(): void {
-    if (this.detSession) { void this.detSession.release(); this.detSession = null; }
-    if (this.recSession) { void this.recSession.release(); this.recSession = null; }
+    this.requestSessionRelease();
+  }
+
+  private clearIdleTimer(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  private scheduleIdleRelease(): void {
+    this.clearIdleTimer();
+    if (this.activeRecognitions > 0 || this.releaseRequested || !this.detSession || !this.recSession) return;
+
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      this.requestSessionRelease();
+    }, OCR_SESSION_IDLE_MS);
+    this.idleTimer.unref?.();
+  }
+
+  private requestSessionRelease(): void {
+    this.clearIdleTimer();
+    this.releaseRequested = true;
+    this.tryReleaseSessions();
+  }
+
+  private tryReleaseSessions(): void {
+    if (this.activeRecognitions > 0 || this.initialization || this.releaseInProgress) return;
+
+    const sessions = [this.detSession, this.recSession];
+    this.detSession = null;
+    this.recSession = null;
     this.dict = [];
+    this.releaseRequested = false;
+
+    if (sessions.every((session) => session === null)) return;
+    this.releaseInProgress = this.releaseSessions(sessions).finally(() => {
+      this.releaseInProgress = null;
+      if (this.releaseRequested) this.tryReleaseSessions();
+    });
+  }
+
+  private async releaseSessions(
+    sessions: Array<import('onnxruntime-node').InferenceSession | null>
+  ): Promise<void> {
+    await Promise.allSettled(
+      sessions.filter((session) => session !== null).map(async (session) => session.release())
+    );
   }
 }

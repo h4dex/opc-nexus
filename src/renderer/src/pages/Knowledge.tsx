@@ -1,9 +1,10 @@
 /** 项目知识库：成果沉淀、全文检索、不可变版本与执行复用记录。 */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Modal } from '../components/common';
 import { MarkdownView } from '../components/MarkdownView';
 import { toast } from '../components/Toast';
 import { useApp } from '../store';
+import { TrailingRefreshController } from '../utils/trailingRefresh';
 import {
   IconArchive, IconBook, IconCheck, IconFile, IconHistory, IconPin, IconPlus, IconRefresh,
   IconSearch, IconTag
@@ -20,6 +21,7 @@ const CATEGORY_META: Record<KnowledgeCategory, string> = {
 const SOURCE_META: Record<KnowledgeSourceType, string> = { manual: '手动记录', deliverable: '验收成果' };
 
 type DetailTab = 'content' | 'versions' | 'trace';
+type KnowledgeLists = { filtered: KnowledgeSummary[]; complete: KnowledgeSummary[] };
 
 export function Knowledge() {
   const { snapshot, navigate, navigationTarget, clearNavigationTarget } = useApp();
@@ -35,8 +37,12 @@ export function Knowledge() {
   const [detail, setDetail] = useState<KnowledgeDetail | null>(null);
   const [editing, setEditing] = useState<KnowledgeDetail | null>(null);
   const [versioning, setVersioning] = useState<KnowledgeDetail | null>(null);
+  const refreshRef = useRef<TrailingRefreshController<KnowledgeLists> | null>(null);
+  if (!refreshRef.current) refreshRef.current = new TrailingRefreshController();
+  const refresh = refreshRef.current;
+  const firstLoadRef = useRef(true);
 
-  const load = useCallback(async () => {
+  const load = useCallback((immediate = false) => {
     const query: KnowledgeQuery = {
       projectId: projectId === 'all' ? undefined : projectId,
       category: category === 'all' ? undefined : category,
@@ -44,23 +50,36 @@ export function Knowledge() {
       status,
       search: search.trim() || undefined
     };
-    try {
-      const [filtered, complete] = await Promise.all([
+    const queryKey = [projectId, category, sourceType, status, search.trim()].join('\0');
+    return refresh.request({
+      run: async () => {
+        const [filtered, complete] = await Promise.all([
         window.aibox.listKnowledge(query),
         window.aibox.listKnowledge({ status: 'all' })
-      ]);
-      setItems(filtered);
-      setAllItems(complete);
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : '知识库加载失败');
-    } finally {
-      setLoading(false);
-    }
-  }, [category, projectId, search, sourceType, status]);
+        ]);
+        return { filtered, complete };
+      },
+      accept: ({ filtered, complete }) => {
+        setItems(filtered);
+        setAllItems(complete);
+        setLoading(false);
+      },
+      reject: (error) => {
+        toast.err(error instanceof Error ? error.message : '知识库加载失败');
+        setLoading(false);
+      }
+    }, { immediate, key: queryKey });
+  }, [category, projectId, refresh, search, sourceType, status]);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => void load(), 180);
-    return () => window.clearTimeout(timer);
+    return () => {
+      firstLoadRef.current = true;
+      refresh.cancel();
+    };
+  }, [refresh]);
+  useEffect(() => {
+    void load(firstLoadRef.current);
+    firstLoadRef.current = false;
   }, [load, snapshot?.version]);
 
   const projects = snapshot?.projects ?? [];
@@ -88,14 +107,14 @@ export function Knowledge() {
     return () => { active = false; };
   }, [clearNavigationTarget, navigationTarget]);
   const refreshDetail = async (id: string) => {
-    await load();
+    await load(true);
     setDetail(await window.aibox.getKnowledge(id));
   };
   const patch = async (item: KnowledgeSummary, value: KnowledgePatch, message: string) => {
     try {
       await window.aibox.updateKnowledge(item.id, value);
       toast.ok(message);
-      await load();
+      await load(true);
       if (detail?.id === item.id) setDetail(await window.aibox.getKnowledge(item.id));
     } catch (error) { toast.err(error instanceof Error ? error.message : '知识更新失败'); }
   };
@@ -148,7 +167,7 @@ export function Knowledge() {
       </article>)}
     </div>}
 
-    {creating && <KnowledgeEditor projects={activeProjects} onClose={() => setCreating(false)} onSaved={async (id) => { setCreating(false); await load(); await openDetail(id); }} />}
+    {creating && <KnowledgeEditor projects={activeProjects} onClose={() => setCreating(false)} onSaved={async (id) => { setCreating(false); await load(true); await openDetail(id); }} />}
     {detail && <KnowledgeDetailModal detail={detail} onClose={() => setDetail(null)} onEdit={() => setEditing(detail)} onVersion={() => setVersioning(detail)} onOpenSource={() => {
       const sourceId = detail.sourceId;
       setDetail(null);

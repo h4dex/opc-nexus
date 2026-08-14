@@ -14,8 +14,6 @@ import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { basename, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import QRCode from 'qrcode';
-import selfsigned from 'selfsigned';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { RawData } from 'ws';
 import type {
@@ -360,6 +358,7 @@ export class MobileGatewayService {
       }
     }
 
+    const selfsigned = (await import('selfsigned')).default;
     const generated = await selfsigned.generate(
       [{ name: 'commonName', value: 'OPC-Nexus Mobile Gateway' }],
       {
@@ -496,6 +495,7 @@ export class MobileGatewayService {
       spki: this.certificateFingerprint,
       expiresAt
     });
+    const QRCode = (await import('qrcode')).default;
     const png = await QRCode.toBuffer(payload, {
       type: 'png',
       scale: PAIRING_QR_SCALE,

@@ -1,5 +1,5 @@
 /**
- * Schema 迁移链路测试（v26 - v31）
+ * Schema 迁移链路测试（v26 - v32）
  *
  * 用真实 sql.js（非 mock）验证迁移，因为迁移本身就是 SQL 行为：
  * ALTER TABLE 是否冲突、回填 UPDATE 是否命中、事务是否完整提交，
@@ -96,7 +96,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_agent_lease ON mobile_contro
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_task_lease ON mobile_control_sessions(task_id) WHERE status = 'active';
 `;
 
-/** 本次迁移的核心 SQL（与 database.ts migrate() 中 v26-v31 分支保持一致） */
+/** 本次迁移的核心 SQL（与 database.ts migrate() 中 v26-v32 分支保持一致） */
 function runMigrations(db: InstanceType<typeof SQL.Database>) {
   const addCol = (table: string, col: string, type: string) => {
     const cols = db.exec(`PRAGMA table_info(${table})`);
@@ -133,7 +133,11 @@ function runMigrations(db: InstanceType<typeof SQL.Database>) {
     addCol('agents', 'agent_kind', "TEXT NOT NULL DEFAULT 'general'");
     db.exec("UPDATE agents SET agent_kind = 'general' WHERE agent_kind IS NULL OR agent_kind = ''");
     addCol('mobile_devices', 'certificate_fingerprint', "TEXT NOT NULL DEFAULT ''");
-    db.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '31')");
+    // v32：外部来源任务幂等键
+    addCol('tasks', 'source_key', 'TEXT');
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_key
+      ON tasks(source, source_key) WHERE source_key IS NOT NULL`);
+    db.exec("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '32')");
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
@@ -180,11 +184,11 @@ const one = (db, sql: string) => db.exec(sql)[0]?.values[0]?.[0];
 const col = (db, table: string, name: string) =>
   db.exec(`PRAGMA table_info(${table})`)[0].values.some((r) => r[1] === name);
 
-describe('schema 迁移 v25 → v31（真实 sql.js）', () => {
-  it('迁移整体可执行且版本号推进到 31', () => {
+describe('schema 迁移 v25 → v32（真实 sql.js）', () => {
+  it('迁移整体可执行且版本号推进到 32', () => {
     const db = makeV25Db();
     expect(() => runMigrations(db)).not.toThrow();
-    expect(one(db, "SELECT value FROM schema_meta WHERE key = 'schema_version'")).toBe('31');
+    expect(one(db, "SELECT value FROM schema_meta WHERE key = 'schema_version'")).toBe('32');
   });
 
   it('v26：绑定已下线引擎的员工改绑 Nexus，不留悬空 engine_id', () => {
@@ -264,6 +268,16 @@ describe('schema 迁移 v25 → v31（真实 sql.js）', () => {
     `);
     expect(() => db.exec("INSERT INTO mobile_agent_configs(agent_id, device_id, hermes_profile, created_at, updated_at) VALUES('agent-demo','phone-1','profile-2',1,1)")).toThrow(/UNIQUE/);
     expect(() => db.exec("INSERT INTO mobile_agent_configs(agent_id, device_id, hermes_profile, created_at, updated_at) VALUES('agent-real','phone-2','profile-3',1,1)")).toThrow(/UNIQUE/);
+  });
+
+  it('v32：仅对非空的 source + source_key 组合强制唯一', () => {
+    const db = makeV25Db();
+    runMigrations(db);
+    expect(col(db, 'tasks', 'source_key')).toBe(true);
+    db.exec("INSERT INTO tasks(id, agent_id, title, source, source_key, created_at) VALUES('idem-1','agent-real','a','channel','weixin:1',2)");
+    expect(() => db.exec("INSERT INTO tasks(id, agent_id, title, source, source_key, created_at) VALUES('idem-2','agent-real','b','channel','weixin:1',3)")).toThrow(/UNIQUE/);
+    expect(() => db.exec("INSERT INTO tasks(id, agent_id, title, source, source_key, created_at) VALUES('idem-3','agent-real','c','desktop','weixin:1',4)")).not.toThrow();
+    expect(() => db.exec("INSERT INTO tasks(id, agent_id, title, source, source_key, created_at) VALUES('idem-4','agent-real','d','channel',NULL,5),('idem-5','agent-real','e','channel',NULL,6)")).not.toThrow();
   });
 
   it('v31：设备、员工和任务活动租约唯一，结束后可创建下一条历史会话', () => {

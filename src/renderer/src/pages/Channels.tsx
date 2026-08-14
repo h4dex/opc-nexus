@@ -1,9 +1,10 @@
 /** 连接中心（PRD 10.x）：四渠道配置、状态监控、路由绑定 */
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconMessage, IconPlug } from '../components/icons';
-import type { Channel } from '@shared/types';
+import type { Channel, WeixinLoginState } from '@shared/types';
+import { createWeixinLoginPollingController, type WeixinLoginPollingController } from '../utils/weixinLoginPolling';
 
 const STATUS_META: Record<Channel['status'], { label: string; tag: string }> = {
   UNCONFIGURED: { label: '未配置', tag: 'gray' },
@@ -16,12 +17,13 @@ const STATUS_META: Record<Channel['status'], { label: string; tag: string }> = {
 };
 
 const TYPE_LABEL: Record<Channel['type'], string> = {
-  weixin: '微信', wecom: '企业微信', feishu: '飞书 / Lark', qq: 'QQ'
+  weixin: '微信 iLink Bot', wecom: '企业微信', feishu: '飞书 / Lark', qq: 'QQ'
 };
 
 export function Channels() {
   const { snapshot } = useApp();
   const [setupTarget, setSetupTarget] = useState<Channel | null>(null);
+  const closeSetup = useCallback(() => setSetupTarget(null), []);
   if (!snapshot) return null;
   const { channels, agentCards } = snapshot;
 
@@ -60,12 +62,12 @@ export function Channels() {
               {c.status === 'RECONNECTING' && (
                 <div style={{ fontSize: 12, color: 'var(--accent)', background: 'var(--accent-soft)', borderRadius: 8, padding: '8px 12px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
                   <span className="dot orange" style={{ animation: 'pulse 1s infinite' }} />
-                  断线重连中…（指数退避策略：5s → 10s → 30s → 60s，最多重试 20 次后转入 ERROR）
+                  断线重连中…
                 </div>
               )}
               {c.status === 'ERROR' && (
                 <div style={{ fontSize: 12, color: 'var(--danger)', background: 'var(--danger-soft)', borderRadius: 8, padding: '8px 12px', marginBottom: 12 }}>
-                  连接异常，重连已耗尽。请检查凭据或网络后重新配置。
+                  连接异常，请检查凭据或网络后重新配置。
                 </div>
               )}
 
@@ -81,7 +83,7 @@ export function Channels() {
                     <IconPlug size={13} />配置连接
                   </button>
                 )}
-                {c.status === 'ONLINE' && (
+                {(c.status === 'ONLINE' || c.status === 'CONNECTING' || c.status === 'RECONNECTING') && (
                   <button className="btn small danger" onClick={() => void window.aibox.disconnectChannel(c.id)}>停用</button>
                 )}
               </div>
@@ -90,7 +92,7 @@ export function Channels() {
         })}
       </div>
 
-      {setupTarget && setupTarget.type === 'feishu' && <FeishuSetupModal channel={setupTarget} onClose={() => setSetupTarget(null)} />}
+      {setupTarget && setupTarget.type === 'feishu' && <FeishuSetupModal channel={setupTarget} onClose={closeSetup} />}
       {setupTarget && setupTarget.type === 'wecom' && (
         <CredentialSetupModal
           channel={setupTarget}
@@ -99,22 +101,140 @@ export function Channels() {
           field2={{ label: 'Secret（长连接专用密钥，仅存入系统密钥库，留空表示沿用已存）', placeholder: '••••••••' }}
           hint="需在管理后台开启「API 模式 · 长连接」；无需公网回调地址，心跳与断线重连由本机自动维护。"
           onSubmit={(v1, v2) => window.aibox.configureWecom(v1, v2)}
-          onClose={() => setSetupTarget(null)}
+          onClose={closeSetup}
         />
       )}
       {setupTarget && setupTarget.type === 'weixin' && (
-        <CredentialSetupModal
+        <WeixinSetupModal
           channel={setupTarget}
-          title="配置渠道 · 个人微信（本地 Bot 桥接）"
-          field1={{ label: '桥接地址（本机 Bot 框架的 WebSocket 接口）', placeholder: 'ws://127.0.0.1:8080/ws' }}
-          field2={{ label: '鉴权令牌（可选，仅存入系统密钥库，留空表示无需/沿用已存）', placeholder: '••••••••' }}
-          hint="适配 WeChatFerry / wechaty 等本机框架；地址仅允许回环 ws:// 或加密 wss://。个人微信自动化存在账号风控风险，仅建议小范围自用。"
-          onSubmit={(v1, v2) => window.aibox.configureWeixin(v1, v2)}
-          onClose={() => setSetupTarget(null)}
+          onClose={closeSetup}
         />
       )}
-      {setupTarget && setupTarget.type === 'qq' && <ChannelSetupModal channel={setupTarget} onClose={() => setSetupTarget(null)} />}
+      {setupTarget && setupTarget.type === 'qq' && <ChannelSetupModal channel={setupTarget} onClose={closeSetup} />}
     </>
+  );
+}
+
+const EMPTY_WEIXIN_LOGIN: WeixinLoginState = {
+  phase: 'IDLE',
+  qrDataUrl: null,
+  message: '尚未开始扫码连接',
+  updatedAt: 0
+};
+
+/** 微信 iLink Bot：二维码由主进程生成，Token 永不进入 Renderer。 */
+function WeixinSetupModal({ channel, onClose }: { channel: Channel; onClose: () => void }) {
+  const { snapshot } = useApp();
+  const [login, setLogin] = useState<WeixinLoginState>(EMPTY_WEIXIN_LOGIN);
+  const [bindId, setBindId] = useState(channel.boundAgentIds[0] ?? '');
+  const [verifyCode, setVerifyCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const polling = useRef<WeixinLoginPollingController | null>(null);
+  const alive = useRef(false);
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    alive.current = true;
+    const controller = createWeixinLoginPollingController({
+      readState: () => window.aibox.getWeixinLoginState(),
+      onState: setLogin,
+      onConnected: () => {
+        alive.current = false;
+        onCloseRef.current();
+      }
+    });
+    polling.current = controller;
+    controller.start();
+    return () => {
+      alive.current = false;
+      controller.dispose();
+      if (polling.current === controller) polling.current = null;
+    };
+  }, []);
+
+  const start = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      polling.current?.accept(await window.aibox.startWeixinLogin(bindId || undefined));
+    } catch (cause) {
+      if (alive.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  };
+
+  const submitCode = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      polling.current?.accept(await window.aibox.submitWeixinVerifyCode(verifyCode));
+      if (alive.current) setVerifyCode('');
+    } catch (cause) {
+      if (alive.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  };
+
+  const close = () => {
+    alive.current = false;
+    polling.current?.dispose();
+    polling.current = null;
+    if (login.phase !== 'CONNECTED') {
+      void window.aibox.cancelWeixinLogin();
+    }
+    onClose();
+  };
+
+  const waiting = ['WAITING_SCAN', 'SCANNED', 'VERIFY_REQUIRED', 'VERIFYING'].includes(login.phase);
+
+  return (
+    <Modal title="配置渠道 · 微信 iLink Bot" onClose={close}
+      footer={<>
+        <button className="btn" onClick={close}>取消</button>
+        {!waiting && login.phase !== 'CONNECTED' && (
+          <button className="btn primary" disabled={busy} onClick={() => void start()}>
+            <IconPlug size={14} />{busy ? '生成中…' : login.phase === 'IDLE' ? '生成二维码' : '重新生成'}
+          </button>
+        )}
+      </>}>
+      <div className="field">
+        <label>绑定数字员工</label>
+        <select value={bindId} disabled={waiting || busy || login.phase === 'CONNECTED'} onChange={(event) => setBindId(event.target.value)}>
+          <option value="">暂不绑定</option>
+          {snapshot?.agentCards.map((card) => (
+            <option key={card.agent.id} value={card.agent.id}>{card.agent.name}</option>
+          ))}
+        </select>
+      </div>
+
+      {login.qrDataUrl && (
+        <div style={{ width: 280, height: 280, margin: '8px auto 14px', background: '#fff', padding: 8, borderRadius: 6 }}>
+          <img src={login.qrDataUrl} alt="微信 iLink Bot 授权二维码" style={{ display: 'block', width: '100%', height: '100%' }} />
+        </div>
+      )}
+
+      <div style={{ minHeight: 22, textAlign: 'center', color: login.phase === 'ERROR' || login.phase === 'EXPIRED' ? 'var(--danger)' : 'var(--text-2)', fontSize: 13 }}>
+        {error || login.message}
+      </div>
+
+      {login.phase === 'VERIFY_REQUIRED' && (
+        <div className="field" style={{ marginTop: 14 }}>
+          <label>手机配对码</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input inputMode="numeric" autoFocus value={verifyCode} maxLength={12}
+              onChange={(event) => setVerifyCode(event.target.value.replace(/\D/g, ''))} />
+            <button className="btn primary" disabled={busy || !verifyCode} onClick={() => void submitCode()}>确认</button>
+          </div>
+        </div>
+      )}
+    </Modal>
   );
 }
 

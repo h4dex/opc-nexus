@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
  *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 31;
+const SCHEMA_VERSION = 32;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   project_id TEXT REFERENCES projects(id),
   title TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'desktop',
+  source_key TEXT,
   parent_id TEXT,
   status TEXT NOT NULL DEFAULT 'QUEUED',
   priority INTEGER NOT NULL DEFAULT 0,
@@ -1000,6 +1001,12 @@ export class Database {
         addCol('agents', 'agent_kind', "TEXT NOT NULL DEFAULT 'general'");
         addCol('mobile_devices', 'certificate_fingerprint', "TEXT NOT NULL DEFAULT ''");
         this.inner.exec("UPDATE agents SET agent_kind = 'general' WHERE agent_kind IS NULL OR agent_kind = ''");
+      }
+      if (prev < 32) {
+        // v32：外部来源消息幂等键。NULL 不参与唯一约束，桌面等既有任务不受影响。
+        addCol('tasks', 'source_key', 'TEXT');
+        this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_key
+          ON tasks(source, source_key) WHERE source_key IS NOT NULL`);
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');

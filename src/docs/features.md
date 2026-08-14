@@ -496,7 +496,7 @@ Skills 是可复用的指令模板（Markdown），按助手绑定后注入 syst
 |------|----------|------|
 | 飞书 | 官方 SDK 长连接 | AppID + AppSecret |
 | 企业微信 | 官方长连接 API | BotID + Secret |
-| 个人微信 | 本地 Bot 桥接（WebSocket） | BridgeURL + Token |
+| 微信 iLink Bot | 腾讯 ClawBot HTTP 长轮询 | 微信扫码授权（Token 仅进 safeStorage） |
 
 ### 10.3 核心能力
 
@@ -513,7 +513,8 @@ Skills 是可复用的指令模板（Markdown），按助手绑定后注入 syst
 |---------|------|
 | `aibox:configureFeishu` | 配置飞书 |
 | `aibox:configureWecom` | 配置企微 |
-| `aibox:configureWeixin` | 配置微信 |
+| `aibox:startWeixinLogin` / `getWeixinLoginState` | 微信 iLink 扫码连接与状态查询 |
+| `aibox:submitWeixinVerifyCode` / `cancelWeixinLogin` | 微信配对码提交与扫码取消 |
 | `aibox:setupChannel` | 通用渠道设置 |
 | `aibox:disconnectChannel` | 断开渠道 |
 | `aibox:bindChannel` | 绑定员工 |
