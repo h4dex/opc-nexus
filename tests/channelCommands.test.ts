@@ -19,7 +19,7 @@ vi.mock('../src/main/services/userConfig.js', () => ({
   loadUserConfig: () => userCfg
 }));
 
-import { tryChannelCommand } from '../src/main/services/channels/common.js';
+import { dispatchChannelTask, tryChannelCommand } from '../src/main/services/channels/common.js';
 import { Orchestrator } from '../src/main/services/orchestrator.js';
 
 function createMockExecutors() {
@@ -113,6 +113,64 @@ describe('tryChannelCommand', () => {
     const ack = vi.fn();
     expect(tryChannelCommand(db, orch, 'ch-test', '/乱写', ack)).toBe(true);
     expect(ack).toHaveBeenCalledWith(expect.stringContaining('未识别的指令'));
+  });
+});
+
+describe('dispatchChannelTask 幂等', () => {
+  it('相同渠道消息只确认、派发和轮询一次', () => {
+    vi.useFakeTimers();
+    try {
+      const { db, orch, executors } = setup();
+      const ack = vi.fn();
+      const final = vi.fn();
+      const message = {
+        db,
+        orchestrator: orch,
+        channelId: 'ch-test',
+        text: '整理客户反馈',
+        sourceKey: 'message:101',
+        ack,
+        final
+      };
+
+      dispatchChannelTask(message);
+      dispatchChannelTask(message);
+
+      expect(db.tables.tasks.size).toBe(1);
+      expect([...db.tables.tasks.values()][0].source_key).toBe('ch-test:message:101');
+      expect(executors.dispatch).toHaveBeenCalledTimes(1);
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(final).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('进程重启后的重投会补发已有任务终态而不重复执行', () => {
+    const { db, orch, agentId, executors } = setup();
+    const existing = orch.createTask(agentId, '整理客户反馈', 'channel', { sourceKey: 'ch-test:message:replayed' });
+    const row = db.tables.tasks.get(existing.id);
+    Object.assign(row, { status: 'COMPLETED', result: '已整理 12 条反馈' });
+    executors.dispatch.mockClear();
+    const ack = vi.fn();
+    const final = vi.fn();
+
+    dispatchChannelTask({
+      db,
+      orchestrator: orch,
+      channelId: 'ch-test',
+      text: '整理客户反馈',
+      sourceKey: 'message:replayed',
+      ack,
+      final
+    });
+
+    expect(db.tables.tasks.size).toBe(1);
+    expect(executors.dispatch).not.toHaveBeenCalled();
+    expect(ack).not.toHaveBeenCalled();
+    expect(final).toHaveBeenCalledWith(expect.stringContaining('已整理 12 条反馈'));
   });
 });
 

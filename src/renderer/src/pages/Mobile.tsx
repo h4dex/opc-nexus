@@ -474,9 +474,9 @@ function MediaView({ artifacts }: { artifacts: MobileArtifact[] }) {
     <div className="mobile-media-grid">
       {artifacts.map((artifact) => <article key={artifact.id} className="mobile-media-item">
         <div className="mobile-media-preview">
-          {artifact.kind === 'screenshot' && <img src={artifact.uri} alt={artifact.filename} />}
-          {artifact.kind === 'screen_recording' && <video controls preload="metadata" src={artifact.uri} />}
-          {artifact.kind === 'audio' && <audio controls preload="metadata" src={artifact.uri} />}
+          {artifact.kind === 'screenshot' && <img src={artifact.uri} alt={artifact.filename} loading="lazy" decoding="async" />}
+          {artifact.kind === 'screen_recording' && <video controls preload="none" src={artifact.uri} />}
+          {artifact.kind === 'audio' && <audio controls preload="none" src={artifact.uri} />}
         </div>
         <div className="mobile-media-meta"><b>{artifact.filename}</b><small>{formatBytes(artifact.size)} · {formatTime(artifact.createdAt)}</small></div>
         <a className="icon-btn" href={artifact.uri} download={artifact.filename} title="下载" aria-label="下载"><IconDownload size={15} /></a>

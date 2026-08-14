@@ -4,7 +4,7 @@
  */
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
-  Agent, AgentCardView, AgentPersonaPatch, AppConfig, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
+  Agent, AgentCardView, AgentPersonaPatch, AppConfig, AppMemorySnapshot, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
   ApiBridgeStatus, RendererSettingKey, RendererSettingMap, WebAdminStatus,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
@@ -18,7 +18,8 @@ import type {
   TeamCollaborationOverview, TeamRun,
   VoiceConfig, VoiceConfigInput, VoiceCommandDraft, VoiceTestResult,
   MobileAdbDevice, MobileAgentConfig, MobileApkInfo, MobileArtifact, MobileCommandLog, MobileDevice, MobileEvent,
-  MobileGatewayStatus, MobilePairingOffer, MobileScriptDefinition, MobileToolCatalog, MobileToolName, Utf8TextPayload
+  MobileGatewayStatus, MobilePairingOffer, MobileScriptDefinition, MobileToolCatalog, MobileToolName, Utf8TextPayload,
+  WeixinLoginState
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -39,6 +40,11 @@ export interface Snapshot {
 
 export interface ResourcePayload {
   history: ResourceSample[];
+  health: ServiceHealth;
+}
+
+export interface ResourceUpdatePayload {
+  sample: ResourceSample;
   health: ServiceHealth;
 }
 
@@ -88,6 +94,7 @@ const api = {
   getAppVersion: (): Promise<string> => ipcRenderer.invoke('aibox:getAppVersion'),
   getResourceHistory: (): Promise<ResourcePayload> => ipcRenderer.invoke('aibox:getResourceHistory'),
   getSystemInfo: (): Promise<SystemInfo> => ipcRenderer.invoke('aibox:getSystemInfo'),
+  getAppMemory: (): Promise<AppMemorySnapshot> => ipcRenderer.invoke('aibox:getAppMemory'),
   globalSearch: (query: string): Promise<GlobalSearchResult[]> => ipcRenderer.invoke('aibox:globalSearch', query),
   getActionCenter: (): Promise<ActionCenterOverview> => ipcRenderer.invoke('aibox:getActionCenter'),
   dismissAction: (actionKey: string, fingerprint: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:dismissAction', actionKey, fingerprint),
@@ -328,9 +335,11 @@ const api = {
   /** 企业微信智能机器人：官方长连接 API 模式（BotID + Secret） */
   configureWecom: (botId: string, secret: string): Promise<{ ok: boolean; message: string }> =>
     ipcRenderer.invoke('aibox:configureWecom', botId, secret),
-  /** 个人微信：本地 Bot 桥接接口（回环 WebSocket 地址 + 可选令牌） */
-  configureWeixin: (bridgeUrl: string, token: string): Promise<{ ok: boolean; message: string }> =>
-    ipcRenderer.invoke('aibox:configureWeixin', bridgeUrl, token),
+  /** 微信 iLink Bot：扫码状态可见，凭据始终留在主进程 */
+  startWeixinLogin: (agentId?: string): Promise<WeixinLoginState> => ipcRenderer.invoke('aibox:startWeixinLogin', agentId),
+  getWeixinLoginState: (): Promise<WeixinLoginState> => ipcRenderer.invoke('aibox:getWeixinLoginState'),
+  submitWeixinVerifyCode: (code: string): Promise<WeixinLoginState> => ipcRenderer.invoke('aibox:submitWeixinVerifyCode', code),
+  cancelWeixinLogin: (): Promise<void> => ipcRenderer.invoke('aibox:cancelWeixinLogin'),
   setupChannel: (id: string, accountName: string): Promise<void> => ipcRenderer.invoke('aibox:setupChannel', id, accountName),
   disconnectChannel: (id: string): Promise<void> => ipcRenderer.invoke('aibox:disconnectChannel', id),
   bindChannel: (channelId: string, agentId: string): Promise<void> => ipcRenderer.invoke('aibox:bindChannel', channelId, agentId),
@@ -386,8 +395,8 @@ const api = {
     ipcRenderer.on('aibox:snapshot', handler);
     return () => ipcRenderer.removeListener('aibox:snapshot', handler);
   },
-  onResources: (fn: (r: ResourcePayload) => void): (() => void) => {
-    const handler = (_: unknown, r: ResourcePayload) => fn(r);
+  onResources: (fn: (r: ResourceUpdatePayload) => void): (() => void) => {
+    const handler = (_: unknown, r: ResourceUpdatePayload) => fn(r);
     ipcRenderer.on('aibox:resources', handler);
     return () => ipcRenderer.removeListener('aibox:resources', handler);
   },

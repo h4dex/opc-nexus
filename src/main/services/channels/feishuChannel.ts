@@ -8,7 +8,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { safeStorage } from 'electron';
-import type { Client as LarkClient } from '@larksuiteoapi/node-sdk';
+import type { Client as LarkClient, WSClient as LarkWSClient } from '@larksuiteoapi/node-sdk';
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
@@ -30,9 +30,10 @@ interface FeishuMessageEvent {
 }
 
 export class FeishuChannel {
-  /** 连接代际：disconnect 后旧连接的事件全部忽略（SDK 无显式 stop API 时的兜底） */
+  /** 连接代际：disconnect 或新连接后，旧连接的异步结果和事件全部忽略。 */
   private generation = 0;
   private active = false;
+  private wsClient: LarkWSClient | null = null;
 
   constructor(private db: Database, private orchestrator: Orchestrator) {}
 
@@ -72,25 +73,31 @@ export class FeishuChannel {
 
   /** 建立长连接（SDK 动态加载：未配置时不引入依赖开销） */
   async connect(): Promise<{ ok: boolean; message: string }> {
+    const gen = ++this.generation;
+    this.closeWsClient();
+    this.active = false;
     const creds = this.readCredentials();
     if (!creds) {
       this.setStatus('UNCONFIGURED');
       return { ok: false, message: '请先保存飞书自建应用的 App ID 与 App Secret' };
     }
-    const gen = ++this.generation;
     this.setStatus('CONNECTING');
 
+    let ws: LarkWSClient | null = null;
     try {
       const Lark = await import('@larksuiteoapi/node-sdk');
+      if (gen !== this.generation) return { ok: false, message: '飞书连接已取消' };
       const client = new Lark.Client({ appId: creds.appId, appSecret: creds.appSecret });
 
       // 先做一次真实鉴权探测（获取 tenant_access_token），失败如实标 AUTH_EXPIRED
       try {
         await client.im.v1.chat.list({ params: { page_size: 1 } });
       } catch (err) {
+        if (gen !== this.generation) return { ok: false, message: '飞书连接已取消' };
         this.setStatus('AUTH_EXPIRED');
         return { ok: false, message: `飞书鉴权失败：${err instanceof Error ? err.message : String(err)}` };
       }
+      if (gen !== this.generation) return { ok: false, message: '飞书连接已取消' };
 
       const dispatcher = new Lark.EventDispatcher({}).register({
         'im.message.receive_v1': async (data: FeishuMessageEvent) => {
@@ -99,14 +106,22 @@ export class FeishuChannel {
         }
       });
 
-      const ws = new Lark.WSClient({ appId: creds.appId, appSecret: creds.appSecret, loggerLevel: Lark.LoggerLevel.error });
-      ws.start({ eventDispatcher: dispatcher });
-
+      ws = new Lark.WSClient({ appId: creds.appId, appSecret: creds.appSecret, loggerLevel: Lark.LoggerLevel.error });
+      this.wsClient = ws;
+      await ws.start({ eventDispatcher: dispatcher });
+      // SDK 的 start() 只安排连接流程，不等待 WebSocket 握手；生命周期由实例持有并在停用时显式关闭。
+      if (gen !== this.generation || this.wsClient !== ws) {
+        this.closeClient(ws);
+        return { ok: false, message: '飞书连接已取消' };
+      }
       this.active = true;
       this.setStatus('ONLINE');
       this.db.audit({ id: randomUUID(), actor: 'system', action: 'channel.feishu.connect', target: creds.appId, result: 'ok' });
       return { ok: true, message: '飞书长连接已建立' };
     } catch (err) {
+      if (ws) this.closeClient(ws);
+      if (this.wsClient === ws) this.wsClient = null;
+      if (gen !== this.generation) return { ok: false, message: '飞书连接已取消' };
       this.active = false;
       this.setStatus('ERROR');
       notify(this.db, '飞书渠道连接失败', err instanceof Error ? err.message : String(err));
@@ -114,11 +129,34 @@ export class FeishuChannel {
     }
   }
 
-  /** 停用：代际递增使旧连接事件失效（SDK 长连接随进程退出释放） */
+  /** 停用：立即释放 WebSocket、心跳/重连定时器和 SDK 消息缓存。 */
   disconnect() {
     this.generation++;
     this.active = false;
+    this.closeWsClient();
     this.setStatus('DISABLED');
+  }
+
+  /** 进程退出时释放连接，但保留数据库状态以便下次启动自动重连。 */
+  dispose(): void {
+    this.generation++;
+    this.active = false;
+    this.closeWsClient();
+  }
+
+  private closeWsClient(): void {
+    const ws = this.wsClient;
+    this.wsClient = null;
+    if (!ws) return;
+    this.closeClient(ws);
+  }
+
+  private closeClient(ws: LarkWSClient): void {
+    try {
+      ws.close({ force: true });
+    } catch {
+      /* 关闭失败不阻塞状态切换 */
+    }
   }
 
   /** 消息 → 路由绑定员工 → 创建渠道任务 → 终态后回帖 */

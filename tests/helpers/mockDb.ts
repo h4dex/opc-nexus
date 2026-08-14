@@ -158,6 +158,19 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? visible : visible ? [visible] : [];
   }
 
+  // SELECT status, result, error FROM tasks WHERE id = ?
+  if (/SELECT status, result, error FROM tasks WHERE id = \?/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    const result = row ? { status: row.status, result: row.result, error: row.error } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  // SELECT * FROM tasks WHERE source = ? AND source_key = ?
+  if (/SELECT \* FROM tasks WHERE source = \? AND source_key = \?/.test(sql)) {
+    const row = [...tables.tasks.values()].find(r => r.source === args[0] && r.source_key === args[1]);
+    return mode === 'get' ? row : row ? [row] : [];
+  }
+
   // SELECT * FROM tasks WHERE status = 'RUNNING' ...
   if (/SELECT \* FROM tasks WHERE status = 'RUNNING'/.test(sql)) {
     const result = rows.filter(r => r.status === 'RUNNING');
@@ -598,9 +611,12 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
 
   // INSERT INTO tasks
   if (/INSERT INTO tasks/.test(sql)) {
-    const [id, agentId, projectId, title, source, parentId, status, stage, sessionId, workspaceOverride, engineOverride, now, startedAt] = args;
+    const [id, agentId, projectId, title, source, sourceKey, parentId, status, stage, sessionId, workspaceOverride, engineOverride, now, startedAt] = args;
+    if (sourceKey != null && [...tables.tasks.values()].some(row => row.source === source && row.source_key === sourceKey)) {
+      return { changes: 0 };
+    }
     tables.tasks.set(id as string, {
-      id, agent_id: agentId, project_id: projectId, title, source, parent_id: parentId, status,
+      id, agent_id: agentId, project_id: projectId, title, source, source_key: sourceKey, parent_id: parentId, status,
       priority: 0, progress: 0, stage, error: null, session_id: sessionId,
       workspace_override: workspaceOverride, engine_override: engineOverride ?? null,
       is_demo: 0, created_at: now, started_at: startedAt, ended_at: null, deleted_at: null, result: null, quality: null

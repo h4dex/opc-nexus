@@ -101,6 +101,13 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 ## 致谢
 
+### Tencent/openclaw-weixin
+
+`src/main/services/channels/ilinkClient.ts` 的微信 iLink 协议兼容行为参考
+[Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin) `v2.4.6`
+（提交 `cef0bfc390393f716903e16d50408118047f87e0`）实现。上游版权归腾讯所有，
+采用 MIT License；其许可条款已包含在本文件的 MIT License 全文中。
+
 ### hermes-android
 
 `mobile/android-bridge` 与 `mobile/hermes-plugin` 基于

@@ -14,10 +14,11 @@
  *
  * @author liyingjie <y@senke.com>
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { toast } from './Toast';
 import type { VoiceCommandDraft } from '@shared/types';
+import { VoiceAudioPump } from '../utils/voiceAudioPump';
 
 /** 云端识别要求的采样率 */
 const TARGET_SAMPLE_RATE = 16000;
@@ -56,15 +57,31 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
   const sessionRef = useRef<string | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const muteRef = useRef<GainNode | null>(null);
+  const audioPumpRef = useRef<VoiceAudioPump | null>(null);
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startGenerationRef = useRef(0);
+  const startInFlightRef = useRef(false);
+  const mountedRef = useRef(true);
 
-  const readyAgents = (snapshot?.agentCards ?? [])
+  const readyAgents = useMemo(() => (snapshot?.agentCards ?? [])
     .filter((c) => c.agent.lifecycle === 'READY')
-    .map((c) => ({ id: c.agent.id, name: c.agent.name }));
+    .map((c) => ({ id: c.agent.id, name: c.agent.name })), [snapshot?.agentCards]);
 
   /** 释放麦克风与音频上下文；主进程会话另行关闭 */
   const teardownAudio = useCallback(() => {
     if (silenceTimer.current) { clearTimeout(silenceTimer.current); silenceTimer.current = null; }
+    audioPumpRef.current?.dispose();
+    audioPumpRef.current = null;
+    if (workletRef.current) workletRef.current.port.onmessage = null;
+    try { workletRef.current?.disconnect(); } catch { /* 已断开忽略 */ }
+    try { sourceRef.current?.disconnect(); } catch { /* 已断开忽略 */ }
+    try { muteRef.current?.disconnect(); } catch { /* 已断开忽略 */ }
+    workletRef.current = null;
+    sourceRef.current = null;
+    muteRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     void ctxRef.current?.close().catch(() => { /* 已关闭忽略 */ });
@@ -72,20 +89,30 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
   }, []);
 
   const stopSession = useCallback(() => {
+    startGenerationRef.current++;
+    startInFlightRef.current = false;
     teardownAudio();
     const id = sessionRef.current;
     sessionRef.current = null;
-    if (id) void window.aibox.stopVoiceSession(id);
+    if (id) void window.aibox.stopVoiceSession(id).catch(() => { /* 主进程可能正在退出 */ });
   }, [teardownAudio]);
 
   // 组件卸载必须释放麦克风，否则录音指示灯会一直亮着
-  useEffect(() => stopSession, [stopSession]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      stopSession();
+    };
+  }, [stopSession]);
 
   /** 一句话结束 → 解析为任务草稿，进入确认态 */
   const toConfirm = useCallback(async (text: string) => {
     if (!text.trim()) return;
     stopSession();
+    const generation = startGenerationRef.current;
     const d = await window.aibox.parseVoiceCommand(text);
+    if (!mountedRef.current || startGenerationRef.current !== generation) return;
     setDraft(d);
     setEditTitle(d.title);
     setEditAgentId(d.agentId ?? readyAgents[0]?.id ?? '');
@@ -114,41 +141,103 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
   }, [toConfirm, stopSession]);
 
   const start = async () => {
+    if (startInFlightRef.current || sessionRef.current) return;
+    startInFlightRef.current = true;
+    const generation = ++startGenerationRef.current;
+    let attemptSessionId: string | null = null;
+    let attemptStream: MediaStream | null = null;
+    let attemptContext: AudioContext | null = null;
+
+    const isCurrent = () => mountedRef.current && startGenerationRef.current === generation;
+    const stopAttemptSession = () => {
+      if (attemptSessionId) {
+        void window.aibox.stopVoiceSession(attemptSessionId).catch(() => { /* 主进程可能正在退出 */ });
+        if (sessionRef.current === attemptSessionId) sessionRef.current = null;
+        attemptSessionId = null;
+      }
+    };
+    const releaseAttempt = () => {
+      attemptStream?.getTracks().forEach((track) => track.stop());
+      if (attemptStream === streamRef.current) streamRef.current = null;
+      if (attemptContext === ctxRef.current) ctxRef.current = null;
+      void attemptContext?.close().catch(() => { /* 已关闭忽略 */ });
+      stopAttemptSession();
+    };
+
     setError(''); setPartial(''); setFinalText(''); setDraft(null);
-    const r = await window.aibox.startVoiceSession();
-    if (!r.ok || !r.sessionId) {
-      setError(r.message);
-      return;
-    }
-    sessionRef.current = r.sessionId;
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const r = await window.aibox.startVoiceSession();
+      if (!isCurrent()) {
+        if (r.sessionId) {
+          attemptSessionId = r.sessionId;
+          stopAttemptSession();
+        }
+        return;
+      }
+      if (!r.ok || !r.sessionId) {
+        if (r.sessionId) {
+          attemptSessionId = r.sessionId;
+          stopAttemptSession();
+        }
+        setError(r.message);
+        return;
+      }
+      attemptSessionId = r.sessionId;
+      sessionRef.current = attemptSessionId;
+
+      attemptStream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
       });
-      streamRef.current = stream;
+      if (!isCurrent()) { releaseAttempt(); return; }
+      streamRef.current = attemptStream;
+
       // 优先让浏览器直接以 16kHz 打开，省去重采样；不支持时退回默认采样率
-      const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
-      ctxRef.current = ctx;
+      attemptContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      ctxRef.current = attemptContext;
       const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
       const url = URL.createObjectURL(blob);
-      await ctx.audioWorklet.addModule(url);
-      URL.revokeObjectURL(url);
+      try {
+        await attemptContext.audioWorklet.addModule(url);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+      if (!isCurrent()) { releaseAttempt(); return; }
 
-      const node = new AudioWorkletNode(ctx, 'pcm-extractor');
+      const sessionId = attemptSessionId;
+      const pump = new VoiceAudioPump(sessionId, (id, chunk) => window.aibox.pushVoiceAudio(id, chunk), {
+        onError: (cause) => {
+          if (!mountedRef.current || startGenerationRef.current !== generation || sessionRef.current !== sessionId) return;
+          stopSession();
+          setPhase('idle');
+          setError(`语音上传失败：${cause instanceof Error ? cause.message : String(cause)}`);
+        }
+      });
+      audioPumpRef.current = pump;
+
+      const node = new AudioWorkletNode(attemptContext, 'pcm-extractor');
+      workletRef.current = node;
       node.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
-        const id = sessionRef.current;
-        if (id) void window.aibox.pushVoiceAudio(id, ev.data);
+        pump.push(ev.data);
       };
-      ctx.createMediaStreamSource(stream).connect(node);
+      const source = attemptContext.createMediaStreamSource(attemptStream);
+      sourceRef.current = source;
+      source.connect(node);
       // AudioWorklet 需接入图才会持续拉取；用零增益避免把自己的声音播出来造成回授
-      const mute = ctx.createGain();
+      const mute = attemptContext.createGain();
+      muteRef.current = mute;
       mute.gain.value = 0;
-      node.connect(mute).connect(ctx.destination);
+      node.connect(mute).connect(attemptContext.destination);
       setPhase('listening');
     } catch (err) {
-      stopSession();
-      setError(`无法访问麦克风：${err instanceof Error ? err.message : String(err)}`);
+      if (isCurrent()) {
+        stopSession();
+        if (mountedRef.current) setError(`无法访问麦克风：${err instanceof Error ? err.message : String(err)}`);
+      } else {
+        releaseAttempt();
+      }
+    } finally {
+      if (startGenerationRef.current === generation) startInFlightRef.current = false;
     }
   };
 

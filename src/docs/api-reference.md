@@ -16,6 +16,7 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:getSnapshot` | 无 | `Snapshot` | 获取全量状态快照 |
 | `aibox:getResourceHistory` | 无 | `{ history, health }` | 资源监控历史 |
 | `aibox:getSystemInfo` | 无 | `SystemInfo` | 系统信息 |
+| `aibox:getAppMemory` | 无 | `AppMemorySnapshot` | Electron Main/Renderer/GPU/Utility 进程内存快照（不含外部 CLI/Playwright 子进程） |
 
 ### Snapshot 结构
 
@@ -279,11 +280,16 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 |---------|------|--------|------|
 | `aibox:configureFeishu` | `appId, appSecret` | `{ ok, message }` | 配置飞书 |
 | `aibox:configureWecom` | `botId, secret` | `{ ok, message }` | 配置企微 |
-| `aibox:configureWeixin` | `bridgeUrl, token` | `{ ok, message }` | 配置微信 |
+| `aibox:startWeixinLogin` | `agentId?: string` | `WeixinLoginState` | 生成微信 iLink 授权二维码并开始轮询；仅在会话最终验证成功后替换渠道绑定，传入员工 ID 时绑定该员工，省略时清除原绑定 |
+| `aibox:getWeixinLoginState` | 无 | `WeixinLoginState` | 查询扫码/配对状态（不返回 Token） |
+| `aibox:submitWeixinVerifyCode` | `code` | `WeixinLoginState` | 提交手机显示的数字配对码 |
+| `aibox:cancelWeixinLogin` | 无 | `void` | 取消尚未提交的扫码会话；`VERIFYING` 阶段会中止远端探测，凭据事务一旦提交则需通过“停用”撤销 |
 | `aibox:setupChannel` | `id, accountName` | `void` | 通用设置 |
 | `aibox:disconnectChannel` | `id: string` | `void` | 断开 |
 | `aibox:bindChannel` | `channelId, agentId` | `void` | 绑定 |
 | `aibox:unbindChannel` | `channelId, agentId` | `void` | 解绑 |
+
+`WeixinLoginState.phase` 中，`VERIFY_REQUIRED` 表示等待用户输入手机显示的数字配对码；提交配对码后状态回到 `SCANNED`，由主进程继续二维码状态轮询。`VERIFYING` 表示微信已确认授权，主进程正在通过 `notifyStart` / `getUpdates` 验证新 iLink 会话；此时关闭弹窗会中止尚未完成的探测。探测通过后，凭据与员工绑定在同一事务内提交，随后进入 `CONNECTED`。
 
 ---
 

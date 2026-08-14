@@ -2,6 +2,60 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.8.0] - 2026-08-14
+
+> 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`），本次升级桌面端 Agent Runtime。
+
+### 新增
+
+- **DeepSeek Harness Runtime**：内置并固定 `@deepseek-ai/agent-harness@0.1.0-rc.6`，通过 ACP 接入任务编排、取消、暂停、审批、超时与流式输出。
+- **受管 Skills 支持**：每次任务创建独立 Skill 快照和 Session 根目录，仅加载 OPC-Nexus 管理的 Skills，为后续插件权限模型提供稳定边界。
+- **多供应商接入**：支持 DeepSeek 官方与 OpenAI-compatible Provider，并通过真实模型探测和 Provider 指纹管理 Harness 就绪状态。
+
+### 安全与稳定性
+
+- Provider 凭据仅在 Main 进程解密；限制运行时环境变量、Provider URL、重定向、路径、ACP 帧、并发请求和输出配额，并对跨 chunk 密钥执行脱敏。
+- P0 默认不开放任意 Shell、文件写入、Web、MCP、子 Agent 或第三方 Cordis 插件；Bridge Key 与 Web Token 使用 `safeStorage` 加密并经审计后的剪贴板 IPC 获取。
+- 加固 API Bridge 与 WebServer 的异步启停、端口占用、快速重启、运行期错误和旧实例事件隔离，失败时保持关闭并允许重试。
+
+### 构建与验证
+
+- 固定 Harness 依赖、npm 版本和 lifecycle 脚本白名单，校验许可证、native/Koffi 边界、Electron Node 兼容性与 RunAsNode fuse。
+- Windows/Linux 发布任务复用同一生产签名 Android APK，并在打包后执行 Harness ACP smoke test。
+
+## [1.7.1] - 2026-08-14
+
+> 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`），本次仅升级桌面端。
+
+### 新增
+
+- **微信 iLink Bot 渠道**：在「连接中心」选择数字员工并生成二维码，使用微信扫码确认后
+  一键完成授权与员工绑定；需要时支持输入手机显示的数字配对码。
+- **可靠消息链路**：支持 HTTP 长轮询收信、上下文回复、持久化消息幂等、加密待发队列、
+  断线恢复、失败退避和腾讯接口冷却状态恢复。
+- **应用内存监控**：系统中心新增 Electron Main、Renderer、GPU 与 Utility 进程的内存明细
+  和最近趋势，区分应用自身内存与整机内存。
+
+### 性能与稳定性
+
+- 浏览器自动化改为共享 Chromium 进程，数字员工继续使用隔离 BrowserContext；空闲与退出时
+  完整释放页面、Context、CDP 连接和浏览器进程。
+- OCR 模型改为按需加载并在空闲后释放；语音音频使用有界缓冲和串行发送，避免积压。
+- 资源历史改为有界增量采样；合并项目、成果与知识库的高频刷新，并清理重复订阅、定时器和
+  会话生命周期残留，降低桌面端长时间运行时的内存增长。
+- 手机截图使用延迟解码，录屏和音频不再预加载媒体内容。
+
+### 兼容性与限制
+
+- 微信 iLink Bot 仅处理扫码账号与 AI Bot 的私聊，不读取现有好友或群聊消息。
+- 原个人微信本地 WebSocket 桥接已由 iLink Bot 替代，升级后需在连接中心重新扫码授权。
+- 企业微信渠道保持不变；飞书接入代码保留，但本版本未使用真实账号完成端到端验证。
+
+### 验证
+
+- 通过 TypeScript 类型检查、Vitest 全量测试（558 passed / 1 skipped / 0 failed）和 Electron
+  生产构建。
+
 ## [1.7.0] - 2026-08-14
 
 > 配套 Android Bridge 版本：`0.4.3`（`versionCode 5`）。桌面端与 Android Bridge
@@ -22,6 +76,9 @@
 - **数字员工快捷派单**：员工卡片、列表和操作菜单新增「安排任务」，可直接指定当前员工创建任务。
 - **Android 品牌资源**：Bridge 使用 OPC-Nexus 普通、圆形、自适应和 Android 13 单色图标，
   并提供 `npm run mobile:icons` 可复现生成脚本。
+- **统一 Release 流水线**：GitHub Actions 只构建一次生产签名 Android Bridge，并将同一 APK
+  内置到 Windows/Linux 桌面包；Windows NSIS、Linux AppImage/DEB、Android APK、签名清单
+  和统一 `SHA256SUMS.txt` 发布到同一个 GitHub Release。
 
 ### 修复
 

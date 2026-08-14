@@ -1,5 +1,5 @@
 /** 成果库：版本、验收、追溯与项目成果包。 */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { AgentAvatar, Modal } from '../components/common';
 import {
@@ -8,6 +8,7 @@ import {
 } from '../components/icons';
 import { MarkdownView } from '../components/MarkdownView';
 import { toast } from '../components/Toast';
+import { TrailingRefreshController } from '../utils/trailingRefresh';
 import type {
   DeliverableDetail, DeliverableReviewInput, DeliverableReviewStatus, DeliverableSummary,
   DeliverableType, ProjectDeliverablePackage
@@ -50,21 +51,29 @@ export function Deliverables() {
   const [editingMeta, setEditingMeta] = useState<DeliverableDetail | null>(null);
   const [addingVersion, setAddingVersion] = useState<DeliverableDetail | null>(null);
   const [projectPackage, setProjectPackage] = useState<ProjectDeliverablePackage | null>(null);
+  const refreshRef = useRef<TrailingRefreshController<DeliverableSummary[]> | null>(null);
+  if (!refreshRef.current) refreshRef.current = new TrailingRefreshController();
+  const refresh = refreshRef.current;
+  const firstLoadRef = useRef(true);
 
-  const load = useCallback(async () => {
-    try {
-      setItems(await window.aibox.listDeliverables());
-    } catch (error) {
+  const load = useCallback((immediate = false) => refresh.request({
+    run: () => window.aibox.listDeliverables(),
+    accept: (value) => { setItems(value); setLoading(false); },
+    reject: (error) => {
       toast.err(error instanceof Error ? error.message : '成果加载失败');
-    } finally {
       setLoading(false);
     }
-  }, []);
+  }, { immediate }), [refresh]);
 
   useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => void load(), 8_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      firstLoadRef.current = true;
+      refresh.cancel();
+    };
+  }, [refresh]);
+  useEffect(() => {
+    void load(firstLoadRef.current);
+    firstLoadRef.current = false;
   }, [load, snapshot?.version]);
 
   const projects = snapshot?.projects ?? [];
@@ -126,7 +135,7 @@ export function Deliverables() {
     return () => { active = false; };
   }, [clearNavigationTarget, navigationTarget]);
   const refreshDetail = async (id: string) => {
-    await load();
+    await load(true);
     const next = await window.aibox.getDeliverable(id);
     setDetail(next);
   };

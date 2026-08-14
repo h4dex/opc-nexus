@@ -1,11 +1,53 @@
 /** 系统状态页（PRD 6.3 / 11.x）：完整资源监控 + 调度保护策略 + 服务健康 */
+import { useEffect, useState } from 'react';
+import type { AppMemorySnapshot } from '@shared/types';
 import { useApp } from '../store';
 import { RingGauge, Sparkline } from '../components/charts';
 import { ProgressBar, formatBytes } from '../components/common';
 import { IconChip, IconCpu, IconDb, IconGpu, IconLayers, IconMemory, IconWifi } from '../components/icons';
 
+const APP_MEMORY_POLL_MS = 10_000;
+const APP_MEMORY_HISTORY_LIMIT = 60;
+
+function processLabel(type: string, name: string | null): string {
+  if (type === 'Browser') return 'Main';
+  if (type === 'Tab') return 'Renderer';
+  if (type === 'GPU') return 'GPU';
+  if (type === 'Utility') return name ? `Utility · ${name}` : 'Utility';
+  return name || type;
+}
+
+function useAppMemory(): { current: AppMemorySnapshot | null; history: number[] } {
+  const [current, setCurrent] = useState<AppMemorySnapshot | null>(null);
+  const [history, setHistory] = useState<number[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    let timer: number | null = null;
+    const sample = async () => {
+      try {
+        const next = await window.aibox.getAppMemory();
+        if (!active) return;
+        setCurrent(next);
+        setHistory((items) => [...items, next.totalBytes].slice(-APP_MEMORY_HISTORY_LIMIT));
+      } catch {
+        // 主进程退出或重载期间保留最后一次有效数据。
+      }
+      if (active) timer = window.setTimeout(() => void sample(), APP_MEMORY_POLL_MS);
+    };
+    void sample();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  return { current, history };
+}
+
 export function System() {
   const { resources, snapshot } = useApp();
+  const appMemory = useAppMemory();
   const last = resources.history[resources.history.length - 1];
   const diskPct = last && last.diskTotal > 0 ? Math.round(((last.diskTotal - last.diskFree) / last.diskTotal) * 100) : null;
 
@@ -38,7 +80,7 @@ export function System() {
         </div>
 
         <div className="card">
-          <div className="card-title"><IconMemory size={17} />内存</div>
+          <div className="card-title"><IconMemory size={17} />整机内存</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 22 }}>
             <RingGauge percent={last?.memoryPercent ?? null} size={140} stroke={13} color="var(--success)">
               <div className="big-number" style={{ fontSize: 30 }}>{last?.memoryPercent != null ? `${Math.round(last.memoryPercent)}%` : '未知'}</div>
@@ -91,6 +133,39 @@ export function System() {
         </div>
 
         <div className="card span2">
+          <div className="card-title"><IconMemory size={17} />Electron 进程内存</div>
+          {appMemory.current ? (
+            <div className="app-memory-layout">
+              <div>
+                <div className="big-number" style={{ fontSize: 30 }}>{formatBytes(appMemory.current.totalBytes)}</div>
+                <div style={{ color: 'var(--text-2)', fontSize: 12.5, margin: '4px 0 10px' }}>
+                  {appMemory.current.basis === 'private' ? '私有内存合计' : '工作集近似合计'} · Main JS 堆 {formatBytes(appMemory.current.mainHeapUsedBytes)}
+                  <br />不含浏览器自动化、CLI 引擎等外部子进程
+                </div>
+                <Sparkline
+                  data={appMemory.history}
+                  color="#d99a22"
+                  height={72}
+                  max={Math.max(1, ...appMemory.history) * 1.1}
+                />
+              </div>
+              <div className="app-memory-processes">
+                {appMemory.current.processes.slice(0, 8).map((metric) => (
+                  <div key={`${metric.pid}-name`} style={{ display: 'contents' }}>
+                    <span style={{ color: 'var(--text-2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={`${processLabel(metric.type, metric.name)} · PID ${metric.pid}`}>
+                      {processLabel(metric.type, metric.name)}
+                    </span>
+                    <b style={{ textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatBytes(metric.memoryBytes)}</b>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="empty" style={{ padding: '28px 0' }}>正在读取应用进程内存...</div>
+          )}
+        </div>
+
+        <div className="card span2">
           <div className="card-title"><IconChip size={17} />服务健康（每 30 秒检查，连续 3 次失败转为异常）</div>
           <div style={{ display: 'flex', gap: 14 }}>
             {healthItems.map((h) => {
@@ -110,7 +185,7 @@ export function System() {
             })}
           </div>
           <div style={{ marginTop: 14, fontSize: 12, color: 'var(--text-2)' }}>
-            网络：{last?.networkOnline ? '在线' : '离线'} · 客户端空闲内存目标 ≤350MB · 数字员工 {snapshot?.stats.totalAgents ?? 0}/50 · 并发任务 {snapshot?.stats.activeTasks ?? 0}/10
+            网络：{last?.networkOnline ? '在线' : '离线'} · 数字员工 {snapshot?.stats.totalAgents ?? 0}/50 · 并发任务 {snapshot?.stats.activeTasks ?? 0}/10
           </div>
         </div>
       </div>

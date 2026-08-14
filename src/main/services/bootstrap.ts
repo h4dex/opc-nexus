@@ -6,7 +6,6 @@
  *   "provider": { "baseUrl": "https://api.deepseek.com", "model": "deepseek-v4-flash", "apiKey": "sk-xxx" },
  *   "channels": {
  *     "wecom": { "botId": "...", "secret": "..." },
- *     "weixin": { "bridgeUrl": "ws://127.0.0.1:8080/ws", "token": "..." },
  *     "feishu": { "appId": "...", "appSecret": "..." }
  *   }
  * }
@@ -19,7 +18,6 @@ import type { Database } from './database.js';
 import { getProviderSettings, readProviderKey, saveProviderConfig } from './provider.js';
 import { loadUserConfig } from './userConfig.js';
 import { WECOM_BOTID_SETTING, WECOM_SECRET_REF } from './channels/wecomChannel.js';
-import { WEIXIN_URL_SETTING, WEIXIN_TOKEN_REF } from './channels/wechatChannel.js';
 import { FEISHU_APPID_SETTING, FEISHU_SECRET_REF } from './channels/feishuChannel.js';
 import { randomUUID } from 'node:crypto';
 
@@ -27,7 +25,6 @@ interface BootstrapFile {
   provider?: { baseUrl?: string; model?: string; apiKey?: string };
   channels?: {
     wecom?: { botId?: string; secret?: string };
-    weixin?: { bridgeUrl?: string; token?: string };
     feishu?: { appId?: string; appSecret?: string };
   };
 }
@@ -115,14 +112,6 @@ export function importCredentialsBootstrap(db: Database): boolean {
       db.setSetting(WECOM_SECRET_REF, safeStorage.encryptString(data.channels.wecom.secret).toString('base64'));
     }
     db.audit({ id: randomUUID(), actor: 'system', action: 'bootstrap.wecom', target: data.channels.wecom.botId, result: 'ok' });
-  }
-
-  // 个人微信
-  if (data.channels?.weixin?.bridgeUrl) {
-    db.setSetting(WEIXIN_URL_SETTING, data.channels.weixin.bridgeUrl);
-    if (data.channels.weixin.token) {
-      db.setSetting(WEIXIN_TOKEN_REF, safeStorage.encryptString(data.channels.weixin.token).toString('base64'));
-    }
   }
 
   // 飞书

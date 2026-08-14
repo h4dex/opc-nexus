@@ -7,7 +7,7 @@ import type { Database } from './database.js';
 import type { Channel, ChannelType } from '../../shared/types.js';
 
 const CHANNEL_META: Record<ChannelType, { name: string; limitation: string }> = {
-  weixin: { name: '微信', limitation: '个人微信无官方 API：经本机 Bot 框架桥接（WeChatFerry / wechaty 等），存在账号风控风险，仅建议小范围自用' },
+  weixin: { name: '微信 iLink Bot', limitation: '微信 ClawBot iLink 接口；仅支持扫码账号与 AI Bot 私聊，不会读取现有好友或群聊消息' },
   wecom: { name: '企业微信', limitation: '需在管理后台创建智能机器人并开启「API 模式 · 长连接」；单聊直发，群聊需 @机器人' },
   feishu: { name: '飞书 / Lark', limitation: '群聊默认按用户隔离会话' },
   qq: { name: 'QQ', limitation: '需在 q.qq.com 注册 Bot 并开通 Intents' }
@@ -76,6 +76,10 @@ export class ChannelManager {
   }
 
   bindAgent(channelId: string, agentId: string) {
+    const channel = this.db.raw.prepare('SELECT id FROM channels WHERE id = ?').get(channelId);
+    const agent = this.db.raw.prepare('SELECT id FROM agents WHERE id = ? AND archived = 0').get(agentId);
+    if (!channel) throw new Error('渠道不存在');
+    if (!agent) throw new Error('数字员工不存在或已归档');
     // 幂等绑定：已存在则跳过，避免重复绑定产生多行（导致“绑定员工”重复显示）
     const existing = this.db.raw.prepare('SELECT id FROM channel_routes WHERE channel_id = ? AND agent_id = ?').get(channelId, agentId);
     if (existing) return;

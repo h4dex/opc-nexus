@@ -269,6 +269,7 @@ export class VoiceService {
       }
     } catch (err) {
       this.sessions.delete(sessionId);
+      session.close();
       return { ok: false, sessionId: null, provider, message: `语音通道建立失败：${err instanceof Error ? err.message : String(err)}` };
     }
 
@@ -375,21 +376,26 @@ export class VoiceSession {
     const ws = new WebSocket(`${endpoint}?token=${encodeURIComponent(token)}`);
     this.ws = ws;
 
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('连接超时（10 秒）')), 10_000);
-      ws.on('open', () => {
-        clearTimeout(timeout);
-        ws.send(JSON.stringify({
-          header: { message_id: randomUUID().replace(/-/g, ''), task_id: this.taskId, namespace: 'SpeechTranscriber', name: 'StartTranscription', appkey: appKey },
-          payload: VoiceSession.startPayload()
-        }));
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('连接超时（10 秒）')), 10_000);
+        ws.on('open', () => {
+          clearTimeout(timeout);
+          ws.send(JSON.stringify({
+            header: { message_id: randomUUID().replace(/-/g, ''), task_id: this.taskId, namespace: 'SpeechTranscriber', name: 'StartTranscription', appkey: appKey },
+            payload: VoiceSession.startPayload()
+          }));
+          resolve();
+        });
+        ws.on('error', (err: Error) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
       });
-      ws.on('error', (err: Error) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
+    } catch (err) {
+      this.close();
+      throw err;
+    }
 
     ws.on('message', (raw: Buffer) => this.handleCloudMessage(raw));
     ws.on('close', () => { this.ready = false; });

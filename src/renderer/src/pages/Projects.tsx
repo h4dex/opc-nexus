@@ -1,9 +1,10 @@
 /** 项目中心：以经营目标组织任务、员工与成果。 */
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
 import { Modal, ProgressBar, TASK_STATUS_META } from '../components/common';
 import { IconAlert, IconCheck, IconClock, IconFolder, IconLayers, IconPlay, IconPlus, IconTask, IconUser } from '../components/icons';
 import { toast } from '../components/Toast';
+import { TrailingRefreshController } from '../utils/trailingRefresh';
 import type {
   Project, ProjectHealth, ProjectInput, ProjectOperationsItem, ProjectOperationsOverview,
   ProjectStatus, Task
@@ -36,16 +37,28 @@ export function Projects() {
   const [viewing, setViewing] = useState<Project | null>(null);
   const [dispatching, setDispatching] = useState<Project | null>(null);
   const [archiving, setArchiving] = useState<Project | null>(null);
+  const refreshRef = useRef<TrailingRefreshController<ProjectOperationsOverview> | null>(null);
+  if (!refreshRef.current) refreshRef.current = new TrailingRefreshController();
+  const refresh = refreshRef.current;
+  const firstLoadRef = useRef(true);
 
   const projects = snapshot?.projects ?? [];
   const tasks = snapshot?.tasks ?? [];
+  const loadOperations = useCallback((immediate = false) => refresh.request({
+    run: () => window.aibox.getProjectOperations(),
+    accept: setOperations,
+    reject: (error) => toast.err(error instanceof Error ? error.message : '项目经营数据加载失败')
+  }, { immediate }), [refresh]);
   useEffect(() => {
-    let active = true;
-    void window.aibox.getProjectOperations()
-      .then((value) => { if (active) setOperations(value); })
-      .catch((error) => toast.err(error instanceof Error ? error.message : '项目经营数据加载失败'));
-    return () => { active = false; };
-  }, [snapshot?.version]);
+    return () => {
+      firstLoadRef.current = true;
+      refresh.cancel();
+    };
+  }, [refresh]);
+  useEffect(() => {
+    void loadOperations(firstLoadRef.current);
+    firstLoadRef.current = false;
+  }, [loadOperations, snapshot?.version]);
   useEffect(() => {
     if (!snapshot || navigationTarget?.entityType !== 'project') return;
     const project = snapshot.projects.find((item) => item.id === navigationTarget.entityId);

@@ -47,6 +47,7 @@ function register(webOverrides: Record<string, unknown> = {}, bridgeOverrides: R
     webServer,
     orchestrator: service({ onChange: vi.fn(), onOutput: vi.fn() }),
     broker: service({ onChange: vi.fn() }),
+    weixin: service({ onStateChange: vi.fn() }),
     voice: service({ onTranscript: vi.fn(), onError: vi.fn() }),
     mobile: service({ onEvent: vi.fn() }),
     monitor: service({ onSample: vi.fn() }),

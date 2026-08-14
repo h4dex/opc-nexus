@@ -10,6 +10,8 @@ import type { ApprovalBroker } from '../approvalBroker.js';
 
 const REPLY_POLL_MS = 2000;
 const REPLY_TIMEOUT_MS = 15 * 60_000;
+/** 当前进程已经为哪些任务维护终态回复轮询；重启后为空，允许上游重投恢复回复。 */
+const activeReplyPolls = new Set<string>();
 
 /** 审批关键词检测：用户通过渠道回复“批准/同意/拒绝/取消”触发审批决策 */
 const APPROVE_RE = /^(批准|同意|approve|yes|确认执行)$/i;
@@ -141,12 +143,14 @@ export function dispatchChannelTask(opts: {
   orchestrator: Orchestrator;
   channelId: string;
   text: string;
+  /** 渠道消息的稳定 ID；用于上游重投/进程重启后的持久化去重。 */
+  sourceKey?: string;
   /** 即时回执（收到消息后立刻回复，也用于路由/校验失败提示） */
   ack: (message: string) => void;
   /** 终态回复（任务完成/失败/超时提示） */
   final: (message: string) => void;
 }) {
-  const { db, orchestrator, channelId, text, ack, final } = opts;
+  const { db, orchestrator, channelId, text, sourceKey, ack, final } = opts;
   if (!text) {
     ack('暂只支持文本消息，请用文字描述任务。');
     return;
@@ -161,13 +165,37 @@ export function dispatchChannelTask(opts: {
   }
 
   let taskId: string;
+  let deduplicated = false;
   try {
-    taskId = orchestrator.createTask(route.agent_id, text.slice(0, 200), 'channel').id;
+    const normalizedSourceKey = sourceKey?.trim();
+    const task = normalizedSourceKey
+      ? orchestrator.createTask(route.agent_id, text.slice(0, 200), 'channel', { sourceKey: `${channelId}:${normalizedSourceKey}` })
+      : orchestrator.createTask(route.agent_id, text.slice(0, 200), 'channel');
+    taskId = task.id;
+    deduplicated = task.deduplicated === true;
+    if (task.deduplicated && activeReplyPolls.has(taskId)) return;
   } catch (err) {
     ack(`任务创建失败：${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  ack('已接收任务，数字员工执行中…（高风险操作需在控制中心审批）');
+  const current = deduplicated
+    ? db.raw.prepare('SELECT status, result, error FROM tasks WHERE id = ?').get(taskId) as
+      | { status: string; result: string | null; error: string | null }
+      | undefined
+    : undefined;
+  if (current?.status === 'COMPLETED') {
+    final(`✅ 任务完成：\n${current.result ?? '（无文本产物）'}`);
+    return;
+  }
+  if (current && ['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(current.status)) {
+    final(`❌ 任务未完成（${current.status}）：${current.error ?? '无错误信息'}`);
+    return;
+  }
+
+  activeReplyPolls.add(taskId);
+  ack(deduplicated
+    ? '已恢复任务状态跟踪，数字员工仍在执行中…'
+    : '已接收任务，数字员工执行中…（高风险操作需在控制中心审批）');
 
   // 轮询任务终态后回复结果
   const started = Date.now();
@@ -175,16 +203,22 @@ export function dispatchChannelTask(opts: {
     const row = db.raw.prepare('SELECT status, result, error FROM tasks WHERE id = ?').get(taskId) as
       | { status: string; result: string | null; error: string | null }
       | undefined;
-    if (!row) return;
+    if (!row) {
+      activeReplyPolls.delete(taskId);
+      return;
+    }
     if (row.status === 'COMPLETED') {
+      activeReplyPolls.delete(taskId);
       final(`✅ 任务完成：\n${row.result ?? '（无文本产物）'}`);
       return;
     }
     if (['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(row.status)) {
+      activeReplyPolls.delete(taskId);
       final(`❌ 任务未完成（${row.status}）：${row.error ?? '无错误信息'}`);
       return;
     }
     if (Date.now() - started > REPLY_TIMEOUT_MS) {
+      activeReplyPolls.delete(taskId);
       final('⏳ 任务仍在执行，请稍后到控制中心查看结果。');
       return;
     }

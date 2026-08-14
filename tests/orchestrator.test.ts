@@ -129,6 +129,28 @@ describe('Orchestrator 状态机', () => {
       expect(executors.dispatch).toHaveBeenCalled();
     });
 
+    it('相同来源幂等键只创建并派发一次', () => {
+      const agentId = seedAgent(db);
+      const first = orch.createTask(agentId, '第一份内容', 'channel', { sourceKey: 'weixin:message:101' });
+      const replay = orch.createTask(agentId, '重投内容', 'channel', { sourceKey: 'weixin:message:101' });
+
+      expect(replay.id).toBe(first.id);
+      expect(replay.deduplicated).toBe(true);
+      expect(db.tables.tasks.size).toBe(1);
+      expect(db.tables.task_events.size).toBe(1);
+      expect(executors.dispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('不同来源可复用相同幂等键，空键不去重', () => {
+      const agentId = seedAgent(db, { concurrency_limit: 4 });
+      const channel = orch.createTask(agentId, '渠道任务', 'channel', { sourceKey: 'event-1' });
+      const schedule = orch.createTask(agentId, '定时任务', 'schedule', { sourceKey: 'event-1' });
+      const withoutKeyA = orch.createTask(agentId, '无键 A', 'desktop');
+      const withoutKeyB = orch.createTask(agentId, '无键 B', 'desktop');
+
+      expect(new Set([channel.id, schedule.id, withoutKeyA.id, withoutKeyB.id])).toHaveProperty('size', 4);
+    });
+
     it('DISABLED 员工创建任务 → QUEUED', () => {
       const agentId = seedAgent(db, { lifecycle: 'DISABLED' });
       const task = orch.createTask(agentId, '排队任务');

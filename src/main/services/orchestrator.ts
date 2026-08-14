@@ -34,6 +34,8 @@ export interface AgentCreationCheckpoint {
   autoWorkspaceExisted: boolean;
 }
 
+export type CreateTaskResult = Task & { deduplicated?: true };
+
 const STAGES = ['理解需求', '规划步骤', '调用工具', '生成产物', '校验结果'];
 
 /** 演示模式后续任务池（仅 demoAutoTasks 开启时生效，生产环境完全隔离） */
@@ -746,10 +748,16 @@ export class Orchestrator {
   /** 创建任务：该员工无活跃任务且未超并发 → 立即经执行器派发；否则进入 QUEUED 等待 FIFO 调度。
    *  opts.parentId：委派/追问的父任务；opts.sessionId：继承会话锚点（P2b 追问续跑）；
    *  opts.workspaceOverride：任务级工作空间覆盖（团队共享工作空间）；
-   *  opts.engineOverride：任务级引擎覆盖（E-2 编码委派，员工归属不变） */
-  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string; projectId?: string; engineOverride?: string } = {}): Task {
+   *  opts.engineOverride：任务级引擎覆盖（E-2 编码委派，员工归属不变）；
+   *  opts.sourceKey：外部来源的稳定消息 ID；重复键返回原任务并标记 deduplicated。 */
+  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string; projectId?: string; engineOverride?: string; sourceKey?: string } = {}): CreateTaskResult {
     const now = Date.now();
     const id = randomUUID();
+    const sourceKey = opts.sourceKey?.trim() || null;
+    if (sourceKey) {
+      const existing = this.db.raw.prepare('SELECT * FROM tasks WHERE source = ? AND source_key = ?').get(source, sourceKey) as Row | undefined;
+      if (existing) return Object.assign(this.mapTask(existing), { deduplicated: true as const });
+    }
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error('员工不存在');
     const mobileState = agent.kind === 'android_operator'
@@ -780,10 +788,14 @@ export class Orchestrator {
     const guardReason = this.dispatchGuard();
     const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null && (!mobileState || mobileState.ready);
     const queuedStage = guardReason ?? mobileState?.reason ?? '排队中';
+    let inserted = false;
     this.db.transaction(() => {
-      this.db.raw.prepare(
-        'INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, session_id, workspace_override, engine_override, created_at, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, ?, NULL)'
-      ).run(id, agentId, projectId, title, source, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : queuedStage, opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride, now, canRun ? now : null);
+      inserted = this.db.raw.prepare(
+        `INSERT INTO tasks(id, agent_id, project_id, title, source, source_key, parent_id, status, priority, progress, stage, error, session_id, workspace_override, engine_override, created_at, started_at, ended_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(source, source_key) WHERE source_key IS NOT NULL DO NOTHING`
+      ).run(id, agentId, projectId, title, source, sourceKey, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : queuedStage, opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride, now, canRun ? now : null).changes > 0;
+      if (!inserted) return;
       if (canRun) {
         this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
           .run(randomUUID(), agentId, id, process.pid, randomUUID(), 'RUNNING', now);
@@ -791,6 +803,13 @@ export class Orchestrator {
       this.db.raw.prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
         .run(randomUUID(), id, canRun ? 'started' : 'queued', '{}', now);
     });
+    if (!inserted) {
+      const existing = sourceKey
+        ? this.db.raw.prepare('SELECT * FROM tasks WHERE source = ? AND source_key = ?').get(source, sourceKey) as Row | undefined
+        : undefined;
+      if (!existing) throw new Error('任务创建失败');
+      return Object.assign(this.mapTask(existing), { deduplicated: true as const });
+    }
     const created = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row;
     const task = this.mapTask(created);
     if (canRun) this.dispatchTask(task, agent);
