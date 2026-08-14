@@ -16,6 +16,8 @@ async function getPw() {
   return pw;
 }
 
+type PlaywrightLoader = () => Promise<typeof import('playwright-core')>;
+
 interface BrowserSession {
   browser: import('playwright-core').Browser;
   context: import('playwright-core').BrowserContext;
@@ -46,7 +48,7 @@ export class BrowserManager {
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
 
-  constructor() {
+  constructor(private readonly loadPlaywright: PlaywrightLoader = getPw) {
     this.cleanupTimer = setInterval(() => { void this.cleanupIdle(); }, 60_000);
     this.cleanupTimer.unref?.();
   }
@@ -126,7 +128,7 @@ export class BrowserManager {
 
   private async createSession(cdpUrl?: string): Promise<BrowserSession> {
     const source: BrowserSession['source'] = cdpUrl ? 'cdp' : 'local';
-    const playwright = await getPw();
+    const playwright = await this.loadPlaywright();
     const browser = cdpUrl
       ? await playwright.chromium.connectOverCDP(cdpUrl)
       : await this.getLocalBrowser();
@@ -163,7 +165,7 @@ export class BrowserManager {
 
     let launchPromise!: Promise<import('playwright-core').Browser>;
     launchPromise = (async () => {
-      const playwright = await getPw();
+      const playwright = await this.loadPlaywright();
       const browser = await playwright.chromium.launch({
         headless: true,
         args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']

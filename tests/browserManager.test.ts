@@ -52,16 +52,14 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
-vi.mock('playwright-core', () => ({
-  chromium: { launch: mocks.launch, connectOverCDP: mocks.connectOverCDP }
-}));
-
 const { BrowserManager } = await import('../src/main/services/browserManager.js');
 
 const managers: InstanceType<typeof BrowserManager>[] = [];
 
 function createManager(): InstanceType<typeof BrowserManager> {
-  const manager = new BrowserManager();
+  const manager = new BrowserManager(async () => ({
+    chromium: { launch: mocks.launch, connectOverCDP: mocks.connectOverCDP }
+  }) as never);
   managers.push(manager);
   return manager;
 }
