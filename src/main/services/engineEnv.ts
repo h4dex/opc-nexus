@@ -23,6 +23,26 @@ export const SECRET_ENV_PATTERN = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|
 /** config_json 中替代敏感值的占位符（Renderer 只能看到它；回传该值表示沿用已存密钥） */
 export const SECRET_PLACEHOLDER = '***';
 
+/** Host variables required to launch a child process without leaking ambient
+ * model credentials or unrelated application secrets into third-party CLIs. */
+export const CHILD_PROCESS_HOST_ENV_ALLOWLIST = new Set([
+  'ALL_PROXY', 'APPDATA', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+  'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)',
+  'COMMONPROGRAMW6432', 'COMSPEC', 'HOME', 'HOMEDRIVE', 'HOMEPATH',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE',
+  'LOCALAPPDATA', 'NODE_EXTRA_CA_CERTS', 'NO_PROXY', 'NUMBER_OF_PROCESSORS',
+  'OS', 'PATH', 'PATHEXT', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_ARCHITEW6432',
+  'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'SHELL',
+  'SSL_CERT_DIR', 'SSL_CERT_FILE', 'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'TERM',
+  'TMP', 'TMPDIR', 'TZ', 'USER', 'USERNAME', 'USERPROFILE', 'WINDIR',
+  'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'
+]);
+
+export interface SensitiveTextRedactor {
+  push(text: string): string;
+  finish(): string;
+}
+
 /** 引擎敏感环境变量在 settings 表中的存储键 */
 export function engineEnvSecretRef(engineId: string): string {
   return `secret:engine:${engineId}:env`;
@@ -54,7 +74,7 @@ export function splitSecretEnv(env: Record<string, string>): {
  * 解析引擎完整环境变量（含解密后的敏感项）。
  * **仅供主进程执行器 spawn 时使用，禁止经 IPC 暴露给 Renderer。**
  */
-export function resolveEngineEnv(db: Database, engineId: string): Record<string, string> {
+export function resolveConfiguredEngineEnv(db: Database, engineId: string): Record<string, string> {
   const env: Record<string, string> = {};
   const row = db.raw.prepare('SELECT config_json FROM engines WHERE id = ?').get(engineId) as
     | { config_json?: string }
@@ -79,12 +99,81 @@ export function resolveEngineEnv(db: Database, engineId: string): Record<string,
     }
   }
 
-  // 供应商凭据下发：让第三方 CLI 复用应用内已配置的供应商，避免用户在
-  // 每个引擎里重复配一遍 key。用户自定义的同名变量优先（上面已写入，此处不覆盖）。
+  return env;
+}
+
+export function resolveEngineEnv(db: Database, engineId: string): Record<string, string> {
+  const env = resolveConfiguredEngineEnv(db, engineId);
+
+  // 供应商凭据下发：让通用第三方 CLI 复用应用内已配置的供应商。专属的
+  // Hermes/Pi/Claude 运行时应改用 resolveConfiguredEngineEnv 或其 profile env，
+  // 避免把默认供应商密钥混入与该进程无关的认证域。
   for (const [k, v] of Object.entries(providerEnvFor(db))) {
     if (env[k] === undefined) env[k] = v;
   }
   return env;
+}
+
+/** Build a minimal process environment, then overlay only explicitly resolved
+ * runtime values. Keys such as API_KEY/TOKEN from the host are never inherited. */
+export function childProcessEnv(
+  runtimeEnv: Record<string, string | undefined>,
+  hostEnv: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(hostEnv)) {
+    if (value !== undefined && CHILD_PROCESS_HOST_ENV_ALLOWLIST.has(key.toUpperCase())) env[key] = value;
+  }
+  for (const [key, value] of Object.entries(runtimeEnv)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+function sensitiveValues(env: Record<string, string | undefined>): string[] {
+  return [...new Set(Object.entries(env)
+    .filter(([key, value]) => SECRET_ENV_PATTERN.test(key) && typeof value === 'string' && value.length >= 4)
+    .map(([, value]) => value as string))]
+    .sort((a, b) => b.length - a.length);
+}
+
+/** Redact exact task-scoped credential values before output reaches logs, IPC,
+ * task results, or error messages. */
+export function redactSensitiveText(text: string, env: Record<string, string | undefined>): string {
+  let redacted = text;
+  for (const secret of sensitiveValues(env)) redacted = redacted.split(secret).join('[REDACTED]');
+  return redacted;
+}
+
+/** Streaming variant that retains a short suffix, covering a secret split
+ * across adjacent stdout chunks. */
+export function createSensitiveTextRedactor(env: Record<string, string | undefined>): SensitiveTextRedactor {
+  const secrets = sensitiveValues(env);
+  if (secrets.length === 0) return { push: (text) => text, finish: () => '' };
+  const holdChars = Math.max(...secrets.map((secret) => secret.length)) - 1;
+  let pending = '';
+  return {
+    push(text) {
+      const combined = pending + text;
+      let split = Math.max(0, combined.length - holdChars);
+      for (const secret of secrets) {
+        let start = combined.indexOf(secret);
+        while (start >= 0) {
+          const end = start + secret.length;
+          if (start < split && end > split) split = start;
+          start = combined.indexOf(secret, start + 1);
+        }
+      }
+      const ready = combined.slice(0, split);
+      pending = combined.slice(split);
+      return redactSensitiveText(ready, env);
+    },
+    finish() {
+      const ready = redactSensitiveText(pending, env);
+      pending = '';
+      return ready;
+    }
+  };
 }
 
 /**

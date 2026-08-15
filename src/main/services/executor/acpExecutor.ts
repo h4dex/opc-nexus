@@ -13,7 +13,7 @@ import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { loadConfig } from '../config.js';
-import { resolveEngineEnv } from '../engineEnv.js';
+import { childProcessEnv, resolveEngineEnv } from '../engineEnv.js';
 import {
   DEEPSEEK_HARNESS_ENGINE_ID,
   cleanupHarnessEnv,
@@ -271,7 +271,7 @@ export class AcpExecutor implements ExecutorAdapter {
         windowsHide: true,
         env: agent.engineId === DEEPSEEK_HARNESS_ENGINE_ID
           ? deepseekHarnessProcessEnv(managedEnv ?? {})
-          : { ...process.env, ...engineEnv }
+          : childProcessEnv(engineEnv)
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -637,7 +637,7 @@ export class AcpExecutor implements ExecutorAdapter {
         if (!sessionId) throw new Error('ACP session/new 未返回 sessionId');
         run.sessionId = sessionId;
 
-        const promptText = `${agent.systemPrompt}\n\n当前任务：${task.title}\n请直接执行该任务，并输出最终结构化结果。`;
+        const promptText = `${agent.systemPrompt}\n\n当前任务：${task.content || task.title}\n请直接执行该任务，并输出最终结构化结果。`;
         const result = await request('session/prompt', {
           sessionId,
           prompt: [{ type: 'text', text: promptText }]
@@ -681,6 +681,9 @@ export class AcpExecutor implements ExecutorAdapter {
 /** 检测握手：spawn + initialize 成功即认为引擎可用（EngineManager.detect 调用，10s 超时） */
 export interface AcpProbeOptions {
   managedHarness?: boolean;
+  /** Optional read-only prompt used by control-plane advisors. */
+  prompt?: string;
+  maxOutputChars?: number;
 }
 
 export function probeAcpEngine(
@@ -697,7 +700,7 @@ export function probeAcpEngine(
         windowsHide: true,
         env: managedHarness
           ? deepseekHarnessProcessEnv(env)
-          : { ...process.env, ...env }
+          : childProcessEnv(env)
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -814,6 +817,8 @@ export function probeAcpTask(
 ): Promise<AcpTaskProbeResult> {
   return new Promise((resolve) => {
     const managedHarness = options.managedHarness === true;
+    const prompt = options.prompt?.trim() || 'Reply with exactly OPC_HARNESS_OK. Do not call tools.';
+    const maxOutputChars = Math.max(100, Math.min(options.maxOutputChars ?? 4_000, 16_000));
     let child: ChildProcess;
     try {
       child = spawn(command[0], command.slice(1), {
@@ -822,7 +827,7 @@ export function probeAcpTask(
         windowsHide: true,
         env: managedHarness
           ? deepseekHarnessProcessEnv(env)
-          : { ...process.env, ...env }
+          : childProcessEnv(env)
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -918,7 +923,7 @@ export function probeAcpTask(
           if (update.sessionUpdate === 'agent_message_chunk') {
             const content = update.content as { type?: string; text?: string } | undefined;
             if (content?.type === 'text' && content.text) {
-              appendBoundedText(outputParts, outputState, content.text, 4_000);
+              appendBoundedText(outputParts, outputState, content.text, maxOutputChars);
             }
           }
           continue;
@@ -956,7 +961,7 @@ export function probeAcpTask(
             method: 'session/prompt',
             params: {
               sessionId,
-              prompt: [{ type: 'text', text: 'Reply with exactly OPC_HARNESS_OK. Do not call tools.' }]
+              prompt: [{ type: 'text', text: prompt }]
             }
           });
           continue;

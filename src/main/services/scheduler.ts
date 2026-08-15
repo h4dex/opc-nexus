@@ -87,6 +87,20 @@ export class Scheduler {
   }
 
   create(input: ScheduleInput): Schedule {
+    return this.createWithCommit(input, 'admin', () => {});
+  }
+
+  /** Lets another Main-process service atomically commit state with schedule creation. */
+  createWithCommit(input: ScheduleInput, actor: string, commit: (schedule: Schedule) => void): Schedule {
+    let result!: Schedule;
+    this.db.transaction(() => {
+      result = this.createMutation(input, actor);
+      commit(result);
+    });
+    return result;
+  }
+
+  private createMutation(input: ScheduleInput, actor: string): Schedule {
     const title = input.title.trim();
     const automationKind = input.automationKind ?? 'task';
     const agentId = input.agentId?.trim() || null;
@@ -100,7 +114,7 @@ export class Scheduler {
     this.db.raw
       .prepare('INSERT INTO schedules(id, agent_id, project_id, automation_kind, title, content, cron_kind, cron_value, enabled, last_run_at, next_run_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)')
       .run(id, agentId, projectId, automationKind, title, input.content?.trim() ?? '', input.cronKind, input.cronValue, next);
-    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'schedule.create', target: id, result: automationKind });
+    this.db.audit({ id: randomUUID(), actor, action: 'schedule.create', target: id, result: automationKind });
     return this.list().find((s) => s.id === id)!;
   }
 

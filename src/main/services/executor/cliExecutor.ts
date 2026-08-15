@@ -16,7 +16,13 @@ import { app } from 'electron';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
-import { resolveEngineEnv } from '../engineEnv.js';
+import {
+  childProcessEnv,
+  createSensitiveTextRedactor,
+  redactSensitiveText,
+  resolveConfiguredEngineEnv,
+  resolveEngineEnv
+} from '../engineEnv.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 import { appendProcessOutput, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
 import { appendBoundedText, boundedText } from '../textEncoding.js';
@@ -24,6 +30,117 @@ import { appendBoundedText, boundedText } from '../textEncoding.js';
 const TIMEOUT_MS = 10 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
 const MAX_STREAM_BUFFER_CHARS = 1_024 * 1_024;
+
+export const CLAUDE_ENGINE_ID = 'eng-claude';
+export const CLAUDE_PROBE_SENTINEL = 'OPC_CLAUDE_OK';
+const CLAUDE_SESSION_PREFIX = 'claude:';
+const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function lastJsonRecord(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch { /* Fall through to JSONL parsing. */ }
+  const objectStart = trimmed.indexOf('{');
+  const objectEnd = trimmed.lastIndexOf('}');
+  if (objectStart >= 0 && objectEnd > objectStart) {
+    try {
+      const parsed = JSON.parse(trimmed.slice(objectStart, objectEnd + 1)) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* Fall through to line-by-line parsing. */ }
+  }
+  const lines = trimmed.split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      const parsed = JSON.parse(lines[index]) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* Ignore non-JSON diagnostics. */ }
+  }
+  return null;
+}
+
+function claudeSessionId(anchor: string | null): string | null {
+  if (!anchor) return null;
+  const candidate = anchor.startsWith(CLAUDE_SESSION_PREFIX)
+    ? anchor.slice(CLAUDE_SESSION_PREFIX.length)
+    : anchor;
+  return CLAUDE_SESSION_ID_RE.test(candidate) ? candidate : null;
+}
+
+export function claudeSessionAnchor(sessionId: string): string | null {
+  return CLAUDE_SESSION_ID_RE.test(sessionId) ? `${CLAUDE_SESSION_PREFIX}${sessionId}` : null;
+}
+
+/** Claude inherits only process mechanics; model credentials must come from the
+ * encrypted engine environment or Claude's own local auth store. */
+export function claudeProcessEnv(
+  runtimeEnv: Record<string, string>,
+  hostEnv: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  return childProcessEnv(runtimeEnv, hostEnv);
+}
+
+export function redactClaudeText(text: string, env: NodeJS.ProcessEnv): string {
+  return redactSensitiveText(text, env);
+}
+
+export function buildClaudeAuthCheckArgs(): string[] {
+  return ['auth', 'status', '--json'];
+}
+
+export function parseClaudeAuthStatus(text: string): { loggedIn: boolean; detail: string } {
+  const record = lastJsonRecord(text);
+  if (!record) return { loggedIn: false, detail: 'Claude auth status did not return JSON' };
+  const loggedIn = record.loggedIn === true;
+  const method = typeof record.authMethod === 'string' ? record.authMethod : 'unknown';
+  const provider = typeof record.apiProvider === 'string' ? record.apiProvider : 'unknown';
+  return {
+    loggedIn,
+    detail: loggedIn ? `authenticated via ${method} (${provider})` : 'Claude Code is not logged in'
+  };
+}
+
+export function buildClaudeProbeArgs(): string[] {
+  return [
+    '-p', '--output-format', 'json', '--safe-mode', '--strict-mcp-config', '--no-chrome',
+    '--no-session-persistence', '--max-budget-usd', '0.05', '--permission-mode', 'dontAsk',
+    '--tools=', `Reply with exactly ${CLAUDE_PROBE_SENTINEL}`
+  ];
+}
+
+export function parseClaudeProbeOutput(text: string): { ok: boolean; output: string; error: string | null } {
+  const record = lastJsonRecord(text);
+  if (!record) return { ok: false, output: '', error: 'Claude probe did not return JSON' };
+  const output = typeof record.result === 'string' ? record.result.trim() : '';
+  if (record.is_error === true) return { ok: false, output, error: output || 'Claude probe reported an error' };
+  if (!output.includes(CLAUDE_PROBE_SENTINEL)) {
+    return { ok: false, output, error: output ? `Unexpected Claude probe output: ${output}` : 'Claude probe returned no result' };
+  }
+  return { ok: true, output, error: null };
+}
+
+export function buildClaudeTaskArgs(
+  prompt: string,
+  sessionAnchor: string | null,
+  permissionMode: Agent['permissionMode']
+): string[] {
+  const tools = permissionMode === 'readonly'
+    ? 'Read,Glob,Grep'
+    : 'Read,Glob,Grep,Edit,Write,Bash';
+  const permissions = permissionMode === 'readonly'
+    ? ['--permission-mode', 'dontAsk']
+    : (permissionMode === 'trusted' || permissionMode === 'autonomous')
+      ? ['--dangerously-skip-permissions']
+      : ['--permission-mode', 'acceptEdits'];
+  const resumeId = claudeSessionId(sessionAnchor);
+  return [
+    '-p', '--output-format', 'stream-json', '--verbose', '--safe-mode',
+    '--strict-mcp-config', '--no-chrome', ...permissions, `--tools=${tools}`,
+    ...(resumeId ? ['--resume', resumeId] : []), prompt
+  ];
+}
 
 interface RunningChild {
   child: ChildProcess;
@@ -68,16 +185,7 @@ export class CliExecutor implements ExecutorAdapter {
       return { bin: this.resolveBin('codex'), args: [...base, '--json', '--skip-git-repo-check', '--sandbox', sandbox, prompt] };
     }
     if (this.kind === 'claude-cli') {
-      // 保留分支以兼容配置文件仍指向 Claude Code 的历史安装；
-      // 四引擎收敛后已无处实例化（Claude Code 于 v26 下线），正常不会走到这里。
-      const perm =
-        mode === 'readonly'
-          ? ['--allowedTools', 'Read,Glob,Grep']
-          : (mode === 'trusted' || mode === 'autonomous')
-            ? ['--dangerously-skip-permissions']
-            : ['--permission-mode', 'acceptEdits', '--allowedTools', 'Read,Edit,Write,Glob,Grep,Bash'];
-      const resume = task.sessionId ? ['--resume', task.sessionId] : [];
-      return { bin: this.resolveBin('claude'), args: ['-p', prompt, ...resume, ...perm, '--output-format', 'stream-json', '--verbose'] };
+      return { bin: this.resolveBin('claude'), args: buildClaudeTaskArgs(prompt, task.sessionId, mode) };
     }
     // 泛化 CLI：运行参数模板取配置覆写，否则用目录默认；{prompt} 替换为任务提示词（权限参数由 CLI 自身配置控制）
     const override = loadConfig().engines[this.engineId]?.runArgs;
@@ -96,22 +204,30 @@ export class CliExecutor implements ExecutorAdapter {
       return;
     }
 
-    const prompt = task.sessionId
-      ? `追问：${task.title}\n请在之前会话的基础上继续处理，并输出最终结果。`
-      : `${agent.systemPrompt}\n\n当前任务：${task.title}\n请直接执行该任务，并输出最终结构化结果。`;
+    const resumableSession = this.kind === 'claude-cli'
+      ? claudeSessionId(task.sessionId) !== null
+      : task.sessionId !== null;
+    const prompt = resumableSession
+      ? `追问：${task.content || task.title}\n请在之前会话的基础上继续处理，并输出最终结果。`
+      : `${agent.systemPrompt}\n\n当前任务：${task.content || task.title}\n请直接执行该任务，并输出最终结构化结果。`;
     const { bin, args } = this.buildCommand(prompt, task, agent);
 
     let child: ChildProcess;
+    let env: NodeJS.ProcessEnv = {};
     try {
       // 引擎自定义环境变量：敏感项经 safeStorage 解密后在此还原，仅存活于子进程
+      const engineEnv = this.kind === 'claude-cli'
+        ? resolveConfiguredEngineEnv(this.db, this.engineId)
+        : resolveEngineEnv(this.db, this.engineId);
+      env = childProcessEnv(engineEnv);
       child = spawnCli(bin, args, {
         cwd: workspace,
         shell: false,
         windowsHide: true,
-        env: { ...process.env, ...resolveEngineEnv(this.db, this.engineId) }
+        env
       });
     } catch (err) {
-      cb.onError(task.id, `无法启动 ${bin}：${err instanceof Error ? err.message : String(err)}`);
+      cb.onError(task.id, redactSensitiveText(`无法启动 ${bin}：${err instanceof Error ? err.message : String(err)}`, env));
       return;
     }
 
@@ -135,12 +251,18 @@ export class CliExecutor implements ExecutorAdapter {
     let lastFlush = Date.now();
     let lastProgress = 5;
     let sawStreamEvent = false;
+    const streamRedactor = createSensitiveTextRedactor(env);
 
     const flush = (force: boolean) => {
       if (outBuf && (force || Date.now() - lastFlush >= 300)) {
-        cb.onOutput(task.id, outBuf);
+        const safe = streamRedactor.push(outBuf);
+        if (safe) cb.onOutput(task.id, safe);
         outBuf = '';
         lastFlush = Date.now();
+      }
+      if (force) {
+        const tail = streamRedactor.finish();
+        if (tail) cb.onOutput(task.id, tail);
       }
     };
     const bump = (stage: string | null, pct: number) => {
@@ -186,13 +308,16 @@ export class CliExecutor implements ExecutorAdapter {
         else if (type === 'error') {
           // 事件流已报错：标记中止，避免进程随后以 code=0 退出时 close 分支再调 onDone
           this.abortedTasks.add(task.id);
-          cb.onError(task.id, String(ev.message ?? 'Codex 执行错误'));
+          cb.onError(task.id, redactSensitiveText(String(ev.message ?? 'Codex 执行错误'), env));
         }
       } else {
         const type = ev.type as string;
         if (type === 'system') {
           // P2b：提取 session_id 作为会话锚点（追问时 --resume）
-          if (typeof ev.session_id === 'string' && !task.sessionId) cb.onSession?.(task.id, ev.session_id);
+          if (typeof ev.session_id === 'string' && !task.sessionId) {
+            const anchor = claudeSessionAnchor(ev.session_id);
+            if (anchor) cb.onSession?.(task.id, anchor);
+          }
           bump('规划步骤', 12);
         } else if (type === 'assistant') {
           const msg = ev.message as { content?: { type: string; text?: string }[] } | undefined;
@@ -203,7 +328,7 @@ export class CliExecutor implements ExecutorAdapter {
         } else if (type === 'result') {
           if (ev.is_error) {
             this.abortedTasks.add(task.id); // 同上：防 close 分支覆盖为成功
-            cb.onError(task.id, String(ev.result ?? 'Claude Code 执行错误'));
+            cb.onError(task.id, redactSensitiveText(String(ev.result ?? 'Claude Code 执行错误'), env));
           } else if (typeof ev.result === 'string' && ev.result && fullState.length === 0) pushText(ev.result);
           bump('校验结果', 95);
         }
@@ -230,7 +355,7 @@ export class CliExecutor implements ExecutorAdapter {
       clearTimeout(timer);
       this.running.delete(task.id);
       // ENOENT = CLI 未安装/不在 PATH
-      cb.onError(task.id, `启动失败：${err.message}（请确认 ${bin} 已安装并在 PATH 中）`);
+      cb.onError(task.id, redactSensitiveText(`启动失败：${err.message}（请确认 ${bin} 已安装并在 PATH 中）`, env));
     });
 
     child.on('close', (code) => {
@@ -245,9 +370,9 @@ export class CliExecutor implements ExecutorAdapter {
       if (code === 0) {
         bump('校验结果', 98);
         const result = full.trim() || (sawStreamEvent ? '（执行完成，无文本产物）' : stderrBuf.slice(0, 2000));
-        cb.onDone(task.id, result.slice(0, MAX_RESULT_CHARS));
+        cb.onDone(task.id, redactSensitiveText(result, env).slice(0, MAX_RESULT_CHARS));
       } else {
-        cb.onError(task.id, `进程退出码 ${code ?? 'null'}：${(stderrBuf || '无错误输出').slice(0, 300)}`);
+        cb.onError(task.id, redactSensitiveText(`进程退出码 ${code ?? 'null'}：${(stderrBuf || '无错误输出').slice(0, 300)}`, env));
       }
     });
   }

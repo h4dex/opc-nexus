@@ -2,26 +2,50 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
-## [1.8.0] - 2026-08-14
+## [1.8.0] - 2026-08-15
 
-> 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`），本次升级桌面端 Agent Runtime。
+> 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`）。本次完成桌面端 Agent Runtime 控制面整合，版本号与 `package.json` 保持 `1.8.0`。
 
-### 新增
+### 架构与调度
+
+- **Canonical 入站控制面**：微信、企业微信、飞书、桌面聊天、语音确认和 Web API 统一归一化为组织、用户、会话与消息，再进入同一条 `dispatchCanonical()` 路径，避免渠道各自创建任务。
+- **Hermes 主控制核**：`KernelRouter` 默认优先使用 Hermes 生成结构化 `DispatchPlan`，负责结合员工特征和 OPC 长期记忆选择 Worker；Hermes 不直接创建 Task、写入记忆或执行渠道副作用。
+- **Nexus 备用控制核**：Hermes 超时、鉴权失败、输出非法或不可用时，自动切换到无 Provider 依赖的确定性 Nexus。Nexus 只负责可解释的回退派单和风险审批，不持有长期记忆。
+- **Orchestrator 单一提交点**：Orchestrator 是 DispatchPlan、Task 创建和任务状态转换的唯一权威；控制核、Advisor、Worker 和渠道适配器不能绕过状态机写入任务。
+- **DeepSeek Harness 双角色边界**：DSH 作为可选复杂任务 Advisor/Reviewer，也可通过 ACP 作为普通 Worker 执行已提交任务，但没有独立派单权，避免与 Hermes 争用审批、幂等和恢复职责。
+
+### 执行器
+
+- **Pi Agent CLI**：新增专用 `PiAgentExecutor`，使用 OPC 管理的独立运行配置和显式 Provider 注入，支持任务执行与会话续接边界。
+- **统一 ExecutorRegistry**：Codex CLI、Claude Code、Pi Agent、DeepSeek Harness ACP、Hermes Worker 统一注册为可调度执行器；Canonical 计划固定 `(workerAgentId, workerEngineId)`，批准引擎不可用时如实失败，不静默替换执行器。
+- **Hermes Worker 隔离**：Hermes 控制核与 Hermes Worker 可同时存在，但分别使用控制面会话和员工级 profile，避免跨员工污染上下文。
+
+### Harness 与运行时打包
 
 - **DeepSeek Harness Runtime**：内置并固定 `@deepseek-ai/agent-harness@0.1.0-rc.6`，通过 ACP 接入任务编排、取消、暂停、审批、超时与流式输出。
-- **受管 Skills 支持**：每次任务创建独立 Skill 快照和 Session 根目录，仅加载 OPC-Nexus 管理的 Skills，为后续插件权限模型提供稳定边界。
+- **受管 Skills**：每次任务创建独立 Skill 快照和 Session 根目录，仅加载 OPC-Nexus 管理的 Skills，为插件权限模型提供稳定边界。
 - **多供应商接入**：支持 DeepSeek 官方与 OpenAI-compatible Provider，并通过真实模型探测和 Provider 指纹管理 Harness 就绪状态。
+- **发布校验**：固定 Harness 依赖、npm 版本和 lifecycle 脚本白名单，校验许可证、native/Koffi 边界、Electron Node 兼容性与 RunAsNode fuse；Windows/Linux 发布任务复用同一生产签名 Android APK，并在打包后执行 Harness ACP smoke test。
 
-### 安全与稳定性
+### 记忆与自动化
 
-- Provider 凭据仅在 Main 进程解密；限制运行时环境变量、Provider URL、重定向、路径、ACP 帧、并发请求和输出配额，并对跨 chunk 密钥执行脱敏。
-- P0 默认不开放任意 Shell、文件写入、Web、MCP、子 Agent 或第三方 Cordis 插件；Bridge Key 与 Web Token 使用 `safeStorage` 加密并经审计后的剪贴板 IPC 获取。
-- 加固 API Bridge 与 WebServer 的异步启停、端口占用、快速重启、运行期错误和旧实例事件隔离，失败时保持关闭并允许重试。
+- **OPC `MemoryService`**：新增按组织、用户、渠道、会话、员工和项目分域的长期记忆，提供版本化 recall、remember、update、forget；OPC 数据库是长期记忆唯一事实源。
+- **记忆提案审核**：控制核只能返回 `memoryProposals`，计划提交后进入持久化 `pending` 队列，接受/拒绝均幂等并写入审计；未经接受的提案不会参与召回。
+- **定时任务提案审核**：控制核只能返回 `taskScheduleProposals`，接受后由 OPC Scheduler 在事务中创建正式计划；Hermes 原生定时能力不参与 OPC 调度。
+- **DSH 记忆边界**：DSH 上游虽有 JSONL、checkpoint 和 SQLite/FTS 等会话基础设施，但当前 ACP 集成每个任务都创建新的 `session/new`，任务结束后清理 session root，不提供跨任务长期记忆或 resume。长期记忆仍由 OPC `MemoryService` 管理。
 
-### 构建与验证
+### 鉴权、安全与稳定性
 
-- 固定 Harness 依赖、npm 版本和 lifecycle 脚本白名单，校验许可证、native/Koffi 边界、Electron Node 兼容性与 RunAsNode fuse。
-- Windows/Linux 发布任务复用同一生产签名 Android APK，并在打包后执行 Harness ACP smoke test。
+- **Hermes 401/403 修复**：为控制核建立独立 `HERMES_HOME` 和显式 `opcnexus` Provider，固定 model/base URL，凭据只通过 Main 进程注入子进程环境，不再串用全局 OpenRouter 配置；明确的鉴权错误会标记 `AUTH_REQUIRED` 并触发 Nexus 回退。
+- **组织边界与幂等**：canonical identity、conversation、message、DispatchPlan、审批和 Task 均带组织边界与持久化去重凭据，渠道重投、进程重启和审批恢复不会重复派单。
+- **Windows CLI 探测修复**：关闭 npm PowerShell shim 的 stdin，修复 Pi、Claude、OpenCode 探测被误判为超时的问题；CLI 启动、超时、退出码和中文错误输出均如实回传。
+- **密钥隔离**：Provider 密钥继续只存在 Main/safeStorage 边界，不进入 Renderer、localStorage 或持久化日志；控制核和 Worker 使用显式运行时环境变量。
+
+### 验证与已知限制
+
+- 已通过 `npm run typecheck`、`npm test`（84 个测试文件，909 passed / 1 skipped）、`npm run build`、`npm run harness:verify`（18,023 files，89.63 MiB）和 `git diff --check`。
+- 本机当前 Hermes 与 Nexus 已完成真实健康/鉴权验证；Pi Agent、DeepSeek Harness、Claude Code 仍需目标机器配置对应 Provider 凭据后才能进入 `HEALTHY`。Codex 的 Microsoft Store 分发路径仍可能触发 Windows `spawn EPERM`，需使用可直接执行的 CLI 路径。
+- 普通浏览器直接打开 Renderer 不具备 Electron preload，不能代替 Electron 运行；本地 Web REST canonical 入口可独立健康检查。
 
 ## [1.7.1] - 2026-08-14
 

@@ -15,15 +15,17 @@ import { existsSync, mkdirSync, readdirSync, rmdirSync } from 'node:fs';
 import { app } from 'electron';
 import type { Database } from './database.js';
 import type { ExecutorRegistry } from './executor/index.js';
-import type { ExecutorCallbacks } from './executor/types.js';
-import type { ApprovalBroker } from './approvalBroker.js';
+import type { ExecutionBinding, ExecutorCallbacks } from './executor/types.js';
+import type { ApprovalBroker, ApprovalRequest } from './approvalBroker.js';
 import type { ToolHost } from './executor/tools.js';
+import type { DatabaseKernelState } from './kernel/databaseKernelState.js';
+import type { DispatchPlan, KernelRequest } from './kernel/types.js';
 import { notify } from './notifier.js';
 import { loadUserConfig } from './userConfig.js';
 import { MAX_TASK_OUTPUT_CHARS } from './textEncoding.js';
 import type {
-  Agent, AgentCardView, Approval, CreateAgentInput, DashboardStats, DerivedAgentStatus,
-  ExecutorKind, Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
+  Agent, AgentCardView, Approval, ApprovalScope, CreateAgentInput, DashboardStats, DerivedAgentStatus,
+  Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
 } from '../../shared/types.js';
 
 type Row = Record<string, unknown>;
@@ -35,6 +37,31 @@ export interface AgentCreationCheckpoint {
 }
 
 export type CreateTaskResult = Task & { deduplicated?: true };
+
+export interface TaskFinishedInfo {
+  taskId: string;
+  agentId: string;
+  status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED' | 'CANCELLED';
+  title: string;
+  result: string | null;
+  error: string | null;
+}
+
+export interface CreateTaskOptions {
+  parentId?: string;
+  sessionId?: string;
+  workspaceOverride?: string;
+  projectId?: string;
+  engineOverride?: string;
+  sourceKey?: string;
+  conversationId?: string;
+  inputMessageId?: string;
+  content?: string;
+  priority?: number;
+  initialApprovalRequest?: string;
+  /** Main-process commit hook. Runs in the task transaction before any Worker starts. */
+  onPersisted?: (taskId: string) => void;
+}
 
 const STAGES = ['理解需求', '规划步骤', '调用工具', '生成产物', '校验结果'];
 
@@ -51,6 +78,33 @@ const MAX_TASK_OUTPUT_EVENTS = 512;
 const MAX_TASK_EVENTS_QUERY = 1000;
 const MAX_TASK_RESULT_CHARS = 16_000;
 const OUTPUT_STATE_TTL_MS = 60_000;
+const DISPATCH_PLAN_APPROVAL_TYPE = 'dispatch_plan';
+
+const EXPLICIT_AUTH_FAILURE_PATTERNS = [
+  /^(?:error:\s*)?HTTP\s+(?:401|403)\b/i,
+  /^(?:error:\s*)?(?:api|provider|model)(?:\s+request)?(?:\s+failed)?[^\r\n]{0,80}\b(?:401|403)\b/i,
+  /^(?:error:\s*)?(?:api\s+)?request\s+failed\s+with\s+status(?:\s+code)?\s+(?:401|403)\b/i,
+  /^Hermes\s+(?:\u6267\u884c\u5931\u8d25|execution failed)\s*[:\uff1a]\s*HTTP\s+(?:401|403)\b/i,
+  /^(?:\u6a21\u578b)?\u4f9b\u5e94\u5546\u8fd4\u56de\s+HTTP\s+(?:401|403)\b/i,
+  /\bmissing authentication(?:\s+header)?\b/i,
+  /\bno usable credentials\b/i,
+  /\b(?:invalid|expired|missing|revoked)\s+(?:api[ _-]?)?(?:key|token|credential)s?\b/i,
+  /\b(?:api[ _-]?key|credential|access token)\s+(?:is\s+)?(?:invalid|expired|missing|revoked)\b/i,
+  /^(?:error:\s*)?(?:unauthorized|forbidden)\b/i,
+  /(?:\u6a21\u578b\u4f9b\u5e94\u5546|API|Provider).{0,24}(?:\u9274\u6743\u5931\u8d25|\u51ed\u636e\u65e0\u6548|\u51ed\u636e\u8fc7\u671f|\u672a\u6388\u6743)/i
+];
+
+/** Only trusted provider/CLI authentication diagnostics may demote an engine. */
+function isExecutorAuthenticationFailure(error: string | undefined): boolean {
+  if (!error) return false;
+  const detail = error.trim();
+  return detail.length > 0 && EXPLICIT_AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(detail));
+}
+
+function approvalScope(type: unknown): ApprovalScope {
+  // `tool` was briefly used for plan approvals before scopes were explicit.
+  return type === DISPATCH_PLAN_APPROVAL_TYPE || type === 'tool' ? 'dispatch_plan' : 'runtime_tool';
+}
 
 interface TaskOutputState {
   chars: number;
@@ -68,8 +122,8 @@ export class Orchestrator {
   private outputStates = new Map<string, TaskOutputState>();
   /** Resume requests made while an aborted ACP child is still closing. */
   private resumeAfterRelease = new Set<string>();
-  /** 任务终态订阅（webhook 通知等；status 仅 COMPLETED/FAILED/INTERRUPTED） */
-  private finishListeners = new Set<(info: { taskId: string; agentId: string; status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; title: string; result: string | null; error: string | null }) => void>();
+  /** 任务终态订阅（webhook、canonical conversation 等）。 */
+  private finishListeners = new Set<(info: TaskFinishedInfo) => void>();
   private schedulerTimer: NodeJS.Timeout | null = null;
   private lastEmit = 0;
   private emitTimer: NodeJS.Timeout | null = null;
@@ -80,7 +134,52 @@ export class Orchestrator {
     releaseAgent?(agentId: string): void;
   } | null = null;
 
-  constructor(private db: Database, private executors: ExecutorRegistry, private broker: ApprovalBroker) {}
+  constructor(private db: Database, private executors: ExecutorRegistry, private broker: ApprovalBroker) {
+    this.broker.setStateController?.({
+      request: (request, approvalId, now) => this.requestRuntimeApproval(request, approvalId, now),
+      abandon: (taskId, approvalId, now) => this.abandonRuntimeApproval(taskId, approvalId, now)
+    });
+  }
+
+  private requestRuntimeApproval(req: ApprovalRequest, approvalId: string, now: number): void {
+    this.db.transaction(() => {
+      const task = this.db.raw.prepare('SELECT agent_id, status FROM tasks WHERE id = ?').get(req.taskId) as
+        | { agent_id: string; status: TaskStatus }
+        | undefined;
+      if (!task || task.agent_id !== req.agentId || task.status !== 'RUNNING') {
+        throw new Error('runtime approval requires a running task owned by the requesting agent');
+      }
+      this.db.raw.prepare(
+        'INSERT INTO approvals(id, task_id, agent_id, type, request, risk, status, created_at, decided_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)'
+      ).run(approvalId, req.taskId, req.agentId, req.type, req.request, req.risk, 'pending', now);
+      const changed = this.db.raw.prepare(
+        "UPDATE tasks SET status = 'WAITING_APPROVAL' WHERE id = ? AND status = 'RUNNING'"
+      ).run(req.taskId).changes;
+      if (changed !== 1) throw new Error('runtime approval task transition conflicted');
+      this.recordEvent(req.taskId, 'approval_required', {
+        approvalId,
+        scope: 'runtime_tool',
+        request: req.request,
+        risk: req.risk
+      }, now);
+    });
+  }
+
+  private abandonRuntimeApproval(taskId: string, approvalId: string, now: number): void {
+    this.db.transaction(() => {
+      const changed = this.db.raw.prepare(
+        "UPDATE approvals SET status = 'rejected', decided_at = ? WHERE id = ? AND task_id = ? AND status = 'pending'"
+      ).run(now, approvalId, taskId).changes;
+      if (changed > 0) {
+        this.recordEvent(taskId, 'approval_decided', {
+          approvalId,
+          scope: 'runtime_tool',
+          approved: false,
+          reason: 'task_abandoned'
+        }, now);
+      }
+    });
+  }
 
   setDispatchGuard(fn: () => string | null) {
     this.dispatchGuard = fn;
@@ -93,12 +192,76 @@ export class Orchestrator {
     this.mobileDispatchPolicy = policy;
   }
 
+  private delegationOrganization(parentTaskId: string): string | null {
+    const parent = this.db.raw.prepare(
+      'SELECT agent_id FROM tasks WHERE id = ? AND deleted_at IS NULL'
+    ).get(parentTaskId) as { agent_id: string } | undefined;
+    if (!parent) return null;
+    const owner = this.db.raw.prepare(
+      'SELECT organization_id, archived FROM agents WHERE id = ?'
+    ).get(parent.agent_id) as { organization_id: string | null; archived: number } | undefined;
+    const organizationId = owner?.organization_id?.trim() ?? '';
+    return organizationId || null;
+  }
+
+  private agentOrganization(agentId: string): string | null {
+    const row = this.db.raw.prepare(
+      'SELECT organization_id FROM agents WHERE id = ?'
+    ).get(agentId) as { organization_id: string | null } | undefined;
+    const organizationId = row?.organization_id?.trim() ?? '';
+    return organizationId || null;
+  }
+
+  private parentTaskAssociation(parentTaskId: string): { organizationId: string; projectId: string | null } | null {
+    const parent = this.db.raw.prepare(
+      'SELECT agent_id, project_id FROM tasks WHERE id = ? AND deleted_at IS NULL'
+    ).get(parentTaskId) as { agent_id: string; project_id: string | null } | undefined;
+    if (!parent) return null;
+    const organizationId = this.agentOrganization(parent.agent_id);
+    return organizationId ? { organizationId, projectId: parent.project_id ?? null } : null;
+  }
+
+  /** Resolve inherited project ownership and enforce the task tenant boundary. */
+  private resolveTaskProject(agentId: string, parentTaskId?: string, requestedProjectId?: string): string | null {
+    const organizationId = this.agentOrganization(agentId);
+    if (!organizationId) throw new Error('\u5458\u5de5\u4e0d\u5b58\u5728');
+
+    const parent = parentTaskId ? this.parentTaskAssociation(parentTaskId) : null;
+    if (parentTaskId && (!parent || parent.organizationId !== organizationId)) {
+      throw new Error('\u7236\u4efb\u52a1\u4e0d\u5b58\u5728\u6216\u4e0d\u53ef\u5173\u8054');
+    }
+
+    const projectId = requestedProjectId ?? parent?.projectId ?? null;
+    if (!projectId) return null;
+    const project = this.db.raw.prepare(
+      "SELECT id, organization_id FROM projects WHERE id = ? AND status != 'archived'"
+    ).get(projectId) as { id: string; organization_id: string | null } | undefined;
+    if (!project || project.organization_id?.trim() !== organizationId) {
+      throw new Error('\u9879\u76ee\u4e0d\u5b58\u5728\u6216\u5df2\u5f52\u6863');
+    }
+    return projectId;
+  }
+
+  private assertDelegationTarget(parentTaskId: string, targetAgentId: string): void {
+    const organizationId = this.delegationOrganization(parentTaskId);
+    const target = organizationId
+      ? this.db.raw.prepare(
+          "SELECT id FROM agents WHERE id = ? AND organization_id = ? AND archived = 0 AND lifecycle = 'READY'"
+        ).get(targetAgentId, organizationId) as { id: string } | undefined
+      : undefined;
+    if (!target) throw new Error('父任务不存在，或目标员工不可委派');
+  }
+
   /** delegate_task 工具的编排能力（P3b A2A 内部委派） */
   toolHost(): ToolHost {
     return {
-      findAgentIdByName: (name) => {
-        // P3b：仅在岗（READY）员工可接受委派，避免子任务无限期排队
-        const r = this.db.raw.prepare("SELECT id FROM agents WHERE name = ? AND archived = 0 AND lifecycle = 'READY'").get(name) as { id: string } | undefined;
+      findAgentIdByName: (name, parentTaskId) => {
+        // 名称解析与父任务同租户；创建时还会在写事务内二次校验。
+        const organizationId = this.delegationOrganization(parentTaskId);
+        if (!organizationId) return null;
+        const r = this.db.raw.prepare(
+          "SELECT id FROM agents WHERE name = ? AND organization_id = ? AND archived = 0 AND lifecycle = 'READY'"
+        ).get(name, organizationId) as { id: string } | undefined;
         return r?.id ?? null;
       },
       createDelegatedTask: (agentId, title, parentTaskId) => this.createTask(agentId, title, 'delegated', { parentId: parentTaskId }),
@@ -149,7 +312,7 @@ export class Orchestrator {
   }
 
   /** 订阅任务终态（执行器回调驱动；用于对外通知渠道） */
-  onTaskFinished(fn: (info: { taskId: string; agentId: string; status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED'; title: string; result: string | null; error: string | null }) => void): () => void {
+  onTaskFinished(fn: (info: TaskFinishedInfo) => void): () => void {
     this.finishListeners.add(fn);
     return () => this.finishListeners.delete(fn);
   }
@@ -172,18 +335,52 @@ export class Orchestrator {
     }
   }
 
-  /** 崩溃恢复：应用重启后把无主 RUNNING 标记为 INTERRUPTED，不伪装成 FAILED/COMPLETED */
+  /** 崩溃恢复：保留尚未执行的计划审批；其余无主运行态中断并关闭运行时审批。 */
   recoverAfterRestart() {
-    const running = this.db.raw.prepare("SELECT id FROM tasks WHERE status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").all() as { id: string }[];
-    if (running.length === 0) return;
+    const active = this.db.raw.prepare("SELECT id, status FROM tasks WHERE status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").all() as { id: string; status: TaskStatus }[];
+    if (active.length === 0) return;
+    const pendingApprovals = this.db.raw.prepare("SELECT * FROM approvals WHERE status = 'pending'").all() as Row[];
+    const durablePlanTasks = new Set(
+      pendingApprovals
+        .filter((approval) => approvalScope(approval.type) === 'dispatch_plan')
+        .map((approval) => approval.task_id as string)
+    );
+    const interrupted = active.filter((task) => task.status !== 'WAITING_APPROVAL' || !durablePlanTasks.has(task.id));
+    if (interrupted.length === 0) return;
     this.db.transaction(() => {
       const now = Date.now();
-      for (const t of running) {
+      for (const t of interrupted) {
         this.db.raw.prepare("UPDATE tasks SET status = 'INTERRUPTED', ended_at = ?, error = '客户端异常退出，任务中断' WHERE id = ?").run(now, t.id);
         this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'INTERRUPTED' WHERE task_id = ? AND ended_at IS NULL").run(now, t.id);
+        this.recordEvent(t.id, 'interrupted', { reason: 'app-restart' }, now);
+        for (const approval of pendingApprovals.filter((item) => item.task_id === t.id)) {
+          this.db.raw.prepare("UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'").run('rejected', now, approval.id as string);
+          this.recordEvent(t.id, 'approval_decided', {
+            approvalId: approval.id,
+            scope: approvalScope(approval.type),
+            approved: false,
+            reason: 'runtime_interrupted_on_restart'
+          }, now);
+        }
       }
     });
-    this.db.audit({ id: randomUUID(), actor: 'system', action: 'recovery.markInterrupted', target: `${running.length} tasks`, result: 'ok' });
+    for (const task of interrupted) {
+      const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Row | undefined;
+      if (!row) continue;
+      for (const fn of this.finishListeners) {
+        try {
+          fn({
+            taskId: task.id,
+            agentId: String(row.agent_id),
+            status: 'INTERRUPTED',
+            title: String(row.title ?? task.id),
+            result: null,
+            error: String(row.error ?? '客户端异常退出，任务中断')
+          });
+        } catch { /* 通知失败不影响恢复 */ }
+      }
+    }
+    this.db.audit({ id: randomUUID(), actor: 'system', action: 'recovery.markInterrupted', target: `${interrupted.length} tasks`, result: 'ok' });
   }
 
   /** 执行调度器：接管数据库中 RUNNING 但无执行器在跑的任务（种子/重启恢复），
@@ -302,6 +499,9 @@ export class Orchestrator {
     return {
       id: r.id as string, agentId: r.agent_id as string, title: r.title as string,
       projectId: (r.project_id as string | null) ?? null,
+      conversationId: (r.conversation_id as string | null) ?? null,
+      inputMessageId: (r.input_message_id as string | null) ?? null,
+      content: ((r.content as string | null) || (r.title as string)),
       source: r.source as Task['source'], parentId: r.parent_id as string | null,
       status: r.status as TaskStatus, priority: r.priority as number, progress: r.progress as number,
       stage: r.stage as string, error: r.error as string | null, result: (r.result as string | null) ?? null,
@@ -476,29 +676,17 @@ export class Orchestrator {
   // ---------- 会话（持续多轮对话） ----------
 
   listConversations(agentId: string): import('../../shared/types.js').Conversation[] {
-    return (this.db.raw.prepare('SELECT * FROM conversations WHERE agent_id = ? ORDER BY last_message_at DESC LIMIT 50').all(agentId) as Row[]).map((r) => ({
+    return (this.db.raw.prepare('SELECT * FROM conversations WHERE agent_id = ? AND channel_id IS NULL ORDER BY last_message_at DESC LIMIT 50').all(agentId) as Row[]).map((r) => ({
       id: r.id as string, agentId: r.agent_id as string, title: r.title as string,
-      lastMessageAt: r.last_message_at as number, messageCount: r.message_count as number
+      organizationId: (r.organization_id as string | null) ?? null,
+      principalId: (r.principal_id as string | null) ?? null,
+      channelId: (r.channel_id as string | null) ?? null,
+      channelIdentityId: (r.channel_identity_id as string | null) ?? null,
+      externalConversationKey: (r.external_conversation_key as string | null) ?? null,
+      lastMessageAt: r.last_message_at as number, messageCount: r.message_count as number,
+      createdAt: (r.created_at as number | null) ?? null,
+      updatedAt: (r.updated_at as number | null) ?? null
     }));
-  }
-
-  /** 创建新会话并发送第一条消息（创建任务执行） */
-  chatWithAgent(agentId: string, message: string, conversationId?: string): { conversationId: string; task: Task } {
-    const agent = this.getAgent(agentId);
-    if (!agent) throw new Error('助手不存在');
-    const now = Date.now();
-    let convId = conversationId ?? '';
-    if (!convId) {
-      convId = randomUUID();
-      this.db.raw.prepare('INSERT INTO conversations(id, agent_id, title, last_message_at, message_count) VALUES(?,?,?,?,?)')
-        .run(convId, agentId, message.slice(0, 60), now, 1);
-    } else {
-      this.db.raw.prepare('UPDATE conversations SET last_message_at = ?, message_count = message_count + 1 WHERE id = ?').run(now, convId);
-    }
-    // 创建任务，继承会话 session（多轮上下文重建）
-    const task = this.createTask(agentId, message.slice(0, 200), 'desktop', { sessionId: `conv-${convId}` });
-    this.emit();
-    return { conversationId: convId, task };
   }
 
   // ---------- 用量统计 ----------
@@ -517,7 +705,8 @@ export class Orchestrator {
 
   listTasks(options: { includeResult?: boolean } = {}): Task[] {
     const select = options.includeResult === false
-      ? `id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error,
+      ? `id, agent_id, project_id, conversation_id, input_message_id, title, content,
+         source, parent_id, status, priority, progress, stage, error,
          NULL AS result, CASE WHEN result IS NOT NULL AND LENGTH(TRIM(result)) > 0 THEN 1 ELSE 0 END AS has_result,
          quality, session_id, workspace_override, engine_override, created_at, started_at, ended_at`
       : '*';
@@ -529,7 +718,9 @@ export class Orchestrator {
     const rows = this.db.raw.prepare("SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_at DESC").all() as Row[];
     return rows.map((r) => ({
       id: r.id as string, taskId: r.task_id as string, agentId: r.agent_id as string,
-      type: r.type as Approval['type'], request: r.request as string, risk: r.risk as Approval['risk'],
+      scope: approvalScope(r.type),
+      type: (r.type === 'tool' ? DISPATCH_PLAN_APPROVAL_TYPE : r.type) as Approval['type'],
+      request: r.request as string, risk: r.risk as Approval['risk'],
       status: 'pending', createdAt: r.created_at as number, decidedAt: null
     }));
   }
@@ -731,9 +922,11 @@ export class Orchestrator {
 
   stopAgent(id: string) {
     const now = Date.now();
+    let cancelled: { id: string }[] = [];
     this.db.transaction(() => {
       this.db.raw.prepare("UPDATE agents SET lifecycle = 'DISABLED', updated_at = ? WHERE id = ?").run(now, id);
       const active = this.db.raw.prepare("SELECT id FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','QUEUED','PAUSED','WAITING_APPROVAL')").all(id) as { id: string }[];
+      cancelled = active;
       for (const t of active) {
         this.resumeAfterRelease.delete(t.id);
         this.broker.abandonTask(t.id);
@@ -741,6 +934,14 @@ export class Orchestrator {
         this.cancelTaskInternal(t.id, now);
       }
     });
+    for (const task of cancelled) {
+      const row = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(task.id) as { title: string } | undefined;
+      for (const fn of this.finishListeners) {
+        try {
+          fn({ taskId: task.id, agentId: id, status: 'CANCELLED', title: row?.title ?? task.id, result: null, error: '数字员工已停止' });
+        } catch { /* 通知失败不影响状态转换 */ }
+      }
+    }
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'agent.stop', target: id, result: 'ok' });
     this.emit();
   }
@@ -749,14 +950,28 @@ export class Orchestrator {
    *  opts.parentId：委派/追问的父任务；opts.sessionId：继承会话锚点（P2b 追问续跑）；
    *  opts.workspaceOverride：任务级工作空间覆盖（团队共享工作空间）；
    *  opts.engineOverride：任务级引擎覆盖（E-2 编码委派，员工归属不变）；
-   *  opts.sourceKey：外部来源的稳定消息 ID；重复键返回原任务并标记 deduplicated。 */
-  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: { parentId?: string; sessionId?: string; workspaceOverride?: string; projectId?: string; engineOverride?: string; sourceKey?: string } = {}): CreateTaskResult {
+   *  opts.sourceKey：外部来源的稳定消息 ID；重复键返回原任务并标记 deduplicated；
+   *  opts.conversationId：canonical conversation 外键。 */
+  createTask(agentId: string, title: string, source: Task['source'] = 'desktop', opts: CreateTaskOptions = {}): CreateTaskResult {
     const now = Date.now();
     const id = randomUUID();
     const sourceKey = opts.sourceKey?.trim() || null;
+    const content = (opts.content ?? title).trim();
+    if (!content) throw new Error('任务内容不能为空');
+    if (content.length > 1_000_000) throw new Error('任务内容超过 1000000 字符');
+    const priority = opts.priority ?? 0;
+    if (!Number.isInteger(priority) || priority < -10 || priority > 10) throw new Error('任务优先级必须为 -10 到 10 的整数');
+    const approvalRequest = opts.initialApprovalRequest?.trim() || null;
+    if (source === 'delegated') {
+      if (!opts.parentId) throw new Error('委派任务必须关联父任务');
+      this.assertDelegationTarget(opts.parentId, agentId);
+    }
     if (sourceKey) {
       const existing = this.db.raw.prepare('SELECT * FROM tasks WHERE source = ? AND source_key = ?').get(source, sourceKey) as Row | undefined;
-      if (existing) return Object.assign(this.mapTask(existing), { deduplicated: true as const });
+      if (existing) {
+        if (opts.onPersisted) this.db.transaction(() => opts.onPersisted?.(String(existing.id)));
+        return Object.assign(this.mapTask(existing), { deduplicated: true as const });
+      }
     }
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error('员工不存在');
@@ -775,33 +990,50 @@ export class Orchestrator {
         if (row?.status === 'HEALTHY') engineOverride = routed;
       }
     }
-    let projectId = opts.projectId ?? null;
-    if (!projectId && opts.parentId) {
-      const parent = this.db.raw.prepare('SELECT project_id FROM tasks WHERE id = ?').get(opts.parentId) as { project_id: string | null } | undefined;
-      projectId = parent?.project_id ?? null;
-    }
-    if (projectId) {
-      const project = this.db.raw.prepare("SELECT id FROM projects WHERE id = ? AND status != 'archived'").get(projectId) as { id: string } | undefined;
-      if (!project) throw new Error('项目不存在或已归档');
-    }
+    const projectId = this.resolveTaskProject(agentId, opts.parentId, opts.projectId);
     const active = this.agentOccupancy(agentId);
     const guardReason = this.dispatchGuard();
-    const canRun = agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null && (!mobileState || mobileState.ready);
+    const canRun = !approvalRequest && agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null && (!mobileState || mobileState.ready);
     const queuedStage = guardReason ?? mobileState?.reason ?? '排队中';
+    const initialStatus = approvalRequest ? 'WAITING_APPROVAL' : canRun ? 'RUNNING' : 'QUEUED';
+    const initialStage = approvalRequest ? '等待审批' : canRun ? STAGES[0] : queuedStage;
     let inserted = false;
     this.db.transaction(() => {
+      const transactionProjectId = this.resolveTaskProject(agentId, opts.parentId, opts.projectId);
+      if (transactionProjectId !== projectId) throw new Error('父任务或项目关联已发生变化');
+      // Lookup and commit are separate calls. Recheck under the write
+      // transaction so an archived/moved target cannot cross the tenant gate.
+      if (source === 'delegated') this.assertDelegationTarget(opts.parentId!, agentId);
       inserted = this.db.raw.prepare(
-        `INSERT INTO tasks(id, agent_id, project_id, title, source, source_key, parent_id, status, priority, progress, stage, error, session_id, workspace_override, engine_override, created_at, started_at, ended_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?, ?, ?, NULL)
+        `INSERT INTO tasks(
+          id, agent_id, project_id, conversation_id, input_message_id, title, content,
+          source, source_key, parent_id, status, priority, progress, stage, error,
+          session_id, workspace_override, engine_override, created_at, started_at, ended_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(source, source_key) WHERE source_key IS NOT NULL DO NOTHING`
-      ).run(id, agentId, projectId, title, source, sourceKey, opts.parentId ?? null, canRun ? 'RUNNING' : 'QUEUED', canRun ? STAGES[0] : queuedStage, opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride, now, canRun ? now : null).changes > 0;
+      ).run(
+        id, agentId, projectId, opts.conversationId ?? null, opts.inputMessageId ?? null,
+        title, content, source, sourceKey, opts.parentId ?? null, initialStatus, priority,
+        initialStage, opts.sessionId ?? null, opts.workspaceOverride ?? null, engineOverride,
+        now, canRun ? now : null
+      ).changes > 0;
       if (!inserted) return;
       if (canRun) {
         this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
           .run(randomUUID(), agentId, id, process.pid, randomUUID(), 'RUNNING', now);
       }
-      this.db.raw.prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
-        .run(randomUUID(), id, canRun ? 'started' : 'queued', '{}', now);
+      if (approvalRequest) {
+        const approvalId = randomUUID();
+        this.db.raw.prepare(
+          'INSERT INTO approvals(id, task_id, agent_id, type, request, risk, status, created_at, decided_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)'
+        ).run(approvalId, id, agentId, DISPATCH_PLAN_APPROVAL_TYPE, approvalRequest, 'medium', 'pending', now);
+        this.db.raw.prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
+          .run(randomUUID(), id, 'approval_required', JSON.stringify({ approvalId, scope: 'dispatch_plan', request: approvalRequest, risk: 'medium' }), now);
+      } else {
+        this.db.raw.prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
+          .run(randomUUID(), id, canRun ? 'started' : 'queued', '{}', now);
+      }
+      opts.onPersisted?.(id);
     });
     if (!inserted) {
       const existing = sourceKey
@@ -813,7 +1045,77 @@ export class Orchestrator {
     const created = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Row;
     const task = this.mapTask(created);
     if (canRun) this.dispatchTask(task, agent);
+    if (approvalRequest) notify(this.db, '任务计划等待审批', approvalRequest);
     this.emit();
+    return task;
+  }
+
+  /**
+   * Sole commit point for a validated control-kernel plan. Planning is
+   * side-effect free; only this method may turn the plan into a runnable task.
+   */
+  applyDispatchPlan(request: KernelRequest, plan: DispatchPlan, state: DatabaseKernelState): CreateTaskResult {
+    if (request.requestId !== plan.requestId || request.conversationId !== plan.conversationId) {
+      throw new Error('调度计划与请求不匹配');
+    }
+
+    let stored = state.findPlan(request.requestId);
+    if (stored) stored = state.savePlan(request, plan);
+    if (stored?.status === 'failed') throw new Error('调度计划已标记失败');
+    if (stored?.status === 'committed') {
+      const existing = stored.taskId
+        ? this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(stored.taskId) as Row | undefined
+        : undefined;
+      if (!existing) throw new Error('已提交调度计划对应的任务不存在');
+      return Object.assign(this.mapTask(existing), { deduplicated: true as const });
+    }
+
+    const selected = request.workers.find((worker) => worker.agentId === plan.workerAgentId);
+    if (!selected || selected.engineId !== plan.workerEngineId) throw new Error('调度计划选择了不可用的执行员工');
+    const agent = this.getAgent(plan.workerAgentId);
+    if (!agent || agent.archived || agent.lifecycle !== 'READY') throw new Error('调度计划选择的员工当前不可执行');
+    if (agent.engineId !== plan.workerEngineId) throw new Error('员工执行引擎在规划后发生变化，请重新规划');
+
+    stored ??= state.savePlan(request, plan);
+    if (stored.status === 'failed') throw new Error('调度计划已标记失败');
+    if (stored.status === 'committed') {
+      const existing = stored.taskId
+        ? this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(stored.taskId) as Row | undefined
+        : undefined;
+      if (!existing) throw new Error('已提交调度计划对应的任务不存在');
+      return Object.assign(this.mapTask(existing), { deduplicated: true as const });
+    }
+
+    const reviewConcerns = plan.advisorReviews
+      .filter((review) => !review.accepted)
+      .map((review) => `${review.advisorId}: ${review.summary}`)
+      .join('；')
+      .slice(0, 1_200);
+    const approvalRequest = plan.requiresHumanApproval
+      ? `控制核计划请求执行「${plan.title}」：${plan.rationale}${reviewConcerns ? `；复核意见：${reviewConcerns}` : ''}`
+      : undefined;
+    const task = this.createTask(plan.workerAgentId, plan.title, request.source, {
+      projectId: request.projectId ?? undefined,
+      conversationId: request.conversationId,
+      inputMessageId: request.inputMessageId,
+      sessionId: `conv-${request.conversationId}`,
+      sourceKey: `kernel:${request.requestId}`,
+      engineOverride: plan.workerEngineId,
+      content: plan.objective,
+      priority: plan.priority,
+      initialApprovalRequest: approvalRequest,
+      onPersisted: (taskId) => {
+        state.markCommitted(request.requestId, taskId);
+        this.db.audit({
+          id: randomUUID(),
+          actor: plan.leaderKernel,
+          action: 'kernel.plan.commit',
+          target: taskId,
+          result: `${plan.workerAgentId}:${plan.workerEngineId}`,
+          source: request.source
+        });
+      }
+    });
     return task;
   }
 
@@ -843,7 +1145,9 @@ export class Orchestrator {
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.followUp', target: parentTaskId, result: 'ok' });
     return this.createTask(parent.agentId, title, parent.source === 'schedule' ? 'desktop' : parent.source, {
       parentId: parent.id,
-      sessionId: parent.sessionId ?? undefined
+      sessionId: parent.sessionId ?? undefined,
+      conversationId: parent.conversationId ?? undefined,
+      content: title
     });
   }
 
@@ -856,7 +1160,10 @@ export class Orchestrator {
     const retried = this.createTask(original.agentId, original.title, original.source === 'schedule' ? 'desktop' : original.source, {
       parentId: original.id,
       projectId: original.projectId ?? undefined,
-      workspaceOverride: original.workspaceOverride ?? undefined
+      conversationId: original.conversationId ?? undefined,
+      workspaceOverride: original.workspaceOverride ?? undefined,
+      engineOverride: original.engineOverride ?? undefined,
+      content: original.content
     });
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.retry', target: taskId, result: retried.id });
     return retried;
@@ -878,9 +1185,32 @@ export class Orchestrator {
   /** 经执行器注册表派发（真实引擎未就绪时自动回退演示模式） */
   private dispatchTask(task: Task, agent: Agent) {
     // 任务级引擎覆盖优先（E-2 编码委派）：子任务仍归属原员工，仅执行引擎不同
-    const engineId = task.engineOverride || agent.engineId;
-    const kind = this.executors.kindFor(engineId);
-    this.executors.dispatch(task, { ...agent, engineId }, this.makeCallbacks(task.id, agent.id, engineId, kind));
+    const requestedEngineId = task.engineOverride || agent.engineId;
+    const binding: ExecutionBinding = {
+      requestedEngineId,
+      resolvedEngineId: null,
+      executorKind: 'unavailable',
+      usedFallback: false
+    };
+    this.executors.dispatch(
+      task,
+      { ...agent, engineId: requestedEngineId },
+      this.makeCallbacks(task.id, agent.id, binding),
+      (resolved) => {
+        Object.assign(binding, resolved);
+        this.db.raw.prepare(
+          'UPDATE agent_runs SET requested_engine_id = ?, resolved_engine_id = ?, executor_kind = ? WHERE task_id = ? AND ended_at IS NULL'
+        ).run(resolved.requestedEngineId, resolved.resolvedEngineId, resolved.executorKind, task.id);
+        this.db.audit({
+          id: randomUUID(),
+          actor: 'system',
+          action: 'task.executorResolved',
+          target: task.id,
+          result: JSON.stringify(resolved),
+          source: task.source
+        });
+      }
+    );
   }
 
   /** 任务事件落库（13.2 审计可追溯；详情页时间线数据源） */
@@ -901,13 +1231,16 @@ export class Orchestrator {
   }
 
   /** 执行器回调：统一走“状态更新 + task_events 同事务”模式；终态触发该员工 FIFO 补位 */
-  private makeCallbacks(taskId: string, agentId: string, engineId: string, kind: ExecutorKind): ExecutorCallbacks {
+  private makeCallbacks(taskId: string, agentId: string, binding: ExecutionBinding): ExecutorCallbacks {
     const finish = (status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED', info: { result?: string; error?: string }) => {
       const now = Date.now();
       this.closeOutputState(taskId);
       const boundedResult = typeof info.result === 'string' ? info.result.slice(0, MAX_TASK_RESULT_CHARS) : undefined;
       // 真实执行鉴权失败：如实把引擎标为 AUTH_REQUIRED，不掩盖
-      const authFailed = kind !== 'simulated' && !!info.error && /401|403|unauthorized|auth|鉴权|登录/i.test(info.error);
+      const authFailed = binding.resolvedEngineId !== null
+        && binding.executorKind !== 'simulated'
+        && binding.executorKind !== 'unavailable'
+        && isExecutorAuthenticationFailure(info.error);
       // 终态守卫（数据层最后防线）：只有非终态任务才能落终态。
       // 迟到回调（看门狗中断后进程才退出、用户取消后执行器才收尾、执行器双重回调）
       // 一律丢弃，绝不把已 INTERRUPTED/CANCELLED 的任务改写成 COMPLETED。
@@ -928,8 +1261,8 @@ export class Orchestrator {
           this.recordEvent(taskId, status === 'FAILED' ? 'failed' : 'interrupted', { error: info.error ?? '' }, now);
         }
         this.db.raw.prepare('UPDATE agent_runs SET ended_at = ?, status = ? WHERE task_id = ? AND ended_at IS NULL').run(now, status, taskId);
-        if (authFailed) {
-          this.db.raw.prepare("UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required' WHERE id = ?").run(engineId);
+        if (authFailed && binding.resolvedEngineId) {
+          this.db.raw.prepare("UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required' WHERE id = ?").run(binding.resolvedEngineId);
         }
       });
       // 守卫拦下的迟到回调：不通知、不推 webhook、不触发补位，只做一次并发释放后返回
@@ -1010,8 +1343,10 @@ export class Orchestrator {
    * PAUSED child that is represented in both places.
    */
   private agentOccupancy(agentId: string, excludeTaskId?: string): number {
-    const occupying = ['RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
-    let active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").get(agentId) as { c: number }).c;
+    // A dispatch-plan approval has not acquired an execution slot. Runtime
+    // tool approvals remain counted through the live executor registry below.
+    const occupying = ['RUNNING', 'PAUSED'];
+    let active = (this.db.raw.prepare("SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','PAUSED')").get(agentId) as { c: number }).c;
 
     if (excludeTaskId) {
       const excluded = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(excludeTaskId) as Row | undefined;
@@ -1090,6 +1425,12 @@ export class Orchestrator {
     this.executors.abort(taskId);
     this.cancelTaskInternal(taskId, Date.now());
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.cancel', target: taskId, result: 'ok' });
+    const detail = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(taskId) as { title: string } | undefined;
+    for (const fn of this.finishListeners) {
+      try {
+        fn({ taskId, agentId: task.agent_id, status: 'CANCELLED', title: detail?.title ?? taskId, result: null, error: '用户取消任务' });
+      } catch { /* 通知失败不影响状态转换 */ }
+    }
     this.emit();
     this.scheduleNext(task.agent_id);
   }
@@ -1112,31 +1453,99 @@ export class Orchestrator {
     this.emit();
   }
 
+  private dispatchPlanReadiness(taskId: string, agent: Agent): { ready: boolean; stage: string } {
+    if (agent.archived) return { ready: false, stage: '员工已归档' };
+    if (agent.lifecycle !== 'READY') return { ready: false, stage: `员工未就绪（${agent.lifecycle}）` };
+    const guardReason = this.dispatchGuard();
+    if (guardReason) return { ready: false, stage: guardReason };
+    if (agent.kind === 'android_operator') {
+      const mobile = this.mobileDispatchPolicy?.canDispatch(agent.id)
+        ?? { bound: false, ready: false, reason: '手机控制服务尚未启动' };
+      if (!mobile.ready) return { ready: false, stage: mobile.reason };
+    }
+    if (this.agentOccupancy(agent.id, taskId) >= Math.max(1, agent.concurrencyLimit)) {
+      return { ready: false, stage: '排队中' };
+    }
+    return { ready: true, stage: STAGES[0] };
+  }
+
   decideApproval(approvalId: string, approve: boolean) {
     const now = Date.now();
     const ap = this.db.raw.prepare('SELECT * FROM approvals WHERE id = ?').get(approvalId) as Row | undefined;
-    if (!ap) return;
+    if (!ap || ap.status !== 'pending') return;
+    const scope = approvalScope(ap.type);
+    const taskId = ap.task_id as string;
+
+    if (scope === 'dispatch_plan') {
+      const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+      if (!row || row.status !== 'WAITING_APPROVAL') return;
+      const agent = this.getAgent(row.agent_id as string);
+      const readiness = agent && approve
+        ? this.dispatchPlanReadiness(taskId, agent)
+        : { ready: false, stage: '审批被拒绝' };
+
+      this.db.transaction(() => {
+        this.db.raw.prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ?').run(approve ? 'approved' : 'rejected', now, approvalId);
+        this.recordEvent(taskId, 'approval_decided', { approvalId, scope, approved: approve }, now);
+        if (!approve) {
+          this.db.raw.prepare("UPDATE tasks SET status = 'FAILED', ended_at = ?, error = '审批被拒绝' WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, taskId);
+          this.recordEvent(taskId, 'failed', { error: '审批被拒绝' }, now);
+          return;
+        }
+        if (!agent || !readiness.ready) {
+          this.db.raw.prepare("UPDATE tasks SET status = 'QUEUED', stage = ?, started_at = NULL WHERE id = ? AND status = 'WAITING_APPROVAL'")
+            .run(readiness.stage, taskId);
+          this.recordEvent(taskId, 'queued', { reason: readiness.stage, afterApproval: true }, now);
+          return;
+        }
+        this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', stage = ?, started_at = ? WHERE id = ? AND status = 'WAITING_APPROVAL'")
+          .run(STAGES[0], now, taskId);
+        this.db.raw.prepare(
+          'INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)'
+        ).run(randomUUID(), agent.id, taskId, process.pid, randomUUID(), 'RUNNING', now);
+        this.recordEvent(taskId, 'started', { afterApproval: true }, now);
+      });
+
+      if (approve && agent && readiness.ready) {
+        const started = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+        if (started?.status === 'RUNNING') this.dispatchTask(this.mapTask(started), agent);
+      }
+      this.db.audit({ id: randomUUID(), actor: 'admin', action: approve ? 'approval.approve' : 'approval.reject', target: approvalId, result: readiness.ready ? 'running' : approve ? 'queued' : 'rejected' });
+      this.emit();
+      if (!approve) this.scheduleNext(ap.agent_id as string);
+      return;
+    }
+
     // P1b：命中活跃执行器（工具循环正挂起等待）→ 仅唤醒，不重新派发；拒绝也不 fail 整个任务
     const wasLive = this.broker.decide(approvalId, approve);
     this.db.transaction(() => {
       this.db.raw.prepare('UPDATE approvals SET status = ?, decided_at = ? WHERE id = ?').run(approve ? 'approved' : 'rejected', now, approvalId);
+      this.recordEvent(taskId, 'approval_decided', { approvalId, scope, approved: approve }, now);
       if (approve || wasLive) {
         // 重置 started_at：审批等待期不计入看门狗时长（否则长时间等审批的任务恢复即被误杀）
-        this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, ap.task_id as string);
+        this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', started_at = ? WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, taskId);
       } else {
-        this.db.raw.prepare("UPDATE tasks SET status = 'FAILED', ended_at = ?, error = '审批被拒绝' WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, ap.task_id as string);
+        this.db.raw.prepare("UPDATE tasks SET status = 'FAILED', ended_at = ?, error = '审批被拒绝' WHERE id = ? AND status = 'WAITING_APPROVAL'").run(now, taskId);
       }
     });
     // 非活跃执行器（种子数据/重启后遗留）且批准 → 重新派发执行（13.2 审批链路）
     if (approve && !wasLive) {
-      const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(ap.task_id as string) as Row | undefined;
+      const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
       const agent = row ? this.getAgent(row.agent_id as string) : null;
       if (row && agent && row.status === 'RUNNING' && !this.executors.isExecuting(row.id as string)) {
+        const activeRun = this.db.raw.prepare('SELECT id FROM agent_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1')
+          .get(row.id as string) as { id: string } | undefined;
+        if (!activeRun) {
+          this.db.raw.prepare(
+            'INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)'
+          ).run(randomUUID(), agent.id, row.id as string, process.pid, randomUUID(), 'RUNNING', now);
+        }
         this.dispatchTask(this.mapTask(row), agent);
       }
     }
     this.db.audit({ id: randomUUID(), actor: 'admin', action: approve ? 'approval.approve' : 'approval.reject', target: approvalId, result: 'ok' });
     this.emit();
+    if (!approve) this.scheduleNext(ap.agent_id as string);
   }
 }
 

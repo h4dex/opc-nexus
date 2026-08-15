@@ -3,6 +3,7 @@
  * 只暴露白名单方法，不暴露 ipcRenderer 本体。
  */
 import { contextBridge, ipcRenderer } from 'electron';
+import { randomUUID } from 'node:crypto';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, AppMemorySnapshot, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
@@ -12,6 +13,11 @@ import type {
   ActionCenterOverview, GlobalSearchResult,
   AssigneeRecommendation, AutomationOverview, AutomationReport, AutomationReportKind,
   CustomerDelivery, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudget, ProjectBudgetInput,
+  AcceptedMemoryProposal, MemoryForgetInput, MemoryItem, MemoryListInput, MemoryProposalDecisionInput,
+  MemoryProposalListInput, MemoryProposalRecord, MemoryRecallInput, MemoryRememberInput, MemoryUpdateInput,
+  AcceptedTaskScheduleProposal, TaskScheduleProposalDecisionInput, TaskScheduleProposalListInput,
+  TaskScheduleProposalRecord,
+  RecalledMemory,
   Project, ProjectDeliverablePackage, ProjectInput, ProjectOperationsOverview, ProjectPatch, ResourceSample, Schedule, ScheduleInput, ServiceHealth, SystemInfo, Task, TaskEvent, TodoItem,
   WfNode, WfEdge, WorkflowDef, WfPlatformConfig, WfNodeEvent,
   CollabWorkspace, CollabTask, CollabAgent, CollabConnectInfo,
@@ -86,6 +92,30 @@ function encodePersonaPatch(patch: AgentPersonaPatch): AgentPersonaPatch & Recor
     userMd: encodeOptionalText(patch.userMd),
     modelOverride: encodeOptionalText(patch.modelOverride)
   } as unknown as AgentPersonaPatch & Record<string, unknown>;
+}
+
+function encodeMemoryRecall(input: MemoryRecallInput): MemoryRecallInput & Record<string, unknown> {
+  return { ...input, query: encodeOptionalText(input.query) } as unknown as MemoryRecallInput & Record<string, unknown>;
+}
+
+function encodeMemoryRemember(input: MemoryRememberInput): MemoryRememberInput & Record<string, unknown> {
+  return {
+    ...input,
+    kind: encodeText(input.kind),
+    content: encodeText(input.content)
+  } as unknown as MemoryRememberInput & Record<string, unknown>;
+}
+
+function encodeMemoryUpdate(input: MemoryUpdateInput): MemoryUpdateInput & Record<string, unknown> {
+  return {
+    ...input,
+    content: encodeOptionalText(input.content),
+    reason: encodeOptionalText(input.reason)
+  } as unknown as MemoryUpdateInput & Record<string, unknown>;
+}
+
+function encodeMemoryReason<T extends MemoryForgetInput | MemoryProposalDecisionInput | TaskScheduleProposalDecisionInput>(input: T): T & Record<string, unknown> {
+  return { ...input, reason: encodeOptionalText(input.reason) } as unknown as T & Record<string, unknown>;
 }
 
 const api = {
@@ -169,11 +199,33 @@ const api = {
   listConversations: (agentId: string): Promise<Conversation[]> => ipcRenderer.invoke('aibox:listConversations', agentId),
   /** 发送消息给助手（创建/继续会话） */
   chatWithAgent: (agentId: string, message: string, conversationId?: string): Promise<{ conversationId: string; task: Task }> =>
-    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId),
+    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId, randomUUID()),
   /** 会话重命名 */
   renameConversation: (id: string, title: string): Promise<void> => ipcRenderer.invoke('aibox:renameConversation', id, encodeText(title)),
   /** 删除会话 */
   deleteConversation: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteConversation', id),
+  // Canonical memory and its human-review queue.
+  listMemories: (input?: MemoryListInput): Promise<MemoryItem[]> => ipcRenderer.invoke('aibox:listMemories', input),
+  recallMemories: (input?: MemoryRecallInput): Promise<RecalledMemory[]> =>
+    ipcRenderer.invoke('aibox:recallMemories', encodeMemoryRecall(input ?? {})),
+  rememberMemory: (input: MemoryRememberInput): Promise<MemoryItem> =>
+    ipcRenderer.invoke('aibox:rememberMemory', encodeMemoryRemember(input)),
+  updateMemory: (input: MemoryUpdateInput): Promise<MemoryItem> =>
+    ipcRenderer.invoke('aibox:updateMemory', encodeMemoryUpdate(input)),
+  forgetMemory: (input: MemoryForgetInput): Promise<MemoryItem> =>
+    ipcRenderer.invoke('aibox:forgetMemory', encodeMemoryReason(input)),
+  listMemoryProposals: (input?: MemoryProposalListInput): Promise<MemoryProposalRecord[]> =>
+    ipcRenderer.invoke('aibox:listMemoryProposals', input),
+  acceptMemoryProposal: (input: MemoryProposalDecisionInput): Promise<AcceptedMemoryProposal> =>
+    ipcRenderer.invoke('aibox:acceptMemoryProposal', encodeMemoryReason(input)),
+  rejectMemoryProposal: (input: MemoryProposalDecisionInput): Promise<MemoryProposalRecord> =>
+    ipcRenderer.invoke('aibox:rejectMemoryProposal', encodeMemoryReason(input)),
+  listTaskScheduleProposals: (input?: TaskScheduleProposalListInput): Promise<TaskScheduleProposalRecord[]> =>
+    ipcRenderer.invoke('aibox:listTaskScheduleProposals', input),
+  acceptTaskScheduleProposal: (input: TaskScheduleProposalDecisionInput): Promise<AcceptedTaskScheduleProposal> =>
+    ipcRenderer.invoke('aibox:acceptTaskScheduleProposal', encodeMemoryReason(input)),
+  rejectTaskScheduleProposal: (input: TaskScheduleProposalDecisionInput): Promise<TaskScheduleProposalRecord> =>
+    ipcRenderer.invoke('aibox:rejectTaskScheduleProposal', encodeMemoryReason(input)),
   /** Token / 模型调用统计 */
   getUsageStats: (): Promise<{ total: { input: number; output: number; total: number }; byModel: { model: string; input: number; output: number; total: number; count: number }[]; recent: { id: string; agentId: string; model: string; input: number; output: number; total: number; createdAt: number }[] }> =>
     ipcRenderer.invoke('aibox:getUsageStats'),
@@ -274,7 +326,8 @@ const api = {
   removeTeamTemplate: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeTeamTemplate', id),
 
   // 任务
-  createTask: (agentId: string, title: string, projectId?: string): Promise<Task> => ipcRenderer.invoke('aibox:createTask', agentId, encodeText(title), projectId),
+  createTask: (agentId: string, title: string, projectId?: string): Promise<Task> =>
+    ipcRenderer.invoke('aibox:createTask', agentId, encodeText(title), projectId, randomUUID()),
   cancelTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:cancelTask', id),
   retryTask: (id: string): Promise<Task> => ipcRenderer.invoke('aibox:retryTask', id),
   deleteTask: (id: string): Promise<void> => ipcRenderer.invoke('aibox:deleteTask', id),
@@ -424,9 +477,9 @@ const api = {
   stopVoiceSession: (sessionId: string): Promise<void> => ipcRenderer.invoke('aibox:stopVoiceSession', sessionId),
   /** 解析语音文本为任务草稿（不派发） */
   parseVoiceCommand: (text: string): Promise<VoiceCommandDraft> => ipcRenderer.invoke('aibox:parseVoiceCommand', encodeText(text)),
-  /** 用户确认后派发（source='voice'） */
-  dispatchVoiceTask: (agentId: string, title: string): Promise<Task> =>
-    ipcRenderer.invoke('aibox:dispatchVoiceTask', agentId, encodeText(title)),
+  /** 用户确认后派发（source='voice'）；messageKey 在一次确认 attempt 内保持稳定。 */
+  dispatchVoiceTask: (agentId: string, title: string, messageKey: string): Promise<Task> =>
+    ipcRenderer.invoke('aibox:dispatchVoiceTask', agentId, encodeText(title), messageKey),
   /** 识别结果流式订阅（边说边出字） */
   onVoiceTranscript: (fn: (p: { sessionId: string; text: string; isFinal: boolean; timestamp: number }) => void): (() => void) => {
     const handler = (_: unknown, p: { sessionId: string; text: string; isFinal: boolean; timestamp: number }) => fn(p);

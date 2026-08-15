@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
+import { redactSensitiveText } from '../engineEnv.js';
 import { getProviderSettings, readProviderKey, type ProviderSettings } from '../provider.js';
 import type { ProviderManager } from '../providerManager.js';
 import { toolsForPermission, toOpenAiTools, type ToolContext, type ToolDef, type ToolHost } from './tools.js';
@@ -184,7 +185,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
     const builtInTools = toolsForPermission(effectivePermission, agent.capabilities, this.host?.codingEngineReady?.().ready ?? false);
     const mcpTools = await mcpToolsForAgent(this.mcpManager, agent.id, agent.capabilities, effectivePermission);
     const tools = [...builtInTools, ...mcpTools];
-    const userPrompt = `当前任务：${task.title}\n请执行该任务并输出结构化结果（Markdown）。`;
+    const userPrompt = `当前任务：${task.content || task.title}\n请执行该任务并输出结构化结果（Markdown）。`;
 
     // 组合人设 system prompt：soul.md + agents.md + user.md + 基础 prompt + 绑定 skills
     const systemContent = this.composeSystemPrompt(agent);
@@ -215,7 +216,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
         if (turn.usage) this.recordUsage(task, agent, opts.model, turn.usage);
       } catch (err) {
         if (isAbort(err)) return;
-        cb.onError(task.id, errMessage(err));
+        cb.onError(task.id, redactProviderErrorText(errMessage(err), opts.key));
         return;
       }
 
@@ -363,12 +364,12 @@ export class LlmApiExecutor implements ExecutorAdapter {
       redirect: 'error'
     }).catch((err) => {
       if (isAbort(err)) throw err;
-      throw new Error(`网络请求失败：${errMessage(err)}`);
+      throw new Error(`网络请求失败：${redactProviderErrorText(errMessage(err), opts.key)}`);
     });
 
     if (!res.ok || !res.body) {
       const body = await res.text().catch(() => '');
-      throw new Error(`供应商返回 HTTP ${res.status}：${body.slice(0, 200)}`);
+      throw new Error(`供应商返回 HTTP ${res.status}：${redactProviderErrorText(body, opts.key).slice(0, 200)}`);
     }
 
     const reader = res.body.getReader();
@@ -478,4 +479,11 @@ function isAbort(err: unknown): boolean {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+export function redactProviderErrorText(text: string, key: string): string {
+  return redactSensitiveText(text, {
+    PROVIDER_API_KEY: key,
+    PROVIDER_AUTHORIZATION: `Bearer ${key}`
+  });
 }

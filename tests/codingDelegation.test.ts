@@ -16,7 +16,7 @@ import { createMockDb, seedAgent, seedEngine } from './helpers/mockDb.js';
 vi.mock('../src/main/services/notifier.js', () => ({ notify: vi.fn() }));
 
 import { Orchestrator } from '../src/main/services/orchestrator.js';
-import { toolsForPermission } from '../src/main/services/executor/tools.js';
+import { TOOLS, toolsForPermission } from '../src/main/services/executor/tools.js';
 
 function mockExecutors() {
   return {
@@ -99,6 +99,92 @@ describe('编码委派创建子任务', () => {
     // 子任务因并发限制排队时不会立即派发；断言 kindFor 若被调用则用的是覆盖引擎
     const calls = executors.kindFor.mock.calls.flat();
     if (calls.length > 0) expect(calls).toContain('eng-opencode');
+  });
+});
+
+describe('A2A 委派租户边界', () => {
+  const sideEffects = (db: ReturnType<typeof createMockDb>) => ({
+    tasks: db.tables.tasks.size,
+    runs: db.tables.agent_runs.size,
+    events: db.tables.task_events.size,
+    approvals: db.tables.approvals.size
+  });
+
+  it('同租户名称解析与子任务创建成功', () => {
+    const { db, orch, agentId } = setup();
+    Object.assign(db.tables.agents.get(agentId), { organization_id: 'org-a' });
+    const targetId = seedAgent(db, { name: '同租户员工', organization_id: 'org-a' });
+    const parent = orch.createTask(agentId, '父任务');
+    const host = orch.toolHost();
+
+    expect(host.findAgentIdByName('同租户员工', parent.id)).toBe(targetId);
+    expect(host.createDelegatedTask(targetId, '同租户子任务', parent.id)).toMatchObject({
+      agentId: targetId,
+      parentId: parent.id,
+      source: 'delegated'
+    });
+  });
+
+  it('跨租户同名员工只解析父任务租户内的目标', () => {
+    const { db, orch, agentId } = setup();
+    Object.assign(db.tables.agents.get(agentId), { organization_id: 'org-a' });
+    seedAgent(db, { name: '共享名称', organization_id: 'org-b' });
+    const localTargetId = seedAgent(db, { name: '共享名称', organization_id: 'org-a' });
+    const parent = orch.createTask(agentId, '父任务');
+
+    expect(orch.toolHost().findAgentIdByName('共享名称', parent.id)).toBe(localTargetId);
+  });
+
+  it('delegate_task 看不到仅存在于其他租户的目标且零副作用', async () => {
+    const { db, orch, agentId, executors } = setup();
+    Object.assign(db.tables.agents.get(agentId), { organization_id: 'org-a' });
+    const foreignTargetId = seedAgent(db, { name: '异租户员工', organization_id: 'org-b' });
+    const parent = orch.createTask(agentId, '父任务');
+    const before = sideEffects(db);
+    executors.dispatch.mockClear();
+    const delegate = TOOLS.find((tool) => tool.name === 'delegate_task')!;
+
+    await expect(delegate.execute(
+      { agent_name: '异租户员工', title: '越界子任务' },
+      { workspace: 'D:/workspace', agentId, taskId: parent.id, host: orch.toolHost() }
+    )).rejects.toThrow('未找到在岗');
+    expect(orch.toolHost().findAgentIdByName('异租户员工', parent.id)).toBeNull();
+    expect(() => orch.toolHost().createDelegatedTask(foreignTargetId, '越界子任务', parent.id))
+      .toThrow('父任务不存在，或目标员工不可委派');
+    expect(() => orch.toolHost().createEngineDelegatedTask!(foreignTargetId, '越界编码任务', parent.id, 'eng-opencode'))
+      .toThrow('父任务不存在，或目标员工不可委派');
+    expect(sideEffects(db)).toEqual(before);
+    expect(executors.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('归档目标在 lookup 与 commit 两层都被拒绝且零副作用', () => {
+    const { db, orch, agentId, executors } = setup();
+    Object.assign(db.tables.agents.get(agentId), { organization_id: 'org-a' });
+    const archivedId = seedAgent(db, { name: '已归档员工', organization_id: 'org-a' });
+    const parent = orch.createTask(agentId, '父任务');
+    expect(orch.toolHost().findAgentIdByName('已归档员工', parent.id)).toBe(archivedId);
+    db.tables.agents.get(archivedId)!.archived = 1;
+    const before = sideEffects(db);
+    executors.dispatch.mockClear();
+
+    expect(orch.toolHost().findAgentIdByName('已归档员工', parent.id)).toBeNull();
+    expect(() => orch.toolHost().createDelegatedTask(archivedId, '归档目标子任务', parent.id))
+      .toThrow('父任务不存在，或目标员工不可委派');
+    expect(sideEffects(db)).toEqual(before);
+    expect(executors.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('父任务不存在时名称解析失败，两个创建入口均零副作用', () => {
+    const { db, orch, agentId, executors } = setup();
+    const before = sideEffects(db);
+
+    expect(orch.toolHost().findAgentIdByName('测试员工', 'missing-parent')).toBeNull();
+    expect(() => orch.toolHost().createDelegatedTask(agentId, '无父任务子任务', 'missing-parent'))
+      .toThrow('父任务不存在，或目标员工不可委派');
+    expect(() => orch.toolHost().createEngineDelegatedTask!(agentId, '无父任务编码任务', 'missing-parent', 'eng-opencode'))
+      .toThrow('父任务不存在，或目标员工不可委派');
+    expect(sideEffects(db)).toEqual(before);
+    expect(executors.dispatch).not.toHaveBeenCalled();
   });
 });
 

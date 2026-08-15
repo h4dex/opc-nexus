@@ -8,6 +8,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync }
 import { dirname, resolve, sep } from 'node:path';
 import { execFile } from 'node:child_process';
 import type { Task } from '../../../shared/types.js';
+import { childProcessEnv } from '../engineEnv.js';
 
 export type ToolRisk = 'safe' | 'write' | 'danger';
 
@@ -27,7 +28,7 @@ export interface ToolContext {
 
 /** 编排器能力注入（委托创建/等待子任务），由 main 装配 */
 export interface ToolHost {
-  findAgentIdByName(name: string): string | null;
+  findAgentIdByName(name: string, parentTaskId: string): string | null;
   createDelegatedTask(agentId: string, title: string, parentTaskId: string): Task;
   waitForTask(taskId: string, timeoutMs: number): Promise<Task | null>;
   /** 委托深度（parentId 链长度），防止无限递归 */
@@ -54,6 +55,22 @@ export interface ToolDef {
 
 const MAX_READ_CHARS = 24_000;
 const MAX_DELEGATE_WAIT_MS = 10 * 60_000;
+const RUN_COMMAND_HOST_ENV_ALLOWLIST = new Set([
+  'COMSPEC', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'LANG', 'LANGUAGE',
+  'LC_ALL', 'LC_CTYPE', 'NODE_EXTRA_CA_CERTS', 'NUMBER_OF_PROCESSORS',
+  'OS', 'PATH', 'PATHEXT', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_ARCHITEW6432',
+  'SHELL', 'SSL_CERT_DIR', 'SSL_CERT_FILE', 'SYSTEMDRIVE', 'SYSTEMROOT',
+  'TEMP', 'TERM', 'TMP', 'TMPDIR', 'TZ', 'USER', 'USERNAME', 'USERPROFILE',
+  'WINDIR'
+]);
+
+function runCommandProcessEnv(): NodeJS.ProcessEnv {
+  const env = childProcessEnv({});
+  for (const key of Object.keys(env)) {
+    if (!RUN_COMMAND_HOST_ENV_ALLOWLIST.has(key.toUpperCase())) delete env[key];
+  }
+  return env;
+}
 
 // ---------- Web 搜索辅助（国内优先：Bing 中国 → DuckDuckGo 回退） ----------
 
@@ -223,7 +240,7 @@ export const TOOLS: ToolDef[] = [
     async execute(args, ctx) {
       if (!ctx.host) throw new Error('委托能力未启用');
       const name = String(args.agent_name ?? '');
-      const targetId = ctx.host.findAgentIdByName(name);
+      const targetId = ctx.host.findAgentIdByName(name, ctx.taskId);
       if (!targetId) throw new Error(`未找到在岗（READY）的数字员工「${name}」，无法委派`);
       if (targetId === ctx.agentId) throw new Error('不允许委托给自己');
       if (ctx.host.delegationDepth(ctx.taskId) >= 2) throw new Error('委托深度已达上限（2 级），请直接完成任务');
@@ -352,7 +369,13 @@ export const TOOLS: ToolDef[] = [
       const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/bash';
       const shellArg = process.platform === 'win32' ? '/c' : '-c';
       return new Promise<string>((resolveP, rejectP) => {
-        execFile(shell, [shellArg, command], { cwd, timeout: 5 * 60_000, maxBuffer: 1024 * 1024, shell: false }, (err, stdout, stderr) => {
+        execFile(shell, [shellArg, command], {
+          cwd,
+          timeout: 5 * 60_000,
+          maxBuffer: 1024 * 1024,
+          shell: false,
+          env: runCommandProcessEnv()
+        }, (err, stdout, stderr) => {
           const out = (stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '');
           const truncated = out.length > 16_000 ? `${out.slice(0, 16_000)}\n…（已截断）` : out;
           if (err && !stdout && !stderr) {

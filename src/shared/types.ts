@@ -258,10 +258,9 @@ export interface MobileApkInfo {
   error: string | null;
 }
 
-/** 引擎类型（四引擎收敛）：hermes = 内置 Nexus Agent 自研 Runtime；hermes-cli = 真实 Hermes Agent CLI；
- *  opencode = 编码专家；codex = 备选编码引擎；external = 配置文件接入的 ACP 引擎。
- *  claude-code / zcode / kimicode 已于 v26 下线。 */
-export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'opencode' | 'external';
+/** Runtime types: Nexus/Hermes are control-capable runtimes; Codex, Claude,
+ * Pi and OpenCode are Worker CLIs; external is an ACP adapter. */
+export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'claude' | 'pi' | 'opencode' | 'external';
 
 export type ChannelType = 'weixin' | 'wecom' | 'feishu' | 'qq';
 
@@ -623,7 +622,11 @@ export interface Task {
   id: string;
   agentId: string;
   projectId: string | null;
+  conversationId: string | null;
+  inputMessageId: string | null;
   title: string;
+  /** Full execution instruction. title is only the bounded display label. */
+  content: string;
   source: TaskSource;
   parentId: string | null;
   status: TaskStatus;
@@ -872,7 +875,7 @@ export interface TaskEvent {
 }
 
 /** 执行器类型：真实 LLM API / 真实 CLI（含泛化 CLI）/ ACP 协议 / 演示模拟 */
-export type ExecutorKind = 'llm-api' | 'codex-cli' | 'claude-cli' | 'generic-cli' | 'acp' | 'simulated' | 'unavailable';
+export type ExecutorKind = 'llm-api' | 'codex-cli' | 'claude-cli' | 'pi-cli' | 'generic-cli' | 'acp' | 'simulated' | 'unavailable';
 
 /** 模型供应商配置（脱敏视图：密钥不离开主进程，15.1） */
 export interface ProviderConfig {
@@ -893,6 +896,7 @@ export interface RendererSettingMap {
   thresholds: { cpu: number; mem: number; gpuTemp: number };
   notifications: boolean;
   demoAutoTasks: boolean;
+  'memory:autoAcceptConversationProposals': boolean;
 }
 
 export type RendererSettingKey = keyof RendererSettingMap;
@@ -916,6 +920,11 @@ export interface AgentRun {
   taskId: string;
   pid: number | null;
   sessionId: string;
+  /** Engine selected by the task/agent before infrastructure fallback. */
+  requestedEngineId: string | null;
+  /** Engine that actually executed the run; null for legacy/simulated/unavailable runs. */
+  resolvedEngineId: string | null;
+  executorKind: ExecutorKind | null;
   status: TaskStatus;
   startedAt: number;
   endedAt: number | null;
@@ -949,11 +958,23 @@ export interface WeixinLoginState {
   updatedAt: number;
 }
 
+export type ApprovalScope = 'dispatch_plan' | 'runtime_tool';
+
+export type ApprovalType =
+  | 'dispatch_plan'
+  | 'write_workspace'
+  | 'outside_workspace'
+  | 'delete'
+  | 'network'
+  | 'install'
+  | 'admin';
+
 export interface Approval {
   id: string;
   taskId: string;
   agentId: string;
-  type: 'write_workspace' | 'outside_workspace' | 'delete' | 'network' | 'install' | 'admin';
+  scope: ApprovalScope;
+  type: ApprovalType;
   request: string;          // 请求描述（命令、路径、预期影响）
   risk: 'low' | 'medium' | 'high';
   status: 'pending' | 'approved' | 'rejected';
@@ -1177,9 +1198,159 @@ export interface AgentPersonaPatch {
 export interface Conversation {
   id: string;
   agentId: string;
+  organizationId: string | null;
+  principalId: string | null;
+  channelId: string | null;
+  channelIdentityId: string | null;
+  externalConversationKey: string | null;
   title: string;
   lastMessageAt: number;
   messageCount: number;
+  createdAt: number | null;
+  updatedAt: number | null;
+}
+
+// ---------- Canonical long-term memory ----------
+
+export type MemoryScopeType = 'organization' | 'principal' | 'channel' | 'conversation' | 'agent' | 'project';
+export type MemoryStatus = 'active' | 'forgotten';
+export type MemoryProposalStatus = 'pending' | 'accepted' | 'rejected';
+
+export interface MemoryScopeInput {
+  principalId?: string | null;
+  channelId?: string | null;
+  conversationId?: string | null;
+  agentId?: string | null;
+  projectId?: string | null;
+}
+
+export interface MemoryItem {
+  id: string;
+  organizationId: string;
+  kind: string;
+  content: string;
+  importance: number;
+  status: MemoryStatus;
+  revision: number;
+  scopes: Array<{ type: MemoryScopeType; id: string }>;
+  createdAt: number;
+  updatedAt: number;
+  forgottenAt: number | null;
+}
+
+export interface RecalledMemory extends MemoryItem {
+  score: number;
+}
+
+export interface MemoryListInput {
+  status?: MemoryStatus | 'all';
+  limit?: number;
+}
+
+export interface MemoryRecallInput extends MemoryScopeInput {
+  query?: string;
+  limit?: number;
+}
+
+export interface MemoryRememberInput extends MemoryScopeInput {
+  kind: string;
+  content: string;
+  importance?: number;
+}
+
+export interface MemoryUpdateInput {
+  memoryId: string;
+  expectedRevision: number;
+  content?: string;
+  importance?: number;
+  reason?: string;
+}
+
+export interface MemoryForgetInput {
+  memoryId: string;
+  expectedRevision: number;
+  reason?: string;
+}
+
+export interface MemoryProposalRecord {
+  id: string;
+  requestId: string;
+  proposalIndex: number;
+  organizationId: string;
+  principalId: string | null;
+  channelId: string | null;
+  conversationId: string | null;
+  agentId: string | null;
+  projectId: string | null;
+  operation: 'remember';
+  kind: string;
+  content: string;
+  importance: number;
+  scopeType: Exclude<MemoryScopeType, 'organization'>;
+  scopeId: string;
+  status: MemoryProposalStatus;
+  proposedBy: string;
+  decidedBy: string | null;
+  decisionReason: string | null;
+  memoryId: string | null;
+  createdAt: number;
+  decidedAt: number | null;
+}
+
+export interface MemoryProposalListInput {
+  status?: MemoryProposalStatus | 'all';
+  limit?: number;
+}
+
+export interface MemoryProposalDecisionInput {
+  proposalId: string;
+  reason?: string;
+}
+
+export interface AcceptedMemoryProposal {
+  proposal: MemoryProposalRecord;
+  memory: MemoryItem;
+}
+
+export type TaskScheduleProposalStatus = 'pending' | 'accepted' | 'rejected';
+
+export interface TaskScheduleProposalRecord {
+  id: string;
+  requestId: string;
+  proposalIndex: number;
+  organizationId: string;
+  principalId: string | null;
+  channelId: string | null;
+  conversationId: string;
+  agentId: string;
+  projectId: string | null;
+  operation: 'create_task_schedule';
+  title: string;
+  content: string;
+  cronKind: Schedule['cronKind'];
+  cronValue: string;
+  status: TaskScheduleProposalStatus;
+  proposedBy: string;
+  decidedBy: string | null;
+  decisionReason: string | null;
+  scheduleId: string | null;
+  createdAt: number;
+  decidedAt: number | null;
+}
+
+export interface TaskScheduleProposalListInput {
+  status?: TaskScheduleProposalStatus | 'all';
+  limit?: number;
+}
+
+export interface TaskScheduleProposalDecisionInput {
+  proposalId: string;
+  reason?: string;
+}
+
+export interface AcceptedTaskScheduleProposal {
+  proposal: TaskScheduleProposalRecord;
+  schedule: Schedule;
 }
 
 export interface SystemInfo {

@@ -14,15 +14,18 @@ import type { ApprovalBroker } from '../approvalBroker.js';
 import { LlmApiExecutor } from './llmApiExecutor.js';
 import { CliExecutor } from './cliExecutor.js';
 import { HermesAgentExecutor } from './hermesAgentExecutor.js';
+import { PiAgentExecutor } from './piAgentExecutor.js';
 import { AcpExecutor } from './acpExecutor.js';
 import { SimulatedExecutor } from './simulatedExecutor.js';
 import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
-import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import type { ExecutionBinding, ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import { PiRuntimeProfileService } from '../piRuntimeProfile.js';
 
 interface ResolvedExecutor {
   adapter: ExecutorAdapter;
-  engineId: string;
+  engineId: string | null;
+  usedFallback: boolean;
 }
 
 interface RunningExecutor {
@@ -36,6 +39,7 @@ export class ExecutorRegistry {
   private sim: SimulatedExecutor;
   /** 真实 Hermes Agent CLI（专属执行器：-z headless + usage-file 会话锚点） */
   private hermes: HermesAgentExecutor;
+  private pi: PiAgentExecutor;
   /** 引擎类型 → CLI 执行器 */
   private cliByType = new Map<string, CliExecutor>();
   /** taskId → 正在执行它的适配器（用于 abort） */
@@ -46,7 +50,9 @@ export class ExecutorRegistry {
     this.acp = new AcpExecutor(db, broker);
     this.sim = new SimulatedExecutor();
     this.hermes = new HermesAgentExecutor(db);
+    this.pi = new PiAgentExecutor(db, new PiRuntimeProfileService(db, providerMgr));
     this.cliByType.set('codex', new CliExecutor('codex-cli', db, 'eng-codex'));
+    this.cliByType.set('claude', new CliExecutor('claude-cli', db, 'eng-claude'));
     this.cliByType.set('opencode', new CliExecutor('generic-cli', db, 'eng-opencode', ['run', '{prompt}']));
   }
 
@@ -88,6 +94,7 @@ export class ExecutorRegistry {
   private adapterFor(engineId: string): ExecutorAdapter | null {
     const type = this.engineType(engineId);
     if (type === 'hermes-cli' && this.hermes.isReady()) return this.hermes;
+    if (type === 'pi' && this.pi.isReady()) return this.pi;
     const cli = this.cliByType.get(type);
     if (cli && cli.isReady()) return cli;
     // 内置 Nexus：engines.status 由 detect() 按供应商配置维护（HEALTHY / SETUP_REQUIRED），
@@ -104,16 +111,17 @@ export class ExecutorRegistry {
   }
 
   /** 主辅解析：主引擎 → 辅助引擎 →（demo 模式）模拟器 / （production 模式）null */
-  private resolve(engineId: string): ResolvedExecutor | null {
+  private resolve(engineId: string, allowFallback = true): ResolvedExecutor | null {
     const primary = this.adapterFor(engineId);
-    if (primary) return { adapter: primary, engineId };
+    if (primary) return { adapter: primary, engineId, usedFallback: false };
+    if (!allowFallback) return null;
     const cfg = loadUserConfig();
     // 辅助引擎仅在与主引擎不同且就绪时生效（基础设施级回退，业务失败不换引擎）
     if (cfg.engine.fallbackEngineId && cfg.engine.fallbackEngineId !== engineId) {
       const fallback = this.adapterFor(cfg.engine.fallbackEngineId);
-      if (fallback) return { adapter: fallback, engineId: cfg.engine.fallbackEngineId };
+      if (fallback) return { adapter: fallback, engineId: cfg.engine.fallbackEngineId, usedFallback: true };
     }
-    return cfg.engine.executionMode === 'production' ? null : { adapter: this.sim, engineId };
+    return cfg.engine.executionMode === 'production' ? null : { adapter: this.sim, engineId: null, usedFallback: true };
   }
 
   /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 unavailable） */
@@ -127,12 +135,40 @@ export class ExecutorRegistry {
   }
 
   /** 派发任务执行；production 模式无可用引擎 → 直接回报错误（任务 FAILED，不伪装成功） */
-  dispatch(task: Task, agent: Agent, cb: ExecutorCallbacks): ExecutorKind {
+  dispatch(
+    task: Task,
+    agent: Agent,
+    cb: ExecutorCallbacks,
+    onResolved?: (binding: ExecutionBinding) => void
+  ): ExecutorKind {
     // P1 修复：编码委派优先 —— task.engineOverride 覆盖 agent.engineId
     const targetEngineId = task.engineOverride || agent.engineId;
-    const resolved = this.resolve(targetEngineId);
+    // A canonical DispatchPlan or explicit task-level override approves one
+    // concrete Worker engine. Replacing it here would cross the selected
+    // provider/permission boundary. Retries intentionally keep the override
+    // while receiving a new task identity.
+    const exactEngineBinding = Boolean(task.inputMessageId || task.engineOverride);
+    const resolved = this.resolve(targetEngineId, !exactEngineBinding);
+    const binding: ExecutionBinding = resolved
+      ? {
+          requestedEngineId: targetEngineId,
+          resolvedEngineId: resolved.engineId,
+          executorKind: resolved.adapter.kind,
+          usedFallback: resolved.usedFallback
+        }
+      : {
+          requestedEngineId: targetEngineId,
+          resolvedEngineId: null,
+          executorKind: 'unavailable',
+          usedFallback: false
+        };
+    // Must run before onError or adapter.start: adapters are allowed to invoke
+    // callbacks synchronously, and those callbacks need the actual engine.
+    onResolved?.(binding);
     if (!resolved) {
-      cb.onError(task.id, '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
+      cb.onError(task.id, exactEngineBinding
+        ? `任务固定的执行引擎不可用：${targetEngineId}（已禁止静默切换到其他引擎）`
+        : '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
       return 'unavailable';
     }
     const { adapter, engineId } = resolved;
@@ -143,7 +179,7 @@ export class ExecutorRegistry {
       this.running.delete(id);
       return true;
     };
-    adapter.start(task, { ...agent, engineId }, {
+    adapter.start(task, { ...agent, engineId: engineId ?? targetEngineId }, {
       onStage: (id, stage) => cb.onStage(id, stage),
       onProgress: (id, pct) => cb.onProgress(id, pct),
       onOutput: (id, chunk) => cb.onOutput(id, chunk),

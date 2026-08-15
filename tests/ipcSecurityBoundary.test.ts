@@ -41,22 +41,58 @@ function register(webOverrides: Record<string, unknown> = {}, bridgeOverrides: R
     ...webOverrides,
     get token() { return 'web-private-token'; }
   });
+  const memory = service({
+    list: vi.fn(() => []),
+    recall: vi.fn(() => []),
+    remember: vi.fn((input) => input),
+    update: vi.fn((input) => input),
+    forget: vi.fn((input) => input)
+  });
+  const memoryProposals = service({
+    list: vi.fn(() => []),
+    accept: vi.fn((input) => input),
+    reject: vi.fn((input) => input)
+  });
+  const taskScheduleProposals = service({
+    list: vi.fn(() => []),
+    accept: vi.fn((input) => input),
+    reject: vi.fn((input) => input)
+  });
+  const orchestrator = service({
+    onChange: vi.fn(), onOutput: vi.fn(), todos: vi.fn(() => []), stats: vi.fn(() => ({})),
+    agentCards: vi.fn(() => []), listTasks: vi.fn(() => []), listApprovals: vi.fn(() => []),
+    createTask: vi.fn()
+  });
+  const desktopControlPlane = service({
+    dispatch: vi.fn(async () => ({ conversationId: 'conversation-local', task: { id: 'task-control-plane' } }))
+  });
   const deps = service({
     db,
     apiBridge,
     webServer,
-    orchestrator: service({ onChange: vi.fn(), onOutput: vi.fn() }),
+    memory,
+    memoryProposals,
+    taskScheduleProposals,
+    engines: service({ hasUsableExecutor: vi.fn(() => true), list: vi.fn(() => []) }),
+    projects: service({ list: vi.fn(() => []) }),
+    channels: service({ list: vi.fn(() => []) }),
+    scheduler: service({ list: vi.fn(() => []) }),
+    orchestrator,
+    desktopControlPlane,
     broker: service({ onChange: vi.fn() }),
     weixin: service({ onStateChange: vi.fn() }),
     voice: service({ onTranscript: vi.fn(), onError: vi.fn() }),
     mobile: service({ onEvent: vi.fn() }),
-    monitor: service({ onSample: vi.fn() }),
+    monitor: service({ onSample: vi.fn(), getAlerts: vi.fn(() => []) }),
     workflows: service({ onBroadcast: vi.fn() })
   });
 
   registerIpc(deps as never);
   const handlers = new Map(ipcMain.handle.mock.calls.map(([name, handler]) => [name, handler]));
-  return { audit, handlers, webServer };
+  return {
+    audit, handlers, webServer, memory, memoryProposals, taskScheduleProposals,
+    orchestrator, desktopControlPlane
+  };
 }
 
 beforeEach(() => {
@@ -64,6 +100,44 @@ beforeEach(() => {
 });
 
 describe('IPC credential boundary', () => {
+  it('routes generic desktop tasks through the canonical control plane', async () => {
+    const { handlers, orchestrator, desktopControlPlane } = register();
+
+    await expect(handlers.get('aibox:createTask')(
+      {}, 'agent-1', 'prepare the report', 'project-1', 'desktop-message-1'
+    )).resolves.toEqual({ id: 'task-control-plane' });
+    expect(desktopControlPlane.dispatch).toHaveBeenCalledWith({
+      preferredAgentId: 'agent-1', message: 'prepare the report',
+      projectId: 'project-1', messageKey: 'desktop-message-1'
+    });
+    expect(orchestrator.createTask).not.toHaveBeenCalled();
+  });
+
+  it('routes confirmed voice tasks through canonical ingress with a stable message key', async () => {
+    const { handlers, audit, orchestrator, desktopControlPlane } = register();
+    const dispatchVoiceTask = handlers.get('aibox:dispatchVoiceTask');
+
+    await expect(dispatchVoiceTask(
+      {}, 'agent-voice', 'summarize the meeting', 'voice-message-1'
+    )).resolves.toEqual({ id: 'task-control-plane' });
+    await expect(dispatchVoiceTask(
+      {}, 'agent-voice', 'summarize the meeting', 'voice-message-1'
+    )).resolves.toEqual({ id: 'task-control-plane' });
+    expect(desktopControlPlane.dispatch).toHaveBeenCalledTimes(2);
+    expect(desktopControlPlane.dispatch).toHaveBeenNthCalledWith(1, {
+      preferredAgentId: 'agent-voice', message: 'summarize the meeting',
+      source: 'voice', messageKey: 'voice-message-1'
+    });
+    expect(desktopControlPlane.dispatch).toHaveBeenNthCalledWith(2, {
+      preferredAgentId: 'agent-voice', message: 'summarize the meeting',
+      source: 'voice', messageKey: 'voice-message-1'
+    });
+    expect(orchestrator.createTask).not.toHaveBeenCalled();
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'voice.dispatch', target: 'task-control-plane', result: 'ok'
+    }));
+  });
+
   it('does not expose generic secret namespace handlers', () => {
     const { handlers } = register();
     expect(handlers.has('aibox:storeSecret')).toBe(false);
@@ -142,5 +216,38 @@ describe('IPC credential boundary', () => {
 
     start.mockRejectedValueOnce(new Error('bridge restart failed'));
     await expect(handlers.get('aibox:regenerateBridgeKey')()).rejects.toThrow('bridge restart failed');
+  });
+
+  it('fixes memory tenant and actor inside Main instead of trusting Renderer input', () => {
+    const { handlers, memory, memoryProposals, taskScheduleProposals } = register();
+
+    handlers.get('aibox:rememberMemory')({}, {
+      organizationId: 'org-attacker', actor: 'kernel', kind: 'fact', content: 'confirmed value', importance: 0.6
+    });
+    expect(memory.remember).toHaveBeenCalledWith(expect.objectContaining({
+      organizationId: 'org-local', actor: 'admin', source: 'desktop', kind: 'fact', content: 'confirmed value'
+    }));
+
+    handlers.get('aibox:updateMemory')({}, {
+      organizationId: 'org-attacker', actor: 'kernel', memoryId: 'memory-1', expectedRevision: 2,
+      content: 'corrected value'
+    });
+    expect(memory.update).toHaveBeenCalledWith(expect.objectContaining({
+      organizationId: 'org-local', actor: 'admin', memoryId: 'memory-1', expectedRevision: 2
+    }));
+
+    handlers.get('aibox:acceptMemoryProposal')({}, {
+      organizationId: 'org-attacker', actor: 'hermes', proposalId: 'proposal-1'
+    });
+    expect(memoryProposals.accept).toHaveBeenCalledWith(expect.objectContaining({
+      organizationId: 'org-local', actor: 'admin', proposalId: 'proposal-1', source: 'desktop'
+    }));
+
+    handlers.get('aibox:acceptTaskScheduleProposal')({}, {
+      organizationId: 'org-attacker', actor: 'hermes', proposalId: 'schedule-proposal-1'
+    });
+    expect(taskScheduleProposals.accept).toHaveBeenCalledWith(expect.objectContaining({
+      organizationId: 'org-local', actor: 'admin', proposalId: 'schedule-proposal-1', source: 'desktop'
+    }));
   });
 });

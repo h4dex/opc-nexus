@@ -18,6 +18,17 @@ interface ChannelRow {
   last_connected_at: number | null; limitation: string;
 }
 
+interface OwnedChannelRow {
+  id: string;
+  organization_id: string;
+}
+
+interface OwnedAgentRow {
+  id: string;
+  organization_id: string;
+  archived: number;
+}
+
 export class ChannelManager {
   constructor(private db: Database) {}
 
@@ -76,10 +87,13 @@ export class ChannelManager {
   }
 
   bindAgent(channelId: string, agentId: string) {
-    const channel = this.db.raw.prepare('SELECT id FROM channels WHERE id = ?').get(channelId);
-    const agent = this.db.raw.prepare('SELECT id FROM agents WHERE id = ? AND archived = 0').get(agentId);
+    const channel = this.db.raw.prepare('SELECT id, organization_id FROM channels WHERE id = ?').get(channelId) as OwnedChannelRow | undefined;
+    const agent = this.db.raw.prepare('SELECT id, organization_id, archived FROM agents WHERE id = ?').get(agentId) as OwnedAgentRow | undefined;
     if (!channel) throw new Error('渠道不存在');
-    if (!agent) throw new Error('数字员工不存在或已归档');
+    if (!agent || agent.archived !== 0) throw new Error('数字员工不存在或已归档');
+    if (channel.organization_id !== agent.organization_id) {
+      throw new Error('渠道和数字员工必须属于同一组织');
+    }
     // 幂等绑定：已存在则跳过，避免重复绑定产生多行（导致“绑定员工”重复显示）
     const existing = this.db.raw.prepare('SELECT id FROM channel_routes WHERE channel_id = ? AND agent_id = ?').get(channelId, agentId);
     if (existing) return;

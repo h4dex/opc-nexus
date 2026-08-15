@@ -2,10 +2,12 @@
 /* eslint-disable */
 import { describe, expect, it, vi } from 'vitest';
 import { createServer } from 'node:net';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
-const { WebServer } = await import('../src/main/services/webServer.js');
+const { WebServer, webRendererDirectory } = await import('../src/main/services/webServer.js');
 
 function makeDb(settings: Record<string, unknown> = {}) {
   const store: Record<string, unknown> = { webPort: 0, ...settings };
@@ -32,7 +34,7 @@ function idleService(overrides: Record<string, unknown> = {}) {
   return new Proxy(overrides, { get: (target, key) => key in target ? target[key as string] : vi.fn() });
 }
 
-function makeServer(db: ReturnType<typeof makeDb>) {
+function makeServer(db: ReturnType<typeof makeDb>, overrides: Record<string, unknown> = {}) {
   return new WebServer({
     db,
     orchestrator: idleService({ listAgents: () => [], agentCards: () => [], listTasks: () => [], listApprovals: () => [] }),
@@ -41,7 +43,11 @@ function makeServer(db: ReturnType<typeof makeDb>) {
     providers: idleService(),
     mcp: idleService(),
     skills: idleService(),
-    teams: idleService()
+    teams: idleService(),
+    desktopControlPlane: idleService({
+      dispatch: async () => ({ conversationId: 'conversation-web', task: { id: 'task-web' } })
+    }),
+    ...overrides
   } as never);
 }
 
@@ -64,6 +70,48 @@ async function availablePort(): Promise<number> {
 }
 
 describe('Web settings HTTP boundary', () => {
+  it('resolves renderer assets from an ESM main-module URL', () => {
+    const mainEntry = join(process.cwd(), 'out', 'main', 'index.js');
+    expect(webRendererDirectory(pathToFileURL(mainEntry).href)).toBe(
+      join(process.cwd(), 'out', 'renderer')
+    );
+  });
+
+  it('routes Web task creation through canonical ingress and forwards Idempotency-Key', async () => {
+    const db = makeDb();
+    const orchestrator = idleService({
+      listAgents: () => [], agentCards: () => [], listTasks: () => [], listApprovals: () => [],
+      createTask: vi.fn()
+    });
+    const desktopControlPlane = idleService({
+      dispatch: vi.fn(async () => ({ conversationId: 'conversation-web', task: { id: 'task-web' } }))
+    });
+    const server = makeServer(db, { orchestrator, desktopControlPlane });
+    await server.start();
+    const address = server.server?.address();
+    if (!address || typeof address === 'string') throw new Error('Web test server did not start');
+    const headers = {
+      Authorization: `Bearer ${server.token}`,
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'web-request-1'
+    };
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/tasks`, {
+        method: 'POST', headers, body: JSON.stringify({ agentId: 'agent-1', title: 'prepare report' })
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ id: 'task-web' });
+      expect(desktopControlPlane.dispatch).toHaveBeenCalledWith({
+        preferredAgentId: 'agent-1', message: 'prepare report', projectId: undefined,
+        source: 'webhook', messageKey: 'web-request-1'
+      });
+      expect(orchestrator.createTask).not.toHaveBeenCalled();
+    } finally {
+      server.stop();
+    }
+  });
+
   it('allows typed preferences and rejects internal keys or malformed values', async () => {
     const db = makeDb({ theme: 'dark', notifications: true });
     const server = makeServer(db);

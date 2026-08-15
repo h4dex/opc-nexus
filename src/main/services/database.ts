@@ -15,8 +15,13 @@ import { validateDatabaseBackup } from './backupValidator.js';
 const require = createRequire(import.meta.url);
 /** v2：tasks.result；v3：session_id + task_messages + schedules；
  *  v4：人设三文件 + conversations + mcp_servers + skills + agent_skills + usage_records；
- *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板 */
-const SCHEMA_VERSION = 32;
+ *  v5：多供应商 providers 表 + agents.provider_id/model_override + 窗口状态 + 模板；
+ *  v33：agent_runs 记录请求引擎、实际引擎与执行器类型；
+ *  v34：组织、渠道身份与 canonical conversation/message 主链；
+ *  v36：canonical task/message/plan 外键语义、输入消息 exactly-once 与外键强制；
+ *  v37：组织化 project/agent/channel 与待审批 memory proposal 持久化。 */
+// v38: durable task schedule proposals reviewed through OPC-Nexus Scheduler.
+const SCHEMA_VERSION = 38;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -26,6 +31,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL DEFAULT 'org-local' REFERENCES organizations(id),
   name TEXT NOT NULL,
   objective TEXT NOT NULL DEFAULT '',
   description TEXT NOT NULL DEFAULT '',
@@ -39,6 +45,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL DEFAULT 'org-local' REFERENCES organizations(id),
   name TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL,
   system_prompt TEXT NOT NULL DEFAULT '',
@@ -73,8 +80,11 @@ CREATE TABLE IF NOT EXISTS engines (
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id),
-  project_id TEXT REFERENCES projects(id),
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  input_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT 'desktop',
   source_key TEXT,
   parent_id TEXT,
@@ -96,6 +106,9 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   task_id TEXT NOT NULL REFERENCES tasks(id),
   pid INTEGER,
   session_id TEXT NOT NULL,
+  requested_engine_id TEXT,
+  resolved_engine_id TEXT,
+  executor_kind TEXT,
   status TEXT NOT NULL,
   started_at INTEGER NOT NULL,
   ended_at INTEGER
@@ -134,12 +147,42 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 CREATE TABLE IF NOT EXISTS channels (
   id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL DEFAULT 'org-local' REFERENCES organizations(id),
   type TEXT NOT NULL,
   account_name TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'UNCONFIGURED',
   credential_ref TEXT,
   last_connected_at INTEGER,
   limitation TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS organizations (
+  id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS principals (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  kind TEXT NOT NULL DEFAULT 'person',
+  display_name TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS channel_identities (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  channel_id TEXT NOT NULL REFERENCES channels(id),
+  principal_id TEXT NOT NULL REFERENCES principals(id),
+  external_identity_key TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS channel_routes (
@@ -189,10 +232,184 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id),
+  organization_id TEXT REFERENCES organizations(id),
+  principal_id TEXT REFERENCES principals(id),
+  channel_id TEXT REFERENCES channels(id),
+  channel_identity_id TEXT REFERENCES channel_identities(id),
+  external_conversation_key TEXT,
   title TEXT NOT NULL DEFAULT '',
   last_message_at INTEGER NOT NULL,
-  message_count INTEGER NOT NULL DEFAULT 0
+  message_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
+  updated_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+  channel_identity_id TEXT REFERENCES channel_identities(id) ON DELETE SET NULL,
+  external_message_key TEXT,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  direction TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kernel_attempts (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  component_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER NOT NULL,
+  error TEXT,
+  UNIQUE(request_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS kernel_sessions (
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  kernel_id TEXT NOT NULL,
+  native_session_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(conversation_id, kernel_id)
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_plans (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL UNIQUE,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  principal_id TEXT NOT NULL REFERENCES principals(id),
+  channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  input_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  leader_kernel TEXT NOT NULL,
+  worker_agent_id TEXT NOT NULL REFERENCES agents(id),
+  worker_engine_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'planned',
+  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+  plan_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  committed_at INTEGER,
+  error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_items (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  scope_key TEXT NOT NULL,
+  importance REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  forgotten_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS memory_scopes (
+  memory_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+  scope_type TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  PRIMARY KEY(memory_id, scope_type)
+);
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  importance REAL NOT NULL,
+  status TEXT NOT NULL,
+  changed_by TEXT NOT NULL,
+  change_kind TEXT NOT NULL,
+  reason TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(memory_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS memory_terms (
+  memory_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+  term TEXT NOT NULL,
+  weight REAL NOT NULL,
+  PRIMARY KEY(memory_id, term)
+);
+
+CREATE TABLE IF NOT EXISTS memory_proposals (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL,
+  proposal_index INTEGER NOT NULL,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+  channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  operation TEXT NOT NULL CHECK(operation = 'remember'),
+  kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  importance REAL NOT NULL CHECK(importance >= 0 AND importance <= 1),
+  scope_type TEXT NOT NULL CHECK(scope_type IN ('principal', 'channel', 'conversation', 'agent', 'project')),
+  scope_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+  proposed_by TEXT NOT NULL,
+  decided_by TEXT,
+  decision_reason TEXT,
+  memory_id TEXT REFERENCES memory_items(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  UNIQUE(request_id, proposal_index)
+);
+
+CREATE TABLE IF NOT EXISTS task_schedule_proposals (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES dispatch_plans(request_id) ON DELETE CASCADE,
+  proposal_index INTEGER NOT NULL,
+  organization_id TEXT NOT NULL REFERENCES organizations(id),
+  principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+  channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  operation TEXT NOT NULL CHECK(operation = 'create_task_schedule'),
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  cron_kind TEXT NOT NULL CHECK(cron_kind IN ('interval', 'daily', 'weekly', 'monthly')),
+  cron_value TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+  proposed_by TEXT NOT NULL,
+  decided_by TEXT,
+  decision_reason TEXT,
+  schedule_id TEXT REFERENCES schedules(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  UNIQUE(request_id, proposal_index)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_plans_input_message ON dispatch_plans(input_message_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_plans_conversation ON dispatch_plans(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_kernel_attempts_request ON kernel_attempts(request_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_memory_scopes_lookup ON memory_scopes(scope_type, scope_id, memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_terms_lookup ON memory_terms(term, memory_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_dedupe
+  ON memory_items(organization_id, content_hash, scope_key) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_status
+  ON task_schedule_proposals(organization_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_request
+  ON task_schedule_proposals(request_id);
+CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_conversation
+  ON task_schedule_proposals(conversation_id);
 
 CREATE TABLE IF NOT EXISTS mcp_servers (
   id TEXT PRIMARY KEY,
@@ -260,7 +477,7 @@ CREATE TABLE IF NOT EXISTS workflows (
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
   id TEXT PRIMARY KEY,
-  workflow_id TEXT NOT NULL REFERENCES workflows(id),
+  workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
   status TEXT NOT NULL DEFAULT 'running',
   node_results TEXT NOT NULL DEFAULT '{}',
   error TEXT,
@@ -662,12 +879,471 @@ export class Database {
     }
   }
 
+  /** Read the version before running any DDL so an incompatible database is never mutated. */
+  private storedSchemaVersion(): number {
+    const metaTable = this.inner.exec(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta' LIMIT 1"
+    );
+    if ((metaTable[0]?.values.length ?? 0) === 0) {
+      const userTables = this.inner.exec(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+      );
+      const count = Number(userTables[0]?.values[0]?.[0] ?? 0);
+      if (count === 0) return 0;
+      throw new Error('数据库缺少 schema_version，已拒绝按全新数据库迁移');
+    }
+
+    const rows = this.inner.exec("SELECT value FROM schema_meta WHERE key = 'schema_version' LIMIT 1");
+    const raw = rows[0]?.values[0]?.[0];
+    const encoded = raw === null || raw === undefined ? '' : String(raw).trim();
+    if (!/^[1-9]\d*$/.test(encoded)) {
+      throw new Error(`数据库版本非法：${encoded || '缺失'}`);
+    }
+    const version = Number(encoded);
+    if (!Number.isSafeInteger(version)) throw new Error(`数据库版本非法：${encoded}`);
+    if (version > SCHEMA_VERSION) {
+      throw new Error(`数据库版本 v${version} 高于当前应用支持的 v${SCHEMA_VERSION}，已拒绝打开以防止数据损坏`);
+    }
+    return version;
+  }
+
+  private assertForeignKeyIntegrity(): void {
+    const violations = this.inner.exec('PRAGMA foreign_key_check')
+      .flatMap((result) => result.values);
+    if (violations.length === 0) return;
+    const detail = violations.slice(0, 5)
+      .map((row) => `${String(row[0])}[rowid=${String(row[1])}] -> ${String(row[2])}`)
+      .join(', ');
+    throw new Error(`数据库外键检查失败（${violations.length} 条）：${detail}`);
+  }
+
+  private enableForeignKeys(): void {
+    this.inner.exec('PRAGMA foreign_keys = ON');
+    const enabled = Number(this.inner.exec('PRAGMA foreign_keys')[0]?.values[0]?.[0] ?? 0);
+    if (enabled !== 1) throw new Error('无法启用 SQLite 外键约束');
+  }
+
+  private migrationRows(sql: string, params: SqlValue[] = []): Row[] {
+    const statement = this.inner.prepare(sql);
+    try {
+      statement.bind(params);
+      const rows: Row[] = [];
+      while (statement.step()) rows.push(statement.getAsObject() as Row);
+      return rows;
+    } finally {
+      statement.free();
+    }
+  }
+
+  private migrationValue(sql: string, params: SqlValue[] = []): SqlValue | undefined {
+    return this.migrationRows(sql, params)[0]?.value;
+  }
+
+  private migrationFailure(version: number, message: string): never {
+    throw new Error(`数据库 v${version} 迁移失败：${message}`);
+  }
+
+  /** Reconcile the v35 bidirectional execution receipt without discarding
+   * messages or dispatch plans. Ambiguous evidence aborts the transaction. */
+  private reconcileCanonicalTaskReceipts(): void {
+    const committedWithoutTask = this.migrationRows(
+      "SELECT id FROM dispatch_plans WHERE status = 'committed' AND task_id IS NULL LIMIT 1"
+    )[0];
+    if (committedWithoutTask) {
+      this.migrationFailure(36, `已提交计划 ${String(committedWithoutTask.id)} 缺少 task_id`);
+    }
+
+    const staleRefs = this.migrationRows(`
+      SELECT task_id, id AS message_id
+      FROM messages
+      WHERE direction = 'inbound' AND task_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = messages.task_id)
+      UNION ALL
+      SELECT task_id, input_message_id AS message_id
+      FROM dispatch_plans
+      WHERE status = 'committed' AND task_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = dispatch_plans.task_id)
+    `);
+    const staleTaskMessages = new Map<string, Set<string>>();
+    for (const row of staleRefs) {
+      const taskId = String(row.task_id ?? '');
+      const messageId = String(row.message_id ?? '');
+      if (!taskId || !messageId) this.migrationFailure(36, '发现无法识别的历史 task/message 引用');
+      const messages = staleTaskMessages.get(taskId) ?? new Set<string>();
+      messages.add(messageId);
+      staleTaskMessages.set(taskId, messages);
+    }
+
+    const staleMessageOwners = new Map<string, string>();
+    for (const [taskId, messageIds] of staleTaskMessages) {
+      if (messageIds.size !== 1) {
+        this.migrationFailure(36, `已删除任务 ${taskId} 对应 ${messageIds.size} 条输入消息，无法恢复唯一收据`);
+      }
+      const messageId = [...messageIds][0];
+      const prior = staleMessageOwners.get(messageId);
+      if (prior && prior !== taskId) {
+        this.migrationFailure(36, `输入消息 ${messageId} 同时指向已删除任务 ${prior} 与 ${taskId}`);
+      }
+      staleMessageOwners.set(messageId, taskId);
+    }
+
+    for (const [taskId, messageIds] of staleTaskMessages) {
+      const messageId = [...messageIds][0];
+      const message = this.migrationRows(`
+        SELECT m.id, m.organization_id, m.conversation_id, m.channel_id, m.created_at,
+               m.direction, m.task_id, c.agent_id AS conversation_agent_id
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.id = ?
+      `, [messageId])[0];
+      if (!message || message.direction !== 'inbound') {
+        this.migrationFailure(36, `已删除任务 ${taskId} 缺少可验证的 inbound message`);
+      }
+      if (message.task_id !== null && message.task_id !== undefined && String(message.task_id) !== taskId) {
+        this.migrationFailure(36, `输入消息 ${messageId} 的历史 task_id 与计划冲突`);
+      }
+      const plans = this.migrationRows(`
+        SELECT id, task_id, worker_agent_id, worker_engine_id, created_at, committed_at
+        FROM dispatch_plans
+        WHERE status = 'committed' AND input_message_id = ?
+      `, [messageId]);
+      if (plans.some((plan) => String(plan.task_id ?? '') !== taskId)) {
+        this.migrationFailure(36, `输入消息 ${messageId} 的已提交计划指向不同任务`);
+      }
+      const workerIds = new Set(plans.map((plan) => String(plan.worker_agent_id ?? '')).filter(Boolean));
+      if (workerIds.size > 1) this.migrationFailure(36, `已删除任务 ${taskId} 有多个执行员工`);
+      const agentId = workerIds.size === 1 ? [...workerIds][0] : String(message.conversation_agent_id ?? '');
+      if (!agentId || this.migrationRows('SELECT id FROM agents WHERE id = ?', [agentId]).length !== 1) {
+        this.migrationFailure(36, `已删除任务 ${taskId} 缺少可验证的执行员工`);
+      }
+      const plan = plans[0];
+      const createdAt = Math.min(
+        Number(message.created_at ?? Date.now()),
+        Number(plan?.created_at ?? message.created_at ?? Date.now())
+      );
+      const endedAt = Number(plan?.committed_at ?? plan?.created_at ?? message.created_at ?? createdAt);
+      this.inner.run(`
+        INSERT INTO tasks(
+          id, agent_id, conversation_id, input_message_id, title, content, source,
+          status, priority, progress, stage, error, engine_override, is_demo,
+          created_at, ended_at, deleted_at
+        ) VALUES(?, ?, ?, ?, '', '', ?, 'INTERRUPTED', 0, 0, '',
+          'Recovered durable receipt for a missing historical task', ?, 0, ?, ?, ?)
+      `, [
+        taskId,
+        agentId,
+        String(message.conversation_id),
+        messageId,
+        message.channel_id === null || message.channel_id === undefined ? 'desktop' : 'channel',
+        plan?.worker_engine_id === null || plan?.worker_engine_id === undefined
+          ? null
+          : String(plan.worker_engine_id),
+        createdAt,
+        endedAt,
+        endedAt
+      ]);
+      this.inner.run('UPDATE messages SET task_id = ? WHERE id = ?', [taskId, messageId]);
+    }
+
+    const invalidTaskInputs = this.migrationRows(`
+      SELECT t.id, t.input_message_id
+      FROM tasks t
+      LEFT JOIN messages m ON m.id = t.input_message_id
+      WHERE t.input_message_id IS NOT NULL AND (m.id IS NULL OR m.direction <> 'inbound')
+      ORDER BY t.id
+    `);
+    for (const task of invalidTaskInputs) {
+      const taskId = String(task.id);
+      const replacement = this.migrationRows(`
+        SELECT id FROM messages
+        WHERE direction = 'inbound' AND task_id = ?
+        ORDER BY created_at ASC, id ASC LIMIT 1
+      `, [taskId])[0];
+      if (!replacement) {
+        this.migrationFailure(36, `任务 ${taskId} 的 input_message_id 无效且没有可验证的入站消息`);
+      }
+      this.inner.run('UPDATE tasks SET input_message_id = ? WHERE id = ?', [String(replacement.id), taskId]);
+    }
+
+    const unclaimedTasks = this.migrationRows('SELECT id FROM tasks WHERE input_message_id IS NULL ORDER BY id');
+    for (const task of unclaimedTasks) {
+      const message = this.migrationRows(`
+        SELECT id FROM messages
+        WHERE direction = 'inbound' AND task_id = ?
+        ORDER BY created_at ASC, id ASC LIMIT 1
+      `, [String(task.id)])[0];
+      if (message) this.inner.run('UPDATE tasks SET input_message_id = ? WHERE id = ?', [String(message.id), String(task.id)]);
+    }
+
+    const duplicateClaims = this.migrationRows(`
+      SELECT input_message_id AS message_id
+      FROM tasks
+      WHERE input_message_id IS NOT NULL
+      GROUP BY input_message_id HAVING COUNT(*) > 1
+      ORDER BY input_message_id
+    `);
+    for (const duplicate of duplicateClaims) {
+      const messageId = String(duplicate.message_id);
+      const message = this.migrationRows('SELECT task_id FROM messages WHERE id = ?', [messageId])[0];
+      const candidates = this.migrationRows(`
+        SELECT id FROM tasks WHERE input_message_id = ? ORDER BY created_at ASC, id ASC
+      `, [messageId]);
+      const reciprocal = message?.task_id === null || message?.task_id === undefined
+        ? undefined
+        : candidates.find((candidate) => String(candidate.id) === String(message.task_id));
+      const winner = String((reciprocal ?? candidates[0])?.id ?? '');
+      if (!winner) this.migrationFailure(36, `输入消息 ${messageId} 没有可选的 canonical task`);
+      this.inner.run('UPDATE tasks SET input_message_id = NULL WHERE input_message_id = ? AND id <> ?', [messageId, winner]);
+    }
+
+    this.inner.exec(`
+      UPDATE messages
+      SET task_id = (SELECT t.id FROM tasks t WHERE t.input_message_id = messages.id LIMIT 1)
+      WHERE direction = 'inbound';
+    `);
+
+    const plans = this.migrationRows('SELECT id, status, task_id, input_message_id FROM dispatch_plans ORDER BY id');
+    for (const plan of plans) {
+      const planId = String(plan.id);
+      const messageId = String(plan.input_message_id ?? '');
+      const message = this.migrationRows('SELECT id, direction FROM messages WHERE id = ?', [messageId])[0];
+      if (!message || message.direction !== 'inbound') {
+        this.migrationFailure(36, `调度计划 ${planId} 缺少可验证的 inbound message`);
+      }
+      let canonical = this.migrationRows('SELECT id FROM tasks WHERE input_message_id = ? LIMIT 1', [messageId])[0];
+      const referencedTaskId = plan.task_id === null || plan.task_id === undefined ? null : String(plan.task_id);
+      if (!canonical && referencedTaskId) {
+        const referenced = this.migrationRows('SELECT input_message_id FROM tasks WHERE id = ?', [referencedTaskId])[0];
+        if (!referenced) this.migrationFailure(36, `调度计划 ${planId} 指向不存在的任务 ${referencedTaskId}`);
+        if (referenced.input_message_id !== null && referenced.input_message_id !== undefined) {
+          this.migrationFailure(36, `调度计划 ${planId} 的任务已归属于另一输入消息`);
+        }
+        this.inner.run('UPDATE tasks SET input_message_id = ? WHERE id = ?', [messageId, referencedTaskId]);
+        this.inner.run('UPDATE messages SET task_id = ? WHERE id = ?', [referencedTaskId, messageId]);
+        canonical = { id: referencedTaskId };
+      }
+      if (plan.status === 'committed' && !canonical) {
+        this.migrationFailure(36, `已提交计划 ${planId} 无法确定 canonical task`);
+      }
+      if (referencedTaskId && canonical && referencedTaskId !== String(canonical.id)) {
+        this.inner.run('UPDATE dispatch_plans SET task_id = ? WHERE id = ?', [String(canonical.id), planId]);
+      }
+    }
+
+    const asymmetric = this.migrationRows(`
+      SELECT t.id
+      FROM tasks t JOIN messages m ON m.id = t.input_message_id
+      WHERE t.input_message_id IS NOT NULL AND (m.direction <> 'inbound' OR m.task_id <> t.id)
+      UNION ALL
+      SELECT m.id
+      FROM messages m JOIN tasks t ON t.id = m.task_id
+      WHERE m.direction = 'inbound' AND t.input_message_id <> m.id
+      LIMIT 1
+    `)[0];
+    if (asymmetric) this.migrationFailure(36, 'task/message 双向执行收据仍不一致');
+
+    const taskConversationConflict = this.migrationRows(`
+      SELECT t.id
+      FROM tasks t JOIN messages m ON m.id = t.input_message_id
+      WHERE t.conversation_id IS NOT NULL AND t.conversation_id <> m.conversation_id
+      LIMIT 1
+    `)[0];
+    if (taskConversationConflict) {
+      this.migrationFailure(36, `任务 ${String(taskConversationConflict.id)} 与输入消息不属于同一会话`);
+    }
+    this.inner.exec(`
+      UPDATE tasks
+      SET conversation_id = (SELECT m.conversation_id FROM messages m WHERE m.id = tasks.input_message_id)
+      WHERE input_message_id IS NOT NULL AND conversation_id IS NULL;
+    `);
+
+    const planTaskConflict = this.migrationRows(`
+      SELECT dp.id
+      FROM dispatch_plans dp
+      JOIN tasks t ON t.id = dp.task_id
+      JOIN messages m ON m.id = dp.input_message_id
+      WHERE dp.task_id IS NOT NULL
+        AND (t.input_message_id <> dp.input_message_id
+          OR t.conversation_id <> dp.conversation_id
+          OR m.conversation_id <> dp.conversation_id
+          OR (dp.status = 'committed' AND t.agent_id <> dp.worker_agent_id))
+      LIMIT 1
+    `)[0];
+    if (planTaskConflict) {
+      this.migrationFailure(36, `调度计划 ${String(planTaskConflict.id)} 与 canonical task/message 冲突`);
+    }
+  }
+
+  private assignEntityOrganizations(
+    table: 'agents' | 'channels' | 'projects',
+    candidateSql: string
+  ): void {
+    const entities = this.migrationRows(`SELECT id FROM ${table} ORDER BY id`);
+    for (const entity of entities) {
+      const id = String(entity.id);
+      const candidates = new Set(
+        this.migrationRows(candidateSql, [id, id, id, id])
+          .map((row) => String(row.organization_id ?? '').trim())
+          .filter(Boolean)
+      );
+      if (candidates.size > 1) {
+        this.migrationFailure(37, `${table}.${id} 同时属于多个组织：${[...candidates].join(', ')}`);
+      }
+      if (candidates.size === 1) {
+        this.inner.run(`UPDATE ${table} SET organization_id = ? WHERE id = ?`, [[...candidates][0], id]);
+      }
+    }
+  }
+
+  private validateOrganizationScopes(): void {
+    const checks: Array<[string, string]> = [
+      ['principal 组织不存在', `SELECT p.id FROM principals p LEFT JOIN organizations o ON o.id = p.organization_id WHERE o.id IS NULL LIMIT 1`],
+      ['agent 组织不存在', `SELECT a.id FROM agents a LEFT JOIN organizations o ON o.id = a.organization_id WHERE o.id IS NULL LIMIT 1`],
+      ['project 组织不存在', `SELECT p.id FROM projects p LEFT JOIN organizations o ON o.id = p.organization_id WHERE o.id IS NULL LIMIT 1`],
+      ['channel 组织不存在', `SELECT c.id FROM channels c LEFT JOIN organizations o ON o.id = c.organization_id WHERE o.id IS NULL LIMIT 1`],
+      ['渠道身份跨组织', `
+        SELECT ci.id FROM channel_identities ci
+        JOIN principals p ON p.id = ci.principal_id
+        JOIN channels c ON c.id = ci.channel_id
+        WHERE ci.organization_id <> p.organization_id OR ci.organization_id <> c.organization_id
+        LIMIT 1`],
+      ['会话跨组织', `
+        SELECT c.id FROM conversations c
+        JOIN agents a ON a.id = c.agent_id
+        LEFT JOIN principals p ON p.id = c.principal_id
+        LEFT JOIN channels ch ON ch.id = c.channel_id
+        LEFT JOIN channel_identities ci ON ci.id = c.channel_identity_id
+        WHERE c.organization_id IS NULL OR c.organization_id <> a.organization_id
+          OR (p.id IS NOT NULL AND p.organization_id <> c.organization_id)
+          OR (ch.id IS NOT NULL AND ch.organization_id <> c.organization_id)
+          OR (ci.id IS NOT NULL AND ci.organization_id <> c.organization_id)
+        LIMIT 1`],
+      ['消息跨组织', `
+        SELECT m.id FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        LEFT JOIN principals p ON p.id = m.principal_id
+        LEFT JOIN channels ch ON ch.id = m.channel_id
+        LEFT JOIN channel_identities ci ON ci.id = m.channel_identity_id
+        WHERE m.organization_id <> c.organization_id
+          OR (p.id IS NOT NULL AND p.organization_id <> m.organization_id)
+          OR (ch.id IS NOT NULL AND ch.organization_id <> m.organization_id)
+          OR (ci.id IS NOT NULL AND ci.organization_id <> m.organization_id)
+        LIMIT 1`],
+      ['任务跨组织', `
+        SELECT t.id FROM tasks t
+        JOIN agents a ON a.id = t.agent_id
+        LEFT JOIN projects p ON p.id = t.project_id
+        LEFT JOIN conversations c ON c.id = t.conversation_id
+        LEFT JOIN messages m ON m.id = t.input_message_id
+        WHERE (p.id IS NOT NULL AND p.organization_id <> a.organization_id)
+          OR (c.id IS NOT NULL AND c.organization_id <> a.organization_id)
+          OR (m.id IS NOT NULL AND m.organization_id <> a.organization_id)
+        LIMIT 1`],
+      ['渠道路由跨组织', `
+        SELECT r.id FROM channel_routes r
+        JOIN channels c ON c.id = r.channel_id
+        JOIN agents a ON a.id = r.agent_id
+        WHERE c.organization_id <> a.organization_id LIMIT 1`],
+      ['调度计划跨组织或主链不一致', `
+        SELECT dp.id FROM dispatch_plans dp
+        JOIN principals p ON p.id = dp.principal_id
+        JOIN conversations c ON c.id = dp.conversation_id
+        JOIN messages m ON m.id = dp.input_message_id
+        JOIN agents a ON a.id = dp.worker_agent_id
+        LEFT JOIN channels ch ON ch.id = dp.channel_id
+        WHERE dp.organization_id <> p.organization_id
+          OR dp.organization_id <> c.organization_id
+          OR dp.organization_id <> m.organization_id
+          OR dp.organization_id <> a.organization_id
+          OR (ch.id IS NOT NULL AND dp.organization_id <> ch.organization_id)
+          OR dp.conversation_id <> m.conversation_id
+          OR NOT (dp.channel_id IS m.channel_id)
+          OR (m.principal_id IS NOT NULL AND dp.principal_id <> m.principal_id)
+        LIMIT 1`]
+    ];
+    for (const [label, sql] of checks) {
+      const row = this.migrationRows(sql)[0];
+      if (row) this.migrationFailure(37, `${label}：${String(row.id)}`);
+    }
+  }
+
+  private migrateOrganizationOwnership(): void {
+    this.assignEntityOrganizations('agents', `
+      SELECT organization_id FROM conversations WHERE agent_id = ? AND organization_id IS NOT NULL
+      UNION SELECT m.organization_id FROM tasks t JOIN messages m ON m.id = t.input_message_id WHERE t.agent_id = ?
+      UNION SELECT organization_id FROM dispatch_plans WHERE worker_agent_id = ?
+      UNION SELECT mi.organization_id FROM memory_items mi JOIN memory_scopes ms ON ms.memory_id = mi.id
+        WHERE ms.scope_type = 'agent' AND ms.scope_id = ?
+    `);
+    this.assignEntityOrganizations('channels', `
+      SELECT organization_id FROM channel_identities WHERE channel_id = ?
+      UNION SELECT organization_id FROM conversations WHERE channel_id = ? AND organization_id IS NOT NULL
+      UNION SELECT organization_id FROM messages WHERE channel_id = ?
+      UNION SELECT organization_id FROM dispatch_plans WHERE channel_id = ?
+    `);
+    this.assignEntityOrganizations('projects', `
+      SELECT c.organization_id FROM tasks t JOIN conversations c ON c.id = t.conversation_id WHERE t.project_id = ? AND c.organization_id IS NOT NULL
+      UNION SELECT m.organization_id FROM tasks t JOIN messages m ON m.id = t.input_message_id WHERE t.project_id = ?
+      UNION SELECT a.organization_id FROM tasks t JOIN agents a ON a.id = t.agent_id WHERE t.project_id = ?
+      UNION SELECT mi.organization_id FROM memory_items mi JOIN memory_scopes ms ON ms.memory_id = mi.id
+        WHERE ms.scope_type = 'project' AND ms.scope_id = ?
+    `);
+    this.inner.exec(`
+      UPDATE conversations
+      SET organization_id = (SELECT a.organization_id FROM agents a WHERE a.id = conversations.agent_id)
+      WHERE organization_id IS NULL;
+    `);
+    this.validateOrganizationScopes();
+  }
+
+  private makeDispatchPlanChannelNullable(): void {
+    const channel = this.migrationRows('PRAGMA table_info(dispatch_plans)')
+      .find((row) => row.name === 'channel_id');
+    if (!channel || Number(channel.notnull) === 0) return;
+    this.inner.exec(`
+      CREATE TABLE dispatch_plans_v37 (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        organization_id TEXT NOT NULL REFERENCES organizations(id),
+        principal_id TEXT NOT NULL REFERENCES principals(id),
+        channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        input_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        leader_kernel TEXT NOT NULL,
+        worker_agent_id TEXT NOT NULL REFERENCES agents(id),
+        worker_engine_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'planned',
+        task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        plan_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        committed_at INTEGER,
+        error TEXT
+      );
+      INSERT INTO dispatch_plans_v37(
+        id, request_id, organization_id, principal_id, channel_id, conversation_id,
+        input_message_id, leader_kernel, worker_agent_id, worker_engine_id, status,
+        task_id, plan_json, created_at, committed_at, error
+      ) SELECT
+        id, request_id, organization_id, principal_id, channel_id, conversation_id,
+        input_message_id, leader_kernel, worker_agent_id, worker_engine_id, status,
+        task_id, plan_json, created_at, committed_at, error
+      FROM dispatch_plans;
+      DROP TABLE dispatch_plans;
+      ALTER TABLE dispatch_plans_v37 RENAME TO dispatch_plans;
+      CREATE UNIQUE INDEX idx_dispatch_plans_input_message ON dispatch_plans(input_message_id);
+      CREATE INDEX idx_dispatch_plans_conversation ON dispatch_plans(conversation_id, created_at);
+    `);
+  }
+
   private migrate() {
     // 13.1：migration 在事务中执行，失败回滚；按版本号增量迁移
+    const prev = this.storedSchemaVersion();
+    // Table rebuilds in v36 require foreign key enforcement to be disabled until
+    // the copied data has passed foreign_key_check. The setting is per connection.
+    this.inner.exec('PRAGMA foreign_keys = OFF');
     this.inner.exec('BEGIN');
     try {
       this.inner.exec(DDL);
-      const prev = Number(this.getMeta('schema_version') ?? '0');
       // 辅助：安全添加列（已存在则跳过，避免 DDL 与 ALTER 冲突）
       const addCol = (table: string, col: string, type: string) => {
         const cols = this.inner.exec(`PRAGMA table_info(${table})`);
@@ -1008,12 +1684,530 @@ export class Database {
         this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_source_key
           ON tasks(source, source_key) WHERE source_key IS NOT NULL`);
       }
+      if (prev < 33) {
+        // v33：基础设施回退后的真实执行引擎归因。历史运行无法证明是否发生过回退，
+        // 因此只回填 requested_engine_id，resolved_engine_id 保持 NULL。
+        addCol('agent_runs', 'requested_engine_id', 'TEXT');
+        addCol('agent_runs', 'resolved_engine_id', 'TEXT');
+        addCol('agent_runs', 'executor_kind', 'TEXT');
+        this.inner.exec(`
+          UPDATE agent_runs
+          SET requested_engine_id = (
+            SELECT COALESCE(t.engine_override, a.engine_id)
+            FROM tasks t JOIN agents a ON a.id = t.agent_id
+            WHERE t.id = agent_runs.task_id
+          )
+          WHERE requested_engine_id IS NULL;
+        `);
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_agent_runs_resolved_engine ON agent_runs(resolved_engine_id, started_at)');
+      }
+      if (prev < 34) {
+        // v34：渠道入口的租户、主体、外部身份、会话和消息形成可追溯主链。
+        // 旧桌面会话可确定归属本地组织；没有渠道证据的身份字段不做推断。
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS organizations (
+          id TEXT PRIMARY KEY,
+          slug TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS principals (
+          id TEXT PRIMARY KEY,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          kind TEXT NOT NULL DEFAULT 'person',
+          display_name TEXT NOT NULL DEFAULT '',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS channel_identities (
+          id TEXT PRIMARY KEY,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          channel_id TEXT NOT NULL REFERENCES channels(id),
+          principal_id TEXT NOT NULL REFERENCES principals(id),
+          external_identity_key TEXT NOT NULL,
+          display_name TEXT NOT NULL DEFAULT '',
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )`);
+        addCol('conversations', 'organization_id', 'TEXT REFERENCES organizations(id)');
+        addCol('conversations', 'principal_id', 'TEXT REFERENCES principals(id)');
+        addCol('conversations', 'channel_id', 'TEXT REFERENCES channels(id)');
+        addCol('conversations', 'channel_identity_id', 'TEXT REFERENCES channel_identities(id)');
+        addCol('conversations', 'external_conversation_key', 'TEXT');
+        addCol('conversations', 'created_at', 'INTEGER');
+        addCol('conversations', 'updated_at', 'INTEGER');
+        addCol('tasks', 'conversation_id', 'TEXT REFERENCES conversations(id)');
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS messages (
+          id TEXT PRIMARY KEY,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          principal_id TEXT REFERENCES principals(id),
+          conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          channel_id TEXT REFERENCES channels(id),
+          channel_identity_id TEXT REFERENCES channel_identities(id),
+          external_message_key TEXT,
+          dedupe_key TEXT NOT NULL UNIQUE,
+          direction TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL DEFAULT '',
+          task_id TEXT REFERENCES tasks(id),
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at INTEGER NOT NULL
+        )`);
+        const now = Date.now();
+        this.inner.run(
+          `INSERT OR IGNORE INTO organizations(id, slug, name, created_at, updated_at)
+           VALUES(?, ?, ?, ?, ?)`,
+          ['org-local', 'local', '本地组织', now, now]
+        );
+        this.inner.exec(`
+          UPDATE conversations
+          SET organization_id = COALESCE(organization_id, 'org-local'),
+              created_at = COALESCE(created_at, last_message_at),
+              updated_at = COALESCE(updated_at, last_message_at);
+          UPDATE tasks
+          SET conversation_id = substr(session_id, 6)
+          WHERE conversation_id IS NULL
+            AND session_id LIKE 'conv-%'
+            AND EXISTS (
+              SELECT 1 FROM conversations c
+              WHERE c.id = substr(tasks.session_id, 6)
+            );
+        `);
+        this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_identities_scope
+          ON channel_identities(organization_id, channel_id, external_identity_key)`);
+        this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_channel_scope
+          ON conversations(organization_id, channel_id, channel_identity_id, external_conversation_key)
+          WHERE organization_id IS NOT NULL AND channel_id IS NOT NULL
+            AND channel_identity_id IS NOT NULL AND external_conversation_key IS NOT NULL`);
+        this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_channel_scope
+          ON messages(organization_id, channel_id, channel_identity_id, conversation_id, direction, external_message_key)
+          WHERE channel_id IS NOT NULL AND channel_identity_id IS NOT NULL AND external_message_key IS NOT NULL`);
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_principals_organization ON principals(organization_id, updated_at)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_channel_identities_principal ON channel_identities(principal_id)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_tasks_conversation ON tasks(conversation_id, created_at)');
+      }
+      if (prev < 35) {
+        // v35: durable kernel routing, canonical scoped memory and full task
+        // instructions. The title remains a bounded display label.
+        addCol('tasks', 'input_message_id', 'TEXT REFERENCES messages(id)');
+        addCol('tasks', 'content', "TEXT NOT NULL DEFAULT ''");
+        this.inner.exec(`
+          UPDATE tasks SET content = title WHERE content IS NULL OR content = '';
+          UPDATE tasks SET input_message_id = (
+            SELECT m.id FROM messages m
+            WHERE m.task_id = tasks.id AND m.direction = 'inbound'
+            ORDER BY m.created_at ASC LIMIT 1
+          ) WHERE input_message_id IS NULL;
+        `);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS kernel_attempts (
+          id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          component_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          ended_at INTEGER NOT NULL,
+          error TEXT,
+          UNIQUE(request_id, sequence)
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS kernel_sessions (
+          conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          kernel_id TEXT NOT NULL,
+          native_session_id TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(conversation_id, kernel_id)
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS dispatch_plans (
+          id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL UNIQUE,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          principal_id TEXT NOT NULL REFERENCES principals(id),
+          channel_id TEXT NOT NULL REFERENCES channels(id),
+          conversation_id TEXT NOT NULL REFERENCES conversations(id),
+          input_message_id TEXT NOT NULL REFERENCES messages(id),
+          leader_kernel TEXT NOT NULL,
+          worker_agent_id TEXT NOT NULL REFERENCES agents(id),
+          worker_engine_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'planned',
+          task_id TEXT,
+          plan_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          committed_at INTEGER,
+          error TEXT
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS memory_items (
+          id TEXT PRIMARY KEY,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          scope_key TEXT NOT NULL,
+          importance REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          revision INTEGER NOT NULL DEFAULT 1,
+          created_by TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          forgotten_at INTEGER
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS memory_scopes (
+          memory_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+          scope_type TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          PRIMARY KEY(memory_id, scope_type)
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS memory_versions (
+          id TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          content TEXT NOT NULL,
+          importance REAL NOT NULL,
+          status TEXT NOT NULL,
+          changed_by TEXT NOT NULL,
+          change_kind TEXT NOT NULL,
+          reason TEXT,
+          created_at INTEGER NOT NULL,
+          UNIQUE(memory_id, revision)
+        )`);
+        this.inner.exec(`CREATE TABLE IF NOT EXISTS memory_terms (
+          memory_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+          term TEXT NOT NULL,
+          weight REAL NOT NULL,
+          PRIMARY KEY(memory_id, term)
+        )`);
+        this.inner.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_plans_input_message ON dispatch_plans(input_message_id)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_dispatch_plans_conversation ON dispatch_plans(conversation_id, created_at)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_kernel_attempts_request ON kernel_attempts(request_id, sequence)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_memory_scopes_lookup ON memory_scopes(scope_type, scope_id, memory_id)');
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_memory_terms_lookup ON memory_terms(term, memory_id)');
+        this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_dedupe
+          ON memory_items(organization_id, content_hash, scope_key) WHERE status = 'active'`);
+        this.inner.exec('CREATE INDEX IF NOT EXISTS idx_tasks_input_message ON tasks(input_message_id)');
+      }
+      if (prev < 36) {
+        // v36: make the canonical message -> plan -> task chain enforceable before
+        // turning foreign_keys on for the connection. Derived orphan rows can be
+        // discarded; user-authored task/message content is retained and invalid
+        // nullable links are detached instead of deleting the owning row.
+        this.inner.exec(`
+          UPDATE tasks SET project_id = NULL
+          WHERE project_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.id = tasks.project_id);
+          UPDATE tasks SET conversation_id = NULL
+          WHERE conversation_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = tasks.conversation_id);
+          UPDATE messages SET principal_id = NULL
+          WHERE principal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM principals p WHERE p.id = messages.principal_id);
+          UPDATE messages SET channel_id = NULL
+          WHERE channel_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.id = messages.channel_id);
+          UPDATE messages SET channel_identity_id = NULL
+          WHERE channel_identity_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM channel_identities ci WHERE ci.id = messages.channel_identity_id
+          );
+          UPDATE messages SET task_id = NULL
+          WHERE direction <> 'inbound' AND task_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = messages.task_id);
+
+          DELETE FROM task_events WHERE task_id NOT IN (SELECT id FROM tasks);
+          DELETE FROM task_messages WHERE task_id NOT IN (SELECT id FROM tasks);
+          DELETE FROM agent_runs
+          WHERE task_id NOT IN (SELECT id FROM tasks) OR agent_id NOT IN (SELECT id FROM agents);
+          DELETE FROM approvals
+          WHERE task_id NOT IN (SELECT id FROM tasks) OR agent_id NOT IN (SELECT id FROM agents);
+          DELETE FROM agent_skills
+          WHERE agent_id NOT IN (SELECT id FROM agents) OR skill_id NOT IN (SELECT id FROM skills);
+          DELETE FROM workflow_runs WHERE workflow_id NOT IN (SELECT id FROM workflows);
+          DELETE FROM kernel_attempts WHERE conversation_id NOT IN (SELECT id FROM conversations);
+          DELETE FROM kernel_sessions WHERE conversation_id NOT IN (SELECT id FROM conversations);
+          DELETE FROM memory_scopes WHERE memory_id NOT IN (SELECT id FROM memory_items);
+          DELETE FROM memory_versions WHERE memory_id NOT IN (SELECT id FROM memory_items);
+          DELETE FROM memory_terms WHERE memory_id NOT IN (SELECT id FROM memory_items);
+          UPDATE schedules SET agent_id = NULL
+          WHERE agent_id IS NOT NULL AND agent_id NOT IN (SELECT id FROM agents);
+          UPDATE schedules SET project_id = NULL
+          WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects);
+          UPDATE team_runs SET project_id = NULL
+          WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects);
+          UPDATE deliverables SET project_id = NULL
+          WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects);
+          UPDATE mobile_control_sessions SET task_id = NULL
+          WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks);
+          UPDATE mobile_commands SET task_id = NULL
+          WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks);
+          UPDATE mobile_artifacts SET task_id = NULL
+          WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks);
+        `);
+
+        this.reconcileCanonicalTaskReceipts();
+
+        this.inner.exec(`
+          CREATE TABLE tasks_v36 (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL REFERENCES agents(id),
+            project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+            conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+            input_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'desktop',
+            source_key TEXT,
+            parent_id TEXT,
+            status TEXT NOT NULL DEFAULT 'QUEUED',
+            priority INTEGER NOT NULL DEFAULT 0,
+            progress INTEGER NOT NULL DEFAULT 0,
+            stage TEXT NOT NULL DEFAULT '',
+            error TEXT,
+            result TEXT,
+            quality TEXT,
+            session_id TEXT,
+            workspace_override TEXT,
+            engine_override TEXT,
+            is_demo INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            ended_at INTEGER,
+            deleted_at INTEGER
+          );
+          INSERT INTO tasks_v36(
+            id, agent_id, project_id, conversation_id, input_message_id, title, content,
+            source, source_key, parent_id, status, priority, progress, stage, error,
+            result, quality, session_id, workspace_override, engine_override, is_demo,
+            created_at, started_at, ended_at, deleted_at
+          ) SELECT
+            id, agent_id, project_id, conversation_id, input_message_id, title, content,
+            source, source_key, parent_id, status, priority, progress, stage, error,
+            result, quality, session_id, workspace_override, engine_override, is_demo,
+            created_at, started_at, ended_at, deleted_at
+          FROM tasks;
+          DROP TABLE tasks;
+          ALTER TABLE tasks_v36 RENAME TO tasks;
+          CREATE INDEX idx_tasks_agent ON tasks(agent_id, status);
+          CREATE INDEX idx_tasks_status ON tasks(status);
+          CREATE INDEX idx_tasks_project ON tasks(project_id, created_at);
+          CREATE UNIQUE INDEX idx_tasks_source_key
+            ON tasks(source, source_key) WHERE source_key IS NOT NULL;
+          CREATE INDEX idx_tasks_conversation ON tasks(conversation_id, created_at);
+          CREATE UNIQUE INDEX idx_tasks_input_message_exactly_once
+            ON tasks(input_message_id) WHERE input_message_id IS NOT NULL;
+        `);
+
+        this.inner.exec(`
+          CREATE TABLE messages_v36 (
+            id TEXT PRIMARY KEY,
+            organization_id TEXT NOT NULL REFERENCES organizations(id),
+            principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+            channel_identity_id TEXT REFERENCES channel_identities(id) ON DELETE SET NULL,
+            external_message_key TEXT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            direction TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL
+          );
+          INSERT INTO messages_v36(
+            id, organization_id, principal_id, conversation_id, channel_id,
+            channel_identity_id, external_message_key, dedupe_key, direction,
+            role, content, task_id, metadata_json, created_at
+          ) SELECT
+            id, organization_id, principal_id, conversation_id, channel_id,
+            channel_identity_id, external_message_key, dedupe_key, direction,
+            role, content, task_id, metadata_json, created_at
+          FROM messages;
+          DROP TABLE messages;
+          ALTER TABLE messages_v36 RENAME TO messages;
+          CREATE UNIQUE INDEX idx_messages_channel_scope
+            ON messages(organization_id, channel_id, channel_identity_id, conversation_id, direction, external_message_key)
+            WHERE channel_id IS NOT NULL AND channel_identity_id IS NOT NULL AND external_message_key IS NOT NULL;
+          CREATE INDEX idx_messages_conversation ON messages(conversation_id, created_at);
+          CREATE INDEX idx_messages_task ON messages(task_id);
+        `);
+
+        this.inner.exec(`
+          CREATE TABLE dispatch_plans_v36 (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            organization_id TEXT NOT NULL REFERENCES organizations(id),
+            principal_id TEXT NOT NULL REFERENCES principals(id),
+            channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            input_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            leader_kernel TEXT NOT NULL,
+            worker_agent_id TEXT NOT NULL REFERENCES agents(id),
+            worker_engine_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+            plan_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            committed_at INTEGER,
+            error TEXT
+          );
+          INSERT INTO dispatch_plans_v36(
+            id, request_id, organization_id, principal_id, channel_id, conversation_id,
+            input_message_id, leader_kernel, worker_agent_id, worker_engine_id, status,
+            task_id, plan_json, created_at, committed_at, error
+          ) SELECT
+            id, request_id, organization_id, principal_id, channel_id, conversation_id,
+            input_message_id, leader_kernel, worker_agent_id, worker_engine_id, status,
+            task_id, plan_json, created_at, committed_at, error
+          FROM dispatch_plans;
+          DROP TABLE dispatch_plans;
+          ALTER TABLE dispatch_plans_v36 RENAME TO dispatch_plans;
+          CREATE UNIQUE INDEX idx_dispatch_plans_input_message ON dispatch_plans(input_message_id);
+          CREATE INDEX idx_dispatch_plans_conversation ON dispatch_plans(conversation_id, created_at);
+        `);
+
+        this.inner.exec(`
+          CREATE TABLE kernel_attempts_v36 (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            component_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER NOT NULL,
+            error TEXT,
+            UNIQUE(request_id, sequence)
+          );
+          INSERT INTO kernel_attempts_v36 SELECT * FROM kernel_attempts;
+          DROP TABLE kernel_attempts;
+          ALTER TABLE kernel_attempts_v36 RENAME TO kernel_attempts;
+          CREATE INDEX idx_kernel_attempts_request ON kernel_attempts(request_id, sequence);
+
+          CREATE TABLE kernel_sessions_v36 (
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            kernel_id TEXT NOT NULL,
+            native_session_id TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(conversation_id, kernel_id)
+          );
+          INSERT INTO kernel_sessions_v36 SELECT * FROM kernel_sessions;
+          DROP TABLE kernel_sessions;
+          ALTER TABLE kernel_sessions_v36 RENAME TO kernel_sessions;
+
+          CREATE TABLE workflow_runs_v36 (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'running',
+            node_results TEXT NOT NULL DEFAULT '{}',
+            error TEXT,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER
+          );
+          INSERT INTO workflow_runs_v36 SELECT * FROM workflow_runs;
+          DROP TABLE workflow_runs;
+          ALTER TABLE workflow_runs_v36 RENAME TO workflow_runs;
+        `);
+      }
+      if (prev < 37) {
+        // v37: every routable entity has an organization owner; desktop plans
+        // use the local principal and intentionally carry no channel.
+        const now = Date.now();
+        this.inner.run(
+          `INSERT OR IGNORE INTO organizations(id, slug, name, created_at, updated_at)
+           VALUES('org-local', 'local', '本地组织', ?, ?)`,
+          [now, now]
+        );
+        this.inner.run(
+          `INSERT OR IGNORE INTO principals(
+             id, organization_id, kind, display_name, created_at, updated_at
+           ) VALUES('principal-local-admin', 'org-local', 'person', '本地管理员', ?, ?)`,
+          [now, now]
+        );
+        const localPrincipal = this.migrationRows(
+          "SELECT organization_id FROM principals WHERE id = 'principal-local-admin'"
+        )[0];
+        if (localPrincipal?.organization_id !== 'org-local') {
+          this.migrationFailure(37, 'principal-local-admin 已存在但不属于 org-local');
+        }
+
+        addCol('projects', 'organization_id', "TEXT NOT NULL DEFAULT 'org-local' REFERENCES organizations(id)");
+        addCol('agents', 'organization_id', "TEXT NOT NULL DEFAULT 'org-local' REFERENCES organizations(id)");
+        addCol('channels', 'organization_id', "TEXT NOT NULL DEFAULT 'org-local' REFERENCES organizations(id)");
+        this.inner.exec(`
+          UPDATE projects SET organization_id = 'org-local' WHERE organization_id IS NULL OR organization_id = '';
+          UPDATE agents SET organization_id = 'org-local' WHERE organization_id IS NULL OR organization_id = '';
+          UPDATE channels SET organization_id = 'org-local' WHERE organization_id IS NULL OR organization_id = '';
+        `);
+        this.migrateOrganizationOwnership();
+        this.makeDispatchPlanChannelNullable();
+
+        this.inner.exec(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_organization_entity
+            ON projects(organization_id, id);
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_organization_entity
+            ON agents(organization_id, id);
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_organization_entity
+            ON channels(organization_id, id);
+          CREATE INDEX IF NOT EXISTS idx_principals_organization_entity
+            ON principals(organization_id, id);
+          CREATE INDEX IF NOT EXISTS idx_channel_identities_organization_lookup
+            ON channel_identities(organization_id, channel_id, external_identity_key);
+          CREATE INDEX IF NOT EXISTS idx_conversations_organization_lookup
+            ON conversations(organization_id, principal_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_messages_organization_lookup
+            ON messages(organization_id, conversation_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_memory_proposals_status
+            ON memory_proposals(organization_id, status, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_memory_proposals_request
+            ON memory_proposals(request_id);
+          CREATE INDEX IF NOT EXISTS idx_memory_proposals_conversation
+            ON memory_proposals(conversation_id);
+        `);
+      }
+      if (prev < 38) {
+        this.inner.exec(`
+          CREATE TABLE IF NOT EXISTS task_schedule_proposals (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL REFERENCES dispatch_plans(request_id) ON DELETE CASCADE,
+            proposal_index INTEGER NOT NULL,
+            organization_id TEXT NOT NULL REFERENCES organizations(id),
+            principal_id TEXT REFERENCES principals(id) ON DELETE SET NULL,
+            channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+            operation TEXT NOT NULL CHECK(operation = 'create_task_schedule'),
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            cron_kind TEXT NOT NULL CHECK(cron_kind IN ('interval', 'daily', 'weekly', 'monthly')),
+            cron_value TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+            proposed_by TEXT NOT NULL,
+            decided_by TEXT,
+            decision_reason TEXT,
+            schedule_id TEXT REFERENCES schedules(id) ON DELETE SET NULL,
+            created_at INTEGER NOT NULL,
+            decided_at INTEGER,
+            UNIQUE(request_id, proposal_index)
+          );
+          CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_status
+            ON task_schedule_proposals(organization_id, status, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_request
+            ON task_schedule_proposals(request_id);
+          CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_conversation
+            ON task_schedule_proposals(conversation_id);
+        `);
+      }
+      this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_input_message_exactly_once
+        ON tasks(input_message_id) WHERE input_message_id IS NOT NULL`);
+      this.assertForeignKeyIntegrity();
       this.setMeta('schema_version', String(SCHEMA_VERSION));
       this.inner.exec('COMMIT');
     } catch (err) {
       this.inner.exec('ROLLBACK');
+      this.enableForeignKeys();
       throw err;
     }
+    this.enableForeignKeys();
     this.flush();
   }
 
@@ -1123,16 +2317,31 @@ export class Database {
     const expiredArtifacts = this.raw.prepare('SELECT storage_name FROM mobile_artifacts WHERE created_at < ?')
       .all(now - 30 * 86_400_000) as { storage_name: string }[];
     this.transaction(() => {
-      // 已结束任务超保留期：级联清理事件/消息/运行记录后删除任务本身
-      const sub = "SELECT id FROM tasks WHERE ended_at IS NOT NULL AND ended_at < ?";
-      this.raw.prepare(`DELETE FROM task_events WHERE task_id IN (${sub})`).run(d90);
-      this.raw.prepare(`DELETE FROM task_messages WHERE task_id IN (${sub})`).run(d90);
-      this.raw.prepare(`DELETE FROM agent_runs WHERE task_id IN (${sub})`).run(d90);
-      this.raw.prepare(`DELETE FROM approvals WHERE task_id IN (${sub})`).run(d90);
-      this.raw.prepare('DELETE FROM tasks WHERE ended_at IS NOT NULL AND ended_at < ?').run(d90);
+      // Canonical inbound tasks are permanent idempotency receipts. Purge their
+      // payload after 90 days, but retain task/message/plan identity forever.
+      const expired = "SELECT id FROM tasks WHERE ended_at IS NOT NULL AND ended_at < ?";
+      const removable = `${expired} AND input_message_id IS NULL`;
+      this.raw.prepare(`DELETE FROM dispatch_plans WHERE task_id IN (${removable})`).run(d90);
+      this.raw.prepare(`UPDATE messages SET task_id = NULL WHERE task_id IN (${removable})`).run(d90);
+      this.raw.prepare(`UPDATE mobile_control_sessions SET task_id = NULL WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`UPDATE mobile_commands SET task_id = NULL WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`UPDATE mobile_artifacts SET task_id = NULL WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`DELETE FROM task_events WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`DELETE FROM task_messages WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`DELETE FROM agent_runs WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`DELETE FROM approvals WHERE task_id IN (${expired})`).run(d90);
+      this.raw.prepare(`
+        UPDATE tasks
+        SET title = '', content = '', stage = '', error = NULL, result = NULL,
+            quality = NULL, session_id = NULL, workspace_override = NULL,
+            engine_override = NULL, deleted_at = COALESCE(deleted_at, ?)
+        WHERE ended_at IS NOT NULL AND ended_at < ? AND input_message_id IS NOT NULL
+      `).run(now, d90);
+      this.raw.prepare('DELETE FROM tasks WHERE ended_at IS NOT NULL AND ended_at < ? AND input_message_id IS NULL').run(d90);
       this.raw.prepare('DELETE FROM resource_samples WHERE created_at < ?').run(d7);
-      this.raw.prepare('DELETE FROM mobile_commands WHERE started_at < ?').run(d90);
       this.raw.prepare('DELETE FROM mobile_artifacts WHERE created_at < ?').run(now - 30 * 86_400_000);
+      this.raw.prepare('UPDATE mobile_artifacts SET command_id = NULL WHERE command_id IN (SELECT id FROM mobile_commands WHERE started_at < ?)').run(d90);
+      this.raw.prepare('DELETE FROM mobile_commands WHERE started_at < ?').run(d90);
       this.raw.prepare("UPDATE mobile_control_sessions SET status = 'expired', ended_at = COALESCE(ended_at, ?) WHERE status = 'active' AND expires_at < ?").run(now, now);
       this.raw.prepare('DELETE FROM audit_logs WHERE created_at < ?').run(d365);
     });
@@ -1149,18 +2358,34 @@ export class Database {
     // 1. SQLite 完整性检查
     const result = this.raw.prepare('PRAGMA integrity_check').get() as { integrity_check: string } | undefined;
     const integrityOk = result?.integrity_check === 'ok';
-    // 2. 修复孤立记录（引用已删除任务的残留数据）
+    // 2. 修复可安全丢弃的派生记录与可置空的历史链接。
     this.transaction(() => {
       const orphanEvents = this.raw.prepare('DELETE FROM task_events WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
       const orphanMsgs = this.raw.prepare('DELETE FROM task_messages WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
       const orphanRuns = this.raw.prepare('DELETE FROM agent_runs WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
       const orphanApprovals = this.raw.prepare('DELETE FROM approvals WHERE task_id NOT IN (SELECT id FROM tasks)').run().changes;
       const orphanSkills = this.raw.prepare('DELETE FROM agent_skills WHERE agent_id NOT IN (SELECT id FROM agents)').run().changes;
-      repaired = orphanEvents + orphanMsgs + orphanRuns + orphanApprovals + orphanSkills;
+      // Only detach non-input message references automatically. Canonical
+      // inbound/task/plan evidence is reported by foreign_key_check and must be
+      // repaired by a deterministic migration or explicit recovery workflow.
+      const detachedMessages = this.raw.prepare(`UPDATE messages SET task_id = NULL
+        WHERE direction <> 'inbound' AND task_id IS NOT NULL
+          AND task_id NOT IN (SELECT id FROM tasks)`).run().changes;
+      const detachedSessions = this.raw.prepare('UPDATE mobile_control_sessions SET task_id = NULL WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      const detachedCommands = this.raw.prepare('UPDATE mobile_commands SET task_id = NULL WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      const detachedArtifacts = this.raw.prepare('UPDATE mobile_artifacts SET task_id = NULL WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM tasks)').run().changes;
+      repaired = orphanEvents + orphanMsgs + orphanRuns + orphanApprovals + orphanSkills
+        + detachedMessages + detachedSessions + detachedCommands + detachedArtifacts;
     });
-    const msg = integrityOk
-      ? repaired > 0 ? `数据库结构完整，已清理 ${repaired} 条孤立记录` : '数据库结构完整，无异常'
-      : `数据库完整性检查异常：${result?.integrity_check ?? '未知错误'}`;
-    return { ok: integrityOk, message: msg, repaired };
+    const foreignKeyViolations = this.raw.prepare('PRAGMA foreign_key_check').all();
+    const ok = integrityOk && foreignKeyViolations.length === 0;
+    const msg = !integrityOk
+      ? `数据库完整性检查异常：${result?.integrity_check ?? '未知错误'}`
+      : foreignKeyViolations.length > 0
+        ? `数据库存在 ${foreignKeyViolations.length} 条无法自动修复的外键异常`
+        : repaired > 0
+          ? `数据库结构完整，已清理 ${repaired} 条孤立记录`
+          : '数据库结构完整，无异常';
+    return { ok, message: msg, repaired };
   }
 }

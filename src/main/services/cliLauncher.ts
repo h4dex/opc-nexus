@@ -9,7 +9,8 @@
  * 而 Node 的 spawn(shell:false) 对这两者都无法直接执行：
  *   - 无扩展名 shim → ENOENT（Windows 不认识它是可执行文件）
  *   - .cmd          → EINVAL（Node 出于安全禁止直接 spawn 批处理）
- * 实测唯一可行路径是经 `cmd.exe /d /s /c <命令>` 拉起。
+ * 这些入口通过配套 PowerShell shim 的 `-File` 模式拉起。不能把用户参数
+ * 拼入 `cmd.exe /c`，否则 `&`、引号等元字符会变成额外命令。
  *
  * 另有一类：Microsoft Store 分发的应用（WindowsApps 下的 reparse point），
  * 直接 spawn 会得到 EPERM，同样需要经 cmd.exe 走 PATH 解析。
@@ -20,15 +21,15 @@
  * @author liyingjie <y@senke.com>
  */
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { delimiter, extname, isAbsolute, join } from 'node:path';
 import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 
 const isWin = process.platform === 'win32';
 const PROCESS_TREE_KILL_TIMEOUT_MS = 5_000;
 
 /**
- * cmd.exe / shell 在命令不存在时的输出特征。
- * 经 cmd 包装后 spawn 不再报 ENOENT，只能从 stderr 识别。
- * 中文 Windows 的 cmd 以 GBK 输出，故同时匹配解码后文本与 UTF-8 误读产生的乱码特征。
+ * CLI shim 在命令不存在时的输出特征。
  */
 const NOT_FOUND_PATTERN = /不是内部或外部命令|is not recognized as|command not found|无法将.*识别为/i;
 
@@ -38,29 +39,57 @@ const NOT_FOUND_PATTERN = /不是内部或外部命令|is not recognized as|comm
  * 导致错误信息无法阅读、也无法用中文特征匹配。这里先试 UTF-8，
  * 若出现替换字符（U+FFFD）则回退 GBK。
  */
-/** 需要经 cmd.exe 间接拉起的可执行形态 */
-function needsCmdShim(binPath: string): boolean {
-  if (!isWin) return false;
-  // .cmd / .bat：Node 禁止直接 spawn
-  if (/\.(cmd|bat)$/i.test(binPath)) return true;
-  // .ps1：需 powershell 解释，统一交给 cmd.exe 走 PATH
-  if (/\.ps1$/i.test(binPath)) return true;
-  // Store 应用（WindowsApps 下的 reparse point）：直接 spawn 得 EPERM
-  if (/[\\/]WindowsApps[\\/]/i.test(binPath)) return true;
-  // 无扩展名：npm shim（Windows 不视其为可执行文件 → ENOENT）
-  if (!/\.[a-z0-9]+$/i.test(binPath)) return true;
-  return false;
+function pathEntries(env: NodeJS.ProcessEnv): string[] {
+  return (env.PATH ?? env.Path ?? env.path ?? '')
+    .split(delimiter)
+    .map((entry) => entry.trim().replace(/^"|"$/g, ''))
+    .filter(Boolean);
+}
+
+function companionPowerShellShim(binPath: string, env: NodeJS.ProcessEnv): string | null {
+  const ext = extname(binPath).toLowerCase();
+  const base = ['.cmd', '.bat', '.ps1'].includes(ext) ? binPath.slice(0, -ext.length) : binPath;
+  if (isAbsolute(binPath) || /[\\/]/.test(binPath)) {
+    const candidate = `${base}.ps1`;
+    return existsSync(candidate) ? candidate : null;
+  }
+  const name = commandNameOf(binPath);
+  for (const entry of pathEntries(env)) {
+    const candidate = join(entry, `${name}.ps1`);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function powerShellLaunch(scriptPath: string, args: string[]): { bin: string; args: string[] } {
+  return {
+    bin: 'powershell.exe',
+    args: ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args]
+  };
 }
 
 /**
  * 把「命令 + 参数」翻译成当前平台真正可 spawn 的形式。
- * 需要 shim 时改用 `cmd.exe /d /s /c`，并把原命令名（而非完整路径）交给 cmd 走 PATH 解析
- * —— WindowsApps 的完整路径即便经 cmd 也可能拒绝访问，用命令名更稳。
+ * Windows npm shim 通过 PowerShell `-File` 执行，参数保持独立 argv，绝不进入
+ * shell 命令字符串。没有安全伴生入口的 batch 文件直接拒绝执行。
  */
-export function resolveLaunch(binPath: string, args: string[]): { bin: string; args: string[] } {
-  if (!needsCmdShim(binPath)) return { bin: binPath, args };
-  const name = commandNameOf(binPath);
-  return { bin: 'cmd.exe', args: ['/d', '/s', '/c', name, ...args] };
+export function resolveLaunch(binPath: string, args: string[], env: NodeJS.ProcessEnv = process.env): { bin: string; args: string[] } {
+  if (!isWin) return { bin: binPath, args };
+  if (/[\\/]WindowsApps[\\/]/i.test(binPath)) {
+    return { bin: `${commandNameOf(binPath)}.exe`, args };
+  }
+  const ext = extname(binPath).toLowerCase();
+  if (ext === '.ps1') return powerShellLaunch(binPath, args);
+  if (ext === '.cmd' || ext === '.bat' || ext === '') {
+    const shim = companionPowerShellShim(binPath, env);
+    if (shim) return powerShellLaunch(shim, args);
+    const executable = ext === '' ? `${binPath}.exe` : '';
+    if (executable && (!/[\\/]/.test(binPath) || existsSync(executable))) {
+      return { bin: executable, args };
+    }
+    throw new Error(`Unsafe Windows command shim has no PowerShell companion: ${binPath}`);
+  }
+  return { bin: binPath, args };
 }
 
 /** 从完整路径取出可执行命令名（去目录、去扩展名），供 cmd.exe 按 PATH 解析 */
@@ -71,8 +100,17 @@ export function commandNameOf(binPath: string): string {
 
 /** 按平台正确启动 CLI；其余 spawn 选项原样透传（cwd / env / windowsHide 等） */
 export function spawnCli(binPath: string, args: string[], opts: SpawnOptions = {}): ChildProcess {
-  const { bin, args: finalArgs } = resolveLaunch(binPath, args);
-  return spawn(bin, finalArgs, { shell: false, windowsHide: true, ...opts });
+  const { bin, args: finalArgs } = resolveLaunch(binPath, args, opts.env as NodeJS.ProcessEnv | undefined);
+  // npm-generated PowerShell shims inspect stdin and pipe `$input` into Node
+  // when it is open. A never-written parent pipe therefore blocks the CLI
+  // before it can even process `--version`. Interactive protocols explicitly
+  // override this default with stdio: ['pipe', 'pipe', 'pipe'].
+  return spawn(bin, finalArgs, {
+    shell: false,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...opts
+  });
 }
 
 /**

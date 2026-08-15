@@ -303,6 +303,7 @@ export function seedIfEmpty(db: Database) {
     );
 
     const agentIds = new Map<string, string>();
+    const activeTaskIds = new Map<string, string>();
 
     for (const a of AGENTS) {
       const id = randomUUID();
@@ -314,6 +315,7 @@ export function seedIfEmpty(db: Database) {
       );
       if (a.task) {
         const tid = randomUUID();
+        activeTaskIds.set(a.name, tid);
         insertTask.run(tid, id, demoProjectForAgent(a.name), a.task.title, 'RUNNING', a.task.progress, '执行中', now - 3600_000, now - 3600_000, null, null);
         insertRun.run(randomUUID(), id, tid, process.pid, randomUUID(), 'RUNNING', now - 3600_000, null);
       }
@@ -333,7 +335,9 @@ export function seedIfEmpty(db: Database) {
     // 8 项待审批（首页"待处理待办 8 项"）
     for (const ap of TODO_APPROVALS) {
       const agentId = agentIds.get(ap.agent)!;
-      insertApproval.run(randomUUID(), randomUUID(), agentId, 'write_workspace', ap.title, ap.risk, now - 1800_000);
+      const taskId = activeTaskIds.get(ap.agent);
+      if (!taskId) throw new Error(`演示审批缺少关联任务：${ap.agent}`);
+      insertApproval.run(randomUUID(), taskId, agentId, 'write_workspace', ap.title, ap.risk, now - 1800_000);
     }
   });
 

@@ -1,5 +1,5 @@
 /**
- * CliExecutor 测试(Codex CLI / 泛化 CLI)
+ * CliExecutor 测试(Codex CLI / Claude Code CLI / 泛化 CLI)
  *
  * 核心执行路径,评审文档标记的覆盖缺口。重点在两处易错且后果严重的逻辑:
  * 1. buildCommand 的权限映射 —— 映射错会静默放宽沙箱
@@ -26,7 +26,11 @@ const appCfg: { engines: Record<string, { runArgs?: string[] }> } = { engines: {
 vi.mock('../src/main/services/config.js', () => ({ loadConfig: () => appCfg }));
 
 // 引擎环境变量：不引入 safeStorage 依赖
-vi.mock('../src/main/services/engineEnv.js', () => ({ resolveEngineEnv: () => ({}) }));
+vi.mock('../src/main/services/engineEnv.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/main/services/engineEnv.js')>(),
+  resolveEngineEnv: () => ({}),
+  resolveConfiguredEngineEnv: () => ({})
+}));
 
 /** 受控子进程：可手动推 stdout/stderr 并触发退出 */
 class FakeChild extends EventEmitter {
@@ -55,7 +59,15 @@ vi.mock('../src/main/services/cliLauncher.js', () => ({
   runCli: async () => ({ ok: true, code: 0, stdout: 'v1.0.0', stderr: '' })
 }));
 
-const { CliExecutor } = await import('../src/main/services/executor/cliExecutor.js');
+const {
+  CliExecutor,
+  buildClaudeAuthCheckArgs,
+  buildClaudeProbeArgs,
+  claudeProcessEnv,
+  parseClaudeAuthStatus,
+  parseClaudeProbeOutput,
+  redactClaudeText
+} = await import('../src/main/services/executor/cliExecutor.js');
 
 /** engines 表 mock：status HEALTHY，path 为 null（走 fallback bin） */
 function makeDb(status = 'HEALTHY', path: string | null = null) {
@@ -172,6 +184,99 @@ describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
   });
 });
 
+describe('Claude Code Worker 边界', () => {
+  const sessionId = '123e4567-e89b-42d3-a456-426614174000';
+  const argsFor = (permissionMode: string, source = 'desktop', sessionIdValue: string | null = null) => {
+    new CliExecutor('claude-cli', makeDb(), 'eng-claude').start(
+      task({ source, sessionId: sessionIdValue }),
+      agent({ permissionMode }),
+      cb()
+    );
+    const args = lastSpawn.args;
+    child.exit(0);
+    return args;
+  };
+
+  it('始终使用无交互 JSONL 与 safe-mode，禁用本机自定义和隐式 MCP', () => {
+    const args = argsFor('standard');
+    expect(args).toContain('-p');
+    expect(args).toContain('stream-json');
+    expect(args).toContain('--safe-mode');
+    expect(args).toContain('--strict-mcp-config');
+    expect(args).toContain('--no-chrome');
+  });
+
+  it('readonly 只暴露读取工具且不询问权限', () => {
+    const args = argsFor('readonly');
+    expect(args.slice(args.indexOf('--permission-mode'), args.indexOf('--permission-mode') + 2)).toEqual([
+      '--permission-mode', 'dontAsk'
+    ]);
+    expect(args).toContain('--tools=Read,Glob,Grep');
+    expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('standard 可编辑工作区但不静默绕过 Bash 权限', () => {
+    const args = argsFor('standard');
+    expect(args.slice(args.indexOf('--permission-mode'), args.indexOf('--permission-mode') + 2)).toEqual([
+      '--permission-mode', 'acceptEdits'
+    ]);
+    expect(args).toContain('--tools=Read,Glob,Grep,Edit,Write,Bash');
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).not.toContain('--allowedTools');
+  });
+
+  it('trusted/autonomous 才允许权限绕过；渠道 trusted 仍降级为 standard', () => {
+    expect(argsFor('trusted')).toContain('--dangerously-skip-permissions');
+    expect(argsFor('autonomous', 'channel')).toContain('--dangerously-skip-permissions');
+    expect(argsFor('trusted', 'channel')).not.toContain('--dangerously-skip-permissions');
+    expect(argsFor('standard', 'team')).toContain('--dangerously-skip-permissions');
+  });
+
+  it('只续接 Claude 命名空间或合法 UUID，不把其他执行器会话传给 --resume', () => {
+    const namespaced = argsFor('standard', 'desktop', `claude:${sessionId}`);
+    expect(namespaced.slice(namespaced.indexOf('--resume'), namespaced.indexOf('--resume') + 2)).toEqual([
+      '--resume', sessionId
+    ]);
+    const legacyRaw = argsFor('standard', 'desktop', sessionId);
+    expect(legacyRaw).toContain('--resume');
+    const incompatible = argsFor('standard', 'desktop', 'codex-thread-123');
+    expect(incompatible).not.toContain('--resume');
+    expect(incompatible.at(-1)).toContain('sp');
+    expect(incompatible.at(-1)).toContain('当前任务');
+  });
+
+  it('子进程不继承无关 ambient API keys，但保留该引擎受管凭据', () => {
+    const env = claudeProcessEnv(
+      { ANTHROPIC_API_KEY: 'managed-anthropic-key' },
+      {
+        PATH: 'C:\\tools', USERPROFILE: 'C:\\Users\\test',
+        OPENAI_API_KEY: 'ambient-openai-key', DEEPSEEK_API_KEY: 'ambient-deepseek-key',
+        ANTHROPIC_API_KEY: 'ambient-anthropic-key'
+      }
+    );
+    expect(env.PATH).toBe('C:\\tools');
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.DEEPSEEK_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBe('managed-anthropic-key');
+  });
+
+  it('探活参数禁用工具和会话落盘，并解析 auth/result JSON', () => {
+    expect(buildClaudeAuthCheckArgs()).toEqual(['auth', 'status', '--json']);
+    const probeArgs = buildClaudeProbeArgs();
+    expect(probeArgs).toContain('--no-session-persistence');
+    expect(probeArgs).toContain('--tools=');
+    expect(parseClaudeAuthStatus('{"loggedIn":true,"authMethod":"oauth_token","apiProvider":"firstParty"}').loggedIn).toBe(true);
+    expect(parseClaudeAuthStatus('diagnostic\n{\n"loggedIn": true,\n"authMethod": "api_key"\n}').loggedIn).toBe(true);
+    expect(parseClaudeProbeOutput('{"type":"result","is_error":false,"result":"OPC_CLAUDE_OK"}').ok).toBe(true);
+    expect(parseClaudeProbeOutput('{"type":"result","is_error":true,"result":"HTTP 401"}').ok).toBe(false);
+  });
+
+  it('探活错误会脱敏该引擎密钥', () => {
+    const text = redactClaudeText('Bearer claude-secret rejected', { ANTHROPIC_API_KEY: 'claude-secret' });
+    expect(text).toBe('Bearer [REDACTED] rejected');
+  });
+});
+
 describe('泛化 CLI 参数模板', () => {
   it('默认模板替换 {prompt} 占位', () => {
     new CliExecutor('generic-cli', makeDb(), 'eng-opencode', ['run', '{prompt}']).start(task(), agent(), cb());
@@ -266,6 +371,41 @@ describe('Codex JSONL 事件解析', () => {
     await settle();
     expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('ENOENT'));
     expect(c.onError.mock.calls[0][1]).toContain('PATH');
+  });
+});
+
+describe('Claude stream-json 事件解析', () => {
+  const sessionId = '123e4567-e89b-42d3-a456-426614174000';
+
+  const run = () => {
+    const callbacks = cb();
+    new CliExecutor('claude-cli', makeDb(), 'eng-claude').start(task(), agent(), callbacks);
+    return callbacks;
+  };
+
+  it('system 事件把 UUID 记录为 Claude 命名空间会话锚点', async () => {
+    const callbacks = run();
+    child.line(JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId }));
+    await settle();
+    expect(callbacks.onSession).toHaveBeenCalledWith('t1', `claude:${sessionId}`);
+  });
+
+  it('assistant 文本进入产物，result 成功结束', async () => {
+    const callbacks = run();
+    child.line(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Claude 产物' }] } }));
+    child.line(JSON.stringify({ type: 'result', is_error: false, result: 'Claude 产物' }));
+    child.exit(0);
+    await settle();
+    expect(callbacks.onDone).toHaveBeenCalledWith('t1', expect.stringContaining('Claude 产物'));
+  });
+
+  it('result is_error 如实失败，随后 code=0 不覆盖为成功', async () => {
+    const callbacks = run();
+    child.line(JSON.stringify({ type: 'result', is_error: true, result: 'HTTP 403 forbidden' }));
+    child.exit(0);
+    await settle();
+    expect(callbacks.onError).toHaveBeenCalledWith('t1', 'HTTP 403 forbidden');
+    expect(callbacks.onDone).not.toHaveBeenCalled();
   });
 });
 

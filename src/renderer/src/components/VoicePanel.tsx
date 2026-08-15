@@ -19,6 +19,7 @@ import { useApp } from '../store';
 import { toast } from './Toast';
 import type { VoiceCommandDraft } from '@shared/types';
 import { VoiceAudioPump } from '../utils/voiceAudioPump';
+import { VoiceDispatchAttempt } from '../utils/voiceDispatchAttempt';
 
 /** 云端识别要求的采样率 */
 const TARGET_SAMPLE_RATE = 16000;
@@ -53,6 +54,7 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
   const [editTitle, setEditTitle] = useState('');
   const [editAgentId, setEditAgentId] = useState('');
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   const sessionRef = useRef<string | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -64,6 +66,7 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const startGenerationRef = useRef(0);
   const startInFlightRef = useRef(false);
+  const dispatchAttemptRef = useRef<VoiceDispatchAttempt | null>(null);
   const mountedRef = useRef(true);
 
   const readyAgents = useMemo(() => (snapshot?.agentCards ?? [])
@@ -113,6 +116,8 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
     const generation = startGenerationRef.current;
     const d = await window.aibox.parseVoiceCommand(text);
     if (!mountedRef.current || startGenerationRef.current !== generation) return;
+    dispatchAttemptRef.current = new VoiceDispatchAttempt();
+    setSubmitting(false);
     setDraft(d);
     setEditTitle(d.title);
     setEditAgentId(d.agentId ?? readyAgents[0]?.id ?? '');
@@ -135,6 +140,8 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
       if (p.sessionId !== sessionRef.current) return;
       setError(p.message);
       setPhase('idle');
+      dispatchAttemptRef.current = null;
+      setSubmitting(false);
       stopSession();
     });
     return () => { offT(); offE(); };
@@ -164,6 +171,8 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
       stopAttemptSession();
     };
 
+    dispatchAttemptRef.current = null;
+    setSubmitting(false);
     setError(''); setPartial(''); setFinalText(''); setDraft(null);
 
     try {
@@ -250,12 +259,20 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
 
   const dispatch = async () => {
     if (!editAgentId || !editTitle.trim()) return;
+    const attempt = dispatchAttemptRef.current;
+    const messageKey = attempt?.tryStart();
+    if (!attempt || !messageKey) return;
+    setSubmitting(true);
+    setError('');
     try {
-      await window.aibox.dispatchVoiceTask(editAgentId, editTitle.trim());
+      await window.aibox.dispatchVoiceTask(editAgentId, editTitle.trim(), messageKey);
       toast.ok(`已派发：${editTitle.trim()}`);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      attempt.finish();
+      if (mountedRef.current && dispatchAttemptRef.current === attempt) setSubmitting(false);
     }
   };
 
@@ -263,11 +280,11 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1200 }}
-      onClick={() => { stopSession(); onClose(); }}>
+      onClick={() => { if (!submitting) { stopSession(); onClose(); } }}>
       <div className="card" style={{ width: 520, padding: 22 }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h3 style={{ margin: 0, fontSize: 15 }}>语音下达任务</h3>
-          <button className="btn small" onClick={() => { stopSession(); onClose(); }}>关闭</button>
+          <button className="btn small" disabled={submitting} onClick={() => { stopSession(); onClose(); }}>关闭</button>
         </div>
 
         {error && (
@@ -308,7 +325,7 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
             <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>任务内容（可修改）</label>
             <input
               style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13, outline: 'none', marginBottom: 12 }}
-              value={editTitle} onChange={(e) => setEditTitle(e.target.value)} autoFocus
+              value={editTitle} disabled={submitting} onChange={(e) => setEditTitle(e.target.value)} autoFocus
             />
 
             <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>
@@ -316,17 +333,20 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
             </label>
             <select
               style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13, marginBottom: 16 }}
-              value={editAgentId} onChange={(e) => setEditAgentId(e.target.value)}
+              value={editAgentId} disabled={submitting} onChange={(e) => setEditAgentId(e.target.value)}
             >
               <option value="">请选择数字员工</option>
               {readyAgents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
             </select>
 
             <div style={{ display: 'flex', gap: 10 }}>
-              <button className="btn primary" disabled={!editAgentId || !editTitle.trim()} onClick={() => void dispatch()}>
-                确认派发
+              <button className="btn primary" disabled={submitting || !editAgentId || !editTitle.trim()} onClick={() => void dispatch()}>
+                {submitting ? '派发中...' : '确认派发'}
               </button>
-              <button className="btn" onClick={() => { setPhase('idle'); setDraft(null); setPartial(''); setFinalText(''); }}>
+              <button className="btn" disabled={submitting} onClick={() => {
+                dispatchAttemptRef.current = null;
+                setPhase('idle'); setDraft(null); setPartial(''); setFinalText('');
+              }}>
                 重说
               </button>
             </div>

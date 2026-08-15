@@ -4,6 +4,8 @@ import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { MarkdownView } from '../components/MarkdownView';
 import { Schedules } from './Schedules';
+import { MemoryProposals } from './MemoryProposals';
+import { TaskScheduleProposals } from './TaskScheduleProposals';
 import { toast } from '../components/Toast';
 import {
   IconAlert, IconCheck, IconClock, IconDb, IconDownload, IconEdit, IconFile, IconFolder,
@@ -14,7 +16,7 @@ import type {
   CustomerDelivery, CustomerDeliveryInput, DeliverableSummary, Project, ProjectBudget
 } from '../../../shared/types';
 
-type Tab = 'overview' | 'plans' | 'budget' | 'delivery';
+type Tab = 'overview' | 'plans' | 'schedule-proposals' | 'memory' | 'budget' | 'delivery';
 const REPORT_LABEL: Record<AutomationReportKind, string> = {
   project_inspection: '立即巡检', weekly_report: '生成周报', monthly_report: '生成月报'
 };
@@ -91,7 +93,7 @@ export function Automation() {
       </div>
     </div>
     <nav className="automation-tabs" aria-label="经营自动化视图">
-      {([['overview', '经营概览'], ['plans', '自动计划'], ['budget', '预算与推荐'], ['delivery', '交付与数据']] as const).map(([key, label]) =>
+      {([['overview', '经营概览'], ['plans', '自动计划'], ['schedule-proposals', '调度提案'], ['memory', '记忆提案'], ['budget', '预算与推荐'], ['delivery', '交付与数据']] as const).map(([key, label]) =>
         <button key={key} type="button" className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>{label}</button>)}
     </nav>
 
@@ -124,6 +126,10 @@ export function Automation() {
     </>}
 
     {tab === 'plans' && <Schedules embedded onChanged={() => void load()} />}
+
+    {tab === 'schedule-proposals' && <TaskScheduleProposals />}
+
+    {tab === 'memory' && <MemoryProposals />}
 
     {tab === 'budget' && overview && <div className="automation-budget-grid">
       <section className="automation-section"><header><h3>项目预算</h3><span>{overview.budgets.length}</span></header>

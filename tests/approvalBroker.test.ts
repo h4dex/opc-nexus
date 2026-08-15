@@ -27,6 +27,19 @@ function makeBrokerDb() {
   };
 }
 
+function attachStateController(broker: InstanceType<typeof ApprovalBroker>, db: ReturnType<typeof makeBrokerDb>['db']) {
+  broker.setStateController({
+    request: (req, approvalId, now) => db.transaction(() => {
+      db.raw.prepare('INSERT INTO approvals').run(approvalId, req.taskId, now);
+      db.raw.prepare("UPDATE tasks SET status = 'WAITING_APPROVAL'").run(req.taskId);
+      db.raw.prepare('INSERT INTO task_events').run(approvalId, req.taskId, now);
+    }),
+    abandon: (_taskId, approvalId, now) => {
+      db.raw.prepare("UPDATE approvals SET status = 'rejected'").run(now, approvalId);
+    }
+  });
+}
+
 const request = {
   taskId: 'task-1',
   agentId: 'agent-1',
@@ -39,6 +52,7 @@ describe('ApprovalBroker single-flight', () => {
   it('不会用重复请求覆盖同任务的未决审批 Promise', async () => {
     const { db, writes } = makeBrokerDb();
     const broker = new ApprovalBroker(db as never);
+    attachStateController(broker, db);
     broker.onChange(() => { throw new Error('listener failure'); });
 
     const firstDecision = broker.request(request);
@@ -64,6 +78,7 @@ describe('ApprovalBroker single-flight', () => {
   it('数据库拒绝状态写入失败时仍释放 Promise 和单任务槽位', async () => {
     const { db } = makeBrokerDb();
     const broker = new ApprovalBroker(db as never);
+    attachStateController(broker, db);
     const firstDecision = broker.request(request);
     const originalPrepare = db.raw.prepare;
     let failedOnce = false;

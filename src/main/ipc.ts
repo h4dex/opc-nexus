@@ -13,6 +13,7 @@ import type { WecomChannel } from './services/channels/wecomChannel.js';
 import type { WeixinChannel } from './services/channels/wechatChannel.js';
 import type { Scheduler } from './services/scheduler.js';
 import type { ApprovalBroker } from './services/approvalBroker.js';
+import type { DesktopControlPlane } from './services/desktopControlPlane.js';
 import type { ResourceMonitor } from './services/resourceMonitor.js';
 import type { McpManager } from './services/mcpManager.js';
 import type { SkillManager } from './services/skillManager.js';
@@ -28,6 +29,9 @@ import type { AutomationManager } from './services/automationManager.js';
 import type { CollabManager } from './services/collabManager.js';
 import type { MobileGatewayService } from './services/mobileGatewayService.js';
 import type { MobileAdbService } from './services/mobileAdbService.js';
+import type { MemoryService } from './services/memoryService.js';
+import type { MemoryProposalService } from './services/memoryProposalService.js';
+import type { TaskScheduleProposalService } from './services/taskScheduleProposalService.js';
 import { getMobileToolCatalog, isMobileToolName, MOBILE_TOOL_NAMES } from './services/mobileCatalog.js';
 import { createProvisionedAgent } from './services/mobileAgentProvisioning.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
@@ -40,6 +44,9 @@ import type {
   KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeVersionInput,
   ProjectInput, ProjectPatch, ScheduleInput, SystemInfo, TodoItem, AgentPersonaPatch, WfNode, WfEdge,
   AutomationReportKind, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudgetInput,
+  MemoryForgetInput, MemoryListInput, MemoryProposalDecisionInput, MemoryProposalListInput,
+  MemoryRecallInput, MemoryRememberInput, MemoryUpdateInput,
+  TaskScheduleProposalDecisionInput, TaskScheduleProposalListInput,
   MobileScriptDefinition, MobileToolName
 } from '../shared/types.js';
 import { hostname, release } from 'node:os';
@@ -59,6 +66,31 @@ function assertString(v: unknown, field: string, min = 1, max = 500): string {
 function assertId(v: unknown, field = 'id'): string {
   return assertString(v, field, 1, 100);
 }
+
+function optionalId(v: unknown, field: string): string | null {
+  return v === undefined || v === null || v === '' ? null : assertId(v, field);
+}
+
+function optionalUnitInterval(v: unknown, field: string): number | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+    throw new Error(`${field} must be between 0 and 1`);
+  }
+  return v;
+}
+
+function positiveInteger(v: unknown, field: string): number {
+  if (!Number.isInteger(v) || (v as number) < 1) throw new Error(`${field} must be a positive integer`);
+  return v as number;
+}
+
+function optionalLimit(v: unknown): number | undefined {
+  if (v === undefined) return undefined;
+  if (!Number.isFinite(v) || (v as number) < 1) throw new Error('limit must be a positive number');
+  return Math.trunc(v as number);
+}
+
+const LOCAL_MEMORY_ORGANIZATION_ID = 'org-local';
 
 export const MAX_VOICE_AUDIO_CHUNK_BYTES = 64 * 1024;
 
@@ -123,6 +155,7 @@ function safeFileSegment(value: string): string {
 export interface IpcDeps {
   db: Database;
   orchestrator: Orchestrator;
+  desktopControlPlane: DesktopControlPlane;
   executors: ExecutorRegistry;
   engines: EngineManager;
   channels: ChannelManager;
@@ -150,11 +183,14 @@ export interface IpcDeps {
   webServer: import('./services/webServer.js').WebServer;
   mobile: MobileGatewayService;
   mobileAdb: MobileAdbService;
+  memory: MemoryService;
+  memoryProposals: MemoryProposalService;
+  taskScheduleProposals: TaskScheduleProposalService;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, voice, webServer, mobile, mobileAdb, getMainWindow } = deps;
+  const { db, orchestrator, desktopControlPlane, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, voice, webServer, mobile, mobileAdb, memory, memoryProposals, taskScheduleProposals, getMainWindow } = deps;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -211,6 +247,94 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:getAppMemory', () => summarizeAppMemory(app.getAppMetrics(), process.memoryUsage()));
   ipcMain.handle('aibox:globalSearch', (_e, query: string) => discovery.search(assertString(query ?? '', 'query', 0, 100)));
   ipcMain.handle('aibox:getActionCenter', () => discovery.actions());
+  ipcMain.handle('aibox:listMemories', (_e, input: MemoryListInput = {}) => memory.list({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    status: input?.status,
+    limit: optionalLimit(input?.limit)
+  }));
+  ipcMain.handle('aibox:recallMemories', (_e, input: MemoryRecallInput = {}) => memory.recall({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    principalId: optionalId(input?.principalId, 'principalId'),
+    channelId: optionalId(input?.channelId, 'channelId'),
+    conversationId: optionalId(input?.conversationId, 'conversationId'),
+    agentId: optionalId(input?.agentId, 'agentId'),
+    projectId: optionalId(input?.projectId, 'projectId'),
+    query: input?.query === undefined ? undefined : assertString(input.query, 'query', 0, 4_000),
+    limit: optionalLimit(input?.limit)
+  }));
+  ipcMain.handle('aibox:rememberMemory', (_e, input: MemoryRememberInput) => memory.remember({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    principalId: optionalId(input?.principalId, 'principalId'),
+    channelId: optionalId(input?.channelId, 'channelId'),
+    conversationId: optionalId(input?.conversationId, 'conversationId'),
+    agentId: optionalId(input?.agentId, 'agentId'),
+    projectId: optionalId(input?.projectId, 'projectId'),
+    kind: assertString(input?.kind, 'kind', 1, 80),
+    content: assertString(input?.content, 'content', 1, 8_000),
+    importance: optionalUnitInterval(input?.importance, 'importance'),
+    actor: 'admin',
+    source: 'desktop'
+  }));
+  ipcMain.handle('aibox:updateMemory', (_e, input: MemoryUpdateInput) => memory.update({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    memoryId: assertId(input?.memoryId, 'memoryId'),
+    expectedRevision: positiveInteger(input?.expectedRevision, 'expectedRevision'),
+    content: input?.content === undefined ? undefined : assertString(input.content, 'content', 1, 8_000),
+    importance: optionalUnitInterval(input?.importance, 'importance'),
+    reason: input?.reason === undefined ? undefined : assertString(input.reason, 'reason', 0, 2_000),
+    actor: 'admin',
+    source: 'desktop'
+  }));
+  ipcMain.handle('aibox:forgetMemory', (_e, input: MemoryForgetInput) => memory.forget({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    memoryId: assertId(input?.memoryId, 'memoryId'),
+    expectedRevision: positiveInteger(input?.expectedRevision, 'expectedRevision'),
+    reason: input?.reason === undefined ? undefined : assertString(input.reason, 'reason', 0, 2_000),
+    actor: 'admin',
+    source: 'desktop'
+  }));
+  ipcMain.handle('aibox:listMemoryProposals', (_e, input: MemoryProposalListInput = {}) => memoryProposals.list({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    status: input?.status,
+    limit: optionalLimit(input?.limit)
+  }));
+  ipcMain.handle('aibox:acceptMemoryProposal', (_e, input: MemoryProposalDecisionInput) => memoryProposals.accept({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    proposalId: assertId(input?.proposalId, 'proposalId'),
+    reason: input?.reason === undefined ? undefined : assertString(input.reason, 'reason', 0, 2_000),
+    actor: 'admin',
+    source: 'desktop'
+  }));
+  ipcMain.handle('aibox:rejectMemoryProposal', (_e, input: MemoryProposalDecisionInput) => memoryProposals.reject({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    proposalId: assertId(input?.proposalId, 'proposalId'),
+    reason: input?.reason === undefined ? undefined : assertString(input.reason, 'reason', 0, 2_000),
+    actor: 'admin',
+    source: 'desktop'
+  }));
+  ipcMain.handle('aibox:listTaskScheduleProposals', (_e, input: TaskScheduleProposalListInput = {}) => taskScheduleProposals.list({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    status: input?.status,
+    limit: optionalLimit(input?.limit)
+  }));
+  ipcMain.handle('aibox:acceptTaskScheduleProposal', (_e, input: TaskScheduleProposalDecisionInput) => {
+    const accepted = taskScheduleProposals.accept({
+      organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+      proposalId: assertId(input?.proposalId, 'proposalId'),
+      reason: input?.reason === undefined ? undefined : assertString(input.reason, 'reason', 0, 2_000),
+      actor: 'admin',
+      source: 'desktop'
+    });
+    pushSnapshot();
+    return accepted;
+  });
+  ipcMain.handle('aibox:rejectTaskScheduleProposal', (_e, input: TaskScheduleProposalDecisionInput) => taskScheduleProposals.reject({
+    organizationId: LOCAL_MEMORY_ORGANIZATION_ID,
+    proposalId: assertId(input?.proposalId, 'proposalId'),
+    reason: input?.reason === undefined ? undefined : assertString(input.reason, 'reason', 0, 2_000),
+    actor: 'admin',
+    source: 'desktop'
+  }));
   ipcMain.handle('aibox:dismissAction', (_e, actionKey: string, fingerprint: string) => {
     discovery.dismiss(assertString(actionKey, 'actionKey', 1, 180), assertString(fingerprint, 'fingerprint', 8, 80));
     return { ok: true };
@@ -460,17 +584,24 @@ export function registerIpc(deps: IpcDeps) {
   });
   // 会话（持续多轮对话）
   ipcMain.handle('aibox:listConversations', (_e, agentId: string) => orchestrator.listConversations(agentId));
-  ipcMain.handle('aibox:chatWithAgent', (_e, agentId: string, message: string, conversationId?: string) => {
-    const r = orchestrator.chatWithAgent(assertId(agentId, 'agentId'), assertString(message, 'message', 1, 20_000), conversationId ? assertId(conversationId, 'conversationId') : undefined);
+  ipcMain.handle('aibox:chatWithAgent', async (_e, agentId: string, message: string, conversationId?: string, messageKey?: string) => {
+    const r = await desktopControlPlane.dispatch({
+      preferredAgentId: assertId(agentId, 'agentId'),
+      message: assertString(message, 'message', 1, 20_000),
+      conversationId: conversationId ? assertId(conversationId, 'conversationId') : undefined,
+      messageKey: messageKey ? assertId(messageKey, 'messageKey') : undefined
+    });
     pushSnapshot();
     return r;
   });
   // 会话管理：重命名 / 删除
   ipcMain.handle('aibox:renameConversation', (_e, id: string, title: string) => {
-    db.raw.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(assertString(title, 'title', 1, 100), assertId(id, 'conversationId'));
+    db.raw.prepare("UPDATE conversations SET title = ? WHERE id = ? AND channel_id IS NULL AND organization_id = 'org-local'")
+      .run(assertString(title, 'title', 1, 100), assertId(id, 'conversationId'));
   });
   ipcMain.handle('aibox:deleteConversation', (_e, id: string) => {
-    db.raw.prepare('DELETE FROM conversations WHERE id = ?').run(id);
+    db.raw.prepare("DELETE FROM conversations WHERE id = ? AND channel_id IS NULL AND organization_id = 'org-local'")
+      .run(assertId(id, 'conversationId'));
   });
   // 用量统计
   ipcMain.handle('aibox:getUsageStats', () => orchestrator.usageStats());
@@ -733,12 +864,22 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:removeTeamTemplate', (_e, id: string) => teams.removeTemplate(id));
 
   // ---------- 任务 ----------
-  ipcMain.handle('aibox:createTask', (_e, agentId: string, title: string, projectId?: string) => orchestrator.createTask(
-    assertId(agentId, 'agentId'),
-    assertString(title, 'title', 1, 500),
-    'desktop',
-    { projectId: projectId ? assertId(projectId, 'projectId') : undefined }
-  ));
+  ipcMain.handle('aibox:createTask', async (
+    _e,
+    agentId: string,
+    title: string,
+    projectId: string | undefined,
+    messageKey: string
+  ) => {
+    const result = await desktopControlPlane.dispatch({
+      preferredAgentId: assertId(agentId, 'agentId'),
+      message: assertString(title, 'title', 1, 500),
+      projectId: projectId ? assertId(projectId, 'projectId') : undefined,
+      messageKey: assertId(messageKey, 'messageKey')
+    });
+    pushSnapshot();
+    return result.task;
+  });
   ipcMain.handle('aibox:cancelTask', (_e, id: string) => orchestrator.cancelTask(assertId(id)));
   ipcMain.handle('aibox:retryTask', (_e, id: string) => {
     const taskId = assertId(id, 'taskId');
@@ -988,11 +1129,16 @@ export function registerIpc(deps: IpcDeps) {
     return parseVoiceCommand(assertString(text, 'text', 0, 2000), agents, defaultAgentId);
   });
   /** 确认后派发：source='voice' 便于审计与统计区分手动派发 */
-  ipcMain.handle('aibox:dispatchVoiceTask', (_e, agentId: string, title: string) => {
-    const task = orchestrator.createTask(assertId(agentId, 'agentId'), assertString(title, 'title', 1, 200), 'voice');
-    db.audit({ id: randomUUID(), actor: 'admin', action: 'voice.dispatch', target: task.id, result: 'ok' });
+  ipcMain.handle('aibox:dispatchVoiceTask', async (_e, agentId: string, title: string, messageKey: string) => {
+    const result = await desktopControlPlane.dispatch({
+      preferredAgentId: assertId(agentId, 'agentId'),
+      message: assertString(title, 'title', 1, 200),
+      source: 'voice',
+      messageKey: assertId(messageKey, 'messageKey')
+    });
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'voice.dispatch', target: result.task.id, result: 'ok' });
     pushSnapshot();
-    return task;
+    return result.task;
   });
   // 数据库维护：完整性检查 + 手动清理
   ipcMain.handle('aibox:integrityCheck', () => db.integrityCheck());

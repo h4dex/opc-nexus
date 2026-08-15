@@ -12,18 +12,27 @@ import type { Client as LarkClient, WSClient as LarkWSClient } from '@larksuiteo
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
-import { tryChannelCommand } from './common.js';
+import { dispatchChannelTask, type ChannelTaskPlanner } from './common.js';
 
 export const FEISHU_APPID_SETTING = 'channel:feishu:appId';
 export const FEISHU_SECRET_REF = 'secret:channel:feishu';
 
-const REPLY_POLL_MS = 2000;
-const REPLY_TIMEOUT_MS = 15 * 60_000;
 const MAX_REPLY_CHARS = 2000;
 
 interface FeishuMessageEvent {
+  sender?: {
+    sender_id?: {
+      open_id?: string;
+      user_id?: string;
+      union_id?: string;
+    };
+    sender_type?: string;
+    tenant_key?: string;
+  };
   message?: {
+    message_id?: string;
     chat_id?: string;
+    chat_type?: string;
     message_type?: string;
     content?: string;
   };
@@ -35,7 +44,7 @@ export class FeishuChannel {
   private active = false;
   private wsClient: LarkWSClient | null = null;
 
-  constructor(private db: Database, private orchestrator: Orchestrator) {}
+  constructor(private db: Database, private orchestrator: Orchestrator, private taskPlanner: ChannelTaskPlanner) {}
 
   isActive(): boolean {
     return this.active;
@@ -187,48 +196,29 @@ export class FeishuChannel {
       await reply('暂只支持文本消息，请用文字描述任务。');
       return;
     }
-    // 对话指令（/状态 /取消 /暂停 /继续 /帮助）：防长任务卡死的干预入口
-    if (tryChannelCommand(this.db, this.orchestrator, 'ch-feishu', text, (msg) => void reply(msg))) return;
-    // 路由：该渠道绑定的第一个员工（10.4 精确会话绑定 > 账号默认）
-    const route = this.db.raw
-      .prepare("SELECT agent_id FROM channel_routes WHERE channel_id = 'ch-feishu' LIMIT 1")
-      .get() as { agent_id: string } | undefined;
-    if (!route) {
-      await reply('该渠道尚未绑定数字员工，请在控制中心「连接中心」完成绑定。');
-      return;
-    }
-
-    let taskId: string;
-    try {
-      const task = this.orchestrator.createTask(route.agent_id, text.slice(0, 200), 'channel');
-      taskId = task.id;
-    } catch (err) {
-      await reply(`任务创建失败：${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
-    await reply('已接收任务，数字员工执行中…（高风险操作需在控制中心审批）');
-
-    // 轮询任务终态后回帖结果
-    const started = Date.now();
-    const poll = () => {
-      const row = this.db.raw.prepare('SELECT status, result, error FROM tasks WHERE id = ?').get(taskId) as
-        | { status: string; result: string | null; error: string | null }
-        | undefined;
-      if (!row) return;
-      if (row.status === 'COMPLETED') {
-        void reply(`✅ 任务完成：\n${(row.result ?? '（无文本产物）').slice(0, MAX_REPLY_CHARS - 20)}`);
-        return;
-      }
-      if (['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(row.status)) {
-        void reply(`❌ 任务未完成（${row.status}）：${row.error ?? '无错误信息'}`);
-        return;
-      }
-      if (Date.now() - started > REPLY_TIMEOUT_MS) {
-        void reply('⏳ 任务仍在执行，请稍后到控制中心查看结果。');
-        return;
-      }
-      setTimeout(poll, REPLY_POLL_MS);
-    };
-    setTimeout(poll, REPLY_POLL_MS);
+    const sender = data.sender?.sender_id;
+    const externalIdentity = sender?.open_id?.trim()
+      || sender?.union_id?.trim()
+      || sender?.user_id?.trim()
+      || `chat:${chatId}`;
+    void dispatchChannelTask({
+      db: this.db,
+      orchestrator: this.orchestrator,
+      taskPlanner: this.taskPlanner,
+      channelId: 'ch-feishu',
+      text,
+      externalIdentity,
+      externalIdentityDisplayName: sender?.user_id?.trim() || sender?.open_id?.trim(),
+      conversationKey: `chat:${chatId}`,
+      sourceKey: data.message?.message_id?.trim(),
+      metadata: {
+        chatType: data.message?.chat_type ?? null,
+        messageType: data.message?.message_type ?? null,
+        senderType: data.sender?.sender_type ?? null,
+        tenantKey: data.sender?.tenant_key ?? null
+      },
+      ack: (message) => void reply(message),
+      final: (message) => void reply(message)
+    });
   }
 }

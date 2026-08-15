@@ -122,8 +122,19 @@ function makeDb(
           // UPDATE engines SET status = ?, auth_status = ? WHERE id = ?
           if (/UPDATE engines SET status = \?, auth_status = \? WHERE id = \?/.test(sql)) {
             const [status, authStatus, id] = args;
+            if (/AND status = 'HEALTHY'/.test(sql) && engines[id as string]?.status !== 'HEALTHY') {
+              return { changes: 0 };
+            }
             if (engines[id as string]) Object.assign(engines[id as string], { status, auth_status: authStatus });
             return { changes: 1 };
+          }
+          if (/UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required' WHERE id = \?/.test(sql)) {
+            const [id] = args;
+            if (/AND status = 'HEALTHY'/.test(sql) && engines[id as string]?.status !== 'HEALTHY') {
+              return { changes: 0 };
+            }
+            if (engines[id as string]) Object.assign(engines[id as string], { status: 'AUTH_REQUIRED', auth_status: 'required' });
+            return { changes: engines[id as string] ? 1 : 0 };
           }
           if (/UPDATE engines SET status = \?, auth_status = \?, version = \?, path = \? WHERE id = \?/.test(sql)) {
             const [status, authStatus, version, path, id] = args;
@@ -168,9 +179,9 @@ beforeEach(() => {
 });
 
 describe('引擎目录收敛(E-1)', () => {
-  it('目录包含四个原有引擎和受管 DeepSeek Harness runtime', () => {
+  it('目录包含控制内核与已验证的 Worker runtime', () => {
     expect(ENGINE_CATALOG.map((e) => e.id).sort()).toEqual(
-      ['eng-codex', 'eng-deepseek-harness', 'eng-hermes', 'eng-hermes-cli', 'eng-opencode'].sort()
+      ['eng-claude', 'eng-codex', 'eng-deepseek-harness', 'eng-hermes', 'eng-hermes-cli', 'eng-opencode', 'eng-pi'].sort()
     );
     expect(ENGINE_CATALOG.find((e) => e.id === 'eng-deepseek-harness')).toMatchObject({
       type: 'external',
@@ -194,6 +205,15 @@ describe('引擎目录收敛(E-1)', () => {
     expect(hermes?.npmPackage).toBeNull();
   });
 
+  it('Claude Code uses the official CLI package as a Worker', () => {
+    expect(ENGINE_CATALOG.find((e) => e.id === 'eng-claude')).toMatchObject({
+      type: 'claude',
+      bin: 'claude',
+      npmPackage: '@anthropic-ai/claude-code'
+    });
+    expect(RETIRED_ENGINE_IDS).not.toContain('eng-claude');
+  });
+
   it('每个引擎都声明数据边界(15.1 要求外部引擎展示数据发送方)', () => {
     for (const e of ENGINE_CATALOG) expect(e.dataBoundary.length).toBeGreaterThan(0);
   });
@@ -203,6 +223,9 @@ describe('鉴权探测状态迁移(H-4)', () => {
   it('Hermes 员工 Profile 首次迁移获得更长的启动窗口', () => {
     expect(cliLaunchProbeTimeoutMs('eng-hermes-cli', { HERMES_HOME: 'C:\\profiles\\employee' })).toBe(45_000);
     expect(cliLaunchProbeTimeoutMs('eng-hermes-cli', {})).toBe(15_000);
+    expect(cliLaunchProbeTimeoutMs('eng-pi', { PI_CODING_AGENT_DIR: 'C:\\profiles\\pi' })).toBe(45_000);
+    expect(cliLaunchProbeTimeoutMs('eng-pi', {})).toBe(45_000);
+    expect(cliLaunchProbeTimeoutMs('eng-claude', {})).toBe(15_000);
     expect(cliLaunchProbeTimeoutMs('eng-codex', { HERMES_HOME: 'ignored' })).toBe(15_000);
   });
 
@@ -210,6 +233,26 @@ describe('鉴权探测状态迁移(H-4)', () => {
     expect(CLI_FAILURE_BODY_PATTERN.test('HTTP 401: Missing Authentication header')).toBe(true);
     expect(CLI_FAILURE_BODY_PATTERN.test('No usable credentials found for provider')).toBe(true);
     expect(CLI_FAILURE_BODY_PATTERN.test('pong')).toBe(false);
+  });
+
+  it('运行时鉴权失败会撤销 HEALTHY 证明并要求重新验证', () => {
+    const db = makeDb({
+      'eng-hermes-cli': { id: 'eng-hermes-cli', status: 'HEALTHY', auth_status: 'authed' }
+    });
+    const manager = new EngineManager(db as never);
+
+    manager.reportAuthenticationFailure('eng-hermes-cli', 'HTTP 403 Forbidden');
+    manager.reportAuthenticationFailure('eng-hermes-cli', 'HTTP 403 Forbidden');
+
+    expect(db._engines['eng-hermes-cli']).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    expect(manager.getHealthSignals('eng-hermes-cli')).toMatchObject({
+      detected: true, launchable: true, authenticated: false, taskVerified: false,
+      detail: 'HTTP 403 Forbidden'
+    });
+    expect(db.audit).toHaveBeenCalledTimes(1);
+    expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'engine.runtimeAuthFailure', target: 'eng-hermes-cli', result: 'AUTH_REQUIRED'
+    }));
   });
 
   it('内置 Nexus:供应商就绪 → HEALTHY + authed', async () => {
@@ -292,13 +335,17 @@ describe('鉴权探测状态迁移(H-4)', () => {
       checkedAt: 1
     });
     db.setSetting(HARNESS_PROVIDER_FINGERPRINT_SETTING, harnessProviderFingerprint(db as never));
-    for (const id of ['eng-hermes-cli', 'eng-opencode', 'eng-codex']) {
+    for (const id of ['eng-hermes-cli', 'eng-opencode', 'eng-codex', 'eng-claude', 'eng-pi']) {
       appCfg.engines[id] = { bin: `missing-${id}` };
     }
 
     await new EngineManager(db as never).detect();
 
     expect(db._engines['eng-deepseek-harness']).toMatchObject({
+      status: 'HEALTHY',
+      auth_status: 'authed'
+    });
+    expect(db._engines['eng-hermes']).toMatchObject({
       status: 'HEALTHY',
       auth_status: 'authed'
     });
@@ -321,7 +368,7 @@ describe('鉴权探测状态迁移(H-4)', () => {
       detected: true, launchable: true, authenticated: true, taskVerified: true,
       detail: 'OPC_HARNESS_OK', checkedAt: 1
     });
-    for (const id of ['eng-hermes-cli', 'eng-opencode', 'eng-codex']) {
+    for (const id of ['eng-hermes-cli', 'eng-opencode', 'eng-codex', 'eng-claude', 'eng-pi']) {
       appCfg.engines[id] = { bin: `missing-${id}` };
     }
 
@@ -467,9 +514,78 @@ describe('引擎配置凭据脱敏(S-4)', () => {
     mgr.saveConfig('eng-opencode', { env: { GITHUB_TOKEN: 'ghp_realtoken' } });
     expect(JSON.stringify(mgr.getConfig('eng-opencode'))).not.toContain('ghp_realtoken');
   });
+
+  it.each([
+    ['separate API key flag', ['--api-key', 'sk-must-not-persist']],
+    ['uppercase underscore assignment', ['--API_KEY=sk-must-not-persist']],
+    ['camel-case access token', ['--accessToken', 'must-not-persist']],
+    ['environment-style assignment', ['OPENAI_API_KEY=must-not-persist']],
+    ['Windows-style client secret', ['/Client_Secret:must-not-persist']],
+    ['authorization header', ['--header', 'Authorization: Bearer must-not-persist']],
+    ['quoted API key header', ['--header', '"X-API-Key: must-not-persist"']],
+    ['secret key variant', ['--SECRET_KEY', 'must-not-persist']],
+    ['passphrase variant', ['--PassPhrase=must-not-persist']]
+  ])('rejects credential-bearing runArgs before persistence: %s', (_label, runArgs) => {
+    const original = JSON.stringify({ runArgs: ['--model', 'safe-model'] });
+    const db = makeDb({
+      'eng-opencode': { id: 'eng-opencode', status: 'HEALTHY', config_json: original }
+    });
+    const mgr = new EngineManager(db as never);
+
+    expect(() => mgr.saveConfig('eng-opencode', { runArgs })).toThrow(/credential/i);
+    expect(db._engines['eng-opencode'].config_json).toBe(original);
+    expect(JSON.stringify(db._engines)).not.toContain('must-not-persist');
+  });
+
+  it('preserves safe token-related arguments', () => {
+    const db = makeDb({ 'eng-opencode': { id: 'eng-opencode', status: 'HEALTHY' } });
+    const mgr = new EngineManager(db as never);
+    const runArgs = [
+      '--model', 'deepseek-chat', '--max-tokens', '4096', '--token-budget', '8192',
+      '--api-key-env', 'OPENAI_API_KEY', '--secret-file', 'C:\\secrets\\provider.txt'
+    ];
+
+    mgr.saveConfig('eng-opencode', { runArgs });
+
+    expect(mgr.getConfig('eng-opencode')?.runArgs).toEqual(runArgs);
+  });
+
+  it.each([
+    ['runArgs', { runArgs: ['--TOKEN=legacy-secret'] }],
+    ['ACP arguments', { acpCommand: ['dsh', 'acp', '--Api_Key', 'legacy-secret'] }]
+  ])('refuses to expose legacy config containing sensitive %s', (_label, config) => {
+    const db = makeDb({
+      'eng-custom-old': {
+        id: 'eng-custom-old',
+        status: 'HEALTHY',
+        config_json: JSON.stringify(config)
+      }
+    });
+
+    expect(() => new EngineManager(db as never).getConfig('eng-custom-old')).toThrow(/credential/i);
+  });
 });
 
 describe('自定义 ACP 引擎注册', () => {
+  it.each([
+    '--token plain-secret',
+    '--API_KEY=inline-secret',
+    '--clientSecret inline-secret',
+    'OPENAI_ACCESS_TOKEN=inline-secret'
+  ])('rejects credential arguments before inserting an engine: %s', (args) => {
+    const db = makeDb();
+    const result = new EngineManager(db as never).registerCustom({
+      name: 'Unsafe ACP',
+      command: 'dsh',
+      args
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    expect(result.message).toMatch(/credential/i);
+    expect(Object.keys(db._engines)).toHaveLength(0);
+    expect(JSON.stringify(db._engines)).not.toContain('secret');
+  });
+
   it('把启动命令和参数作为 acpCommand 持久化到数据库', () => {
     const db = makeDb();
     const result = new EngineManager(db as never).registerCustom({

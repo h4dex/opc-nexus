@@ -17,7 +17,16 @@ import type { ApprovalBroker } from '../src/main/services/approvalBroker.js';
 
 function createMockExecutors(): ExecutorRegistry {
   return {
-    dispatch: vi.fn(),
+    dispatch: vi.fn((task, agent, _callbacks, onResolved) => {
+      const requestedEngineId = task.engineOverride || agent.engineId;
+      onResolved?.({
+        requestedEngineId,
+        resolvedEngineId: null,
+        executorKind: 'simulated',
+        usedFallback: true
+      });
+      return 'simulated';
+    }),
     abort: vi.fn(),
     isExecuting: vi.fn().mockReturnValue(false),
     activeTaskIdsForAgent: vi.fn().mockReturnValue([]),
@@ -63,6 +72,15 @@ describe('Orchestrator 状态机', () => {
     orch = new Orchestrator(db as never, executors, broker);
     seedEngine(db);
   });
+
+  function createPlanApproval(agentId: string, title = '待批准计划') {
+    const task = orch.createTask(agentId, title, 'channel', {
+      content: `${title}的完整执行内容`,
+      initialApprovalRequest: `批准执行：${title}`
+    });
+    const approval = [...db.tables.approvals.values()].find((row) => row.task_id === task.id)!;
+    return { task, approval, approvalId: approval.id as string };
+  }
 
   describe('createAgent 验证', () => {
     it('名称过短应抛出异常', () => {
@@ -129,6 +147,206 @@ describe('Orchestrator 状态机', () => {
       expect(executors.dispatch).toHaveBeenCalled();
     });
 
+    it('完整任务正文与 canonical 输入消息独立于短标题保存', () => {
+      const agentId = seedAgent(db);
+      const content = `完整正文-${'x'.repeat(500)}`;
+      const task = orch.createTask(agentId, '短标题', 'channel', {
+        content,
+        conversationId: 'conversation-1',
+        inputMessageId: 'message-1'
+      });
+      expect(task.title).toBe('短标题');
+      expect(task.content).toBe(content);
+      expect(task.conversationId).toBe('conversation-1');
+      expect(task.inputMessageId).toBe('message-1');
+      expect(executors.dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ content }), expect.anything(), expect.anything(), expect.anything()
+      );
+    });
+
+    it('控制核计划只能经 applyDispatchPlan 提交且支持提交前审批', () => {
+      const agentId = seedAgent(db);
+      const request = {
+        requestId: 'kernel:message-1', organizationId: 'org-local', principalId: 'principal-1',
+        channelId: 'ch-test', conversationId: 'conversation-1', inputMessageId: 'message-1',
+        message: '完整用户请求', preferredAgentId: agentId, projectId: null,
+        workers: [{ agentId, name: '测试员工', role: '测试', engineId: 'engine-sim', capabilities: [] }],
+        memories: []
+      };
+      const plan = {
+        schemaVersion: 1, requestId: request.requestId, conversationId: request.conversationId,
+        leaderKernel: 'hermes', workerAgentId: agentId, workerEngineId: 'engine-sim',
+        title: '计划标题', objective: '未经截断的完整计划目标', rationale: '员工职责匹配',
+        priority: 2, expectedOutputs: ['报告'], requiresHumanApproval: true,
+        memoryProposals: [], taskScheduleProposals: [], advisorAdvice: [], advisorReviews: []
+      };
+      const state = {
+        findPlan: vi.fn(() => null),
+        savePlan: vi.fn(() => ({ status: 'planned', taskId: null, plan })),
+        markCommitted: vi.fn(() => ({ status: 'committed', taskId: 'unused', plan }))
+      };
+
+      const task = orch.applyDispatchPlan(request, plan, state as never);
+      expect(task).toMatchObject({
+        status: 'WAITING_APPROVAL', content: plan.objective, priority: 2,
+        conversationId: 'conversation-1', inputMessageId: 'message-1'
+      });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+      expect(state.savePlan).toHaveBeenCalledWith(request, plan);
+      expect(state.markCommitted).toHaveBeenCalledWith(request.requestId, task.id);
+      expect([...db.tables.approvals.values()]).toHaveLength(1);
+
+      const approvalId = [...db.tables.approvals.keys()][0];
+      expect(db.tables.approvals.get(approvalId)?.type).toBe('dispatch_plan');
+      expect(orch.listApprovals()[0]).toMatchObject({ scope: 'dispatch_plan', type: 'dispatch_plan' });
+      orch.decideApproval(approvalId, true);
+      expect(db.tables.tasks.get(task.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+      const decision = [...db.tables.task_events.values()].find((event) => event.task_id === task.id && event.event_type === 'approval_decided');
+      expect(JSON.parse(decision?.payload as string)).toMatchObject({
+        approvalId, scope: 'dispatch_plan', approved: true
+      });
+    });
+
+    it('控制核计划在 Worker 启动前完成 durable commit', () => {
+      const agentId = seedAgent(db);
+      const order: string[] = [];
+      const request = {
+        requestId: 'kernel:message-atomic', organizationId: 'org-local', principalId: 'principal-1',
+        channelId: 'ch-test', conversationId: 'conversation-atomic', inputMessageId: 'message-atomic',
+        message: '执行已规划任务', preferredAgentId: agentId, projectId: null,
+        workers: [{ agentId, name: '测试员工', role: '测试', engineId: 'engine-sim', capabilities: [] }],
+        memories: []
+      };
+      const plan = {
+        schemaVersion: 1, requestId: request.requestId, conversationId: request.conversationId,
+        leaderKernel: 'hermes', workerAgentId: agentId, workerEngineId: 'engine-sim',
+        title: '原子提交任务', objective: '任务正文', rationale: '职责匹配', priority: 0,
+        expectedOutputs: ['结果'], requiresHumanApproval: false, memoryProposals: [], taskScheduleProposals: [],
+        advisorAdvice: [], advisorReviews: []
+      };
+      const state = {
+        findPlan: vi.fn(() => null),
+        savePlan: vi.fn(() => ({ status: 'planned', taskId: null, plan })),
+        markCommitted: vi.fn(() => {
+          order.push('committed');
+          return { status: 'committed', taskId: 'task-atomic', plan };
+        })
+      };
+      executors.dispatch.mockImplementationOnce(() => {
+        order.push('dispatched');
+        return 'simulated';
+      });
+
+      orch.applyDispatchPlan(request, plan, state as never);
+
+      expect(order).toEqual(['committed', 'dispatched']);
+      expect(state.markCommitted).toHaveBeenCalledOnce();
+    });
+
+    it('计划审批通过时重新检查员工生命周期，不满足则进入 QUEUED', () => {
+      const agentId = seedAgent(db);
+      const { task, approvalId } = createPlanApproval(agentId);
+      db.tables.agents.get(agentId)!.lifecycle = 'DISABLED';
+
+      orch.decideApproval(approvalId, true);
+
+      expect(db.tables.approvals.get(approvalId)?.status).toBe('approved');
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'QUEUED', stage: '员工未就绪（DISABLED）' });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+
+      db.tables.agents.get(agentId)!.lifecycle = 'READY';
+      orch.wakeAgentQueue(agentId);
+      expect(db.tables.tasks.get(task.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+    });
+
+    it('计划审批通过时重新检查并发额度，待批计划本身不占执行槽', () => {
+      const agentId = seedAgent(db, { concurrency_limit: 1 });
+      const { task, approvalId } = createPlanApproval(agentId);
+      const running = orch.createTask(agentId, '占用并发槽的任务');
+      expect(running.status).toBe('RUNNING');
+      vi.mocked(executors.dispatch).mockClear();
+
+      orch.decideApproval(approvalId, true);
+
+      expect(db.tables.tasks.get(running.id)?.status).toBe('RUNNING');
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'QUEUED', stage: '排队中' });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('计划审批通过时重新检查资源保护门禁', () => {
+      const agentId = seedAgent(db);
+      const { task, approvalId } = createPlanApproval(agentId);
+      orch.setDispatchGuard(() => '系统资源保护中');
+
+      orch.decideApproval(approvalId, true);
+
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'QUEUED', stage: '系统资源保护中' });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('计划审批通过时重新检查手机设备门禁', () => {
+      seedEngine(db, 'eng-hermes-cli');
+      let ready = true;
+      orch.setMobileDispatchPolicy({
+        canDispatch: () => ({ bound: true, ready, reason: ready ? '设备在线' : '设备离线' })
+      });
+      const agentId = seedAgent(db, {
+        agent_kind: 'android_operator', engine_id: 'eng-hermes-cli', concurrency_limit: 1
+      });
+      const { task, approvalId } = createPlanApproval(agentId);
+      ready = false;
+
+      orch.decideApproval(approvalId, true);
+
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'QUEUED', stage: '设备离线' });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('拒绝计划审批会终止任务并记录决策事件', () => {
+      const agentId = seedAgent(db);
+      const { task, approvalId } = createPlanApproval(agentId);
+
+      orch.decideApproval(approvalId, false);
+
+      expect(db.tables.approvals.get(approvalId)?.status).toBe('rejected');
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'FAILED', error: '审批被拒绝' });
+      const decision = [...db.tables.task_events.values()].find((event) => event.task_id === task.id && event.event_type === 'approval_decided');
+      expect(JSON.parse(decision?.payload as string)).toMatchObject({ scope: 'dispatch_plan', approved: false });
+    });
+
+    it('recovers an already committed plan before revalidating current worker eligibility', () => {
+      const agentId = seedAgent(db);
+      const existing = orch.createTask(agentId, '已提交任务', 'channel', { sourceKey: 'kernel:committed' });
+      executors.dispatch.mockClear();
+      const request = {
+        requestId: 'kernel:message-replayed', organizationId: 'org-local', principalId: 'principal-1',
+        channelId: 'ch-test', conversationId: 'conversation-1', inputMessageId: 'message-replayed',
+        message: '重投消息', preferredAgentId: agentId, projectId: null, workers: [], memories: []
+      };
+      const plan = {
+        schemaVersion: 1, requestId: request.requestId, conversationId: request.conversationId,
+        leaderKernel: 'hermes', workerAgentId: agentId, workerEngineId: 'engine-sim',
+        title: '已提交任务', objective: '完整任务内容', rationale: '职责匹配', priority: 0,
+        expectedOutputs: ['报告'], requiresHumanApproval: false, memoryProposals: [], taskScheduleProposals: [],
+        advisorAdvice: [], advisorReviews: []
+      };
+      const committed = { status: 'committed', taskId: existing.id, plan };
+      const state = {
+        findPlan: vi.fn(() => committed),
+        savePlan: vi.fn(() => committed),
+        markCommitted: vi.fn()
+      };
+
+      const replay = orch.applyDispatchPlan(request, plan, state as never);
+
+      expect(replay).toMatchObject({ id: existing.id, deduplicated: true });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+      expect(state.savePlan).toHaveBeenCalledWith(request, plan);
+      expect(state.markCommitted).not.toHaveBeenCalled();
+    });
+
     it('相同来源幂等键只创建并派发一次', () => {
       const agentId = seedAgent(db);
       const first = orch.createTask(agentId, '第一份内容', 'channel', { sourceKey: 'weixin:message:101' });
@@ -139,6 +357,78 @@ describe('Orchestrator 状态机', () => {
       expect(db.tables.tasks.size).toBe(1);
       expect(db.tables.task_events.size).toBe(1);
       expect(executors.dispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('fallback 鉴权失败只标记实际执行引擎并持久化运行归因', () => {
+      const requestedEngineId = 'engine-primary';
+      const resolvedEngineId = 'engine-fallback';
+      seedEngine(db, requestedEngineId);
+      seedEngine(db, resolvedEngineId);
+      const agentId = seedAgent(db, { engine_id: requestedEngineId });
+      vi.mocked(executors.dispatch).mockImplementation((task, _agent, callbacks, onResolved) => {
+        onResolved?.({
+          requestedEngineId,
+          resolvedEngineId,
+          executorKind: 'generic-cli',
+          usedFallback: true
+        });
+        callbacks.onError(task.id, 'HTTP 401: Missing Authentication header');
+        return 'generic-cli';
+      });
+
+      const task = orch.createTask(agentId, '验证真实引擎归因');
+
+      expect(db.tables.tasks.get(task.id)?.status).toBe('FAILED');
+      expect(db.tables.engines.get(requestedEngineId)?.status).toBe('HEALTHY');
+      expect(db.tables.engines.get(resolvedEngineId)).toMatchObject({
+        status: 'AUTH_REQUIRED', auth_status: 'required'
+      });
+      expect([...db.tables.agent_runs.values()].find((run) => run.task_id === task.id)).toMatchObject({
+        requested_engine_id: requestedEngineId,
+        resolved_engine_id: resolvedEngineId,
+        executor_kind: 'generic-cli',
+        status: 'FAILED'
+      });
+      expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'task.executorResolved',
+        target: task.id,
+        result: expect.stringContaining(`\"resolvedEngineId\":\"${resolvedEngineId}\"`)
+      }));
+    });
+
+    it('recognizes an explicit provider HTTP 403 as an authentication failure', () => {
+      const engineId = 'engine-provider-403';
+      seedEngine(db, engineId);
+      const agentId = seedAgent(db, { engine_id: engineId });
+      vi.mocked(executors.dispatch).mockImplementation((task, _agent, callbacks, onResolved) => {
+        onResolved?.({ requestedEngineId: engineId, resolvedEngineId: engineId, executorKind: 'hermes-cli', usedFallback: false });
+        callbacks.onError(task.id, 'Hermes \u6267\u884c\u5931\u8d25\uff1aHTTP 403: Forbidden');
+        return 'hermes-cli';
+      });
+
+      orch.createTask(agentId, 'provider auth failure');
+
+      expect(db.tables.engines.get(engineId)).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    });
+
+    it.each([
+      'Task failed while editing auth and login documentation',
+      'Website fetch failed: HTTP 403 Forbidden for https://example.com',
+      'Compilation failed in src/auth/login.ts'
+    ])('does not demote an engine for incidental task text: %s', (error) => {
+      const engineId = 'engine-non-auth-error';
+      seedEngine(db, engineId);
+      const agentId = seedAgent(db, { engine_id: engineId });
+      vi.mocked(executors.dispatch).mockImplementation((task, _agent, callbacks, onResolved) => {
+        onResolved?.({ requestedEngineId: engineId, resolvedEngineId: engineId, executorKind: 'generic-cli', usedFallback: false });
+        callbacks.onError(task.id, error);
+        return 'generic-cli';
+      });
+
+      const task = orch.createTask(agentId, 'ordinary executor failure');
+
+      expect(db.tables.tasks.get(task.id)?.status).toBe('FAILED');
+      expect(db.tables.engines.get(engineId)).toMatchObject({ status: 'HEALTHY', auth_status: 'authed' });
     });
 
     it('不同来源可复用相同幂等键，空键不去重', () => {
@@ -169,6 +459,80 @@ describe('Orchestrator 状态机', () => {
       expect(followUp.parentId).toBe(task.id);
     });
 
+    it('allows parent and project associations inside one organization', () => {
+      const agentId = seedAgent(db, { organization_id: 'org-a' });
+      const projectId = seedProject(db, { organization_id: 'org-a' });
+      const parent = orch.createTask(agentId, 'parent', 'desktop', { projectId });
+
+      const child = orch.createTask(agentId, 'child', 'desktop', { parentId: parent.id });
+
+      expect(child).toMatchObject({ parentId: parent.id, projectId });
+    });
+
+    it('rejects a foreign project without task, run, event, or dispatch side effects', () => {
+      const agentId = seedAgent(db, { organization_id: 'org-a' });
+      const projectId = seedProject(db, { organization_id: 'org-b' });
+
+      expect(() => orch.createTask(agentId, 'foreign project', 'desktop', { projectId }))
+        .toThrow('\u9879\u76ee\u4e0d\u5b58\u5728\u6216\u5df2\u5f52\u6863');
+      expect(db.tables.tasks.size).toBe(0);
+      expect(db.tables.agent_runs.size).toBe(0);
+      expect(db.tables.task_events.size).toBe(0);
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('rejects a foreign parent and does not inherit its project', () => {
+      const parentAgentId = seedAgent(db, { organization_id: 'org-a' });
+      const childAgentId = seedAgent(db, { organization_id: 'org-b' });
+      const projectId = seedProject(db, { organization_id: 'org-a' });
+      const parent = orch.createTask(parentAgentId, 'foreign parent', 'desktop', { projectId });
+      const counts = {
+        tasks: db.tables.tasks.size,
+        runs: db.tables.agent_runs.size,
+        events: db.tables.task_events.size,
+        dispatches: vi.mocked(executors.dispatch).mock.calls.length
+      };
+
+      expect(() => orch.createTask(childAgentId, 'cross tenant child', 'desktop', { parentId: parent.id }))
+        .toThrow('\u7236\u4efb\u52a1\u4e0d\u5b58\u5728\u6216\u4e0d\u53ef\u5173\u8054');
+      expect(db.tables.tasks.size).toBe(counts.tasks);
+      expect(db.tables.agent_runs.size).toBe(counts.runs);
+      expect(db.tables.task_events.size).toBe(counts.events);
+      expect(vi.mocked(executors.dispatch).mock.calls.length).toBe(counts.dispatches);
+    });
+
+    it('rejects a missing parent without creating a task', () => {
+      const agentId = seedAgent(db, { organization_id: 'org-a' });
+
+      expect(() => orch.createTask(agentId, 'missing parent', 'desktop', { parentId: 'missing' }))
+        .toThrow('\u7236\u4efb\u52a1\u4e0d\u5b58\u5728\u6216\u4e0d\u53ef\u5173\u8054');
+      expect(db.tables.tasks.size).toBe(0);
+      expect(db.tables.agent_runs.size).toBe(0);
+      expect(db.tables.task_events.size).toBe(0);
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('rechecks project ownership inside the write transaction', () => {
+      const agentId = seedAgent(db, { organization_id: 'org-a' });
+      const projectId = seedProject(db, { organization_id: 'org-a' });
+      const transaction = db.transaction;
+      let moved = false;
+      db.transaction = (fn) => {
+        if (!moved) {
+          moved = true;
+          db.tables.projects.get(projectId)!.organization_id = 'org-b';
+        }
+        return transaction(fn);
+      };
+
+      expect(() => orch.createTask(agentId, 'project moved during create', 'desktop', { projectId }))
+        .toThrow('\u9879\u76ee\u4e0d\u5b58\u5728\u6216\u5df2\u5f52\u6863');
+      expect(db.tables.tasks.size).toBe(0);
+      expect(db.tables.agent_runs.size).toBe(0);
+      expect(db.tables.task_events.size).toBe(0);
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
     it('拒绝关联不存在或已归档的项目', () => {
       const agentId = seedAgent(db);
       const archivedId = seedProject(db, { status: 'archived' });
@@ -187,6 +551,8 @@ describe('Orchestrator 状态机', () => {
 
     it('cancelTask → CANCELLED 并触发 FIFO 补位', () => {
       const agentId = seedAgent(db, { concurrency_limit: 1 });
+      const finished = vi.fn();
+      orch.onTaskFinished(finished);
       const t1 = orch.createTask(agentId, '任务1');
       const t2 = orch.createTask(agentId, '任务2');
       expect(t2.status).toBe('QUEUED');
@@ -196,6 +562,7 @@ describe('Orchestrator 状态机', () => {
       // t1 已取消
       const t1After = db.tables.tasks.get(t1.id);
       expect(t1After?.status).toBe('CANCELLED');
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: t1.id, status: 'CANCELLED' }));
 
       // t2 应被 FIFO 调度为 RUNNING
       const t2After = db.tables.tasks.get(t2.id);
@@ -254,17 +621,25 @@ describe('Orchestrator 状态机', () => {
       expect(orch.taskResult(task.id)).toHaveLength(16_000);
     });
 
-    it('retryTask 保留员工、项目、工作区和父任务追溯', () => {
+    it('retryTask 保留员工、项目、工作区、父任务追溯和批准的执行引擎', () => {
       const agentId = seedAgent(db);
       const projectId = seedProject(db);
-      const task = orch.createTask(agentId, '重新生成周报', 'desktop', { projectId, workspaceOverride: 'D:/project-work' });
+      const task = orch.createTask(agentId, '重新生成周报', 'desktop', {
+        projectId,
+        workspaceOverride: 'D:/project-work',
+        inputMessageId: 'message-original',
+        engineOverride: 'engine-approved'
+      });
       const row = db.tables.tasks.get(task.id)!;
       row.status = 'FAILED';
       row.error = '模型超时';
       row.ended_at = Date.now();
 
       const retried = orch.retryTask(task.id);
-      expect(retried).toMatchObject({ agentId, projectId, title: task.title, parentId: task.id, workspaceOverride: 'D:/project-work' });
+      expect(retried).toMatchObject({
+        agentId, projectId, title: task.title, parentId: task.id,
+        workspaceOverride: 'D:/project-work', engineOverride: 'engine-approved', inputMessageId: null
+      });
       expect(retried.id).not.toBe(task.id);
       expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'task.retry', target: task.id, result: retried.id }));
     });
@@ -399,6 +774,8 @@ describe('Orchestrator 状态机', () => {
   describe('崩溃恢复', () => {
     it('recoverAfterRestart 将 RUNNING 标记为 INTERRUPTED', () => {
       const agentId = seedAgent(db);
+      const finished = vi.fn();
+      orch.onTaskFinished(finished);
       const task = orch.createTask(agentId, '崩溃任务');
       expect(task.status).toBe('RUNNING');
 
@@ -406,21 +783,44 @@ describe('Orchestrator 状态机', () => {
       const after = db.tables.tasks.get(task.id);
       expect(after?.status).toBe('INTERRUPTED');
       expect(after?.error).toBe('客户端异常退出，任务中断');
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: task.id, status: 'INTERRUPTED' }));
     });
 
-    it('recoverAfterRestart 将 WAITING_APPROVAL 标记为 INTERRUPTED', () => {
+    it('recoverAfterRestart 保留计划审批，重启后批准仍可派发', () => {
       const agentId = seedAgent(db);
-      // 手动插入一个 WAITING_APPROVAL 任务
-      const id = 'task-waiting';
-      db.tables.tasks.set(id, {
-        id, agent_id: agentId, title: '等待审批', source: 'desktop',
-        parent_id: null, status: 'WAITING_APPROVAL', priority: 0,
-        progress: 50, stage: '调用工具', error: null, session_id: null,
-        created_at: Date.now(), started_at: Date.now(), ended_at: null, result: null
+      const { task, approvalId } = createPlanApproval(agentId);
+      const restarted = new Orchestrator(db as never, executors, createMockBroker());
+
+      restarted.recoverAfterRestart();
+
+      expect(db.tables.tasks.get(task.id)?.status).toBe('WAITING_APPROVAL');
+      expect(db.tables.approvals.get(approvalId)?.status).toBe('pending');
+      restarted.decideApproval(approvalId, true);
+      expect(db.tables.tasks.get(task.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+    });
+
+    it('recoverAfterRestart 中断运行时工具审批并自动拒绝审批记录', () => {
+      const agentId = seedAgent(db);
+      const task = orch.createTask(agentId, '运行时工具审批');
+      db.tables.tasks.get(task.id)!.status = 'WAITING_APPROVAL';
+      db.tables.approvals.set('approval-runtime', {
+        id: 'approval-runtime', task_id: task.id, agent_id: agentId,
+        type: 'write_workspace', request: '写入工作区', risk: 'medium',
+        status: 'pending', created_at: Date.now(), decided_at: null
       });
 
       orch.recoverAfterRestart();
-      expect(db.tables.tasks.get(id)?.status).toBe('INTERRUPTED');
+
+      expect(db.tables.tasks.get(task.id)?.status).toBe('INTERRUPTED');
+      expect(db.tables.approvals.get('approval-runtime')).toMatchObject({
+        status: 'rejected', decided_at: expect.any(Number)
+      });
+      const decision = [...db.tables.task_events.values()].find((event) => event.task_id === task.id && event.event_type === 'approval_decided');
+      expect(JSON.parse(decision?.payload as string)).toMatchObject({
+        approvalId: 'approval-runtime', scope: 'runtime_tool', approved: false,
+        reason: 'runtime_interrupted_on_restart'
+      });
     });
 
     it('无活跃任务时 recoverAfterRestart 无操作', () => {

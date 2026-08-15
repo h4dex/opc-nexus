@@ -16,8 +16,7 @@ import { app, safeStorage } from 'electron';
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
-import { dispatchChannelTask, createWs, tryChannelApproval, tryChannelCommand, type WsLike } from './common.js';
-import type { ApprovalBroker } from '../approvalBroker.js';
+import { dispatchChannelTask, createWs, type ChannelTaskPlanner, type WsLike } from './common.js';
 
 export const WECOM_BOTID_SETTING = 'channel:wecom:botId';
 export const WECOM_SECRET_REF = 'secret:channel:wecom';
@@ -60,7 +59,7 @@ export class WecomChannel {
   /** 已处理 msgid 环形去重（官方要求按 msgid 排重） */
   private seenMsgIds: string[] = [];
 
-  constructor(private db: Database, private orchestrator: Orchestrator, private broker: ApprovalBroker) {}
+  constructor(private db: Database, private orchestrator: Orchestrator, private taskPlanner: ChannelTaskPlanner) {}
 
   isActive(): boolean {
     return this.active;
@@ -314,19 +313,25 @@ export class WecomChannel {
       return;
     }
 
-    // 对话指令（/状态 /取消 /暂停 /继续 /帮助）：防长任务卡死的干预入口
-    if (tryChannelCommand(this.db, this.orchestrator, CHANNEL_ID, text, (msg) => this.respondStream(ws, reqId, msg))) return;
-    // 渠道审批拦截：回复“批准/拒绝”触发审批决策
-    if (tryChannelApproval(this.db, this.broker, CHANNEL_ID, text, (msg) => this.respondStream(ws, reqId, msg))) return;
     // 终态推送目标：群聊用 chatid（chat_type=2），单聊用发送者 userid（chat_type=1）
     const pushChatId = body.chattype === 'group' ? body.chatid : body.from?.userid;
     const pushChatType = body.chattype === 'group' ? 2 : 1;
+    const externalIdentity = body.from?.userid?.trim() || `unknown:${body.aibotid?.trim() || 'bot'}`;
+    const conversationKey = body.chattype === 'group'
+      ? `group:${body.chatid?.trim() || 'unknown'}`
+      : `direct:${externalIdentity}`;
 
-    dispatchChannelTask({
+    void dispatchChannelTask({
       db: this.db,
       orchestrator: this.orchestrator,
+      taskPlanner: this.taskPlanner,
       channelId: CHANNEL_ID,
       text,
+      externalIdentity,
+      externalIdentityDisplayName: body.from?.userid,
+      conversationKey,
+      sourceKey: body.msgid?.trim() || reqId?.trim(),
+      metadata: { chatType: body.chattype ?? null, messageType: body.msgtype ?? null },
       ack: (message) => this.respondStream(ws, reqId, message),
       final: (message) => {
         if (gen !== this.generation || !pushChatId) return;

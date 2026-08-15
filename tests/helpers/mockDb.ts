@@ -15,6 +15,7 @@ export interface MockDb {
     };
   };
   transaction: (fn: () => void) => void;
+  flush: () => void;
   audit: (entry: unknown) => void;
   getSetting: <T>(key: string, fallback: T) => T;
 }
@@ -29,7 +30,11 @@ interface Tables {
   engines: Map<string, Record<string, unknown>>;
   channels: Map<string, Record<string, unknown>>;
   channel_routes: Map<string, Record<string, unknown>>;
+  organizations: Map<string, Record<string, unknown>>;
+  principals: Map<string, Record<string, unknown>>;
+  channel_identities: Map<string, Record<string, unknown>>;
   conversations: Map<string, Record<string, unknown>>;
+  messages: Map<string, Record<string, unknown>>;
   usage_records: Map<string, Record<string, unknown>>;
   teams: Map<string, Record<string, unknown>>;
   team_runs: Map<string, Record<string, unknown>>;
@@ -58,7 +63,11 @@ export function createMockDb(): MockDb & { tables: Tables } {
     engines: new Map(),
     channels: new Map(),
     channel_routes: new Map(),
+    organizations: new Map(),
+    principals: new Map(),
+    channel_identities: new Map(),
     conversations: new Map(),
+    messages: new Map(),
     usage_records: new Map(),
     teams: new Map(),
     team_runs: new Map(),
@@ -77,6 +86,7 @@ export function createMockDb(): MockDb & { tables: Tables } {
   };
 
   const audit = vi.fn();
+  const flush = vi.fn();
   const getSetting = <T>(key: string, fallback: T): T => {
     return tables.settings.has(key) ? (tables.settings.get(key) as T) : fallback;
   };
@@ -98,6 +108,7 @@ export function createMockDb(): MockDb & { tables: Tables } {
   return {
     raw,
     transaction: (fn: () => void) => fn(),
+    flush,
     audit,
     getSetting,
     tables
@@ -109,6 +120,116 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   const table = detectTable(sql);
   if (!table) return mode === 'get' ? undefined : [];
   const rows = [...tables[table].values()];
+
+  if (/SELECT id, organization_id FROM channels WHERE id = \?/.test(sql)) {
+    const row = tables.channels.get(args[0] as string);
+    const result = row ? { id: row.id, organization_id: row.organization_id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT organization_id FROM channels WHERE id = \?/.test(sql)) {
+    const row = tables.channels.get(args[0] as string);
+    const result = row ? { organization_id: row.organization_id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id, organization_id, archived FROM agents WHERE id = \?/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    const result = row ? { id: row.id, organization_id: row.organization_id, archived: row.archived } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT organization_id, archived FROM agents WHERE id = \?/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    const result = row ? { organization_id: row.organization_id, archived: row.archived } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT organization_id FROM agents WHERE id = \?/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    const result = row ? { organization_id: row.organization_id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id FROM channel_routes WHERE channel_id = \? AND agent_id = \?/.test(sql)) {
+    const row = [...tables.channel_routes.values()].find((item) =>
+      item.channel_id === args[0] && item.agent_id === args[1]
+    );
+    const result = row ? { id: row.id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id FROM organizations WHERE slug = \?/.test(sql)) {
+    const row = [...tables.organizations.values()].find((item) => item.slug === args[0]);
+    const result = row ? { id: row.id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id, principal_id FROM channel_identities/.test(sql)) {
+    const row = [...tables.channel_identities.values()].find((item) =>
+      item.organization_id === args[0]
+      && item.channel_id === args[1]
+      && item.external_identity_key === args[2]
+    );
+    const result = row ? { id: row.id, principal_id: row.principal_id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id FROM conversations\s+WHERE organization_id = \? AND channel_id = \? AND channel_identity_id = \?/.test(sql)) {
+    const row = [...tables.conversations.values()].find((item) =>
+      item.organization_id === args[0]
+      && item.channel_id === args[1]
+      && item.channel_identity_id === args[2]
+      && item.external_conversation_key === args[3]
+    );
+    const result = row ? { id: row.id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id, task_id FROM messages\s+WHERE id = \? AND organization_id = \?/.test(sql)) {
+    const row = tables.messages.get(args[0] as string);
+    const scoped = row
+      && row.organization_id === args[1]
+      && row.channel_id === args[2]
+      && row.channel_identity_id === args[3]
+      && row.conversation_id === args[4]
+      ? { id: row.id, task_id: row.task_id }
+      : undefined;
+    return mode === 'get' ? scoped : scoped ? [scoped] : [];
+  }
+
+  if (/SELECT id, task_id FROM messages\s+WHERE organization_id = \? AND channel_id = \?/.test(sql)) {
+    const row = [...tables.messages.values()].find((item) =>
+      item.organization_id === args[0]
+      && item.channel_id === args[1]
+      && item.channel_identity_id === args[2]
+      && item.conversation_id === args[3]
+      && item.direction === args[4]
+      && item.external_message_key === args[5]
+    );
+    const result = row ? { id: row.id, task_id: row.task_id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT id, content, metadata_json FROM messages\s+WHERE conversation_id = \? AND direction = 'outbound' AND external_message_key = \?/.test(sql)) {
+    const row = [...tables.messages.values()].find((item) =>
+      item.conversation_id === args[0]
+      && item.direction === 'outbound'
+      && item.external_message_key === args[1]
+    );
+    const result = row ? { id: row.id, content: row.content, metadata_json: row.metadata_json } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  if (/SELECT content FROM messages\s+WHERE conversation_id = \? AND direction = 'outbound' AND external_message_key = \?/.test(sql)) {
+    const row = [...tables.messages.values()].find((item) =>
+      item.conversation_id === args[0]
+      && item.direction === 'outbound'
+      && item.external_message_key === args[1]
+    );
+    const result = row ? { content: row.content } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
 
   // SELECT * FROM projects ORDER BY updated_at DESC
   if (/SELECT \* FROM projects ORDER BY updated_at DESC/.test(sql)) {
@@ -122,10 +243,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? row : row ? [row] : [];
   }
 
-  // SELECT id FROM projects WHERE id = ? AND status != 'archived'
-  if (/SELECT id FROM projects WHERE id = \?/.test(sql)) {
+  // SELECT id[, organization_id] FROM projects WHERE id = ? AND status != 'archived'
+  if (/SELECT id(?:, organization_id)? FROM projects WHERE id = \?/.test(sql)) {
     const row = tables.projects.get(args[0] as string);
-    const result = row && row.status !== 'archived' ? { id: row.id } : undefined;
+    const result = row && row.status !== 'archived'
+      ? { id: row.id, organization_id: row.organization_id }
+      : undefined;
     return mode === 'get' ? result : result ? [result] : [];
   }
 
@@ -145,9 +268,23 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? row : row ? [row] : [];
   }
 
-  // SELECT id FROM agents WHERE name = ? AND archived = 0 AND lifecycle = 'READY'
+  if (/SELECT id FROM agents WHERE id = \? AND organization_id = \? AND archived = 0 AND lifecycle = 'READY'/.test(sql)) {
+    const row = tables.agents.get(args[0] as string);
+    const result = row
+      && row.organization_id === args[1]
+      && row.archived === 0
+      && row.lifecycle === 'READY'
+      ? { id: row.id }
+      : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
+  // Tenant-scoped delegate_task lookup.
   if (/SELECT id FROM agents WHERE name = \?/.test(sql)) {
-    const found = rows.find(r => r.name === args[0] && r.archived === 0 && r.lifecycle === 'READY');
+    const found = rows.find(r => r.name === args[0]
+      && (!/organization_id = \?/.test(sql) || r.organization_id === args[1])
+      && r.archived === 0
+      && r.lifecycle === 'READY');
     return mode === 'get' ? (found ? { id: found.id } : undefined) : found ? [{ id: found.id }] : [];
   }
 
@@ -156,6 +293,12 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     const row = tables.tasks.get(args[0] as string);
     const visible = row && (!/deleted_at IS NULL/.test(sql) || row.deleted_at == null) ? row : undefined;
     return mode === 'get' ? visible : visible ? [visible] : [];
+  }
+
+  if (/SELECT id FROM agent_runs WHERE task_id = \? AND ended_at IS NULL/.test(sql)) {
+    const row = [...tables.agent_runs.values()].find(item => item.task_id === args[0] && item.ended_at == null);
+    const result = row ? { id: row.id } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
   }
 
   // SELECT status, result, error FROM tasks WHERE id = ?
@@ -197,8 +340,8 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result[0] : result;
   }
 
-  // SELECT id FROM tasks WHERE status IN ('RUNNING','WAITING_APPROVAL','PAUSED')
-  if (/SELECT id FROM tasks WHERE status IN/.test(sql)) {
+  // SELECT id[, status] FROM tasks WHERE status IN ('RUNNING','WAITING_APPROVAL','PAUSED')
+  if (/SELECT id(?:, status)? FROM tasks WHERE status IN/.test(sql)) {
     const statuses = ['RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
     const result = [...tables.tasks.values()].filter(r => statuses.includes(r.status as string));
     return mode === 'get' ? result[0] : result;
@@ -236,7 +379,9 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
 
   // SELECT COUNT(*) c FROM tasks WHERE agent_id = ? AND status IN (...)
   if (/SELECT COUNT\(\*\) c FROM tasks WHERE agent_id = \? AND status IN/.test(sql)) {
-    const statuses = ['RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
+    const statuses = sql.includes("'WAITING_APPROVAL'")
+      ? ['RUNNING', 'WAITING_APPROVAL', 'PAUSED']
+      : ['RUNNING', 'PAUSED'];
     const count = [...tables.tasks.values()].filter(r => r.agent_id === args[0] && statuses.includes(r.status as string)).length;
     return { c: count };
   }
@@ -263,7 +408,16 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   // SELECT agent_id FROM tasks WHERE id = ?
   if (/SELECT agent_id FROM tasks WHERE id = \?/.test(sql)) {
     const row = tables.tasks.get(args[0] as string);
-    return mode === 'get' ? (row ? { agent_id: row.agent_id } : undefined) : [];
+    const visible = row && (!/deleted_at IS NULL/.test(sql) || row.deleted_at == null) ? row : undefined;
+    return mode === 'get' ? (visible ? { agent_id: visible.agent_id } : undefined) : [];
+  }
+
+  if (/SELECT agent_id, project_id FROM tasks WHERE id = \? AND deleted_at IS NULL/.test(sql)) {
+    const row = tables.tasks.get(args[0] as string);
+    const result = row && row.deleted_at == null
+      ? { agent_id: row.agent_id, project_id: row.project_id ?? null }
+      : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
   }
 
   // SELECT parent_id FROM tasks WHERE id = ?
@@ -330,6 +484,21 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? row : row ? [row] : [];
   }
 
+  // SELECT latest pending approval for one canonical channel conversation.
+  if (/SELECT a\.id, a\.request FROM approvals a\s+JOIN tasks t ON t\.id = a\.task_id/.test(sql)) {
+    const row = [...tables.approvals.values()]
+      .filter(r => {
+        const task = tables.tasks.get(r.task_id as string);
+        return r.agent_id === args[0]
+          && r.status === 'pending'
+          && task?.conversation_id === args[1]
+          && task?.source === 'channel';
+      })
+      .sort((a, b) => (b.created_at as number) - (a.created_at as number))[0];
+    const result = row ? { id: row.id, request: row.request } : undefined;
+    return mode === 'get' ? result : result ? [result] : [];
+  }
+
   // SELECT * FROM task_events WHERE task_id = ?
   if (/SELECT \* FROM task_events WHERE task_id = \?/.test(sql)) {
     return [...tables.task_events.values()].filter(r => r.task_id === args[0]);
@@ -394,6 +563,20 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return [];
   }
 
+  if (/SELECT agent_id FROM channel_routes WHERE channel_id = \? AND conversation_key = \?/.test(sql)) {
+    const row = [...tables.channel_routes.values()].find(r =>
+      r.channel_id === args[0] && r.conversation_key === args[1]
+    );
+    return mode === 'get' ? (row ? { agent_id: row.agent_id } : undefined) : row ? [{ agent_id: row.agent_id }] : [];
+  }
+
+  if (/SELECT agent_id FROM channel_routes WHERE channel_id = \? AND conversation_key = '\*'/.test(sql)) {
+    const row = [...tables.channel_routes.values()].find(r =>
+      r.channel_id === args[0] && r.conversation_key === '*'
+    );
+    return mode === 'get' ? (row ? { agent_id: row.agent_id } : undefined) : row ? [{ agent_id: row.agent_id }] : [];
+  }
+
   // SELECT agent_id FROM channel_routes WHERE channel_id = ? LIMIT 1（渠道路由/指令）
   if (/SELECT agent_id FROM channel_routes WHERE channel_id = \?/.test(sql)) {
     const row = [...tables.channel_routes.values()].find(r => r.channel_id === args[0]);
@@ -404,7 +587,11 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   if (/SELECT id, title, status, progress, stage FROM tasks WHERE agent_id = \?/.test(sql)) {
     const statuses = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
     const result = [...tables.tasks.values()]
-      .filter(r => r.agent_id === args[0] && r.deleted_at == null && statuses.includes(r.status as string))
+      .filter(r => r.agent_id === args[0]
+        && r.conversation_id === args[1]
+        && r.source === 'channel'
+        && r.deleted_at == null
+        && statuses.includes(r.status as string))
       .sort((a, b) => (a.created_at as number) - (b.created_at as number))
       .map(r => ({ id: r.id, title: r.title, status: r.status, progress: r.progress, stage: r.stage }));
     return mode === 'get' ? result[0] : result;
@@ -523,6 +710,150 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
 }
 
 function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: number } {
+  if (/INSERT INTO organizations/.test(sql)) {
+    const [id, slug, name, createdAt, updatedAt] = args;
+    const duplicate = [...tables.organizations.values()].some((row) => row.id === id || row.slug === slug);
+    if (duplicate) return { changes: 0 };
+    tables.organizations.set(id as string, { id, slug, name, created_at: createdAt, updated_at: updatedAt });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO principals/.test(sql)) {
+    const [id, organizationId, displayName, createdAt, updatedAt] = args;
+    if (tables.principals.has(id as string)) return { changes: 0 };
+    tables.principals.set(id as string, {
+      id, organization_id: organizationId, kind: 'person', display_name: displayName,
+      created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO channel_identities/.test(sql)) {
+    const [id, organizationId, channelId, principalId, externalIdentityKey, displayName, metadataJson, createdAt, updatedAt] = args;
+    const duplicate = [...tables.channel_identities.values()].some((row) =>
+      row.organization_id === organizationId
+      && row.channel_id === channelId
+      && row.external_identity_key === externalIdentityKey
+    );
+    if (duplicate) return { changes: 0 };
+    tables.channel_identities.set(id as string, {
+      id, organization_id: organizationId, channel_id: channelId, principal_id: principalId,
+      external_identity_key: externalIdentityKey, display_name: displayName, metadata_json: metadataJson,
+      created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO conversations\(\s*id, agent_id, organization_id, principal_id/.test(sql)) {
+    const [id, agentId, organizationId, principalId, channelId, channelIdentityId,
+      externalConversationKey, title, lastMessageAt, createdAt, updatedAt] = args;
+    const duplicate = [...tables.conversations.values()].some((row) =>
+      row.organization_id === organizationId
+      && row.channel_id === channelId
+      && row.channel_identity_id === channelIdentityId
+      && row.external_conversation_key === externalConversationKey
+    );
+    if (duplicate) return { changes: 0 };
+    tables.conversations.set(id as string, {
+      id, agent_id: agentId, organization_id: organizationId, principal_id: principalId,
+      channel_id: channelId, channel_identity_id: channelIdentityId,
+      external_conversation_key: externalConversationKey, title, last_message_at: lastMessageAt,
+      message_count: 0, created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO conversations\(\s*id, agent_id, organization_id, title/.test(sql)) {
+    const [id, agentId, title, lastMessageAt, messageCount, createdAt, updatedAt] = args;
+    tables.conversations.set(id as string, {
+      id, agent_id: agentId, organization_id: 'org-local', principal_id: null,
+      channel_id: null, channel_identity_id: null, external_conversation_key: null,
+      title, last_message_at: lastMessageAt, message_count: messageCount,
+      created_at: createdAt, updated_at: updatedAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO messages/.test(sql)) {
+    const inbound = /'inbound', 'user'/.test(sql);
+    const [id, organizationId, principalId, conversationId, channelId, channelIdentityId,
+      externalMessageKey, dedupeKey, content] = args;
+    const taskId = inbound ? null : args[9];
+    const encodedMetadata = inbound ? args[9] : args[10];
+    const createdAt = inbound ? args[10] : args[11];
+    const direction = inbound ? 'inbound' : 'outbound';
+    const duplicate = [...tables.messages.values()].some((row) =>
+      row.dedupe_key === dedupeKey
+      || (
+        row.organization_id === organizationId
+        && row.channel_id === channelId
+        && row.channel_identity_id === channelIdentityId
+        && row.conversation_id === conversationId
+        && row.direction === direction
+        && row.external_message_key === externalMessageKey
+      )
+    );
+    if (duplicate) return { changes: 0 };
+    tables.messages.set(id as string, {
+      id, organization_id: organizationId, principal_id: principalId, conversation_id: conversationId,
+      channel_id: channelId, channel_identity_id: channelIdentityId,
+      external_message_key: externalMessageKey, dedupe_key: dedupeKey,
+      direction, role: inbound ? 'user' : 'assistant', content, task_id: taskId,
+      metadata_json: encodedMetadata, created_at: createdAt
+    });
+    return { changes: 1 };
+  }
+
+  if (/UPDATE messages SET task_id = \?/.test(sql)) {
+    const [taskId, id, organizationId, channelId, channelIdentityId, conversationId, allowedTaskId] = args;
+    const row = tables.messages.get(id as string);
+    if (!row
+      || row.organization_id !== organizationId
+      || row.channel_id !== channelId
+      || row.channel_identity_id !== channelIdentityId
+      || row.conversation_id !== conversationId
+      || (row.task_id != null && row.task_id !== allowedTaskId)) return { changes: 0 };
+    row.task_id = taskId;
+    return { changes: 1 };
+  }
+
+  if (/UPDATE messages SET content = \?, metadata_json = \?/.test(sql)) {
+    const [content, metadataJson, id, conversationId, externalMessageKey] = args;
+    const row = tables.messages.get(id as string);
+    if (!row
+      || row.conversation_id !== conversationId
+      || row.direction !== 'outbound'
+      || row.external_message_key !== externalMessageKey) return { changes: 0 };
+    row.content = content;
+    row.metadata_json = metadataJson;
+    return { changes: 1 };
+  }
+
+  if (/UPDATE conversations\s+SET agent_id = \?/.test(sql)) {
+    const [agentId, lastMessageAt, updatedAt, id, organizationId, channelId, channelIdentityId] = args;
+    const row = tables.conversations.get(id as string);
+    if (!row || row.organization_id !== organizationId || row.channel_id !== channelId || row.channel_identity_id !== channelIdentityId) {
+      return { changes: 0 };
+    }
+    row.agent_id = agentId;
+    row.last_message_at = lastMessageAt;
+    row.message_count = Number(row.message_count) + 1;
+    row.updated_at = updatedAt;
+    return { changes: 1 };
+  }
+
+  if (/UPDATE conversations\s+SET last_message_at = \?, message_count = message_count \+ 1, updated_at = \?\s+WHERE id = \? AND organization_id/.test(sql)) {
+    const [lastMessageAt, updatedAt, id, organizationId, channelId, channelIdentityId] = args;
+    const row = tables.conversations.get(id as string);
+    if (!row || row.organization_id !== organizationId || row.channel_id !== channelId || row.channel_identity_id !== channelIdentityId) {
+      return { changes: 0 };
+    }
+    row.last_message_at = lastMessageAt;
+    row.message_count = Number(row.message_count) + 1;
+    row.updated_at = updatedAt;
+    return { changes: 1 };
+  }
+
   if (/INSERT INTO automation_reports/.test(sql)) {
     const [id, scheduleId, projectId, kind, title, periodStart, periodEnd, metricsJson, findingsJson, content, trigger, createdAt] = args;
     tables.automation_reports.set(id as string, { id, schedule_id: scheduleId, project_id: projectId, kind, title,
@@ -611,13 +942,18 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
 
   // INSERT INTO tasks
   if (/INSERT INTO tasks/.test(sql)) {
-    const [id, agentId, projectId, title, source, sourceKey, parentId, status, stage, sessionId, workspaceOverride, engineOverride, now, startedAt] = args;
+    const [
+      id, agentId, projectId, conversationId, inputMessageId, title, content,
+      source, sourceKey, parentId, status, priority, stage, sessionId,
+      workspaceOverride, engineOverride, now, startedAt
+    ] = args;
     if (sourceKey != null && [...tables.tasks.values()].some(row => row.source === source && row.source_key === sourceKey)) {
       return { changes: 0 };
     }
     tables.tasks.set(id as string, {
-      id, agent_id: agentId, project_id: projectId, title, source, source_key: sourceKey, parent_id: parentId, status,
-      priority: 0, progress: 0, stage, error: null, session_id: sessionId,
+      id, agent_id: agentId, project_id: projectId, conversation_id: conversationId,
+      input_message_id: inputMessageId, title, content, source, source_key: sourceKey, parent_id: parentId, status,
+      priority, progress: 0, stage, error: null, session_id: sessionId,
       workspace_override: workspaceOverride, engine_override: engineOverride ?? null,
       is_demo: 0, created_at: now, started_at: startedAt, ended_at: null, deleted_at: null, result: null, quality: null
     });
@@ -730,6 +1066,30 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
       id, agent_id: agentId, task_id: taskId, pid, session_id: sessionId, status, started_at: startedAt, ended_at: null
     });
     return { changes: 1 };
+  }
+
+  if (/INSERT INTO approvals/.test(sql)) {
+    const [id, taskId, agentId, type, request, risk, status, createdAt] = args;
+    tables.approvals.set(id as string, {
+      id, task_id: taskId, agent_id: agentId, type, request, risk, status,
+      created_at: createdAt, decided_at: null
+    });
+    return { changes: 1 };
+  }
+
+  // Bind an active run to the executor resolution selected by the registry.
+  if (/UPDATE agent_runs SET requested_engine_id = \?/.test(sql)) {
+    const [requestedEngineId, resolvedEngineId, executorKind, taskId] = args;
+    let changes = 0;
+    for (const run of tables.agent_runs.values()) {
+      if (run.task_id === taskId && run.ended_at === null) {
+        run.requested_engine_id = requestedEngineId;
+        run.resolved_engine_id = resolvedEngineId;
+        run.executor_kind = executorKind;
+        changes++;
+      }
+    }
+    return { changes };
   }
 
   // INSERT INTO task_events
@@ -854,6 +1214,17 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     const [now, id] = args;
     const task = tables.tasks.get(id as string);
     if (task && task.status === 'PAUSED') { task.status = 'RUNNING'; task.started_at = now; return { changes: 1 }; }
+    return { changes: 0 };
+  }
+
+  // Approved dispatch plans that cannot acquire a slot return to FIFO.
+  if (/UPDATE tasks SET status = 'QUEUED', stage = \?, started_at = NULL WHERE id = \? AND status = 'WAITING_APPROVAL'/.test(sql)) {
+    const [stage, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'WAITING_APPROVAL') {
+      task.status = 'QUEUED'; task.stage = stage; task.started_at = null;
+      return { changes: 1 };
+    }
     return { changes: 0 };
   }
 
@@ -992,9 +1363,13 @@ function detectTable(sql: string): keyof Tables | null {
   if (/\btask_events\b/.test(sql)) return 'task_events';
   if (/\bapprovals\b/.test(sql)) return 'approvals';
   if (/\bengines\b/.test(sql)) return 'engines';
+  if (/\borganizations\b/.test(sql)) return 'organizations';
+  if (/\bprincipals\b/.test(sql)) return 'principals';
+  if (/\bchannel_identities\b/.test(sql)) return 'channel_identities';
   if (/\bchannels\b/.test(sql) && !/channel_routes/.test(sql)) return 'channels';
   if (/\bchannel_routes\b/.test(sql)) return 'channel_routes';
   if (/\bconversations\b/.test(sql)) return 'conversations';
+  if (/\bmessages\b/.test(sql)) return 'messages';
   if (/\busage_records\b/.test(sql)) return 'usage_records';
   if (/\bteam_runs\b/.test(sql)) return 'team_runs';
   if (/\bteams\b/.test(sql)) return 'teams';
@@ -1025,6 +1400,7 @@ export function seedAgent(db: ReturnType<typeof createMockDb>, overrides: Partia
     soul_md: '',
     agents_md: '',
     user_md: '',
+    organization_id: 'org-local',
     lifecycle: 'READY',
     engine_id: 'engine-sim',
     workspace: '',
@@ -1059,7 +1435,7 @@ export function seedProject(db: ReturnType<typeof createMockDb>, overrides: Part
   const now = Date.now();
   db.tables.projects.set(id, {
     id, name: `测试项目-${id.slice(8)}`, objective: '验证项目归属闭环', description: '', client_name: '',
-    status: 'active', color: '#4d6bfe', due_at: null, created_at: now, updated_at: now,
+    organization_id: 'org-local', status: 'active', color: '#4d6bfe', due_at: null, created_at: now, updated_at: now,
     ...overrides
   });
   return id;

@@ -9,6 +9,18 @@ import type { ChildProcess } from 'node:child_process';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 
 /**
+ * Immutable executor selection for one dispatch attempt. The requested engine
+ * can differ from the resolved engine when the configured fallback is used.
+ * Simulated/unavailable dispatches have no real resolved engine.
+ */
+export interface ExecutionBinding {
+  requestedEngineId: string;
+  resolvedEngineId: string | null;
+  executorKind: ExecutorKind;
+  usedFallback: boolean;
+}
+
+/**
  * 安全终止子进程：Windows 下 SIGTERM 常被 CLI 忽略，统一用 SIGKILL 强制终止；
  * 进程若已自行退出（spawn 失败/崩溃），kill 会抛 EINVAL/ESRCH，此处吞掉避免外泄成未捕获异常。
  *

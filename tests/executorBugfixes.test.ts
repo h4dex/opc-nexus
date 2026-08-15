@@ -117,7 +117,7 @@ describe('[P1] engine_override 编码委派真实生效', () => {
       c
     );
     expect(kind).toBe('unavailable');
-    expect(c.onError).toHaveBeenCalledWith('t3', expect.stringContaining('无可用执行引擎'));
+    expect(c.onError).toHaveBeenCalledWith('t3', expect.stringContaining('任务固定的执行引擎不可用'));
     expect(c.onDone).not.toHaveBeenCalled();
   });
 });

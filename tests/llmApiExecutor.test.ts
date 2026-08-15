@@ -215,6 +215,26 @@ describe('SSE 解析与产出', () => {
     expect(c.onDone).not.toHaveBeenCalled();
   });
 
+  it('redacts the task provider key and Authorization value from HTTP error bodies', async () => {
+    providerKey = 'sk-provider-body-secret';
+    globalThis.fetch = vi.fn(async () => ({
+      ok: false,
+      status: 403,
+      body: null,
+      text: async () => `forbidden api_key=${providerKey}; Authorization: Bearer ${providerKey}`
+    })) as never;
+    const c = cb();
+
+    new LlmApiExecutor(makeDb(), broker()).start(task(), agent(), c);
+    await settle();
+
+    const message = c.onError.mock.calls[0][1];
+    expect(message).toContain('403');
+    expect(message).toContain('[REDACTED]');
+    expect(message).not.toContain(providerKey);
+    expect(c.onDone).not.toHaveBeenCalled();
+  });
+
   it('网络异常如实上报', async () => {
     globalThis.fetch = vi.fn(async () => { throw new Error('ECONNREFUSED'); }) as never;
     const c = cb();

@@ -14,7 +14,8 @@
  */
 import express from 'express';
 import cors from 'cors';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { safeStorage } from 'electron';
 import type { Database } from './database.js';
@@ -25,6 +26,7 @@ import type { ProviderManager } from './providerManager.js';
 import type { McpManager } from './mcpManager.js';
 import type { SkillManager } from './skillManager.js';
 import type { TeamEngine } from './teamEngine.js';
+import type { DesktopControlPlane } from './desktopControlPlane.js';
 import { getProviderConfig, saveProviderConfig } from './provider.js';
 import { loadConfig, saveConfig } from './config.js';
 import { notify } from './notifier.js';
@@ -40,6 +42,7 @@ export interface WebServerDeps {
   mcp: McpManager;
   skills: SkillManager;
   teams: TeamEngine;
+  desktopControlPlane: DesktopControlPlane;
 }
 
 const DEFAULT_PORT = 28889;
@@ -53,6 +56,10 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const RATE_LIMIT_PER_MIN = 120;
 /** 认证接口频率限制：单 IP 每分钟最多尝试次数 */
 const AUTH_RATE_LIMIT_PER_MIN = 10;
+
+export function webRendererDirectory(moduleUrl: string): string {
+  return join(dirname(fileURLToPath(moduleUrl)), '../renderer');
+}
 
 interface SessionEntry { token: string; expiresAt: number; }
 interface RateBucket { count: number; resetAt: number; }
@@ -251,7 +258,7 @@ export class WebServer {
   }
 
   private async startOnce(): Promise<void> {
-    const { db, orchestrator, engines, channels, providers, mcp, skills, teams } = this.deps;
+    const { db, orchestrator, engines, channels, providers, mcp, skills, teams, desktopControlPlane } = this.deps;
     this.ensureToken();
     const app = express();
 
@@ -283,7 +290,7 @@ export class WebServer {
     });
 
     // 静态文件：复用 renderer 构建产物
-    const rendererDir = join(__dirname, '../renderer');
+    const rendererDir = webRendererDirectory(import.meta.url);
     app.use(express.static(rendererDir));
     app.get('{*splat}', (req, res, next) => {
       if (req.path.startsWith('/api/')) return next();
@@ -368,9 +375,20 @@ export class WebServer {
 
     // 任务
     app.get('/api/tasks', (_req, res) => res.json(orchestrator.listTasks({ includeResult: false })));
-    app.post('/api/tasks', (req, res) => {
-      const t = orchestrator.createTask(req.body.agentId, req.body.title);
-      res.json(t);
+    app.post('/api/tasks', async (req, res) => {
+      const suppliedKey = String(req.get('Idempotency-Key') ?? '').trim();
+      if (suppliedKey.length > 100) {
+        res.status(400).json({ error: 'Idempotency-Key is too long' });
+        return;
+      }
+      const result = await desktopControlPlane.dispatch({
+        preferredAgentId: String(req.body?.agentId ?? ''),
+        message: String(req.body?.title ?? ''),
+        projectId: req.body?.projectId ? String(req.body.projectId) : undefined,
+        source: 'webhook',
+        messageKey: suppliedKey || randomUUID()
+      });
+      res.json(result.task);
     });
     app.post('/api/tasks/:id/cancel', (req, res) => {
       orchestrator.cancelTask(req.params.id);

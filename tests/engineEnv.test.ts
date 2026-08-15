@@ -20,7 +20,17 @@ vi.mock('../src/main/services/provider.js', () => ({
   readProviderKey: () => mockKey
 }));
 
-const { splitSecretEnv, resolveEngineEnv, engineEnvSecretRef, providerEnvFor, SECRET_PLACEHOLDER } =
+const {
+  childProcessEnv,
+  createSensitiveTextRedactor,
+  engineEnvSecretRef,
+  providerEnvFor,
+  redactSensitiveText,
+  resolveConfiguredEngineEnv,
+  resolveEngineEnv,
+  splitSecretEnv,
+  SECRET_PLACEHOLDER
+} =
   await import('../src/main/services/engineEnv.js');
 
 beforeEach(() => {
@@ -181,5 +191,39 @@ describe('供应商凭据下发给第三方引擎', () => {
     const env = resolveEngineEnv(db as never, 'eng-opencode');
     expect(env.MY_FLAG).toBe('1');
     expect(env.OPENAI_API_KEY).toBe('sk-auto');
+  });
+});
+
+describe('子进程环境边界', () => {
+  it('configured-only 解析不会自动混入默认供应商密钥', () => {
+    mockProvider = { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' };
+    mockKey = 'default-provider-secret';
+    const db = makeDb(JSON.stringify({ env: { LOG_LEVEL: 'debug' } }));
+    expect(resolveConfiguredEngineEnv(db as never, 'eng-claude')).toEqual({ LOG_LEVEL: 'debug' });
+  });
+
+  it('只继承启动所需宿主变量，并由受管运行时覆盖同名值', () => {
+    const env = childProcessEnv(
+      { OPENAI_API_KEY: 'managed-key', PATH: 'C:/managed-tools' },
+      {
+        PATH: 'C:/ambient-tools', USERPROFILE: 'C:/Users/test',
+        OPENAI_API_KEY: 'ambient-openai', DEEPSEEK_API_KEY: 'ambient-deepseek',
+        INTERNAL_SERVICE_TOKEN: 'ambient-service-token'
+      }
+    );
+    expect(env.PATH).toBe('C:/managed-tools');
+    expect(env.USERPROFILE).toBe('C:/Users/test');
+    expect(env.OPENAI_API_KEY).toBe('managed-key');
+    expect(env.DEEPSEEK_API_KEY).toBeUndefined();
+    expect(env.INTERNAL_SERVICE_TOKEN).toBeUndefined();
+  });
+
+  it('脱敏完整文本以及跨 chunk 拆开的凭据', () => {
+    const env = { OPENAI_API_KEY: 'provider-secret' };
+    expect(redactSensitiveText('Bearer provider-secret', env)).toBe('Bearer [REDACTED]');
+    const stream = createSensitiveTextRedactor(env);
+    const output = stream.push('Bearer provider-') + stream.push('secret accepted') + stream.finish();
+    expect(output).toBe('Bearer [REDACTED] accepted');
+    expect(output).not.toContain('provider-secret');
   });
 });

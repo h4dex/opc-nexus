@@ -39,6 +39,18 @@ import { WebServer } from './services/webServer.js';
 import { ApiBridge } from './services/apiBridge.js';
 import { MobileGatewayService } from './services/mobileGatewayService.js';
 import { MobileAdbService } from './services/mobileAdbService.js';
+import { ChannelControlPlane } from './services/channelControlPlane.js';
+import { DesktopControlPlane } from './services/desktopControlPlane.js';
+import { DesktopIngressService } from './services/desktopIngressService.js';
+import { MemoryService } from './services/memoryService.js';
+import { MemoryProposalService } from './services/memoryProposalService.js';
+import { TaskScheduleProposalService } from './services/taskScheduleProposalService.js';
+import { HermesRuntimeProfileService } from './services/hermesRuntimeProfile.js';
+import { DatabaseKernelState } from './services/kernel/databaseKernelState.js';
+import { DeepSeekPlanningAdvisor } from './services/kernel/deepseekPlanningAdvisor.js';
+import { HermesControlKernel } from './services/kernel/hermesControlKernel.js';
+import { KernelRouter } from './services/kernel/kernelRouter.js';
+import { NexusControlKernel } from './services/kernel/nexusControlKernel.js';
 import { registerIpc } from './ipc.js';
 
 protocol.registerSchemesAsPrivileged([{
@@ -202,6 +214,25 @@ app.whenReady().then(async () => {
   const providerManager = new ProviderManager(db, () => engines.invalidateHarnessProviderVerification());
   const executors = new ExecutorRegistry(db, broker, providerManager);
   const orchestrator = new Orchestrator(db, executors, broker);
+  const scheduler = new Scheduler(db, orchestrator);
+  const kernelState = new DatabaseKernelState(db);
+  const memory = new MemoryService(db);
+  const memoryProposals = new MemoryProposalService(db, memory);
+  memoryProposals.recoverCommitted();
+  const taskScheduleProposals = new TaskScheduleProposalService(db, scheduler);
+  taskScheduleProposals.recoverCommitted();
+  const kernelRouter = new KernelRouter(
+    new HermesControlKernel(db, new HermesRuntimeProfileService(db, providerManager), kernelState, undefined, engines),
+    new NexusControlKernel(),
+    [new DeepSeekPlanningAdvisor(db)],
+    kernelState
+  );
+  const channelControlPlane = new ChannelControlPlane(
+    db, orchestrator, kernelRouter, memory, kernelState, memoryProposals, taskScheduleProposals
+  );
+  const desktopIngress = new DesktopIngressService(db);
+  const desktopControlPlane = new DesktopControlPlane(db, desktopIngress, channelControlPlane);
+  orchestrator.onTaskFinished(({ taskId }) => desktopIngress.recordTaskOutcome(taskId));
   const mobile = new MobileGatewayService(db);
   const mobileAdb = new MobileAdbService();
   mobileRef = mobile;
@@ -219,7 +250,6 @@ app.whenReady().then(async () => {
   const monitor = new ResourceMonitor();
   monitorRef = monitor;
   monitor.setDatabase(db);
-  const scheduler = new Scheduler(db, orchestrator);
   const mcpManager = new McpManager(db);
   mcpRef = mcpManager;
   const skillManager = new SkillManager(db);
@@ -237,10 +267,10 @@ app.whenReady().then(async () => {
     projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, teams: teamEngine, automation: automationManager
   });
   const collabManager = new CollabManager(db);
-  const feishu = new FeishuChannel(db, orchestrator);
+  const feishu = new FeishuChannel(db, orchestrator, channelControlPlane);
   feishuRef = feishu;
-  const wecom = new WecomChannel(db, orchestrator, broker);
-  const weixin = new WeixinChannel(db, orchestrator, broker);
+  const wecom = new WecomChannel(db, orchestrator, channelControlPlane);
+  const weixin = new WeixinChannel(db, orchestrator, { taskPlanner: channelControlPlane });
   weixinRef = weixin;
 
   // 工具循环的委派能力（P3b）与调度保护门禁（11.2）注入
@@ -337,10 +367,10 @@ app.whenReady().then(async () => {
   }
 
   // 局域网 Web 管理服务器（工控机远程管理）
-  const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine });
+  const webServer = new WebServer({ db, orchestrator, engines, channels, providers: providerManager, mcp: mcpManager, skills: skillManager, teams: teamEngine, desktopControlPlane });
   webServerRef = webServer;
 
-  const { pushSnapshot } = registerIpc({ db, orchestrator, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, mobile, mobileAdb, getMainWindow: () => mainWindow });
+  const { pushSnapshot } = registerIpc({ db, orchestrator, desktopControlPlane, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp: mcpManager, skills: skillManager, providers: providerManager, workflows: workflowEngine, projects: projectManager, deliverables: deliverableManager, knowledge: knowledgeManager, automation: automationManager, discovery: discoveryManager, teams: teamEngine, wfPlatforms: wfPlatformMgr, collab: collabManager, ocr: ocrService, voice: voiceService, apiBridge, webServer, mobile, mobileAdb, memory, memoryProposals, taskScheduleProposals, getMainWindow: () => mainWindow });
 
   // Detect after IPC registration so the completed engine state is pushed to
   // an already-open Renderer instead of remaining at the seeded placeholder.

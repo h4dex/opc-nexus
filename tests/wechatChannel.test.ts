@@ -238,27 +238,71 @@ function makeHarness(server = new FakeIlinkServer(), options: {
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   qrToDataUrl?: (content: string) => Promise<string>;
+  ingressService?: Record<string, unknown>;
+  taskPlanner?: { dispatch: (...args: any[]) => Promise<{ id: string; deduplicated?: boolean }> };
 } = {}) {
   const db = new FakeDb();
   let taskIndex = 0;
+  const linkedTasks = new Map<string, string>();
+  const defaultIngressService = {
+    ingest: vi.fn((input: Record<string, unknown>) => {
+      const messageKey = String(input.messageKey);
+      return {
+        organizationId: 'org-local',
+        organizationKey: 'local',
+        principalId: 'principal-owner',
+        channelId: String(input.channelId),
+        channelIdentityId: 'identity-owner',
+        externalIdentity: String(input.externalIdentity),
+        conversationId: 'conversation-weixin-owner',
+        conversationKey: String(input.conversationKey),
+        messageId: `message-${messageKey}`,
+        messageKey,
+        dedupeKey: `channel-message:${messageKey}`,
+        taskId: linkedTasks.get(messageKey) ?? null,
+        deduplicated: linkedTasks.has(messageKey)
+      };
+    }),
+    linkTask: vi.fn((context: { messageKey: string }, taskId: string) => {
+      linkedTasks.set(context.messageKey, taskId);
+    }),
+    recordOutbound: vi.fn(() => 'outbound-message')
+  };
+  const ingressService = { ...defaultIngressService, ...options.ingressService };
   const orchestrator = {
     createTask: vi.fn((_agentId: string, _title: string, _source: string) => {
       const id = `task-${++taskIndex}`;
       db.tasks.set(id, { id, status: 'COMPLETED', result: 'done', error: null });
       return { id };
-    })
+    }),
+    decideApproval: vi.fn()
   };
-  const broker = { decide: vi.fn() };
-  const channel = new WeixinChannel(db as never, orchestrator as never, broker as never, {
+  const taskPlanner = options.taskPlanner ?? {
+    dispatch: vi.fn(async ({ ingress, message, preferredAgentId }) => orchestrator.createTask(
+      preferredAgentId,
+      message.slice(0, 200),
+      'channel',
+      {
+        sourceKey: ingress.dedupeKey,
+        sessionId: `conv-${ingress.conversationId}`,
+        conversationId: ingress.conversationId,
+        inputMessageId: ingress.messageId,
+        content: message
+      }
+    ))
+  };
+  const channel = new WeixinChannel(db as never, orchestrator as never, {
     fetchImpl: server.fetch,
     qrToDataUrl: options.qrToDataUrl ?? (async (content: string) => `data:image/png;base64,${content}`),
     sleep: options.sleep ?? (async (_ms: number, signal?: AbortSignal) => {
       if (signal?.aborted) throw new Error('aborted');
       await Promise.resolve();
     }),
-    now: options.now
+    now: options.now,
+    ingressService,
+    taskPlanner
   });
-  return { db, orchestrator, broker, channel, server };
+  return { db, orchestrator, channel, server, ingressService, taskPlanner };
 }
 
 async function flushUntil(predicate: () => boolean, description: string): Promise<void> {
@@ -535,31 +579,150 @@ describe('WeixinChannel iLink integration', () => {
     const server = new FakeIlinkServer();
     const direct = makeMessage();
     server.updates.push({ ret: 0, msgs: [direct, { ...direct }], get_updates_buf: 'cursor-2' });
-    const { channel, db, orchestrator } = makeHarness(server);
+    const { channel, db, orchestrator, ingressService } = makeHarness(server);
     seedSession(db);
 
     await channel.connect();
     await flushUntil(() => orchestrator.createTask.mock.calls.length === 1, 'channel task dispatch');
-    await flushUntil(() => server.requestsFor('/sendmessage').length === 1, 'task acknowledgement');
+    await flushUntil(() => server.requestsFor('/sendmessage').length === 2, 'planning and task acknowledgements');
 
     expect(orchestrator.createTask).toHaveBeenCalledWith(
       'agent-1',
       '整理今天的客户反馈',
       'channel',
-      { sourceKey: 'ch-weixin:bot-account:message:101' }
+      {
+        sourceKey: 'channel-message:bot-account:message:101',
+        sessionId: 'conv-conversation-weixin-owner',
+        conversationId: 'conversation-weixin-owner',
+        inputMessageId: 'message-bot-account:message:101',
+        content: '整理今天的客户反馈'
+      }
     );
-    const ack = jsonBody(server.requestsFor('/sendmessage')[0]);
+    expect(ingressService.ingest).toHaveBeenCalledWith(expect.objectContaining({
+      channelId: 'ch-weixin',
+      externalIdentity: 'bot-account:owner-user',
+      conversationKey: 'direct:owner-user',
+      messageKey: 'bot-account:message:101',
+      text: '整理今天的客户反馈'
+    }));
+    const planningAck = jsonBody(server.requestsFor('/sendmessage')[0]);
+    expect(planningAck.msg).toMatchObject({
+      to_user_id: 'owner-user',
+      context_token: 'context-101',
+      item_list: [{ type: 1, text_item: { text: expect.stringContaining('控制核') } }]
+    });
+    const ack = jsonBody(server.requestsFor('/sendmessage')[1]);
     expect(ack.msg).toMatchObject({
       to_user_id: 'owner-user',
       context_token: 'context-101',
-      item_list: [{ type: 1, text_item: { text: expect.stringContaining('已接收任务') } }]
+      item_list: [{ type: 1, text_item: { text: expect.stringContaining('规划完成') } }]
     });
 
     await channel.disconnect();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(orchestrator.createTask).toHaveBeenCalledTimes(1);
-    expect(server.requestsFor('/sendmessage')).toHaveLength(1);
+    expect(server.requestsFor('/sendmessage')).toHaveLength(2);
     expect(db.settings.has(WEIXIN_OUTBOX_REF)).toBe(false);
+  });
+
+  it('does not advance cursor or seenIds when canonical planning fails', async () => {
+    const server = new FakeIlinkServer();
+    server.updates.push(
+      { ret: 0, msgs: [], get_updates_buf: 'cursor-before' },
+      {
+        ret: 0,
+        msgs: [makeMessage({ message_id: 501, context_token: 'context-501' })],
+        get_updates_buf: 'cursor-after-planner-failure'
+      }
+    );
+    const taskPlanner = { dispatch: vi.fn().mockRejectedValue(new Error('planner unavailable')) };
+    const sleep = vi.fn(async (_ms: number, signal?: AbortSignal) => {
+      if (signal?.aborted) throw new Error('aborted');
+    });
+    const { channel, db } = makeHarness(server, { taskPlanner, sleep });
+    seedSession(db);
+    db.settings.set(WEIXIN_POLL_STATE_REF, seal({ cursor: 'cursor-initial', contextTokens: {}, seenIds: [] }));
+
+    await channel.connect();
+    await flushUntil(() => taskPlanner.dispatch.mock.calls.length === 1, 'failed canonical dispatch');
+    await flushUntil(() => sleep.mock.calls.some(([ms]) => ms === 2_000), 'dispatch retry backoff');
+    await flushUntil(() => server.pendingSignals.length === 1, 'retry poll after planning failure');
+
+    expect(unseal<{ cursor: string; seenIds: string[] }>(db.settings.get(WEIXIN_POLL_STATE_REF))).toMatchObject({
+      cursor: 'cursor-before',
+      seenIds: []
+    });
+    expect(server.requestsFor('/sendmessage')).toHaveLength(0);
+    expect(db.settings.has(WEIXIN_OUTBOX_REF)).toBe(false);
+    expect(db.channel.status).toBe('RECONNECTING');
+    expect(channel.getLoginState().message).not.toContain('冷却');
+    await channel.disconnect();
+  });
+
+  it('does not advance cursor or seenIds when linking the canonical task fails', async () => {
+    const server = new FakeIlinkServer();
+    server.updates.push(
+      { ret: 0, msgs: [], get_updates_buf: 'cursor-before' },
+      {
+        ret: 0,
+        msgs: [makeMessage({ message_id: 502, context_token: 'context-502' })],
+        get_updates_buf: 'cursor-after-link-failure'
+      }
+    );
+    const linkTask = vi.fn(() => { throw new Error('link persistence failed'); });
+    const { channel, db, orchestrator } = makeHarness(server, { ingressService: { linkTask } });
+    seedSession(db);
+    db.settings.set(WEIXIN_POLL_STATE_REF, seal({ cursor: 'cursor-initial', contextTokens: {}, seenIds: [] }));
+
+    await channel.connect();
+    await flushUntil(() => linkTask.mock.calls.length === 1, 'failed task link');
+    await flushUntil(() => server.pendingSignals.length === 1, 'retry poll after link failure');
+
+    expect(orchestrator.createTask).toHaveBeenCalledTimes(1);
+    expect(unseal<{ cursor: string; seenIds: string[] }>(db.settings.get(WEIXIN_POLL_STATE_REF))).toMatchObject({
+      cursor: 'cursor-before',
+      seenIds: []
+    });
+    await channel.disconnect();
+  });
+
+  it('waits for dispatch and durable linking before advancing cursor and seenIds once', async () => {
+    vi.useFakeTimers();
+    try {
+      const server = new FakeIlinkServer();
+      server.updates.push({
+        ret: 0,
+        msgs: [makeMessage({ message_id: 503, context_token: 'context-503' })],
+        get_updates_buf: 'cursor-after-linked-task'
+      });
+      const planned = deferred<{ id: string }>();
+      const taskPlanner = { dispatch: vi.fn(() => planned.promise) };
+      const { channel, db, ingressService } = makeHarness(server, { taskPlanner });
+      seedSession(db);
+      db.settings.set(WEIXIN_POLL_STATE_REF, seal({ cursor: 'cursor-before', contextTokens: {}, seenIds: [] }));
+
+      const connecting = channel.connect();
+      await flushUntil(() => taskPlanner.dispatch.mock.calls.length === 1, 'pending canonical dispatch');
+      expect(unseal<{ cursor: string; seenIds: string[] }>(db.settings.get(WEIXIN_POLL_STATE_REF))).toMatchObject({
+        cursor: 'cursor-before',
+        seenIds: []
+      });
+
+      db.tasks.set('task-awaited-link', { id: 'task-awaited-link', status: 'COMPLETED', result: 'done', error: null });
+      planned.resolve({ id: 'task-awaited-link' });
+      await connecting;
+      await flushUntil(() => server.pendingSignals.length === 1, 'poll after durable link');
+
+      expect(ingressService.linkTask).toHaveBeenCalledTimes(1);
+      expect(unseal<{ cursor: string; seenIds: string[] }>(db.settings.get(WEIXIN_POLL_STATE_REF))).toMatchObject({
+        cursor: 'cursor-after-linked-task',
+        seenIds: ['message:503']
+      });
+      await channel.disconnect();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it('persists replies encrypted before sending and deletes them after success', async () => {
@@ -579,8 +742,9 @@ describe('WeixinChannel iLink integration', () => {
     expect(encrypted).not.toContain('已接收任务');
     expect(encrypted).not.toContain('secret-context-301');
     const stored = unseal<Array<{ id: string; content: string }>>(encrypted);
-    expect(stored).toHaveLength(1);
-    expect(stored[0]).toMatchObject({ id: expect.any(String), content: expect.stringContaining('已接收任务') });
+    expect(stored).toHaveLength(2);
+    expect(stored[0]).toMatchObject({ id: expect.any(String), content: expect.stringContaining('控制核') });
+    expect(stored[1]).toMatchObject({ id: expect.any(String), content: expect.stringContaining('规划完成') });
     expect(db.flush).toHaveBeenCalled();
 
     send.resolve(new Response(JSON.stringify({ ret: 0 }), { status: 200 }));
@@ -604,7 +768,7 @@ describe('WeixinChannel iLink integration', () => {
     seedSession(first.db);
 
     await first.channel.connect();
-    await flushUntil(() => unseal<unknown[]>(first.db.settings.get(WEIXIN_OUTBOX_REF)).length === 2, 'two persisted replies');
+    await flushUntil(() => unseal<unknown[]>(first.db.settings.get(WEIXIN_OUTBOX_REF)).length === 4, 'four persisted replies');
     await first.channel.dispose();
     expect(first.db.settings.has(WEIXIN_OUTBOX_REF)).toBe(true);
 
@@ -616,11 +780,11 @@ describe('WeixinChannel iLink integration', () => {
     second.db.settings.set(WEIXIN_OUTBOX_REF, first.db.settings.get(WEIXIN_OUTBOX_REF));
 
     await second.channel.connect();
-    await flushUntil(() => secondServer.requestsFor('/sendmessage').length === 2, 'restarted outbox drain');
+    await flushUntil(() => secondServer.requestsFor('/sendmessage').length === 4, 'restarted outbox drain');
     await flushUntil(() => !second.db.settings.has(WEIXIN_OUTBOX_REF), 'restarted outbox deletion');
 
     const sentContexts = secondServer.requestsFor('/sendmessage').map((request) => jsonBody(request).msg.context_token);
-    expect(sentContexts).toEqual(['context-401', 'context-402']);
+    expect(sentContexts).toEqual(['context-401', 'context-401', 'context-402', 'context-402']);
     await second.channel.disconnect();
   });
 

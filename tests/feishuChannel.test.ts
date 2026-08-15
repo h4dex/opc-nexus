@@ -7,15 +7,24 @@ vi.mock('../src/main/services/notifier.js', () => ({ notify: vi.fn() }));
 const sdk = vi.hoisted(() => ({
   instances: [] as any[],
   start: vi.fn(async () => {}),
-  chatList: vi.fn(async () => ({}))
+  chatList: vi.fn(async () => ({})),
+  messageCreate: vi.fn(async () => ({}))
 }));
+
+const channelCommon = vi.hoisted(() => ({
+  dispatchChannelTask: vi.fn(),
+  tryChannelApproval: vi.fn(() => false),
+  tryChannelCommand: vi.fn(() => false)
+}));
+
+vi.mock('../src/main/services/channels/common.js', () => channelCommon);
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class Client {
     im = {
       v1: {
         chat: { list: sdk.chatList },
-        message: { create: vi.fn(async () => ({})) }
+        message: { create: sdk.messageCreate }
       }
     };
   }
@@ -79,7 +88,7 @@ class FakeDb {
 
 function makeChannel() {
   const db = new FakeDb();
-  const channel = new FeishuChannel(db as never, {} as never);
+  const channel = new FeishuChannel(db as never, {} as never, { dispatch: vi.fn() });
   channel.saveCredentials('cli_0123456789abcdef', 'app-secret');
   return { channel, db };
 }
@@ -88,6 +97,10 @@ beforeEach(() => {
   sdk.instances.length = 0;
   sdk.start.mockReset().mockResolvedValue(undefined);
   sdk.chatList.mockReset().mockResolvedValue({});
+  sdk.messageCreate.mockReset().mockResolvedValue({});
+  channelCommon.dispatchChannelTask.mockReset();
+  channelCommon.tryChannelApproval.mockReset().mockReturnValue(false);
+  channelCommon.tryChannelCommand.mockReset().mockReturnValue(false);
 });
 
 describe('FeishuChannel WebSocket lifecycle', () => {
@@ -148,5 +161,49 @@ describe('FeishuChannel WebSocket lifecycle', () => {
     expect(sdk.instances[0].close).toHaveBeenCalledWith({ force: true });
     expect(channel.isActive()).toBe(false);
     expect(db.statuses.at(-1)).toBe('ONLINE');
+  });
+
+  it('passes full text and stable identity scope to common ingress while truncating only platform replies', async () => {
+    const { channel } = makeChannel();
+    await channel.connect();
+    const longText = `${'飞书长消息'.repeat(6_000)}END`;
+    const startOptions = sdk.start.mock.calls[0][0];
+    const receive = startOptions.eventDispatcher.handlers['im.message.receive_v1'];
+
+    await receive({
+      sender: {
+        sender_id: { open_id: 'ou_sender', user_id: 'user_sender', union_id: 'on_sender' },
+        sender_type: 'user',
+        tenant_key: 'tenant-1'
+      },
+      message: {
+        message_id: 'om_message_1',
+        chat_id: 'oc_chat_1',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: longText })
+      }
+    });
+
+    expect(channelCommon.dispatchChannelTask).toHaveBeenCalledWith(expect.objectContaining({
+      channelId: 'ch-feishu',
+      text: longText,
+      externalIdentity: 'ou_sender',
+      externalIdentityDisplayName: 'user_sender',
+      conversationKey: 'chat:oc_chat_1',
+      sourceKey: 'om_message_1',
+      metadata: {
+        chatType: 'group',
+        messageType: 'text',
+        senderType: 'user',
+        tenantKey: 'tenant-1'
+      }
+    }));
+
+    const dispatch = channelCommon.dispatchChannelTask.mock.calls[0][0];
+    dispatch.final('R'.repeat(2_500));
+    await vi.waitFor(() => expect(sdk.messageCreate).toHaveBeenCalledTimes(1));
+    const payload = sdk.messageCreate.mock.calls[0][0];
+    expect(JSON.parse(payload.data.content).text).toHaveLength(2_000);
   });
 });

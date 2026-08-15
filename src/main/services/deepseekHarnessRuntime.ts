@@ -5,6 +5,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } 
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { Agent } from '../../shared/types.js';
 import type { Database } from './database.js';
+import { childProcessEnv } from './engineEnv.js';
 import { ProviderManager, type ResolvedProvider } from './providerManager.js';
 import { getProviderSettings, readProviderKey } from './provider.js';
 
@@ -25,47 +26,6 @@ export interface HarnessRuntimePaths {
   entry: string;
   config: string;
 }
-
-const HOST_ENV_ALLOWLIST = new Set([
-  'ALL_PROXY',
-  'APPDATA',
-  'COMMONPROGRAMFILES',
-  'COMMONPROGRAMFILES(X86)',
-  'COMMONPROGRAMW6432',
-  'COMSPEC',
-  'HOME',
-  'HOMEDRIVE',
-  'HOMEPATH',
-  'HTTP_PROXY',
-  'HTTPS_PROXY',
-  'LANG',
-  'LANGUAGE',
-  'LC_ALL',
-  'LC_CTYPE',
-  'LOCALAPPDATA',
-  'NODE_EXTRA_CA_CERTS',
-  'NO_PROXY',
-  'NUMBER_OF_PROCESSORS',
-  'OS',
-  'PATH',
-  'PATHEXT',
-  'PROCESSOR_ARCHITECTURE',
-  'PROCESSOR_ARCHITEW6432',
-  'PROGRAMDATA',
-  'PROGRAMFILES',
-  'PROGRAMFILES(X86)',
-  'PROGRAMW6432',
-  'SHELL',
-  'SSL_CERT_DIR',
-  'SSL_CERT_FILE',
-  'SYSTEMROOT',
-  'TEMP',
-  'TMP',
-  'TMPDIR',
-  'TZ',
-  'USERPROFILE',
-  'WINDIR'
-]);
 
 function runtimeRoot(): string {
   return app.isPackaged
@@ -92,11 +52,7 @@ export function harnessNodeSupported(version = process.versions.node): boolean {
 
 /** Build a minimal host environment without forwarding unrelated API keys. */
 export function deepseekHarnessProcessEnv(runtimeEnv: Record<string, string>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && HOST_ENV_ALLOWLIST.has(key.toUpperCase())) env[key] = value;
-  }
-  return { ...env, ...runtimeEnv };
+  return childProcessEnv(runtimeEnv);
 }
 
 export function deepseekHarnessCommand(): string[] | null {

@@ -17,7 +17,10 @@ vi.mock('../src/main/services/config.js', () => ({ loadConfig: () => appCfg }));
 
 let resolvedEnv: Record<string, string> = {};
 const resolveEngineEnv = vi.fn((_db: unknown, _engineId: string) => resolvedEnv);
-vi.mock('../src/main/services/engineEnv.js', () => ({ resolveEngineEnv }));
+vi.mock('../src/main/services/engineEnv.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/main/services/engineEnv.js')>(),
+  resolveEngineEnv
+}));
 
 const harnessProviderVerificationIsCurrent = vi.fn(() => false);
 vi.mock('../src/main/services/harnessProviderVerification.js', () => ({ harnessProviderVerificationIsCurrent }));
@@ -303,7 +306,7 @@ describe('ACP 启动命令解析', () => {
 });
 
 describe('ACP 子进程环境', () => {
-  it('保留 process.env 并合并当前 effective engine 的安全环境', () => {
+  it('只保留宿主启动变量并合并当前 effective engine 的安全环境', () => {
     const db = makeDb({ 'eng-harness': { acpCommand: ['dsh', 'acp'] } });
     resolvedEnv = { AIBOX_RUNTIME_TEST: 'from-engine' };
     const previousHost = process.env.AIBOX_HOST_TEST;
@@ -316,10 +319,9 @@ describe('ACP 子进程环境', () => {
       executor.start(task as never, agent as never, callbacks() as never);
 
       expect(resolveEngineEnv).toHaveBeenCalledWith(db, 'eng-harness');
-      expect(lastSpawn?.options.env).toMatchObject({
-        AIBOX_HOST_TEST: 'from-host',
-        AIBOX_RUNTIME_TEST: 'from-engine'
-      });
+      expect(lastSpawn?.options.env).toMatchObject({ AIBOX_RUNTIME_TEST: 'from-engine' });
+      expect(lastSpawn?.options.env.AIBOX_HOST_TEST).toBeUndefined();
+      expect(lastSpawn?.options.env.PATH).toBe(process.env.PATH);
     } finally {
       executor.abort(task.id);
       if (previousHost === undefined) delete process.env.AIBOX_HOST_TEST;
@@ -393,7 +395,10 @@ describe('ACP 子进程环境', () => {
     await vi.waitFor(() => expect(child.stdin.write).toHaveBeenCalledTimes(3));
     expect(JSON.parse(child.stdin.write.mock.calls[2][0])).toMatchObject({
       method: 'session/prompt',
-      params: { sessionId: 'probe-session' }
+      params: {
+        sessionId: 'probe-session',
+        prompt: [{ type: 'text', text: 'Reply with exactly OPC_HARNESS_OK. Do not call tools.' }]
+      }
     });
 
     child.stdout.emit('data', Buffer.from(

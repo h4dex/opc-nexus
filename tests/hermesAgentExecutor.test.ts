@@ -2,7 +2,7 @@
  * Hermes Agent 执行器测试(P1)
  *
  * 覆盖真实 hermes-agent CLI 的接入语义(接口事实经本机 v0.19.0 实测核实):
- * - headless 参数构造与 --usage-file 会话锚点
+ * - 首轮 oneshot 与可恢复 quiet-chat 参数构造
  * - 四级权限 → --accept-hooks / -t 的映射,以及渠道任务的 trusted 降级
  * - 会话续接 -r 与 --no-restore-cwd(工作目录由本应用托管)
  * - 就绪判定与配置文件参数覆写
@@ -90,6 +90,15 @@ describe('HermesAgentExecutor headless 参数构造', () => {
     expect(args[args.indexOf('-m') + 1]).toBe('anthropic/claude-sonnet-4.6');
   });
 
+  it('managed runtime pins both model and provider instead of inheriting global Hermes config', () => {
+    const exec = new HermesAgentExecutor(makeDb());
+    const args = exec['buildArgs']('PROMPT', baseTask, baseAgent, '/tmp/u.json', {
+      model: 'deepseek-chat', provider: 'opcnexus'
+    });
+    expect(args[args.indexOf('-m') + 1]).toBe('deepseek-chat');
+    expect(args[args.indexOf('--provider') + 1]).toBe('opcnexus');
+  });
+
   it('配置文件 runArgs 覆写时完全接管参数模板', () => {
     appCfg.engines['eng-hermes-cli'] = { runArgs: ['--custom', '{prompt}'] };
     const args = buildArgs(new HermesAgentExecutor(makeDb()), baseTask, baseAgent);
@@ -126,6 +135,7 @@ describe('HermesAgentExecutor 权限映射', () => {
     // 曾误写复数 files，hermes 直接以退出码 2 拒绝执行整个任务。
     expect(sets).toContain('file');
     expect(sets).not.toContain('files');
+    expect(sets).not.toContain('memory');
     // 只读集合不得包含可写副作用的工具集
     for (const forbidden of ['terminal', 'code_execution', 'browser', 'computer_use']) {
       expect(sets).not.toContain(forbidden);
@@ -146,13 +156,16 @@ describe('HermesAgentExecutor 权限映射', () => {
 });
 
 describe('HermesAgentExecutor 会话续接', () => {
-  it('hermes- 前缀的 sessionId 续接并阻止 cd 回旧目录', () => {
+  it('hermes- 前缀的 sessionId 使用 quiet chat 续接并阻止 cd 回旧目录', () => {
     const args = buildArgs(
       new HermesAgentExecutor(makeDb()),
       { ...baseTask, sessionId: 'hermes-abc123' },
       baseAgent
     );
-    expect(args[args.indexOf('-r') + 1]).toBe('abc123');
+    expect(args.slice(0, 3)).toEqual(['chat', '-Q', '-q']);
+    expect(args).not.toContain('-z');
+    expect(args).not.toContain('--usage-file');
+    expect(args[args.indexOf('--resume') + 1]).toBe('abc123');
     // 工作目录由本应用按员工 workspace 托管,不能被会话记录覆盖
     expect(args).toContain('--no-restore-cwd');
   });
@@ -163,11 +176,11 @@ describe('HermesAgentExecutor 会话续接', () => {
       { ...baseTask, sessionId: 'llm-xyz' },
       baseAgent
     );
-    expect(args).not.toContain('-r');
+    expect(args).not.toContain('--resume');
   });
 
   it('无 sessionId 时不传续接参数', () => {
-    expect(buildArgs(new HermesAgentExecutor(makeDb()), baseTask, baseAgent)).not.toContain('-r');
+    expect(buildArgs(new HermesAgentExecutor(makeDb()), baseTask, baseAgent)).not.toContain('--resume');
   });
 });
 

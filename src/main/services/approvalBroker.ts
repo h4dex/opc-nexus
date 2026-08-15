@@ -18,14 +18,25 @@ export interface ApprovalRequest {
   risk: Approval['risk'];
 }
 
+export interface ApprovalStateController {
+  request(req: ApprovalRequest, approvalId: string, now: number): void;
+  abandon(taskId: string, approvalId: string, now: number): void;
+}
+
 export class ApprovalBroker {
   /** approvalId → 唤醒执行器 */
   private pending = new Map<string, (approved: boolean) => void>();
   /** taskId → 该任务当前挂起的 approvalId（abort 时取消） */
   private byTask = new Map<string, string>();
   private listeners = new Set<() => void>();
+  private stateController: ApprovalStateController | null = null;
 
   constructor(private db: Database) {}
+
+  /** Orchestrator owns all durable approval and task state transitions. */
+  setStateController(controller: ApprovalStateController): void {
+    this.stateController = controller;
+  }
 
   /** 审批产生/决策后需要推送快照（由 ipc 层订阅） */
   onChange(fn: () => void): () => void {
@@ -46,15 +57,8 @@ export class ApprovalBroker {
     }
     const id = randomUUID();
     const now = Date.now();
-    this.db.transaction(() => {
-      this.db.raw
-        .prepare('INSERT INTO approvals(id, task_id, agent_id, type, request, risk, status, created_at, decided_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)')
-        .run(id, req.taskId, req.agentId, req.type, req.request, req.risk, 'pending', now);
-      this.db.raw.prepare("UPDATE tasks SET status = 'WAITING_APPROVAL' WHERE id = ? AND status = 'RUNNING'").run(req.taskId);
-      this.db.raw
-        .prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
-        .run(randomUUID(), req.taskId, 'approval_required', JSON.stringify({ approvalId: id, request: req.request, risk: req.risk }), now);
-    });
+    if (!this.stateController) throw new Error('approval state controller is not configured');
+    this.stateController.request(req, id, now);
     const decision = new Promise<boolean>((resolve) => {
       this.pending.set(id, (approved) => {
         this.pending.delete(id);
@@ -81,7 +85,8 @@ export class ApprovalBroker {
     const approvalId = this.byTask.get(taskId);
     if (!approvalId) return;
     try {
-      this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE id = ? AND status = 'pending'").run(Date.now(), approvalId);
+      if (!this.stateController) throw new Error('approval state controller is not configured');
+      this.stateController.abandon(taskId, approvalId, Date.now());
     } finally {
       const wake = this.pending.get(approvalId);
       if (wake) wake(false);

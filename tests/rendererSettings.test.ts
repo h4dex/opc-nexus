@@ -17,7 +17,7 @@ function database(initial: Record<string, unknown> = {}) {
 }
 
 describe('Renderer setting boundary', () => {
-  it('allows only the four typed UI preference keys', () => {
+  it('allows only typed UI preference keys', () => {
     const db = database({ theme: 'dark', notifications: true });
 
     expect(readRendererSetting(db, 'theme')).toBe('dark');
@@ -32,9 +32,11 @@ describe('Renderer setting boundary', () => {
     const db = database();
     writeRendererSetting(db, 'theme', 'light');
     writeRendererSetting(db, 'demoAutoTasks', false);
+    writeRendererSetting(db, 'memory:autoAcceptConversationProposals', true);
     writeRendererSetting(db, 'thresholds', { cpu: 85, mem: 90, gpuTemp: 100 });
 
     expect(db.values.get('theme')).toBe('light');
+    expect(db.values.get('memory:autoAcceptConversationProposals')).toBe(true);
     expect(db.values.get('thresholds')).toEqual({ cpu: 85, mem: 90, gpuTemp: 100 });
     expect(() => validateRendererSetting('theme', 'system')).toThrow(/Invalid theme/);
     expect(() => validateRendererSetting('notifications', 'true')).toThrow(/Invalid notifications/);

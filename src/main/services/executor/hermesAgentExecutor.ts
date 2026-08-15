@@ -1,13 +1,14 @@
 /**
- * Hermes Agent 执行器：真实拉起 NousResearch/hermes-agent CLI（headless 一次性模式）。
+ * Hermes Agent 执行器：真实拉起 NousResearch/hermes-agent CLI（headless 模式）。
  *
  * 接口事实均经本机实测核实（v0.19.0），详见 src/docs/architecture-review.md 附录：
  * - `hermes -z "<prompt>"`：stdout 仅输出最终响应纯文本，**无 JSONL 事件流**，
  *   故无法像 Codex/Claude 那样做细粒度阶段解析，进度按输出长度粗粒度推进
  * - `--usage-file <path>`：写出 JSON 用量报告（含 session_id / token / 成本），
  *   失败时也会写出；这是拿到 session_id 的**唯一途径**（-z 模式不打印 session 行）
- * - `-r <session_id>`：续接会话；配合 --no-restore-cwd 阻止 cd 回旧目录，
- *   因为工作目录由本应用按员工 workspace 托管
+ * - v0.19.0 的顶层 `-z` 会在 chat 分支前退出，因而会静默忽略 `--resume`；首轮使用
+ *   `-z + --usage-file`，续接必须使用 `chat -Q -q ... --resume <session_id>`
+ * - quiet chat 把 `session_id: ...` 写到 stderr；配合 --no-restore-cwd 阻止 cd 回旧目录
  * - 无 `--cwd` 参数，工作目录只能经 spawn 的 cwd 选项传入
  * - 退出码：0 成功 / 1 错误 / 2 空响应或参数校验失败 / 130 中断
  *
@@ -30,7 +31,14 @@ import { app } from 'electron';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import { loadConfig } from '../config.js';
-import { resolveEngineEnv } from '../engineEnv.js';
+import {
+  childProcessEnv,
+  createSensitiveTextRedactor,
+  providerEnvFor,
+  redactSensitiveText
+} from '../engineEnv.js';
+import { HermesRuntimeProfileService, type PreparedHermesRuntime } from '../hermesRuntimeProfile.js';
+import { parseHermesQuietSessionId } from '../hermesCliProtocol.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 import type { MobileGatewayService } from '../mobileGatewayService.js';
 import { appendBoundedText, appendProcessOutput, boundedText, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
@@ -45,7 +53,7 @@ const MAX_RESULT_CHARS = 16_000;
  * hermes 会报 "did not contain any valid toolsets" 并以退出码 2 直接失败。
  * 这里只放只读类：检索/看文件/看图，不含 terminal、code_execution、browser 等可写副作用的集合。
  */
-const READONLY_TOOLSETS = ['file', 'web', 'vision', 'memory', 'session_search'];
+const READONLY_TOOLSETS = ['file', 'web', 'vision', 'session_search'];
 
 /** hermes --usage-file 写出的 JSON 结构（仅取本应用需要的字段） */
 interface HermesUsageReport {
@@ -82,8 +90,11 @@ export class HermesAgentExecutor implements ExecutorAdapter {
   private abortedTasks = new Set<string>();
   private preparingTasks = new Set<string>();
   private mobileGateway: MobileGatewayService | null = null;
+  private readonly profiles: HermesRuntimeProfileService;
 
-  constructor(private db: Database) {}
+  constructor(private db: Database) {
+    this.profiles = new HermesRuntimeProfileService(db);
+  }
 
   setMobileGateway(gateway: MobileGatewayService): void {
     this.mobileGateway = gateway;
@@ -102,10 +113,20 @@ export class HermesAgentExecutor implements ExecutorAdapter {
   }
 
   /** 构造 headless 参数；运行参数模板可被配置文件 engines['eng-hermes-cli'].runArgs 覆写 */
-  private buildArgs(prompt: string, task: Task, agent: Agent, usageFile: string): string[] {
+  private buildArgs(
+    prompt: string,
+    task: Task,
+    agent: Agent,
+    usageFile: string,
+    runtime: Pick<PreparedHermesRuntime, 'model' | 'provider'> | null = null
+  ): string[] {
+    const resumedSession = task.sessionId?.startsWith('hermes-')
+      ? task.sessionId.slice('hermes-'.length)
+      : null;
     if (agent.kind === 'android_operator') {
-      const args = ['-z', prompt, '--usage-file', usageFile, '--accept-hooks', '-t', 'android'];
-      if (task.sessionId?.startsWith('hermes-')) args.push('-r', task.sessionId.slice('hermes-'.length), '--no-restore-cwd');
+      const args = resumedSession
+        ? ['chat', '-Q', '-q', prompt, '--accept-hooks', '-t', 'android', '--resume', resumedSession, '--no-restore-cwd']
+        : ['-z', prompt, '--usage-file', usageFile, '--accept-hooks', '-t', 'android'];
       if (agent.modelOverride) args.push('-m', agent.modelOverride);
       return args;
     }
@@ -117,7 +138,9 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       return args;
     }
 
-    const args = ['-z', prompt, '--usage-file', usageFile];
+    const args = resumedSession
+      ? ['chat', '-Q', '-q', prompt]
+      : ['-z', prompt, '--usage-file', usageFile];
 
     // 权限映射：trusted/autonomous 才免 hook 审批；渠道来源任务的 trusted 降级为 standard（10.5）
     const baseMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
@@ -128,10 +151,12 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     if (mode === 'readonly') args.push('-t', READONLY_TOOLSETS.join(','));
 
     // 会话续接：工作目录由本应用托管，阻止 hermes cd 回会话记录的旧目录
-    if (task.sessionId?.startsWith('hermes-')) {
-      args.push('-r', task.sessionId.slice('hermes-'.length), '--no-restore-cwd');
+    if (resumedSession) {
+      args.push('--resume', resumedSession, '--no-restore-cwd');
     }
-    if (agent.modelOverride) args.push('-m', agent.modelOverride);
+    const model = runtime?.model ?? agent.modelOverride;
+    if (model) args.push('-m', model);
+    if (runtime) args.push('--provider', runtime.provider);
     return args;
   }
 
@@ -179,12 +204,26 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       return;
     }
 
+    let runtime: PreparedHermesRuntime | null = null;
+    if (!mobileEnv) {
+      try {
+        runtime = this.profiles.ensure(agent);
+      } catch (error) {
+        cb.onError(task.id, `Hermes 运行配置不可用：${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+
     const prompt = task.sessionId
-      ? `追问：${task.title}\n请在之前会话的基础上继续处理，并输出最终结果。`
-      : `${agent.systemPrompt}\n\n当前任务：${task.title}\n请直接执行该任务，并输出最终结构化结果。`;
+      ? `追问：${task.content || task.title}\n请在之前会话的基础上继续处理，并输出最终结果。`
+      : `${agent.systemPrompt}\n\n当前任务：${task.content || task.title}\n请直接执行该任务，并输出最终结构化结果。`;
     const usageFile = join(tmpdir(), `hermes-usage-${randomUUID().slice(0, 8)}.json`);
-    const args = this.buildArgs(prompt, task, agent, usageFile);
+    const args = this.buildArgs(prompt, task, agent, usageFile, runtime);
     const bin = this.resolveBin();
+    const env = childProcessEnv({
+      ...(runtime?.env ?? providerEnvFor(this.db)),
+      ...mobileEnv
+    });
 
     let child: ChildProcess;
     try {
@@ -192,11 +231,11 @@ export class HermesAgentExecutor implements ExecutorAdapter {
         cwd: workspace,
         shell: false,
         windowsHide: true,
-        env: { ...process.env, ...resolveEngineEnv(this.db, ENGINE_ID), ...mobileEnv }
+        env
       });
     } catch (err) {
       if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'cancelled');
-      cb.onError(task.id, `无法启动 ${bin}：${err instanceof Error ? err.message : String(err)}`);
+      cb.onError(task.id, redactSensitiveText(`无法启动 ${bin}：${err instanceof Error ? err.message : String(err)}`, env));
       return;
     }
 
@@ -213,7 +252,7 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     cb.onStage(task.id, '理解需求');
     cb.onProgress(task.id, 5);
 
-    // -z 模式无事件流：按输出长度粗粒度推进进度，不伪造阶段细节
+    // Hermes headless modes have no event stream: advance coarsely by output length.
     const fullParts: string[] = [];
     const fullState = { length: 0, truncated: false };
     let full = '';
@@ -223,12 +262,18 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     let lastFlush = Date.now();
     let lastProgress = 5;
     const stdoutDecoder = createUtf8StreamDecoder();
+    const streamRedactor = createSensitiveTextRedactor(env);
 
     const flush = (force: boolean) => {
       if (outBuf && (force || Date.now() - lastFlush >= 300)) {
-        cb.onOutput(task.id, outBuf);
+        const safe = streamRedactor.push(outBuf);
+        if (safe) cb.onOutput(task.id, safe);
         outBuf = '';
         lastFlush = Date.now();
+      }
+      if (force) {
+        const tail = streamRedactor.finish();
+        if (tail) cb.onOutput(task.id, tail);
       }
     };
 
@@ -253,7 +298,7 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       this.running.delete(task.id);
       this.cleanupUsage(usageFile);
       if (mobileEnv) this.mobileGateway?.finishTask(task.id, 'cancelled');
-      cb.onError(task.id, `启动失败：${err.message}（请确认 hermes 已安装并在 PATH 中）`);
+      cb.onError(task.id, redactSensitiveText(`启动失败：${err.message}（请确认 hermes 已安装并在 PATH 中）`, env));
     });
 
     child.on('close', (code) => {
@@ -273,14 +318,14 @@ export class HermesAgentExecutor implements ExecutorAdapter {
 
       // 用量报告：失败时同样写出，先读再按退出码分流
       const usage = this.readUsage(usageFile);
-      if (usage?.session_id && !task.sessionId) cb.onSession?.(task.id, `hermes-${usage.session_id}`);
+      const nativeSessionId = usage?.session_id || parseHermesQuietSessionId(stderrBuf);
       if (usage) this.recordUsage(task, agent, usage);
       const reportedFailure = hermesFailureDetail(usage, full, stderrBuf);
       if (mobileEnv) this.mobileGateway?.finishTask(task.id, code === 0 && !reportedFailure ? 'completed' : 'failed');
 
       if (code === 0) {
         if (reportedFailure) {
-          cb.onError(task.id, `Hermes 执行失败：${reportedFailure}`);
+          cb.onError(task.id, `Hermes 执行失败：${redactSensitiveText(reportedFailure, env)}`);
           return;
         }
         const result = full.trim();
@@ -288,14 +333,15 @@ export class HermesAgentExecutor implements ExecutorAdapter {
           cb.onError(task.id, 'Hermes 执行完成但未产生文本输出');
           return;
         }
+        if (nativeSessionId) cb.onSession?.(task.id, `hermes-${nativeSessionId}`);
         cb.onStage(task.id, '校验结果');
         cb.onProgress(task.id, 98);
-        cb.onDone(task.id, result.slice(0, MAX_RESULT_CHARS));
+        cb.onDone(task.id, redactSensitiveText(result, env).slice(0, MAX_RESULT_CHARS));
         return;
       }
 
       // 退出码语义（实测）：1 = 运行错误；2 = 空响应/参数校验失败；130 = 中断
-      const detail = usage?.failure || stderrBuf.trim() || full.trim() || '无错误输出';
+      const detail = redactSensitiveText(usage?.failure || stderrBuf.trim() || full.trim() || '无错误输出', env);
       if (code === 130) {
         cb.onError(task.id, 'Hermes 执行被中断');
       } else if (code === 2) {

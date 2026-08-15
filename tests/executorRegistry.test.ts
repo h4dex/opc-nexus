@@ -116,6 +116,22 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.kindFor('eng-hermes-cli')).toBe('generic-cli');
   });
 
+  it('Pi Agent uses its dedicated JSONL executor when healthy', () => {
+    const db = makeDb({
+      'eng-pi': { type: 'pi', status: 'HEALTHY' }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    expect(reg.kindFor('eng-pi')).toBe('pi-cli');
+  });
+
+  it('Claude Code uses the dedicated Claude CLI mode when healthy', () => {
+    const db = makeDb({
+      'eng-claude': { type: 'claude', status: 'HEALTHY' }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    expect(reg.kindFor('eng-claude')).toBe('claude-cli');
+  });
+
   it('engineOverride 解析为外部 ACP 时把覆盖后的引擎 ID 传给执行器', () => {
     userCfg.engine.executionMode = 'production';
     userCfg.engine.fallbackEngineId = null;
@@ -158,11 +174,13 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     });
     const reg = new ExecutorRegistry(db as never, broker as never);
     const start = vi.spyOn(reg['acp'], 'start').mockImplementation(() => undefined);
+    const onResolved = vi.fn();
 
     expect(reg.dispatch(
       { id: 't-fallback', agentId: 'a1', title: '测试' } as never,
       { id: 'a1', engineId: 'eng-codex' } as never,
-      { onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(), onError: vi.fn() } as never
+      { onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(), onError: vi.fn() } as never,
+      onResolved
     )).toBe('acp');
 
     expect(start).toHaveBeenCalledWith(
@@ -170,6 +188,94 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
       expect.objectContaining({ engineId: 'eng-harness' }),
       expect.any(Object)
     );
+    expect(onResolved).toHaveBeenCalledOnce();
+    expect(onResolved).toHaveBeenCalledWith({
+      requestedEngineId: 'eng-codex',
+      resolvedEngineId: 'eng-harness',
+      executorKind: 'acp',
+      usedFallback: true
+    });
+  });
+
+  it('canonical DispatchPlan 精确绑定的引擎不可用时禁止静默 fallback', () => {
+    userCfg.engine.executionMode = 'demo';
+    userCfg.engine.fallbackEngineId = 'eng-harness';
+    const db = makeDb({
+      'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' },
+      'eng-harness': {
+        type: 'external', status: 'HEALTHY',
+        config_json: JSON.stringify({ acpCommand: ['dsh', 'acp'] })
+      }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    const start = vi.spyOn(reg['acp'], 'start').mockImplementation(() => undefined);
+    const onError = vi.fn();
+    const onResolved = vi.fn();
+
+    expect(reg.dispatch(
+      {
+        id: 't-plan', agentId: 'a1', title: '受控任务', inputMessageId: 'message-1'
+      } as never,
+      { id: 'a1', engineId: 'eng-codex' } as never,
+      { onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(), onError } as never,
+      onResolved
+    )).toBe('unavailable');
+
+    expect(start).not.toHaveBeenCalled();
+    expect(onResolved).toHaveBeenCalledWith({
+      requestedEngineId: 'eng-codex', resolvedEngineId: null,
+      executorKind: 'unavailable', usedFallback: false
+    });
+    expect(onError).toHaveBeenCalledWith('t-plan', expect.stringContaining('禁止静默切换'));
+  });
+
+  it('显式 engineOverride 在重试或编码委派中也禁止静默 fallback', () => {
+    userCfg.engine.executionMode = 'demo';
+    userCfg.engine.fallbackEngineId = 'eng-harness';
+    const db = makeDb({
+      'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' },
+      'eng-harness': {
+        type: 'external', status: 'HEALTHY',
+        config_json: JSON.stringify({ acpCommand: ['dsh', 'acp'] })
+      }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    const fallback = vi.spyOn(reg['acp'], 'start').mockImplementation(() => undefined);
+    const onError = vi.fn();
+
+    expect(reg.dispatch(
+      { id: 't-retry', agentId: 'a1', title: '重试', engineOverride: 'eng-codex', inputMessageId: null } as never,
+      { id: 'a1', engineId: 'eng-harness' } as never,
+      { onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(), onError } as never
+    )).toBe('unavailable');
+
+    expect(fallback).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith('t-retry', expect.stringContaining('禁止静默切换'));
+  });
+
+  it('无可用引擎时也在同步错误回调前报告 unavailable binding', () => {
+    userCfg.engine.executionMode = 'production';
+    userCfg.engine.fallbackEngineId = null;
+    const db = makeDb({ 'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' } });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    const order: string[] = [];
+
+    expect(reg.dispatch(
+      { id: 't-unavailable', agentId: 'a1', title: '测试' } as never,
+      { id: 'a1', engineId: 'eng-codex' } as never,
+      {
+        onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(),
+        onError: () => order.push('error')
+      } as never,
+      (binding) => {
+        order.push('resolved');
+        expect(binding).toEqual({
+          requestedEngineId: 'eng-codex', resolvedEngineId: null,
+          executorKind: 'unavailable', usedFallback: false
+        });
+      }
+    )).toBe('unavailable');
+    expect(order).toEqual(['resolved', 'error']);
   });
 
   it('ACP abort 后保持占用，直到执行器报告 child close release', () => {

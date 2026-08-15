@@ -1,8 +1,7 @@
 /**
  * 引擎中心（PRD 9.x）
- * 引擎目录：内置 Nexus Agent（自研 Runtime，直连 OpenAI 兼容 API）+ 真实 Hermes Agent CLI
- * + 5 个本机 CLI 引擎（Codex CLI / Claude Code / ZCode / OpenCode / Kimi Code）。
- * 注：引擎清单待收敛为四种（Nexus / Hermes / OpenCode / Codex CLI），见 docs/architecture-review.md E-1。
+ * 引擎目录：Nexus 与 Hermes 控制 Runtime，加上受管 Harness 和本机 Worker CLI
+ *（Codex / Claude Code / Pi / OpenCode）。
  * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / HEALTHY，不做假安装。
  * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）；
  * ZCode 为桌面应用无公开 npm 包，仅提供官方指引。
@@ -19,8 +18,33 @@ import { providerReady } from './provider.js';
 import { loadConfig, sanitizeRegistry } from './config.js';
 import { runCli } from './cliLauncher.js';
 import { acpCommandFor, probeAcpEngine, probeAcpTask } from './executor/acpExecutor.js';
-import { engineEnvSecretRef, resolveEngineEnv, splitSecretEnv, SECRET_PLACEHOLDER } from './engineEnv.js';
+import {
+  childProcessEnv,
+  engineEnvSecretRef,
+  redactSensitiveText,
+  resolveConfiguredEngineEnv,
+  resolveEngineEnv,
+  splitSecretEnv,
+  SECRET_PLACEHOLDER
+} from './engineEnv.js';
 import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
+import { HermesRuntimeProfileService } from './hermesRuntimeProfile.js';
+import { PI_ENGINE_ID, PiRuntimeProfileService } from './piRuntimeProfile.js';
+import {
+  buildPiAuthCheckArgs,
+  buildPiProbeArgs,
+  parsePiAuthCheck,
+  parsePiProbeOutput,
+  redactPiText
+} from './executor/piAgentExecutor.js';
+import {
+  CLAUDE_ENGINE_ID,
+  buildClaudeAuthCheckArgs,
+  buildClaudeProbeArgs,
+  parseClaudeAuthStatus,
+  parseClaudeProbeOutput,
+  redactClaudeText
+} from './executor/cliExecutor.js';
 import {
   DEEPSEEK_HARNESS_ENGINE_ID,
   DEEPSEEK_HARNESS_VERSION,
@@ -68,8 +92,8 @@ export interface CatalogEntry {
 
 /**
  * 引擎目录：Nexus Agent（内置自研 Runtime）/ DeepSeek Harness（受管 ACP sidecar）/
- * Hermes Agent（真实 CLI）/ OpenCode（编码专家）/ Codex CLI（备选编码引擎）。
- * ZCode / Kimi Code / Claude Code 已下线：清单膨胀且缺乏验证，由 v26 迁移改绑到 Nexus。
+ * Hermes Agent（真实 CLI）/ Claude Code / OpenCode / Codex CLI。
+ * ZCode / Kimi Code 已下线；Claude Code 以经过验证的无交互 Worker 重新接入。
  */
 export const ENGINE_CATALOG: CatalogEntry[] = [
   {
@@ -88,6 +112,14 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
     guide: { guide: '请按 Hermes Agent 官方方式安装 hermes CLI；如可执行名或运行参数不同，可在配置文件 engines["eng-hermes-cli"] 中覆写 bin/runArgs', url: null }
   },
   {
+    id: PI_ENGINE_ID, type: 'pi', name: 'Pi Agent', bin: 'pi', npmPackage: '@earendil-works/pi-coding-agent',
+    dataBoundary: 'Pi runs locally; model requests are sent to the provider configured in OPC-Nexus',
+    guide: {
+      guide: 'npm install -g --ignore-scripts @earendil-works/pi-coding-agent, then configure a model provider in OPC-Nexus',
+      url: 'https://github.com/earendil-works/pi'
+    }
+  },
+  {
     id: 'eng-opencode', type: 'opencode', name: 'OpenCode', bin: 'opencode', npmPackage: 'opencode-ai',
     dataBoundary: '数据发送目标取决于 OpenCode 内所配置的模型提供商',
     guide: { guide: 'npm install -g opencode-ai，安装后运行 opencode auth login 配置提供商', url: 'https://opencode.ai/docs' }
@@ -96,16 +128,63 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
     id: 'eng-codex', type: 'codex', name: 'OpenAI Codex CLI', bin: 'codex', npmPackage: '@openai/codex',
     dataBoundary: '数据将发送至 OpenAI API',
     guide: { guide: 'npm install -g @openai/codex，安装后运行 codex 完成登录', url: 'https://github.com/openai/codex' }
+  },
+  {
+    id: CLAUDE_ENGINE_ID, type: 'claude', name: 'Claude Code', bin: 'claude', npmPackage: '@anthropic-ai/claude-code',
+    dataBoundary: 'Claude Code 在本机运行；提示词与必要文件内容发送至 Anthropic 或用户配置的企业模型提供商，会话保存在 Claude Code 本地数据目录',
+    guide: { guide: 'npm install -g @anthropic-ai/claude-code，安装后运行 claude auth login 完成登录', url: 'https://docs.anthropic.com/en/docs/claude-code' }
   }
 ];
 
 /** 已下线引擎：v26 迁移把绑定它们的员工改绑 Nexus，并从 engines 表清理 */
-export const RETIRED_ENGINE_IDS = ['eng-claude', 'eng-zcode', 'eng-kimi'] as const;
+export const RETIRED_ENGINE_IDS = ['eng-zcode', 'eng-kimi'] as const;
 
 interface ExternalAcpEntry {
   id: string;
   name: string;
   command: string[] | null;
+}
+
+const SENSITIVE_ARGUMENT_NAME_PATTERN =
+  /(?:apikey|token|secret|secretkey|password|passwd|passphrase|credentials?|privatekey|accesskey|clientkey|consumerkey|signingkey|licensekey|authorization|bearer)$/;
+
+function argumentName(arg: string): string | null {
+  const value = arg.trim().replace(/^["']/, '');
+  const option = value.match(/^-{1,2}([^=:\s]+)/)
+    ?? value.match(/^\/([^/\\=:\s]+)(?:[=:\s]|$)/);
+  const assignment = value.match(/^([A-Za-z_][A-Za-z0-9_.-]*)\s*=/);
+  const name = option?.[1] ?? assignment?.[1];
+  return name ? name.toLowerCase().replace(/[^a-z0-9]/g, '') : null;
+}
+
+function containsCredentialArgument(arg: string): boolean {
+  const header = arg.match(/(?:^|[=\s])["']?([A-Za-z_][A-Za-z0-9_.-]*)\s*:/);
+  if (header) {
+    const headerName = header[1].toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (SENSITIVE_ARGUMENT_NAME_PATTERN.test(headerName)) return true;
+  }
+  if (/^\s*["']?bearer\s+\S+/i.test(arg)) return true;
+  const name = argumentName(arg);
+  return name !== null && SENSITIVE_ARGUMENT_NAME_PATTERN.test(name);
+}
+
+function assertSafeEngineArguments(value: unknown, field: string): asserts value is string[] | undefined {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.some((arg) => typeof arg !== 'string')) {
+    throw new Error(`Invalid ${field}: expected a string array`);
+  }
+  if (value.some(containsCredentialArgument)) {
+    throw new Error(
+      `Credential-bearing ${field} are not allowed; configure secrets through encrypted environment variables`
+    );
+  }
+}
+
+function assertSafePersistedEngineConfig(value: unknown): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const config = value as Record<string, unknown>;
+  assertSafeEngineArguments(config.runArgs, 'runArgs');
+  assertSafeEngineArguments(config.acpCommand, 'ACP arguments');
 }
 
 /** 旧配置文件中的 ACP 条目仅用于升级导入，运行时状态与命令以 SQLite 为准。 */
@@ -185,6 +264,18 @@ export class EngineManager {
        ON CONFLICT(id) DO NOTHING`
     );
     for (const ext of legacyExternalAcpEntries()) {
+      try {
+        assertSafeEngineArguments(ext.command, 'ACP arguments');
+      } catch {
+        this.db.audit({
+          id: randomUUID(),
+          actor: 'system',
+          action: 'engine.legacyConfig',
+          target: ext.id,
+          result: 'rejected: credential argument'
+        });
+        continue;
+      }
       legacyStmt.run(
         ext.id,
         ext.name,
@@ -197,16 +288,15 @@ export class EngineManager {
 
   list(): Engine[] {
     const rows = this.db.raw.prepare('SELECT * FROM engines ORDER BY is_default DESC, name').all() as unknown as EngineRow[];
-    const runCounts = this.db.raw
-      .prepare("SELECT agent_id, COUNT(*) c FROM agent_runs WHERE ended_at IS NULL GROUP BY agent_id")
-      .all() as { agent_id: string; c: number }[];
-    const agentEngine = new Map(
-      (this.db.raw.prepare('SELECT id, engine_id FROM agents').all() as { id: string; engine_id: string }[]).map((r) => [r.id, r.engine_id])
-    );
+    const runCounts = this.db.raw.prepare(
+      `SELECT COALESCE(ar.resolved_engine_id, ar.requested_engine_id, a.engine_id) engine_id, COUNT(*) c
+       FROM agent_runs ar JOIN agents a ON a.id = ar.agent_id
+       WHERE ar.ended_at IS NULL
+       GROUP BY COALESCE(ar.resolved_engine_id, ar.requested_engine_id, a.engine_id)`
+    ).all() as { engine_id: string; c: number }[];
     const perEngine = new Map<string, number>();
     for (const r of runCounts) {
-      const eng = agentEngine.get(r.agent_id);
-      if (eng) perEngine.set(eng, (perEngine.get(eng) ?? 0) + r.c);
+      if (r.engine_id) perEngine.set(r.engine_id, (perEngine.get(r.engine_id) ?? 0) + r.c);
     }
     return rows.map((r) => {
       const entry = ENGINE_CATALOG.find((e) => e.id === r.id);
@@ -320,7 +410,11 @@ export class EngineManager {
 
       // 用 --version 验证「真能启动」：Windows 上 npm 无扩展名 shim（ENOENT）、
       // .cmd（EINVAL）、Store 应用（EPERM）都会在此暴露，而非等到派发任务才失败。
-      const ver = await runCli(found, ['--version'], { timeoutMs: 15_000 });
+      const launchEnv = childProcessEnv({});
+      const ver = await runCli(found, ['--version'], {
+        timeoutMs: cliLaunchProbeTimeoutMs(entry.id, launchEnv),
+        env: launchEnv
+      });
       const version = (ver.stdout || ver.stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80) || null;
       const launchable = !(ver.error && !ver.stdout && !ver.stderr);
 
@@ -369,7 +463,9 @@ export class EngineManager {
       }
     }
     // Nexus Agent：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED（演示模式，UI 必须标注）
-    this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
+    const nexusReady = providerReady(this.db);
+    this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+      .run(nexusReady ? 'HEALTHY' : 'SETUP_REQUIRED', nexusReady ? 'authed' : 'required', 'eng-hermes');
     return this.list();
   }
 
@@ -393,7 +489,7 @@ export class EngineManager {
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.install.start', target: `${npmPackage} @ ${registry}`, result: 'ok' });
 
     try {
-      const r = await npmInstallGlobal(npmPackage, registry);
+      const r = await npmInstallGlobal(npmPackage, registry, id === PI_ENGINE_ID);
       if (!r.ok) {
         this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED' WHERE id = ?").run(id);
         this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.install', target: npmPackage, result: `failed: ${r.message.slice(0, 120)}` });
@@ -535,6 +631,32 @@ export class EngineManager {
   /** 读取四级探活信号；未探活过返回 undefined */
   getHealthSignals(id: string): EngineHealthSignals | undefined {
     return this.db.getSetting<EngineHealthSignals | undefined>(healthSignalsKey(id), undefined);
+  }
+
+  /** Runtime 已经启动但 Provider 拒绝鉴权时，撤销之前的健康证明。
+   * detail 必须由调用方先按该子进程环境完成脱敏。 */
+  reportAuthenticationFailure(id: string, detail: string): void {
+    const boundedDetail = detail.trim().slice(0, 2_000) || 'Provider authentication failed';
+    let changed = false;
+    this.db.transaction(() => {
+      changed = this.db.raw.prepare(
+        "UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required' WHERE id = ? AND status = 'HEALTHY'"
+      ).run(id).changes === 1;
+      if (!changed) return;
+      const previous = this.getHealthSignals(id);
+      this.saveHealthSignals(id, {
+        detected: previous?.detected ?? true,
+        launchable: true,
+        authenticated: false,
+        taskVerified: false,
+        detail: boundedDetail
+      });
+      this.db.audit({
+        id: randomUUID(), actor: 'system', action: 'engine.runtimeAuthFailure',
+        target: id, result: 'AUTH_REQUIRED'
+      });
+    });
+    if (changed) this.addLog(id, 'warn', `Runtime authentication failed: ${boundedDetail.slice(0, 500)}`);
   }
 
   setDefault(id: string) {
@@ -741,8 +863,14 @@ export class EngineManager {
    * 与 providerManager 的密钥处理保持同一模式。
    */
   saveConfig(id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }) {
+    assertSafeEngineArguments(config.runArgs, 'runArgs');
+    assertSafeEngineArguments((config as Record<string, unknown>).acpCommand, 'ACP arguments');
     const { safe, secrets } = splitSecretEnv(config.env ?? {});
-    const persisted = { ...config, env: safe };
+    const persisted = {
+      runArgs: config.runArgs,
+      env: safe,
+      maxConcurrency: config.maxConcurrency
+    };
     this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(persisted), id);
 
     const ref = engineEnvSecretRef(id);
@@ -760,7 +888,11 @@ export class EngineManager {
       this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(ref);
     }
     // 日志只记录非敏感部分，避免凭据进入 engine_logs
-    this.addLog(id, 'info', `配置已更新: ${JSON.stringify(persisted).slice(0, 100)}`);
+    this.addLog(
+      id,
+      'info',
+      `Configuration updated: runArgs=${config.runArgs?.length ?? 0}, env=${Object.keys(safe).length}`
+    );
   }
 
   /**
@@ -770,7 +902,10 @@ export class EngineManager {
   getConfig(id: string): { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null {
     const row = this.db.raw.prepare('SELECT config_json FROM engines WHERE id = ?').get(id) as { config_json?: string } | undefined;
     if (!row?.config_json) return null;
-    try { return JSON.parse(row.config_json); } catch { return null; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(row.config_json); } catch { return null; }
+    assertSafePersistedEngineConfig(parsed);
+    return parsed as { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number };
   }
 
   /**
@@ -801,7 +936,10 @@ export class EngineManager {
   /** 获取引擎性能指标（从 agent_runs 统计） */
   getMetrics(engineId: string): { avgLatencyMs: number; successRate: number; totalRuns: number } {
     const runs = this.db.raw.prepare(
-      `SELECT ar.started_at, ar.ended_at, t.status FROM agent_runs ar JOIN tasks t ON ar.task_id = t.id JOIN agents a ON ar.agent_id = a.id WHERE a.engine_id = ? AND ar.ended_at IS NOT NULL ORDER BY ar.ended_at DESC LIMIT 200`
+      `SELECT ar.started_at, ar.ended_at, t.status
+       FROM agent_runs ar JOIN tasks t ON ar.task_id = t.id JOIN agents a ON ar.agent_id = a.id
+       WHERE COALESCE(ar.resolved_engine_id, ar.requested_engine_id, a.engine_id) = ? AND ar.ended_at IS NOT NULL
+       ORDER BY ar.ended_at DESC LIMIT 200`
     ).all(engineId) as { started_at: number; ended_at: number; status: string }[];
     if (runs.length === 0) return { avgLatencyMs: 0, successRate: 0, totalRuns: 0 };
     const totalMs = runs.reduce((sum, r) => sum + (r.ended_at - r.started_at), 0);
@@ -816,13 +954,18 @@ export class EngineManager {
   /** 注册自定义引擎 */
   registerCustom(input: { name: string; command: string; args?: string; dataBoundary?: string }): { ok: boolean; message: string; id?: string } {
     if (!input.name.trim() || !input.command.trim()) return { ok: false, message: '名称和命令不能为空' };
+    const args = input.args?.split(/\s+/).filter(Boolean) ?? [];
+    try {
+      assertSafeEngineArguments(args, 'ACP arguments');
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : 'Invalid ACP arguments' };
+    }
     const id = `eng-custom-${randomUUID().slice(0, 6)}`;
     this.db.raw.prepare(
       `INSERT INTO engines(id, type, name, version, path, status, auth_status, is_default, data_boundary) VALUES(?, 'external', ?, NULL, ?, 'NOT_INSTALLED', 'unknown', 0, ?)`
     ).run(id, input.name.trim(), input.command.trim(), input.dataBoundary || '自定义引擎；数据发送目标取决于配置');
     // acpCommand 是外部引擎的完整可执行入口；path 保留给旧版本兼容读取。
     const command = input.command.trim();
-    const args = input.args?.split(/\s+/).filter(Boolean) ?? [];
     const config = { acpCommand: [command, ...args] };
     this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(config), id);
     this.addLog(id, 'info', `自定义引擎「${input.name}」已注册，命令: ${input.command}`);
@@ -831,8 +974,8 @@ export class EngineManager {
 }
 
 /** npm 全局安装（Windows 下 npm 为 .cmd，须经 cmd.exe /c 拉起；参数均已白名单校验，无注入面） */
-function npmInstallGlobal(pkg: string, registry: string): Promise<{ ok: boolean; message: string }> {
-  return npmCommand(['install', '-g', pkg, '--registry', registry]);
+function npmInstallGlobal(pkg: string, registry: string, ignoreScripts = false): Promise<{ ok: boolean; message: string }> {
+  return npmCommand(['install', '-g', ...(ignoreScripts ? ['--ignore-scripts'] : []), pkg, '--registry', registry]);
 }
 
 /** 通用 npm 命令执行（install/update/uninstall） */
@@ -923,7 +1066,12 @@ const USAGE_ERROR_PATTERN = /unrecognized arguments|unknown (option|argument|fla
 
 /** A newly-created Hermes profile may run config/plugin migrations on first use. */
 export function cliLaunchProbeTimeoutMs(engineId: string, env: NodeJS.ProcessEnv): number {
-  return engineId === 'eng-hermes-cli' && Boolean(env.HERMES_HOME?.trim()) ? 45_000 : 15_000;
+  const managedProfile = (engineId === 'eng-hermes-cli' && Boolean(env.HERMES_HOME?.trim()))
+    // Pi is exclusively integrated through an OPC-managed profile. Startup
+    // detection runs before that profile is prepared, but needs the same cold
+    // start allowance as the authenticated probe.
+    || engineId === PI_ENGINE_ID;
+  return managedProfile ? 45_000 : 15_000;
 }
 
 /**
@@ -938,7 +1086,7 @@ export function cliLaunchProbeTimeoutMs(engineId: string, env: NodeJS.ProcessEnv
  * 只有四级全通过才写 HEALTHY —— 此前只验证到 detected 就标 HEALTHY，
  * 导致引擎页显示健康但实际一跑就 ENOENT / EPERM / 参数错。
  */
-async function probeCliAuth(
+export async function probeCliAuth(
   engineId: string,
   binPath: string,
   db: Database
@@ -950,22 +1098,106 @@ async function probeCliAuth(
     taskVerified: false,
     detail: ''
   };
-  const env = { ...process.env, ...resolveEngineEnv(db, engineId) };
+  let hermesRuntime: ReturnType<HermesRuntimeProfileService['ensureProbe']> | null = null;
+  let piRuntime: ReturnType<PiRuntimeProfileService['ensureProbe']> | null = null;
+  if (engineId === 'eng-hermes-cli') {
+    try {
+      hermesRuntime = new HermesRuntimeProfileService(db).ensureProbe();
+    } catch (error) {
+      signals.launchable = true;
+      signals.detail = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        status: 'AUTH_REQUIRED',
+        authStatus: 'required',
+        signals,
+        message: `Hermes 需要 OPC-Nexus 模型供应商：${signals.detail}`
+      };
+    }
+  }
+  if (engineId === PI_ENGINE_ID) {
+    try {
+      piRuntime = new PiRuntimeProfileService(db).ensureProbe();
+    } catch (error) {
+      signals.launchable = true;
+      signals.detail = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        status: 'AUTH_REQUIRED',
+        authStatus: 'required',
+        signals,
+        message: `Pi requires an OPC-Nexus model provider: ${signals.detail}`
+      };
+    }
+  }
+  const engineEnv = engineId === CLAUDE_ENGINE_ID
+    ? resolveConfiguredEngineEnv(db, engineId)
+    : (hermesRuntime || piRuntime)
+      ? {}
+      : resolveEngineEnv(db, engineId);
+  const env = childProcessEnv({ ...engineEnv, ...hermesRuntime?.env, ...piRuntime?.env });
 
   // 第 1 级：launchable —— 用 --version 验证进程真能起来（最轻量、不消耗额度）
   const ver = await runCli(binPath, ['--version'], { timeoutMs: cliLaunchProbeTimeoutMs(engineId, env), env });
   if (ver.error && !ver.stdout && !ver.stderr) {
-    signals.detail = `进程无法启动：${ver.error}`;
+    const safeError = redactSensitiveText(ver.error, env);
+    signals.detail = `进程无法启动：${safeError}`;
     return {
       ok: false, status: 'ERROR', authStatus: 'unknown', signals,
-      message: `已检测到可执行文件但无法启动：${ver.error}。`
+      message: `已检测到可执行文件但无法启动：${safeError}。`
         + '（Windows 上 npm 无扩展名 shim、.cmd 批处理与 Microsoft Store 应用均需经 cmd.exe 拉起）'
     };
   }
   signals.launchable = true;
 
+  if (piRuntime) {
+    const auth = await runCli(binPath, buildPiAuthCheckArgs(piRuntime), { timeoutMs: 30_000, env });
+    const parsed = parsePiAuthCheck(auth.stdout);
+    if (!parsed.ready) {
+      const rawDetail = auth.stderr || auth.stdout || auth.error || parsed.reason;
+      const detail = redactPiText(rawDetail.trim().slice(0, 300), env);
+      signals.detail = detail;
+      const credentialsMissing = auth.code === 1 && /credential|auth|key|token/i.test(`${parsed.reason} ${detail}`);
+      return {
+        ok: false,
+        status: credentialsMissing ? 'AUTH_REQUIRED' : 'DEGRADED',
+        authStatus: credentialsMissing ? 'required' : 'unknown',
+        signals,
+        message: `Pi auth check failed: ${detail}`
+      };
+    }
+    signals.authenticated = true;
+  }
+
+  if (engineId === CLAUDE_ENGINE_ID) {
+    const auth = await runCli(binPath, buildClaudeAuthCheckArgs(), { timeoutMs: 15_000, env });
+    const parsed = parseClaudeAuthStatus(auth.stdout);
+    if (auth.code !== 0 || !parsed.loggedIn) {
+      const commandDetail = auth.stderr || auth.stdout || auth.error || '';
+      const rawDetail = USAGE_ERROR_PATTERN.test(commandDetail) ? commandDetail : parsed.detail;
+      const detail = redactClaudeText(rawDetail.trim().slice(0, 300), env);
+      signals.detail = detail || parsed.detail;
+      const usageFailure = USAGE_ERROR_PATTERN.test(signals.detail);
+      return {
+        ok: false,
+        status: usageFailure ? 'DEGRADED' : 'AUTH_REQUIRED',
+        authStatus: usageFailure ? 'unknown' : 'required',
+        signals,
+        message: usageFailure
+          ? `Claude Code auth probe is incompatible with this CLI version: ${signals.detail}`
+          : `Claude Code needs login: ${signals.detail}`
+      };
+    }
+  }
+
   // 第 2、3 级：跑最小任务，同时验证凭据与产出
-  const args = AUTH_PROBE_ARGS[engineId];
+  const args = hermesRuntime
+    ? ['-z', 'ping', '-m', hermesRuntime.model, '--provider', hermesRuntime.provider]
+    : piRuntime
+      ? buildPiProbeArgs(piRuntime)
+      : engineId === CLAUDE_ENGINE_ID
+        ? buildClaudeProbeArgs()
+        : AUTH_PROBE_ARGS[engineId];
   if (!args) {
     signals.detail = '该引擎未定义最小任务探测参数';
     return {
@@ -976,7 +1208,14 @@ async function probeCliAuth(
 
   // 60s：真实模型请求可能较慢
   const run = await runCli(binPath, args, { timeoutMs: 60_000, env });
-  const detail = (run.stderr || run.stdout || run.error || '无输出').trim().slice(0, 300);
+  const piProbe = piRuntime ? parsePiProbeOutput(run.stdout) : null;
+  const claudeProbe = engineId === CLAUDE_ENGINE_ID ? parseClaudeProbeOutput(run.stdout) : null;
+  const rawDetail = piProbe?.error || claudeProbe?.error || run.stderr || run.stdout || run.error || 'no output';
+  const detail = piRuntime
+    ? redactPiText(rawDetail.trim().slice(0, 300), env)
+    : engineId === CLAUDE_ENGINE_ID
+      ? redactClaudeText(rawDetail.trim().slice(0, 300), env)
+      : redactSensitiveText(rawDetail.trim().slice(0, 300), env);
 
   if (run.error && run.code === null) {
     // 超时/启动异常：不确定，不可乐观判定为已登录
@@ -987,14 +1226,19 @@ async function probeCliAuth(
     };
   }
 
-  if (run.code === 0 && run.stdout.trim() && !CLI_FAILURE_BODY_PATTERN.test(detail)) {
+  const producedOutput = piProbe ? piProbe.ok : claudeProbe ? claudeProbe.ok : Boolean(run.stdout.trim());
+  if (run.code === 0 && producedOutput && !CLI_FAILURE_BODY_PATTERN.test(detail)) {
     signals.authenticated = true;
     signals.taskVerified = true;
-    signals.detail = run.stdout.trim().slice(0, 200);
+    signals.detail = redactSensitiveText(
+      (piProbe?.output || claudeProbe?.output || run.stdout.trim()).slice(0, 200),
+      env
+    );
     return { ok: true, status: 'HEALTHY', authStatus: 'authed', signals, message: '四级探活通过：可启动、凭据有效、最小任务已产出结果' };
   }
 
   if (AUTH_ERROR_PATTERN.test(detail)) {
+    signals.authenticated = false;
     signals.detail = detail;
     return { ok: false, status: 'AUTH_REQUIRED', authStatus: 'required', signals, message: `需要登录：${detail}` };
   }

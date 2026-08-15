@@ -6,10 +6,10 @@ import { randomUUID } from 'node:crypto';
 import { safeStorage } from 'electron';
 import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
-import type { ApprovalBroker } from '../approvalBroker.js';
+import type { ChannelIngressService } from '../channelIngressService.js';
 import type { WeixinLoginState } from '../../../shared/types.js';
 import { notify } from '../notifier.js';
-import { dispatchChannelTask, tryChannelApproval, tryChannelCommand } from './common.js';
+import { dispatchChannelTask, type ChannelTaskPlanner } from './common.js';
 import {
   ILinkClient,
   ILinkHttpError,
@@ -52,6 +52,8 @@ interface PollState {
   cooldownUntil?: number;
 }
 
+type UpdateAcceptance = 'accepted' | 'cooldown' | 'retry';
+
 interface OutboxEntry {
   id: string;
   generation: number;
@@ -79,6 +81,8 @@ interface ChannelOptions {
   qrToDataUrl?: (content: string) => Promise<string>;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
+  ingressService?: Pick<ChannelIngressService, 'ingest' | 'linkTask' | 'recordOutbound'>;
+  taskPlanner: ChannelTaskPlanner;
 }
 
 function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
@@ -124,6 +128,8 @@ export class WeixinChannel {
   private readonly qrToDataUrl: (content: string) => Promise<string>;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
+  private readonly ingressService?: Pick<ChannelIngressService, 'ingest' | 'linkTask' | 'recordOutbound'>;
+  private readonly taskPlanner: ChannelTaskPlanner;
   private lastStatus = '';
   private activeClient: ILinkClient | null = null;
   private activeAccountId: string | null = null;
@@ -134,8 +140,7 @@ export class WeixinChannel {
   constructor(
     private db: Database,
     private orchestrator: Orchestrator,
-    private broker: ApprovalBroker,
-    options: ChannelOptions = {}
+    options: ChannelOptions
   ) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.qrToDataUrl = options.qrToDataUrl ?? (async (content) => {
@@ -144,6 +149,8 @@ export class WeixinChannel {
     });
     this.sleep = options.sleep ?? sleepWithAbort;
     this.now = options.now ?? Date.now;
+    this.ingressService = options.ingressService;
+    this.taskPlanner = options.taskPlanner;
   }
 
   isActive(): boolean {
@@ -258,8 +265,15 @@ export class WeixinChannel {
       if (abort.signal.aborted || gen !== this.generation || !this.active) return { ok: false, message: '微信 iLink 连接已取消' };
       const response = await client.getUpdates(pollState.cursor, 5_000, abort.signal, { timeoutAsEmpty: false });
       if (abort.signal.aborted || gen !== this.generation || !this.active) return { ok: false, message: '微信 iLink 连接已取消' };
-      if (!await this.acceptUpdateResponse(gen, credentials, client, pollState, response, abort.signal)) {
+      const acceptance = await this.acceptUpdateResponse(gen, credentials, client, pollState, response, abort.signal);
+      if (acceptance !== 'accepted') {
         if (abort.signal.aborted || gen !== this.generation || !this.active) return { ok: false, message: '微信 iLink 连接已取消' };
+        if (acceptance === 'retry') {
+          this.setStatus('RECONNECTING');
+          this.updateLoginState('CONNECTED', null, '微信消息处理暂未完成，将自动重试');
+          this.startMonitor(gen, credentials, client, pollState, false);
+          return { ok: true, message: '微信 iLink 已连接，消息处理将自动重试' };
+        }
         this.startMonitor(gen, credentials, client, pollState, false);
         return { ok: true, message: '微信 iLink 会话冷却中，将自动恢复' };
       }
@@ -462,16 +476,19 @@ export class WeixinChannel {
       this.monitorAbort = abort;
       this.activeClient = client;
       this.activeAccountId = credentials.accountId;
-      const online = await this.acceptUpdateResponse(monitorGen, credentials, client, pollState, response, abort.signal);
+      const acceptance = await this.acceptUpdateResponse(monitorGen, credentials, client, pollState, response, abort.signal);
       if (abort.signal.aborted || monitorGen !== this.generation || !this.active) return;
 
       this.loginAttemptActive = false;
       this.loginAbort = null;
       this.loginRestore = null;
       this.pendingActivation = null;
-      this.updateLoginState('CONNECTED', null, online
+      if (acceptance === 'retry') this.setStatus('RECONNECTING');
+      this.updateLoginState('CONNECTED', null, acceptance === 'accepted'
         ? '微信 iLink Bot 已连接，仅接收扫码账号的私聊消息'
-        : '微信 iLink 会话冷却中，将自动恢复');
+        : acceptance === 'cooldown'
+          ? '微信 iLink 会话冷却中，将自动恢复'
+          : '微信消息处理暂未完成，将自动重试');
       this.startMonitor(monitorGen, credentials, client, pollState, false);
     } catch (error) {
       if ((signal.aborted || attempt !== this.loginAttempt) && this.loginCommittedAttempt !== attempt) return;
@@ -538,7 +555,9 @@ export class WeixinChannel {
         }
         const response = await client.getUpdates(pollState.cursor, timeoutMs, signal);
         if (signal.aborted || gen !== this.generation) return;
-        if (!await this.acceptUpdateResponse(gen, credentials, client, pollState, response, signal)) {
+        const acceptance = await this.acceptUpdateResponse(gen, credentials, client, pollState, response, signal);
+        if (acceptance === 'retry') throw new Error('微信渠道任务未持久化，将重试当前消息');
+        if (acceptance === 'cooldown') {
           failures = 0;
           continue;
         }
@@ -570,7 +589,7 @@ export class WeixinChannel {
     pollState: PollState,
     response: Awaited<ReturnType<ILinkClient['getUpdates']>>,
     signal: AbortSignal
-  ): Promise<boolean> {
+  ): Promise<UpdateAcceptance> {
     const code = responseErrorCode(response);
     if (code != null) {
       if (code === -14) {
@@ -579,7 +598,7 @@ export class WeixinChannel {
         this.setStatus('RECONNECTING');
         if (!this.loginAttemptActive) this.updateLoginState('CONNECTED', null, '微信 iLink 会话冷却中，将在一小时后自动恢复');
         notify(this.db, '微信 iLink 会话暂时冷却', '腾讯接口要求暂停一小时，届时将自动恢复，无需重新扫码。');
-        return false;
+        return 'cooldown';
       }
       throw new Error(`微信拉取消息失败：${response.errmsg ?? `ret=${code}`}`);
     }
@@ -591,7 +610,8 @@ export class WeixinChannel {
     const nextCursor = response.get_updates_buf || requestCursor;
     for (const message of response.msgs ?? []) {
       const accepted = await this.handleMessage(gen, client, credentials, pollState, message);
-      if (signal.aborted || gen !== this.generation) return false;
+      if (signal.aborted || gen !== this.generation) return 'retry';
+      if (accepted === false) return 'retry';
       if (!accepted) continue;
       const candidate = this.withAcceptedMessage(pollState, accepted.key, accepted.from, accepted.contextToken);
       const savedCandidate = this.savePollState(candidate);
@@ -605,11 +625,11 @@ export class WeixinChannel {
     if (savedCommitted.cooldownUntil && savedCommitted.cooldownUntil > this.now()) {
       this.setStatus('RECONNECTING');
       if (!this.loginAttemptActive) this.updateLoginState('CONNECTED', null, '微信 iLink 会话冷却中，将在一小时后自动恢复');
-      return false;
+      return 'cooldown';
     }
     this.setStatus('ONLINE');
     if (!this.loginAttemptActive) this.updateLoginState('CONNECTED', null, '微信 iLink Bot 已连接');
-    return true;
+    return 'accepted';
   }
 
   private async handleMessage(
@@ -618,7 +638,7 @@ export class WeixinChannel {
     credentials: ILinkCredentials,
     pollState: PollState,
     message: ILinkMessage
-  ): Promise<{ key: string | null; from: string; contextToken: string } | null> {
+  ): Promise<{ key: string | null; from: string; contextToken: string } | null | false> {
     if (message.message_type !== 1 || message.group_id) return null;
     const from = String(message.from_user_id ?? '').trim();
     if (!from || from !== credentials.ownerUserId) return null;
@@ -639,17 +659,27 @@ export class WeixinChannel {
       contextToken,
       content
     });
-    if (tryChannelCommand(this.db, this.orchestrator, CHANNEL_ID, text, send)) return { key, from, contextToken };
-    if (tryChannelApproval(this.db, this.broker, CHANNEL_ID, text, send)) return { key, from, contextToken };
-    dispatchChannelTask({
+    const pendingAcks: string[] = [];
+    const durable = await dispatchChannelTask({
       db: this.db,
       orchestrator: this.orchestrator,
+      taskPlanner: this.taskPlanner,
       channelId: CHANNEL_ID,
       text,
+      externalIdentity: `${credentials.accountId}:${from}`,
+      externalIdentityDisplayName: from,
+      conversationKey: `direct:${from}`,
       sourceKey: `${credentials.accountId}:${key}`,
-      ack: send,
+      metadata: { accountId: credentials.accountId, messageType: message.message_type ?? null },
+      ingressService: this.ingressService,
+      // A failed canonical dispatch keeps the upstream cursor unchanged and is
+      // retried. Buffer synchronous acknowledgements so that retrying the same
+      // message cannot enqueue an unbounded stream of failure notices.
+      ack: (content) => { pendingAcks.push(content); },
       final: send
     });
+    if (!durable) return false;
+    for (const content of pendingAcks) send(content);
     return { key, from, contextToken };
   }
 
