@@ -7,7 +7,7 @@
  * 覆盖:
  * - SSE 解析:content 增量、tool_calls 分片按 index 合并、usage 提取、心跳帧容错
  * - 工具循环:无 tool_calls 即产出、有 tool_calls 则执行后续轮、轮次上限
- * - 审批门禁四级权限语义(含渠道任务 trusted 降级、专家团 autonomous 提升)
+ * - 审批门禁四级权限语义(含渠道任务 trusted 降级、专家团权限继承)
  * - 就绪判定、错误如实上报(不伪装完成)、中止处理
  *
  * @author liyingjie <y@senke.com>
@@ -416,12 +416,12 @@ describe('审批门禁（四级权限语义）', () => {
     expect(b.request).not.toHaveBeenCalled();
   });
 
-  it('专家团任务:standard 提升为 autonomous,免审批', async () => {
+  it('专家团任务:standard 保留员工权限,写操作仍需审批', async () => {
     writeThenDone();
     const b = broker(true);
     new LlmApiExecutor(makeDb(), b).start(task({ source: 'team' }), agent({ permissionMode: 'standard' }), cb());
     await settle();
-    expect(b.request).not.toHaveBeenCalled();
+    expect(b.request).toHaveBeenCalledWith(expect.objectContaining({ type: 'write_workspace' }));
   });
 
   it('trusted:danger 类工具(删除)仍需审批', async () => {

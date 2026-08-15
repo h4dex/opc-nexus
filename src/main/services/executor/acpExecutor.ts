@@ -440,7 +440,8 @@ export class AcpExecutor implements ExecutorAdapter {
           send({ id, result: opt ? { outcome: { outcome: 'selected', optionId: opt.optionId } } : { outcome: { outcome: 'cancelled' } } });
 
         // ACP rc.6 不携带稳定风险等级，沿用 OPC-Nexus 的统一权限语义。
-        const effectiveMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+        // source=team 是来源标签，不授予额外权限；嵌套任务继承员工策略。
+        const effectiveMode = agent.permissionMode;
         if (effectiveMode === 'readonly') return pick(reject);
         if (effectiveMode === 'autonomous' || (effectiveMode === 'trusted' && task.source !== 'channel')) return pick(allow);
         const approved = await this.broker.request({

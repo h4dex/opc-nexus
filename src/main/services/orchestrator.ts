@@ -60,6 +60,9 @@ export interface CreateTaskOptions {
   content?: string;
   priority?: number;
   initialApprovalRequest?: string;
+  /** Same-agent engine handoff is intentional; ordinary A2A delegation may
+   * never target an employee already present in the ancestor chain. */
+  allowAncestorAgentDelegation?: boolean;
   /** Main-process commit hook. Runs in the task transaction before any Worker starts. */
   onPersisted?: (taskId: string) => void;
 }
@@ -80,6 +83,9 @@ const MAX_TASK_EVENTS_QUERY = 1000;
 const MAX_TASK_RESULT_CHARS = 16_000;
 const OUTPUT_STATE_TTL_MS = 60_000;
 const DISPATCH_PLAN_APPROVAL_TYPE = 'dispatch_plan';
+const ACTIVE_TASK_STATUSES = ['QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED'] as const;
+const TERMINAL_TASK_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'] as const;
+const MAX_DELEGATION_ANCESTRY = 100;
 
 const EXPLICIT_AUTH_FAILURE_PATTERNS = [
   /^(?:error:\s*)?HTTP\s+(?:401|403)\b/i,
@@ -112,6 +118,13 @@ interface TaskOutputState {
   events: number;
   truncated: boolean;
   closed: boolean;
+}
+
+interface CancelledTaskRecord {
+  id: string;
+  agentId: string;
+  title: string;
+  error: string;
 }
 
 export class Orchestrator {
@@ -201,6 +214,7 @@ export class Orchestrator {
     const owner = this.db.raw.prepare(
       'SELECT organization_id, archived FROM agents WHERE id = ?'
     ).get(parent.agent_id) as { organization_id: string | null; archived: number } | undefined;
+    if (!owner || owner.archived !== 0) return null;
     const organizationId = owner?.organization_id?.trim() ?? '';
     return organizationId || null;
   }
@@ -243,7 +257,50 @@ export class Orchestrator {
     return projectId;
   }
 
-  private assertDelegationTarget(parentTaskId: string, targetAgentId: string): void {
+  private assertDelegationTarget(parentTaskId: string, targetAgentId: string, allowCurrentAgent = false): void {
+    const parent = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(parentTaskId) as Row | undefined;
+    if (!parent) throw new Error('父任务不存在，或目标员工不可委派');
+
+    // A task that has already left the live state machine cannot create new
+    // work. This closes the race where cancellation wins after lookup but
+    // before the delegated INSERT transaction.
+    if (!ACTIVE_TASK_STATUSES.includes(parent.status as typeof ACTIVE_TASK_STATUSES[number])) {
+      throw new Error('父任务已经结束，不能继续委派');
+    }
+    // Validate the existing parent chain before accepting another edge. The
+    // normal INSERT path always creates a fresh UUID, but this guard protects
+    // against imported/corrupted rows and makes cycle failures explicit.
+    const seen = new Set<string>();
+    let current: Row | undefined = parent;
+    let depth = 0;
+    while (current) {
+      const currentId = String(current.id ?? '');
+      if (!currentId || seen.has(currentId)) {
+        throw new Error('父任务祖先链存在循环，无法委派');
+      }
+      seen.add(currentId);
+      const isImmediateParent = currentId === parentTaskId;
+      if (current.agent_id === targetAgentId && !(allowCurrentAgent && isImmediateParent)) {
+        throw new Error('委派目标已出现在祖先任务链中，不能形成员工循环委派');
+      }
+      depth += 1;
+      if (depth > MAX_DELEGATION_ANCESTRY) {
+        throw new Error('父任务祖先链过深或存在循环，无法委派');
+      }
+      // parent_id also links independent desktop follow-ups/retries. Only a
+      // consecutive delegated edge represents an active wait relationship.
+      if (current.source !== 'delegated') break;
+      const ancestorId = typeof current.parent_id === 'string' && current.parent_id.length > 0
+        ? current.parent_id
+        : null;
+      if (!ancestorId) break;
+      current = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(ancestorId) as Row | undefined;
+      if (!current) throw new Error('父任务祖先链无效，无法委派');
+    }
+    if (!this.delegationChainIsLive(parent)) {
+      throw new Error('父任务的委派祖先已经结束，不能继续委派');
+    }
+
     const organizationId = this.delegationOrganization(parentTaskId);
     const target = organizationId
       ? this.db.raw.prepare(
@@ -251,6 +308,182 @@ export class Orchestrator {
         ).get(targetAgentId, organizationId) as { id: string } | undefined
       : undefined;
     if (!target) throw new Error('父任务不存在，或目标员工不可委派');
+  }
+
+  /** A delegated task is runnable only while every delegated parent edge
+   * leads to a live task. Desktop follow-ups deliberately terminate the walk. */
+  private delegationChainIsLive(task: Row): boolean {
+    const seen = new Set<string>();
+    let current: Row | undefined = task;
+    while (current?.source === 'delegated') {
+      const currentId = String(current.id ?? '');
+      const parentId = typeof current.parent_id === 'string' && current.parent_id.length > 0
+        ? current.parent_id
+        : null;
+      if (!currentId || !parentId || seen.has(currentId) || seen.has(parentId)) return false;
+      seen.add(currentId);
+      const parent = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(parentId) as Row | undefined;
+      if (!parent || !ACTIVE_TASK_STATUSES.includes(parent.status as typeof ACTIVE_TASK_STATUSES[number])) return false;
+      current = parent;
+    }
+    return true;
+  }
+
+  private queuedDelegations(): { id: string; parent_id: string; agent_id: string }[] {
+    return this.db.raw.prepare(
+      "SELECT id, parent_id, agent_id FROM tasks WHERE source = 'delegated' AND status = 'QUEUED' AND deleted_at IS NULL"
+    ).all() as { id: string; parent_id: string; agent_id: string }[];
+  }
+
+  private activeDelegations(): Row[] {
+    return this.db.raw.prepare(
+      "SELECT * FROM tasks WHERE source = 'delegated' AND status IN ('QUEUED','RUNNING','WAITING_APPROVAL','PAUSED') AND deleted_at IS NULL"
+    ).all() as Row[];
+  }
+
+  /** Find delegated work that must be abandoned when its parent tree is being
+   * interrupted. This includes running/approval/paused children, not only the
+   * queued rows that the FIFO scheduler could otherwise start later. */
+  private recoveryDelegationIds(interruptedIds: ReadonlySet<string>): Set<string> {
+    const result = new Set<string>();
+    for (const child of this.activeDelegations()) {
+      const seen = new Set<string>();
+      let parentId = typeof child.parent_id === 'string' && child.parent_id.length > 0 ? child.parent_id : null;
+      while (parentId) {
+        if (interruptedIds.has(parentId)) {
+          result.add(String(child.id));
+          break;
+        }
+        if (seen.has(parentId)) {
+          result.add(String(child.id));
+          break;
+        }
+        seen.add(parentId);
+        const parent = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(parentId) as Row | undefined;
+        if (!parent || !ACTIVE_TASK_STATUSES.includes(parent.status as typeof ACTIVE_TASK_STATUSES[number])) {
+          result.add(String(child.id));
+          break;
+        }
+        if (parent.source !== 'delegated') break;
+        parentId = typeof parent.parent_id === 'string' && parent.parent_id.length > 0 ? parent.parent_id : null;
+      }
+    }
+    return result;
+  }
+
+  private activeTaskOccupants(): { id: string; agent_id: string; status: TaskStatus }[] {
+    return this.db.raw.prepare(
+      "SELECT id, agent_id, status FROM tasks WHERE status IN ('RUNNING','PAUSED') AND deleted_at IS NULL"
+    ).all() as { id: string; agent_id: string; status: TaskStatus }[];
+  }
+
+  /**
+   * Reject a newly queued delegation only when the wait cycle is a hard
+   * deadlock. An employee-level cycle is not sufficient with concurrency > 1:
+   * another active task may finish and release a slot. Every slot on every
+   * employee in the cycle must be occupied by a task whose queued children all
+   * remain inside that same cycle.
+   */
+  private assertNoDelegationWaitCycle(parentTaskId: string, targetAgentId: string): void {
+    const parent = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(parentTaskId) as Row | undefined;
+    if (!parent) throw new Error('父任务不存在，无法检查委派等待关系');
+    const parentAgentId = String(parent.agent_id ?? '');
+    const graph = new Map<string, Set<string>>();
+    const queuedByParent = new Map<string, Set<string>>();
+    for (const edge of this.queuedDelegations()) {
+      const edgeParent = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(edge.parent_id) as Row | undefined;
+      if (!edgeParent
+        || !ACTIVE_TASK_STATUSES.includes(edgeParent.status as typeof ACTIVE_TASK_STATUSES[number])
+        || !this.delegationChainIsLive(edgeParent)) continue;
+      const from = String(edgeParent.agent_id ?? '');
+      const to = String(edge.agent_id ?? '');
+      if (!from || !to) continue;
+      const outgoing = queuedByParent.get(edge.parent_id) ?? new Set<string>();
+      outgoing.add(to);
+      queuedByParent.set(edge.parent_id, outgoing);
+      const targets = graph.get(from) ?? new Set<string>();
+      targets.add(to);
+      graph.set(from, targets);
+    }
+
+    // The edge being inserted is not visible in queuedDelegations() yet.
+    const pendingOutgoing = queuedByParent.get(parentTaskId) ?? new Set<string>();
+    pendingOutgoing.add(targetAgentId);
+    queuedByParent.set(parentTaskId, pendingOutgoing);
+    const parentTargets = graph.get(parentAgentId) ?? new Set<string>();
+    parentTargets.add(targetAgentId);
+    graph.set(parentAgentId, parentTargets);
+
+    const findPath = (current: string, target: string, visited: Set<string>): string[] | null => {
+      if (current === target) return [current];
+      if (visited.has(current)) return null;
+      visited.add(current);
+      for (const next of graph.get(current) ?? []) {
+        const tail = findPath(next, target, visited);
+        if (tail) return [current, ...tail];
+      }
+      return null;
+    };
+    const cyclePath = findPath(targetAgentId, parentAgentId, new Set<string>());
+    if (!cyclePath) return;
+    const cycleAgents = new Set(cyclePath);
+    const occupants = this.activeTaskOccupants();
+    const occupantsByAgent = new Map<string, typeof occupants>();
+    for (const task of occupants) {
+      const list = occupantsByAgent.get(task.agent_id) ?? [];
+      list.push(task);
+      occupantsByAgent.set(task.agent_id, list);
+    }
+    for (const agentId of cycleAgents) {
+      const agent = this.getAgent(agentId);
+      const limit = Math.max(1, agent?.concurrencyLimit ?? 1);
+      if (this.agentOccupancy(agentId) < limit) return;
+      const blocked = (occupantsByAgent.get(agentId) ?? []).filter((task) => {
+        const targets = queuedByParent.get(task.id);
+        return Boolean(targets && targets.size > 0 && [...targets].every((target) => cycleAgents.has(target)));
+      }).length;
+      if (blocked < limit) return;
+    }
+    throw new Error('委派等待关系会形成员工循环，子任务无法取得执行槽');
+  }
+
+  /**
+   * Check whether a child assigned to an employee can acquire a slot while
+   * its parent is still executing. In particular, coding delegation keeps the
+   * same employee and otherwise self-deadlocks at concurrency=1.
+   */
+  private delegationCapacity(agentId: string, parentTaskId: string): {
+    available: boolean;
+    active: number;
+    limit: number;
+    reason?: string;
+  } {
+    const parent = this.db.raw.prepare('SELECT agent_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL').get(parentTaskId) as
+      { agent_id: string; status: TaskStatus } | undefined;
+    const agent = this.getAgent(agentId);
+    if (!parent) {
+      return { available: false, active: 0, limit: 0, reason: '父任务不存在，无法创建编码委派' };
+    }
+    if (parent.agent_id !== agentId) {
+      return { available: false, active: 0, limit: 0, reason: '编码委派必须保留父任务的员工归属，只能覆盖执行引擎' };
+    }
+    if (!ACTIVE_TASK_STATUSES.includes(parent.status as typeof ACTIVE_TASK_STATUSES[number])) {
+      return { available: false, active: 0, limit: 0, reason: '父任务已经结束，不能创建编码委派' };
+    }
+    if (!agent || agent.archived || agent.lifecycle !== 'READY') {
+      return { available: false, active: 0, limit: 0, reason: '父任务员工当前不可用，无法创建编码委派' };
+    }
+    const limit = Math.max(1, agent.concurrencyLimit);
+    const active = this.agentOccupancy(agentId);
+    if (active >= limit) {
+      return {
+        available: false,
+        active,
+        limit,
+        reason: `当前员工「${agent.name}」并发槽已占满（${active}/${limit}），编码委派会等待父任务释放自身槽位而自锁；请提高并发上限，或改用 delegate_task 委派给其他员工`
+      };
+    }
+    return { available: true, active, limit };
   }
 
   /** delegate_task 工具的编排能力（P3b A2A 内部委派） */
@@ -267,33 +500,39 @@ export class Orchestrator {
       },
       createDelegatedTask: (agentId, title, parentTaskId) => this.createTask(agentId, title, 'delegated', { parentId: parentTaskId }),
       // E-2 编码委派：员工归属不变，仅把执行引擎覆盖为编码引擎
-      createEngineDelegatedTask: (agentId, title, parentTaskId, engineId) =>
-        this.createTask(agentId, title, 'delegated', { parentId: parentTaskId, engineOverride: engineId }),
+      createEngineDelegatedTask: (agentId, title, parentTaskId, engineId) => {
+        const capacity = this.delegationCapacity(agentId, parentTaskId);
+        if (!capacity.available) throw new Error(capacity.reason ?? '当前无法创建编码委派');
+        // codingEngineReady is a UI/tool-registration hint; the durable
+        // creation boundary must recheck because engine state can change
+        // between discovery and invocation.
+        const engine = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(engineId) as { status: string } | undefined;
+        if (engine?.status !== 'HEALTHY') throw new Error('编码委派目标引擎不存在或当前不可用');
+        return this.createTask(agentId, title, 'delegated', {
+          parentId: parentTaskId,
+          engineOverride: engineId,
+          allowAncestorAgentDelegation: true
+        });
+      },
+      delegationCapacity: (agentId, parentTaskId) => this.delegationCapacity(agentId, parentTaskId),
       codingEngineReady: () => {
         const engineId = 'eng-opencode';
         const row = this.db.raw.prepare('SELECT name, status FROM engines WHERE id = ?').get(engineId) as { name: string; status: string } | undefined;
         return { ready: row?.status === 'HEALTHY', engineId, name: row?.name ?? 'OpenCode' };
       },
-      waitForTask: (taskId, timeoutMs) =>
-        new Promise((resolve) => {
-          const started = Date.now();
-          const check = () => {
-            const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
-            if (!row) return resolve(null);
-            const t = this.mapTask(row);
-            if (['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(t.status)) return resolve(t);
-            if (Date.now() - started >= timeoutMs) return resolve(null);
-            setTimeout(check, 2000);
-          };
-          check();
-        }),
+      cancelTask: (taskId, reason) => this.cancelTask(taskId, reason),
+      waitForTask: (taskId, timeoutMs, parentTaskId) => this.waitForTask(taskId, timeoutMs, parentTaskId),
       delegationDepth: (taskId) => {
         let depth = 0;
         let cur: string | null = taskId;
-        while (cur && depth < 10) {
-          const r = this.db.raw.prepare('SELECT parent_id FROM tasks WHERE id = ?').get(cur) as { parent_id: string | null } | undefined;
-          if (!r?.parent_id) break;
+        const seen = new Set<string>();
+        while (cur) {
+          if (seen.has(cur)) throw new Error('父任务祖先链存在循环，无法委派');
+          seen.add(cur);
+          const r = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(cur) as Row | undefined;
+          if (!r || r.source !== 'delegated' || typeof r.parent_id !== 'string' || !r.parent_id) break;
           depth++;
+          if (depth > MAX_DELEGATION_ANCESTRY) throw new Error('父任务祖先链过深或存在循环，无法委派');
           cur = r.parent_id;
         }
         return depth;
@@ -339,38 +578,65 @@ export class Orchestrator {
   /** 崩溃恢复：保留尚未执行的计划审批；其余无主运行态中断并关闭运行时审批。 */
   recoverAfterRestart() {
     const active = this.db.raw.prepare("SELECT id, status FROM tasks WHERE status IN ('RUNNING','WAITING_APPROVAL','PAUSED')").all() as { id: string; status: TaskStatus }[];
-    if (active.length === 0) return;
-    const pendingApprovals = this.db.raw.prepare("SELECT * FROM approvals WHERE status = 'pending'").all() as Row[];
+    const pendingApprovals = active.length > 0
+      ? this.db.raw.prepare("SELECT * FROM approvals WHERE status = 'pending'").all() as Row[]
+      : [];
     const durablePlanTasks = new Set(
       pendingApprovals
         .filter((approval) => approvalScope(approval.type) === 'dispatch_plan')
         .map((approval) => approval.task_id as string)
     );
-    const interrupted = active.filter((task) => task.status !== 'WAITING_APPROVAL' || !durablePlanTasks.has(task.id));
-    if (interrupted.length === 0) return;
-    this.db.transaction(() => {
-      const now = Date.now();
-      for (const t of interrupted) {
-        this.db.raw.prepare("UPDATE tasks SET status = 'INTERRUPTED', ended_at = ?, error = '客户端异常退出，任务中断' WHERE id = ?").run(now, t.id);
-        this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'INTERRUPTED' WHERE task_id = ? AND ended_at IS NULL").run(now, t.id);
-        // Mobile leases live in SQLite, while the gateway's in-memory token
-        // map cannot survive a process restart. Close the lease together with
-        // the interrupted task so a reconnect is not blocked by stale state.
-        this.db.raw.prepare(
-          "UPDATE mobile_control_sessions SET status = 'disconnected', ended_at = COALESCE(ended_at, ?) WHERE task_id = ? AND status = 'active'"
-        ).run(now, t.id);
-        this.recordEvent(t.id, 'interrupted', { reason: 'app-restart' }, now);
-        for (const approval of pendingApprovals.filter((item) => item.task_id === t.id)) {
-          this.db.raw.prepare("UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'").run('rejected', now, approval.id as string);
-          this.recordEvent(t.id, 'approval_decided', {
-            approvalId: approval.id,
-            scope: approvalScope(approval.type),
-            approved: false,
-            reason: 'runtime_interrupted_on_restart'
-          }, now);
+    const interruptedCandidates = active.filter((task) => task.status !== 'WAITING_APPROVAL' || !durablePlanTasks.has(task.id));
+    const recoveryDelegationIds = this.recoveryDelegationIds(new Set(interruptedCandidates.map((task) => task.id)));
+    // Delegated descendants are abandoned as CANCELLED. A delegated row may
+    // itself appear in the active scan; remove it from the INTERRUPTED set so
+    // one task receives one terminal transition and one finish notification.
+    const interrupted = interruptedCandidates.filter((task) => !recoveryDelegationIds.has(task.id));
+    const now = Date.now();
+    const cancelled: CancelledTaskRecord[] = [];
+    if (interrupted.length > 0 || recoveryDelegationIds.size > 0) {
+      this.db.transaction(() => {
+        for (const t of interrupted) {
+          this.db.raw.prepare("UPDATE tasks SET status = 'INTERRUPTED', ended_at = ?, error = '客户端异常退出，任务中断' WHERE id = ?").run(now, t.id);
+          this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'INTERRUPTED' WHERE task_id = ? AND ended_at IS NULL").run(now, t.id);
+          // Mobile leases live in SQLite, while the gateway's in-memory token
+          // map cannot survive a process restart. Close the lease together with
+          // the interrupted task so a reconnect is not blocked by stale state.
+          this.db.raw.prepare(
+            "UPDATE mobile_control_sessions SET status = 'disconnected', ended_at = COALESCE(ended_at, ?) WHERE task_id = ? AND status = 'active'"
+          ).run(now, t.id);
+          this.recordEvent(t.id, 'interrupted', { reason: 'app-restart' }, now);
+          for (const approval of pendingApprovals.filter((item) => item.task_id === t.id)) {
+            this.db.raw.prepare("UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'").run('rejected', now, approval.id as string);
+            this.recordEvent(t.id, 'approval_decided', {
+              approvalId: approval.id,
+              scope: approvalScope(approval.type),
+              approved: false,
+              reason: 'runtime_interrupted_on_restart'
+            }, now);
+          }
         }
-      }
-    });
+        for (const taskId of recoveryDelegationIds) {
+          const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as Row | undefined;
+          if (!row || !ACTIVE_TASK_STATUSES.includes(row.status as typeof ACTIVE_TASK_STATUSES[number])) continue;
+          const error = '上级委派在应用重启前已结束，委派已取消';
+          if (!this.cancelTaskInternal(taskId, now, error)) continue;
+          this.db.raw.prepare(
+            "UPDATE mobile_control_sessions SET status = 'disconnected', ended_at = COALESCE(ended_at, ?) WHERE task_id = ? AND status = 'active'"
+          ).run(now, taskId);
+          cancelled.push({
+            id: taskId,
+            agentId: String(row.agent_id),
+            title: String(row.title ?? taskId),
+            error
+          });
+        }
+      });
+      this.releaseCancelledTasks(cancelled);
+    }
+
+    if (interrupted.length === 0 && cancelled.length === 0) return;
+    this.notifyCancelledTasks(cancelled);
     for (const task of interrupted) {
       const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Row | undefined;
       if (!row) continue;
@@ -387,7 +653,13 @@ export class Orchestrator {
         } catch { /* 通知失败不影响恢复 */ }
       }
     }
-    this.db.audit({ id: randomUUID(), actor: 'system', action: 'recovery.markInterrupted', target: `${interrupted.length} tasks`, result: 'ok' });
+    if (interrupted.length > 0) {
+      this.db.audit({ id: randomUUID(), actor: 'system', action: 'recovery.markInterrupted', target: `${interrupted.length} tasks`, result: 'ok' });
+    }
+    if (cancelled.length > 0) {
+      this.db.audit({ id: randomUUID(), actor: 'system', action: 'recovery.cancelOrphanedDelegations', target: `${cancelled.length} tasks`, result: 'ok' });
+    }
+    this.emit();
   }
 
   /** 执行调度器：接管数据库中 RUNNING 但无执行器在跑的任务（种子/重启恢复），
@@ -932,28 +1204,27 @@ export class Orchestrator {
 
   stopAgent(id: string) {
     const now = Date.now();
-    let cancelled: { id: string }[] = [];
-    this.db.transaction(() => {
-      this.db.raw.prepare("UPDATE agents SET lifecycle = 'DISABLED', updated_at = ? WHERE id = ?").run(now, id);
-      const active = this.db.raw.prepare("SELECT id FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','QUEUED','PAUSED','WAITING_APPROVAL')").all(id) as { id: string }[];
-      cancelled = active;
-      for (const t of active) {
-        this.resumeAfterRelease.delete(t.id);
-        this.broker.abandonTask(t.id);
-        this.executors.abort(t.id);
-        this.cancelTaskInternal(t.id, now);
-      }
-    });
-    for (const task of cancelled) {
-      const row = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(task.id) as { title: string } | undefined;
-      for (const fn of this.finishListeners) {
-        try {
-          fn({ taskId: task.id, agentId: id, status: 'CANCELLED', title: row?.title ?? task.id, result: null, error: '数字员工已停止' });
-        } catch { /* 通知失败不影响状态转换 */ }
-      }
+    const active = this.db.raw.prepare("SELECT id FROM tasks WHERE agent_id = ? AND status IN ('RUNNING','QUEUED','PAUSED','WAITING_APPROVAL')").all(id) as { id: string }[];
+    const taskIds = new Set<string>();
+    for (const task of active) {
+      for (const descendant of this.collectTaskTree(task.id)) taskIds.add(descendant);
     }
+    const cancelled = this.cancelTaskSet(
+      [...taskIds],
+      now,
+      '数字员工已停止',
+      '父任务因员工停止而取消',
+      new Set(active.map((task) => task.id)),
+      () => {
+        this.db.raw.prepare("UPDATE agents SET lifecycle = 'DISABLED', updated_at = ? WHERE id = ?").run(now, id);
+      }
+    );
+    this.notifyCancelledTasks(cancelled);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'agent.stop', target: id, result: 'ok' });
     this.emit();
+    for (const agentId of new Set(cancelled.map((task) => task.agentId))) {
+      if (agentId !== id) this.scheduleNext(agentId);
+    }
   }
 
   /** 创建任务：该员工无活跃任务且未超并发 → 立即经执行器派发；否则进入 QUEUED 等待 FIFO 调度。
@@ -974,7 +1245,7 @@ export class Orchestrator {
     const approvalRequest = opts.initialApprovalRequest?.trim() || null;
     if (source === 'delegated') {
       if (!opts.parentId) throw new Error('委派任务必须关联父任务');
-      this.assertDelegationTarget(opts.parentId, agentId);
+      this.assertDelegationTarget(opts.parentId, agentId, Boolean(opts.allowAncestorAgentDelegation));
     }
     if (sourceKey) {
       const existing = this.db.raw.prepare('SELECT * FROM tasks WHERE source = ? AND source_key = ?').get(source, sourceKey) as Row | undefined;
@@ -1008,13 +1279,17 @@ export class Orchestrator {
     const queuedStage = guardReason ?? mobileState?.reason ?? '排队中';
     const initialStatus = approvalRequest ? 'WAITING_APPROVAL' : canRun ? 'RUNNING' : 'QUEUED';
     const initialStage = approvalRequest ? '等待审批' : canRun ? STAGES[0] : queuedStage;
+    if (source === 'delegated' && !canRun) this.assertNoDelegationWaitCycle(opts.parentId!, agentId);
     let inserted = false;
     this.db.transaction(() => {
       const transactionProjectId = this.resolveTaskProject(agentId, opts.parentId, opts.projectId);
       if (transactionProjectId !== projectId) throw new Error('父任务或项目关联已发生变化');
       // Lookup and commit are separate calls. Recheck under the write
       // transaction so an archived/moved target cannot cross the tenant gate.
-      if (source === 'delegated') this.assertDelegationTarget(opts.parentId!, agentId);
+      if (source === 'delegated') {
+        this.assertDelegationTarget(opts.parentId!, agentId, Boolean(opts.allowAncestorAgentDelegation));
+        if (!canRun) this.assertNoDelegationWaitCycle(opts.parentId!, agentId);
+      }
       inserted = this.db.raw.prepare(
         `INSERT INTO tasks(
           id, agent_id, project_id, conversation_id, input_message_id, title, content,
@@ -1131,17 +1406,43 @@ export class Orchestrator {
     return task;
   }
 
-  /** 等待任务到达终态（供团队流水线等编排逻辑轮询；超时返回 null）。轮询间隔指数退避 500ms→4s，降低并行任务时的 DB 压力 */
-  waitForTask(taskId: string, timeoutMs: number): Promise<Task | null> {
+  /**
+   * 等待任务到达终态（供团队流水线和委派工具使用；超时返回 null）。
+   * 传入 parentTaskId 时，父任务进入终态/消失会先取消子任务，避免
+   * 委派工具被中止后留下无人回收的 QUEUED/RUNNING 任务。
+   */
+  waitForTask(taskId: string, timeoutMs: number, parentTaskId?: string): Promise<Task | null> {
     return new Promise((resolve) => {
       const started = Date.now();
       let delay = 500;
+      let settled = false;
+      const finish = (value: Task | null) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
       const check = () => {
+        if (settled) return;
         const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
-        if (!row) return resolve(null);
+        if (!row) return finish(null);
         const t = this.mapTask(row);
-        if (['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(t.status)) return resolve(t);
-        if (Date.now() - started >= timeoutMs) return resolve(null);
+        if (TERMINAL_TASK_STATUSES.includes(t.status as typeof TERMINAL_TASK_STATUSES[number])) return finish(t);
+
+        if (parentTaskId) {
+          const parent = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(parentTaskId) as Row | undefined;
+          const parentLive = parent
+            ? !TERMINAL_TASK_STATUSES.includes(parent.status as typeof TERMINAL_TASK_STATUSES[number])
+            : false;
+          if (!parentLive) {
+            // cancelTask is idempotent with respect to a child that completed
+            // between the read above and this call.
+            try { this.cancelTask(taskId, '父任务已结束'); } catch { /* child may have completed concurrently */ }
+            const canceled = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
+            return finish(canceled ? this.mapTask(canceled) : null);
+          }
+        }
+
+        if (Date.now() - started >= timeoutMs) return finish(null);
         delay = Math.min(delay * 1.5, 4000);
         setTimeout(check, delay);
       };
@@ -1155,7 +1456,8 @@ export class Orchestrator {
     if (!row) throw new Error('原任务不存在');
     const parent = this.mapTask(row);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.followUp', target: parentTaskId, result: 'ok' });
-    return this.createTask(parent.agentId, title, parent.source === 'schedule' ? 'desktop' : parent.source, {
+    const source = parent.source === 'schedule' || parent.source === 'delegated' ? 'desktop' : parent.source;
+    return this.createTask(parent.agentId, title, source, {
       parentId: parent.id,
       sessionId: parent.sessionId ?? undefined,
       conversationId: parent.conversationId ?? undefined,
@@ -1169,7 +1471,8 @@ export class Orchestrator {
     if (!row) throw new Error('原任务不存在或已删除');
     const original = this.mapTask(row);
     if (!['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(original.status)) throw new Error('任务尚未结束，不能重试');
-    const retried = this.createTask(original.agentId, original.title, original.source === 'schedule' ? 'desktop' : original.source, {
+    const source = original.source === 'schedule' || original.source === 'delegated' ? 'desktop' : original.source;
+    const retried = this.createTask(original.agentId, original.title, source, {
       parentId: original.id,
       projectId: original.projectId ?? undefined,
       conversationId: original.conversationId ?? undefined,
@@ -1428,19 +1731,42 @@ export class Orchestrator {
     if (agent.kind === 'android_operator' && !this.mobileDispatchPolicy?.canDispatch(agentId).ready) return;
     const active = this.agentOccupancy(agentId);
     if (active >= Math.max(1, agent.concurrencyLimit)) return;
-    const row = this.db.raw.prepare("SELECT * FROM tasks WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at LIMIT 1").get(agentId) as Row | undefined;
-    if (!row) return;
-    const now = Date.now();
-    this.db.transaction(() => {
-      this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', stage = ?, started_at = ? WHERE id = ?").run(STAGES[0], now, row.id as string);
-      this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
-        .run(randomUUID(), agentId, row.id as string, process.pid, randomUUID(), 'RUNNING', now);
-      this.recordEvent(row.id as string, 'started', {}, now);
-    });
-    const task = this.mapTask(row);
-    task.status = 'RUNNING';
-    this.dispatchTask(task, agent);
-    this.emit();
+    let prunedOrphan = false;
+    while (true) {
+      const row = this.db.raw.prepare("SELECT * FROM tasks WHERE agent_id = ? AND status = 'QUEUED' ORDER BY created_at LIMIT 1").get(agentId) as Row | undefined;
+      if (!row) {
+        if (prunedOrphan) this.emit();
+        return;
+      }
+      if (row.source === 'delegated' && !this.delegationChainIsLive(row)) {
+        const cancelled = this.cancelTaskSet(
+          this.collectTaskTree(String(row.id)),
+          Date.now(),
+          '父任务已经结束，排队中的委派已取消',
+          '上级委派已经结束'
+        );
+        if (cancelled.length === 0) return;
+        prunedOrphan = true;
+        this.notifyCancelledTasks(cancelled);
+        this.db.audit({ id: randomUUID(), actor: 'system', action: 'task.cancelOrphanedDelegation', target: String(row.id), result: 'ok' });
+        for (const affectedAgentId of new Set(cancelled.map((task) => task.agentId))) {
+          if (affectedAgentId !== agentId) this.scheduleNext(affectedAgentId);
+        }
+        continue;
+      }
+      const now = Date.now();
+      this.db.transaction(() => {
+        this.db.raw.prepare("UPDATE tasks SET status = 'RUNNING', stage = ?, started_at = ? WHERE id = ?").run(STAGES[0], now, row.id as string);
+        this.db.raw.prepare('INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)')
+          .run(randomUUID(), agentId, row.id as string, process.pid, randomUUID(), 'RUNNING', now);
+        this.recordEvent(row.id as string, 'started', {}, now);
+      });
+      const task = this.mapTask(row);
+      task.status = 'RUNNING';
+      this.dispatchTask(task, agent);
+      this.emit();
+      return;
+    }
   }
 
   /** 设备上线或控制租约释放后，唤醒对应手机员工的 FIFO 队列。 */
@@ -1448,30 +1774,121 @@ export class Orchestrator {
     this.scheduleNext(agentId);
   }
 
-  private cancelTaskInternal(taskId: string, now: number) {
-    this.resumeAfterRelease.delete(taskId);
-    this.closeOutputState(taskId);
-    this.db.raw.prepare("UPDATE tasks SET status = 'CANCELLED', ended_at = ? WHERE id = ? AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')").run(now, taskId);
-    this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'CANCELLED' WHERE task_id = ? AND ended_at IS NULL").run(now, taskId);
-    this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE task_id = ? AND status = 'pending'").run(now, taskId);
+  /** Return the root task and delegated descendants, cycle-safe. parent_id is
+   * also used by follow-ups/retries, which are independent executions and
+   * must not be cancelled as delegation children. */
+  private collectTaskTree(rootTaskId: string): string[] {
+    const queue = [rootTaskId];
+    const seen = new Set<string>();
+    const result: string[] = [];
+    while (queue.length > 0) {
+      const parentId = queue.shift()!;
+      if (seen.has(parentId)) continue;
+      seen.add(parentId);
+      result.push(parentId);
+      const children = this.db.raw.prepare(
+        "SELECT id FROM tasks WHERE parent_id = ? AND deleted_at IS NULL AND source = 'delegated'"
+      ).all(parentId) as { id: string }[];
+      for (const child of children) {
+        if (child?.id && !seen.has(child.id)) queue.push(child.id);
+      }
+    }
+    return result;
   }
 
-  cancelTask(taskId: string) {
+  /**
+   * Mark a single live task cancelled. The guarded UPDATE is deliberately the
+   * first state transition; executor aborts happen only after the whole set is
+   * durable, so synchronous onError/onDone callbacks cannot win the race.
+   */
+  private cancelTaskInternal(taskId: string, now: number, reason: string): boolean {
+    const changed = this.db.raw.prepare(
+      "UPDATE tasks SET status = 'CANCELLED', ended_at = ? WHERE id = ? AND status IN ('RUNNING','QUEUED','WAITING_APPROVAL','PAUSED')"
+    ).run(now, taskId).changes > 0;
+    if (!changed) return false;
+    this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'CANCELLED' WHERE task_id = ? AND ended_at IS NULL").run(now, taskId);
+    this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE task_id = ? AND status = 'pending'").run(now, taskId);
+    this.recordEvent(taskId, 'cancelled', { reason }, now);
+    return true;
+  }
+
+  private releaseCancelledTasks(cancelled: CancelledTaskRecord[]): void {
+    for (const task of cancelled) {
+      this.resumeAfterRelease.delete(task.id);
+      this.closeOutputState(task.id);
+      try { this.broker.abandonTask(task.id); } catch { /* best effort */ }
+      try { this.executors.abort(task.id); } catch { /* best effort */ }
+    }
+  }
+
+  /**
+   * Cancel a set of tasks atomically, then release broker/executor resources.
+   * The caller supplies root/descendant messages for finish subscribers.
+   */
+  private cancelTaskSet(
+    taskIds: string[],
+    now: number,
+    rootReason: string,
+    descendantReason: string,
+    rootTaskIds = new Set(taskIds.slice(0, 1)),
+    beforePersist?: () => void
+  ): CancelledTaskRecord[] {
+    const cancelled: CancelledTaskRecord[] = [];
+    this.db.transaction(() => {
+      beforePersist?.();
+      for (const taskId of taskIds) {
+        const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as Row | undefined;
+        if (!row || !ACTIVE_TASK_STATUSES.includes(row.status as typeof ACTIVE_TASK_STATUSES[number])) continue;
+        const error = rootTaskIds.has(taskId) ? rootReason : descendantReason;
+        if (!this.cancelTaskInternal(taskId, now, error)) continue;
+        cancelled.push({
+          id: taskId,
+          agentId: String(row.agent_id),
+          title: String(row.title ?? taskId),
+          error
+        });
+      }
+    });
+
+    // State is already terminal before either callback-capable resource is
+    // touched. A failing abort must not prevent the rest of the tree from
+    // being released.
+    this.releaseCancelledTasks(cancelled);
+    return cancelled;
+  }
+
+  private notifyCancelledTasks(cancelled: CancelledTaskRecord[]): void {
+    for (const task of cancelled) {
+      for (const fn of this.finishListeners) {
+        try {
+          fn({ taskId: task.id, agentId: task.agentId, status: 'CANCELLED', title: task.title, result: null, error: task.error });
+        } catch { /* notification failure must not alter state */ }
+      }
+    }
+  }
+
+  /** Cancel a task and all active descendants; public API remains one-arg compatible. */
+  cancelTask(taskId: string, reason = '用户取消任务') {
     const task = this.db.raw.prepare('SELECT agent_id, status FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as { agent_id: string; status: TaskStatus } | undefined;
     if (!task) throw new Error('任务不存在或已删除');
-    if (!['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'].includes(task.status)) throw new Error('任务已经结束，不能取消');
-    this.broker.abandonTask(taskId);
-    this.executors.abort(taskId);
-    this.cancelTaskInternal(taskId, Date.now());
-    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.cancel', target: taskId, result: 'ok' });
-    const detail = this.db.raw.prepare('SELECT title FROM tasks WHERE id = ?').get(taskId) as { title: string } | undefined;
-    for (const fn of this.finishListeners) {
-      try {
-        fn({ taskId, agentId: task.agent_id, status: 'CANCELLED', title: detail?.title ?? taskId, result: null, error: '用户取消任务' });
-      } catch { /* 通知失败不影响状态转换 */ }
+    if (!ACTIVE_TASK_STATUSES.includes(task.status as typeof ACTIVE_TASK_STATUSES[number])) throw new Error('任务已经结束，不能取消');
+
+    const cancelled = this.cancelTaskSet(this.collectTaskTree(taskId), Date.now(), reason, '父任务已取消');
+    const rootCancelled = cancelled.some((item) => item.id === taskId);
+    if (!rootCancelled) {
+      // Another terminal transition won between the initial read and our
+      // guarded UPDATE. Preserve the existing API error instead of emitting a
+      // duplicate cancellation event.
+      const latest = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as Row | undefined;
+      if (!latest) throw new Error('任务不存在或已删除');
+      if (!ACTIVE_TASK_STATUSES.includes(latest.status as typeof ACTIVE_TASK_STATUSES[number])) throw new Error('任务已经结束，不能取消');
+      return;
     }
+
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.cancel', target: taskId, result: 'ok' });
+    this.notifyCancelledTasks(cancelled);
     this.emit();
-    this.scheduleNext(task.agent_id);
+    for (const agentId of new Set(cancelled.map((item) => item.agentId))) this.scheduleNext(agentId);
   }
 
   pauseTask(taskId: string) {

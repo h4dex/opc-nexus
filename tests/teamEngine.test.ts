@@ -145,6 +145,39 @@ describe('TeamEngine 纯函数', () => {
   });
 });
 
+describe('TeamEngine 团队配置边界', () => {
+  function configHarness(configJson?: string) {
+    let stored: string | undefined = configJson;
+    const db = {
+      raw: {
+        prepare: (sql: string) => ({
+          get: () => sql.startsWith('SELECT config_json') ? { config_json: stored } : undefined,
+          all: () => [],
+          run: (value: string) => {
+            if (sql.startsWith('UPDATE teams SET config_json')) stored = value;
+            return { changes: 1 };
+          }
+        })
+      }
+    };
+    return {
+      engine: new TeamEngine(db as never, createMockOrchestrator() as never),
+      stored: () => stored
+    };
+  }
+
+  it('读取旧数据时把超时、重试和并发归一化到服务边界', () => {
+    const { engine } = configHarness(JSON.stringify({ timeout: 2, maxRetries: 99, concurrency: 0 }));
+    expect(engine.getConfig('team-1')).toEqual({ timeout: 60, maxRetries: 5, concurrency: 1 });
+  });
+
+  it('保存时拒绝非有限值并限制整数范围', () => {
+    const { engine, stored } = configHarness();
+    engine.saveConfig('team-1', { timeout: Number.POSITIVE_INFINITY, maxRetries: -3.2, concurrency: 8.9 });
+    expect(JSON.parse(stored()!)).toEqual({ timeout: 600, maxRetries: 0, concurrency: 5 });
+  });
+});
+
 describe('TeamEngine 执行干预控制流', () => {
   let db: ReturnType<typeof createMockDb>;
   let orch: ReturnType<typeof createMockOrchestrator>;
@@ -235,6 +268,67 @@ describe('TeamEngine 执行干预控制流', () => {
       const id = seedTeamRun(db, { phase: 'done' });
       expect(engine.injectGuidance(id, '指导').ok).toBe(false);
     });
+  });
+
+  it('按 config.concurrency 限制同一轮实际运行的子任务数量', async () => {
+    const runId = seedTeamRun(db, { team_id: 'team-test', phase: 'execute', subtasks_json: '[]' });
+    const team = { id: 'team-test', name: '测试团队', coordinatorId: 'coord', memberIds: ['a1', 'a2', 'a3', 'a4'], mode: 'coordinate', workspace: '/tmp/team', createdAt: 1 };
+    const coordinator = { id: 'coord', name: '主理人', role: '协调' };
+    const teamMembers = [
+      { id: 'a1', name: '成员1', role: '一' },
+      { id: 'a2', name: '成员2', role: '二' },
+      { id: 'a3', name: '成员3', role: '三' },
+      { id: 'a4', name: '成员4', role: '四' }
+    ];
+    let active = 0;
+    let maxActive = 0;
+    let taskCounter = 0;
+    orch.createTask.mockImplementation((agentId: string) => ({ id: `child-${++taskCounter}`, agentId }));
+    orch.waitForTask.mockImplementation(async (taskId: string) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active--;
+      return { id: taskId, status: 'COMPLETED' };
+    });
+    orch.taskResult.mockImplementation((taskId: string) => `result-${taskId}`);
+    engine.buildMemberPrompt = vi.fn().mockReturnValue('child prompt');
+    engine.coordinatorDecide = vi.fn().mockResolvedValue({ action: 'finish', conclusion: 'done', newTasks: [] });
+
+    const subtasks = teamMembers.map((member) => ({
+      agent: member.name, agentId: member.id, subtask: `work-${member.id}`, taskId: null, status: 'pending'
+    }));
+    const result = await engine.executeRounds(
+      runId, team, coordinator, teamMembers, 'parent task', '/tmp/team', subtasks,
+      { timeout: 1, maxRetries: 1, concurrency: 2 }, 1, [], 0
+    );
+
+    expect(result).toBe('done');
+    expect(maxActive).toBe(2);
+    expect(orch.createTask).toHaveBeenCalledTimes(4);
+    expect(subtasks.every((subtask) => subtask.status === 'done')).toBe(true);
+  });
+
+  it('团队子任务超时会回收底层任务，避免继续占用执行槽', async () => {
+    const runId = seedTeamRun(db, { team_id: 'team-test', phase: 'execute', subtasks_json: '[]' });
+    const team = { id: 'team-test', name: '测试团队', coordinatorId: 'coord', memberIds: ['a1'], mode: 'coordinate', workspace: '/tmp/team', createdAt: 1 };
+    const coordinator = { id: 'coord', name: '主理人', role: '协调' };
+    const member = { id: 'a1', name: '成员1', role: '执行' };
+    const orchestrator = createMockOrchestrator();
+    orchestrator.createTask.mockReturnValue({ id: 'child-timeout', agentId: 'a1' });
+    orchestrator.waitForTask.mockResolvedValue(null);
+    engine = new TeamEngine(db as never, orchestrator as never);
+    engine.buildMemberPrompt = vi.fn().mockReturnValue('child prompt');
+    engine.coordinatorDecide = vi.fn().mockResolvedValue({ action: 'finish', conclusion: 'done', newTasks: [] });
+
+    const subtasks = [{ agent: member.name, agentId: member.id, subtask: '超时工作', taskId: null, status: 'pending' }];
+    await engine.executeRounds(
+      runId, team, coordinator, [member], 'parent task', '/tmp/team', subtasks,
+      { timeout: 1, maxRetries: 1, concurrency: 1 }, 1, [], 0
+    );
+
+    expect(orchestrator.cancelTask).toHaveBeenCalledWith('child-timeout', '团队子任务超时');
+    expect(subtasks[0].status).toBe('failed');
   });
 });
 

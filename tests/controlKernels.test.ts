@@ -261,6 +261,23 @@ describe('HermesControlKernel', () => {
     expect(health.reportAuthenticationFailure).not.toHaveBeenCalled();
   });
 
+  it('does not misclassify local profile failures when the reporter has no runtime callback', async () => {
+    const profiles = {
+      ensureController: vi.fn(() => { throw new Error('ENOSPC: no space left while writing config.yaml'); })
+    };
+    const health = { reportAuthenticationFailure: vi.fn() };
+    const kernel = new HermesControlKernel(
+      statusDb({ 'eng-hermes-cli': 'HEALTHY' }) as never,
+      profiles as never,
+      undefined,
+      vi.fn() as never,
+      health
+    );
+
+    await expect(kernel.plan(request(), [])).rejects.toThrow('ENOSPC');
+    expect(health.reportAuthenticationFailure).not.toHaveBeenCalled();
+  });
+
   it('clears a stale native session and retries exactly once with a fresh one-shot request', async () => {
     const home = 'C:/opc/controller';
     const profiles = { ensureController: () => ({

@@ -240,9 +240,9 @@ export class CliExecutor implements ExecutorAdapter {
     model?: string,
     managedProvider: ResolvedProvider | null = null
   ): { bin: string; args: string[] } {
-    // P1a 静态限权：permissionMode → CLI 沙箱/权限参数；渠道来源任务 trusted 降级为 standard（10.5），autonomous 不降级
-    // 专家团任务（source='team'）默认完全自主（autonomous），无需人工审批
-    const baseMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    // P1a 静态限权：permissionMode → CLI 沙箱/权限参数；任务来源只用于
+    // 渠道安全降级，不得把 team/nested 任务提升为 autonomous。
+    const baseMode = agent.permissionMode;
     const mode = task.source === 'channel' && baseMode === 'trusted' ? 'standard' : baseMode;
     if (this.kind === 'codex-cli') {
       // codex exec --json：非交互执行，stdout 输出 JSONL 事件流；有 session 则 resume 续跑（P2b）

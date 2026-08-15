@@ -20,7 +20,7 @@
 
 | 组件 | 当前版本 | 说明 |
 |------|----------|------|
-| OPC-Nexus 桌面端 | `1.8.0` | Windows / Linux Agent 管理与手机控制中心 |
+| OPC-Nexus 桌面端 | `1.8.1` | Windows / Linux Agent 管理与手机控制中心 |
 | OPC-Nexus 手机桥 | `0.4.3` | Android 8.0+、无需 Root，重点验证 API 34 |
 
 桌面端与手机桥独立维护版本号。每次功能变更验证通过后递增受影响组件的版本；用户指定版本时以指定版本为准。
@@ -60,10 +60,11 @@
 ![OPC-Nexus 手机控制台](./docs/screenshots/mobile-console.png)
 
 ### 任务编排与执行
-- 队列调度、优先级管理、并发控制
+- 队列调度、优先级管理、有限 Worker 池与嵌套委派环路保护
 - 人工审批流程（WAITING_APPROVAL 状态）
 - 任务中断 / 恢复 / 取消
 - 多执行器：LLM API / CLI / ACP 协议 / 模拟执行
+- OPC Orchestrator 统一持有任务、审批、长期记忆和状态；DSH 作为受限 ACP Worker/Advisor，Hermes 负责 Android 手机任务
 
 ### 专家团协作
 - 主 Agent 全局调度循环

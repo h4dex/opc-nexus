@@ -246,7 +246,8 @@ export function Tasks() {
 const EVENT_LABEL: Record<string, string> = {
   queued: '进入队列', started: '开始执行', stage: '阶段切换', progress: '进度更新',
   tool_call: '工具调用', tool_result: '工具结果', approval_required: '等待审批',
-  result: '产出结果', completed: '执行完成', failed: '执行失败', interrupted: '执行中断'
+  result: '产出结果', completed: '执行完成', failed: '执行失败', interrupted: '执行中断',
+  cancelled: '执行取消'
 };
 
 /** 事件行的补充描述（工具名/参数/错误等） */
@@ -259,6 +260,7 @@ function eventDetail(e: TaskEvent): string {
     case 'approval_required': return String(p.request ?? '').slice(0, 100);
     case 'failed':
     case 'interrupted': return String(p.error ?? '');
+    case 'cancelled': return String(p.reason ?? '');
     default: return '';
   }
 }

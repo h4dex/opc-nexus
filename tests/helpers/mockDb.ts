@@ -295,6 +295,28 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? visible : visible ? [visible] : [];
   }
 
+  if (/SELECT id, parent_id, agent_id FROM tasks WHERE source = 'delegated' AND status = 'QUEUED' AND deleted_at IS NULL/.test(sql)) {
+    const result = [...tables.tasks.values()]
+      .filter((row) => row.source === 'delegated' && row.status === 'QUEUED' && row.deleted_at == null)
+      .map((row) => ({ id: row.id, parent_id: row.parent_id, agent_id: row.agent_id }));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT \* FROM tasks WHERE source = 'delegated' AND status IN \('QUEUED','RUNNING','WAITING_APPROVAL','PAUSED'\) AND deleted_at IS NULL/.test(sql)) {
+    const result = [...tables.tasks.values()]
+      .filter((row) => row.source === 'delegated'
+        && ['QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED'].includes(row.status as string)
+        && row.deleted_at == null);
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT id, agent_id, status FROM tasks WHERE status IN \('RUNNING','PAUSED'\) AND deleted_at IS NULL/.test(sql)) {
+    const result = [...tables.tasks.values()]
+      .filter((row) => ['RUNNING', 'PAUSED'].includes(row.status as string) && row.deleted_at == null)
+      .map((row) => ({ id: row.id, agent_id: row.agent_id, status: row.status }));
+    return mode === 'get' ? result[0] : result;
+  }
+
   if (/SELECT id FROM agent_runs WHERE task_id = \? AND ended_at IS NULL/.test(sql)) {
     const row = [...tables.agent_runs.values()].find(item => item.task_id === args[0] && item.ended_at == null);
     const result = row ? { id: row.id } : undefined;
@@ -434,8 +456,15 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
 
   if (/SELECT id FROM tasks WHERE parent_id = \? AND deleted_at IS NULL/.test(sql)) {
     const active = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
-    const result = [...tables.tasks.values()].find((row) => row.parent_id === args[0] && row.deleted_at == null && active.includes(row.status as string));
-    return mode === 'get' ? (result ? { id: result.id } : undefined) : result ? [{ id: result.id }] : [];
+    const requiresActive = /status IN/.test(sql);
+    const requiresDelegated = /source = 'delegated'/.test(sql);
+    const result = [...tables.tasks.values()]
+      .filter((row) => row.parent_id === args[0]
+        && row.deleted_at == null
+        && (!requiresActive || active.includes(row.status as string))
+        && (!requiresDelegated || row.source === 'delegated'))
+      .map((row) => ({ id: row.id }));
+    return mode === 'get' ? result[0] : result;
   }
 
   // SELECT project_id FROM tasks WHERE id = ?

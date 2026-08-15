@@ -10,7 +10,7 @@ export const ILINK_QUIT_CLEANUP_BUDGET_MS = ILINK_NOTIFY_STOP_TIMEOUT_MS + 250;
 const ILINK_APP_ID = 'bot';
 // Tencent/openclaw-weixin v2.4.6: major << 16 | minor << 8 | patch.
 const ILINK_CLIENT_VERSION = String((2 << 16) | (4 << 8) | 6);
-const CHANNEL_VERSION = '1.8.0';
+const CHANNEL_VERSION = '1.8.1';
 const WIRE_CLIENT_ID_PREFIX = 'opc-nexus-';
 const MAX_WIRE_CLIENT_ID_LENGTH = 128;
 
@@ -292,7 +292,7 @@ export class ILinkClient {
   }
 
   private baseInfo() {
-    return { channel_version: CHANNEL_VERSION, bot_agent: 'OPC-Nexus/1.8.0' };
+    return { channel_version: CHANNEL_VERSION, bot_agent: 'OPC-Nexus/1.8.1' };
   }
 
   private async notifyLifecycle(endpoint: string, timeoutMs: number, signal?: AbortSignal) {

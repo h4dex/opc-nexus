@@ -816,6 +816,46 @@ describe('Orchestrator 状态机', () => {
       expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: task.id, status: 'INTERRUPTED' }));
     });
 
+    it('recoverAfterRestart 取消父任务中断后残留的 QUEUED 委派', () => {
+      const parentAgentId = seedAgent(db, { name: '父员工' });
+      const childAgentId = seedAgent(db, { name: '子员工', concurrency_limit: 1 });
+      const parent = orch.createTask(parentAgentId, '崩溃前父任务');
+      orch.createTask(childAgentId, '占用子员工槽位');
+      const child = orch.toolHost().createDelegatedTask(childAgentId, '排队中的委派', parent.id);
+      const finished = vi.fn();
+      orch.onTaskFinished(finished);
+      expect(child.status).toBe('QUEUED');
+
+      orch.recoverAfterRestart();
+
+      expect(db.tables.tasks.get(parent.id)?.status).toBe('INTERRUPTED');
+      expect(db.tables.tasks.get(child.id)?.status).toBe('CANCELLED');
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: child.id, status: 'CANCELLED' }));
+      expect([...db.tables.task_events.values()]).toContainEqual(expect.objectContaining({
+        task_id: child.id,
+        event_type: 'cancelled'
+      }));
+    });
+
+    it('recoverAfterRestart 在同一恢复事务中取消 RUNNING delegated 后代', () => {
+      const parentAgentId = seedAgent(db, { name: '恢复父员工' });
+      const childAgentId = seedAgent(db, { name: '恢复子员工' });
+      const leafAgentId = seedAgent(db, { name: '恢复末端员工' });
+      const parent = orch.createTask(parentAgentId, '崩溃前父任务');
+      const child = orch.toolHost().createDelegatedTask(childAgentId, '运行中的委派', parent.id);
+      const grandchild = orch.toolHost().createDelegatedTask(leafAgentId, '运行中的孙委派', child.id);
+      const finished = vi.fn();
+      orch.onTaskFinished(finished);
+
+      orch.recoverAfterRestart();
+
+      expect(db.tables.tasks.get(parent.id)?.status).toBe('INTERRUPTED');
+      expect(db.tables.tasks.get(child.id)?.status).toBe('CANCELLED');
+      expect(db.tables.tasks.get(grandchild.id)?.status).toBe('CANCELLED');
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: child.id, status: 'CANCELLED' }));
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: grandchild.id, status: 'CANCELLED' }));
+    });
+
     it('recoverAfterRestart 关闭中断任务的手机租约但保留历史租约', () => {
       const agentId = seedAgent(db);
       const task = orch.createTask(agentId, '带手机租约的崩溃任务');

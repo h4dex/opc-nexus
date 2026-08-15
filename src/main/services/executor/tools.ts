@@ -30,7 +30,25 @@ export interface ToolContext {
 export interface ToolHost {
   findAgentIdByName(name: string, parentTaskId: string): string | null;
   createDelegatedTask(agentId: string, title: string, parentTaskId: string): Task;
-  waitForTask(taskId: string, timeoutMs: number): Promise<Task | null>;
+  /**
+   * Wait for a child task. When parentTaskId is supplied, the host also
+   * watches the parent and cancels the child if the parent disappears or
+   * reaches a terminal state.
+   */
+  waitForTask(taskId: string, timeoutMs: number, parentTaskId?: string): Promise<Task | null>;
+  /** Cancel a delegated child after timeout/parent cancellation. Optional to
+   * preserve compatibility with older external ToolHost implementations. */
+  cancelTask?(taskId: string, reason?: string): void;
+  /**
+   * Capacity check used by same-agent engine delegation. A child that cannot
+   * acquire a slot would otherwise wait behind the parent forever.
+   */
+  delegationCapacity?(agentId: string, parentTaskId: string): {
+    available: boolean;
+    active: number;
+    limit: number;
+    reason?: string;
+  };
   /** 委托深度（parentId 链长度），防止无限递归 */
   delegationDepth(taskId: string): number;
   /** 主 Agent 全局调度：列出所有在岗员工 */
@@ -245,8 +263,14 @@ export const TOOLS: ToolDef[] = [
       if (targetId === ctx.agentId) throw new Error('不允许委托给自己');
       if (ctx.host.delegationDepth(ctx.taskId) >= 2) throw new Error('委托深度已达上限（2 级），请直接完成任务');
       const sub = ctx.host.createDelegatedTask(targetId, String(args.title ?? '子任务'), ctx.taskId);
-      const done = await ctx.host.waitForTask(sub.id, MAX_DELEGATE_WAIT_MS);
-      if (!done) throw new Error('子任务等待超时（10 分钟），已放弃等待');
+      const done = await ctx.host.waitForTask(sub.id, MAX_DELEGATE_WAIT_MS, ctx.taskId);
+      if (!done) {
+        // A timed-out delegated task must not remain queued/running after its
+        // parent has stopped waiting. The host owns the state transition and
+        // treats a terminal child as an idempotent no-op.
+        try { ctx.host.cancelTask?.(sub.id, '委派等待超时'); } catch { /* child may have completed concurrently */ }
+        throw new Error('子任务等待超时（10 分钟），已取消子任务');
+      }
       if (done.status === 'COMPLETED') return `子任务完成。产出：\n${(done.result ?? '（无文本产物）').slice(0, 8000)}`;
       throw new Error(`子任务未成功（${done.status}）：${done.error ?? '无错误信息'}`);
     }
@@ -279,9 +303,20 @@ export const TOOLS: ToolDef[] = [
       const title = String(args.title ?? '').trim();
       if (!title) throw new Error('请提供编码任务描述');
 
+      const capacity = ctx.host.delegationCapacity?.(ctx.agentId, ctx.taskId);
+      if (capacity && !capacity.available) {
+        throw new Error(
+          capacity.reason
+            ?? `当前员工并发槽已占满（${capacity.active}/${capacity.limit}），编码委派会等待自身释放并发槽而自锁；请提高并发上限或改用 delegate_task 委派给其他员工`
+        );
+      }
+
       const sub = ctx.host.createEngineDelegatedTask(ctx.agentId, title, ctx.taskId, coding.engineId);
-      const done = await ctx.host.waitForTask(sub.id, MAX_DELEGATE_WAIT_MS);
-      if (!done) throw new Error('编码子任务等待超时（10 分钟），已放弃等待');
+      const done = await ctx.host.waitForTask(sub.id, MAX_DELEGATE_WAIT_MS, ctx.taskId);
+      if (!done) {
+        try { ctx.host.cancelTask?.(sub.id, '编码委派等待超时'); } catch { /* child may have completed concurrently */ }
+        throw new Error('编码子任务等待超时（10 分钟），已取消子任务');
+      }
       if (done.status === 'COMPLETED') {
         return `编码任务已由 ${coding.name} 完成。产出：\n${(done.result ?? '（无文本产物）').slice(0, 8000)}`;
       }

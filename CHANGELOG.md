@@ -2,6 +2,28 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [1.8.1] - 2026-08-16
+
+> 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`）。本次为嵌套编排安全与调度稳定性补丁，不启用完整的 DSH 子智能体工作流图。
+
+### 调度与并发
+
+- **Team 并发上限生效**：`TeamEngine` 按 `config.concurrency` 使用有限 Worker 池；尚未取得执行槽位的子任务保持 `pending`，领取槽位后才进入 `running`，并发数不会被一次性任务拆解绕过。
+- **权限不随来源提升**：来自 `team` 的任务不再自动获得 `autonomous` 权限；Nexus LLM、ACP/DSH、Codex/Claude/通用 CLI 与 Hermes 均保留员工原有权限模式，`standard` 任务仍需经过审批代理。
+
+### 嵌套委派安全
+
+- **环路与死锁保护**：拒绝终态父任务继续委派、损坏的祖先链、同一任务树或独立根任务之间的 A -> B -> A 员工等待环，以及并发槽已满时同员工父子任务互相等待；`engineOverride` 不能借用其他员工或更早的祖先员工绕过检查。
+- **超时、重启与终止回收**：委派等待超时会主动取消子任务；应用重启会清理父链已中断的排队委派，派发前也会再次校验父链；父任务取消或员工停止时，仅沿 `source='delegated'` 的后代任务级联回收，并先持久化整棵任务树的 `CANCELLED` 终态，再中止执行器，避免同步回调覆盖终态。
+- **终态任务续接**：对已完成委派任务发起人工追问或重试时，创建独立的桌面来源任务，不再把终态任务误用为新的委派父任务。
+
+### 运行时边界
+
+- **DSH 保持受限角色**：DeepSeek Harness 继续作为受限 ACP Worker/Advisor 使用，不在本补丁中取得全局派单、审批、长期记忆或 Android 工具权限。
+- **Android 固定执行链路**：Android 手机任务继续由 Hermes Agent 通过 Mobile Gateway 和受策略约束的 `android_*` 工具执行；DSH 本身没有手机工具桥，不能直接操控设备。
+- **Hermes 健康状态分类**：只有明确的 Provider、凭据或解密错误才标记 `AUTH_REQUIRED`；profile 路径、权限和磁盘等本地运行时故障不再伪装成 401/403 鉴权问题。
+- **Orchestrator 仍是全局权威**：OPC Orchestrator 继续统一持有任务树、审批、长期记忆、取消与状态转换；执行器内部的子任务协作不能绕过该控制面。
+
 ## [1.8.0] - 2026-08-15
 
 > 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`）。本次完成桌面端 Agent Runtime 控制面整合，版本号与 `package.json` 保持 `1.8.0`。

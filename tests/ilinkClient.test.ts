@@ -124,7 +124,7 @@ describe('ILinkClient requests', () => {
     expect(request.init.method).toBe('POST');
     expect(requestBody(request)).toEqual({
       get_updates_buf: 'cursor-1',
-      base_info: { channel_version: '1.8.0', bot_agent: 'OPC-Nexus/1.8.0' }
+      base_info: { channel_version: '1.8.1', bot_agent: 'OPC-Nexus/1.8.1' }
     });
     const headers = requestHeaders(request);
     expect(headers).toMatchObject({
@@ -183,7 +183,7 @@ describe('ILinkClient requests', () => {
         item_list: [{ type: 1, text_item: { text: '任务已完成' } }],
         context_token: 'context-from-update'
       },
-      base_info: { channel_version: '1.8.0', bot_agent: 'OPC-Nexus/1.8.0' }
+      base_info: { channel_version: '1.8.1', bot_agent: 'OPC-Nexus/1.8.1' }
     });
   });
 

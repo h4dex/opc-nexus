@@ -60,10 +60,10 @@ export class HermesControlKernel implements ControlKernel {
     } catch (error) {
       const detail = (error instanceof Error ? error.message : String(error)).trim().slice(0, 2_000)
         || 'Hermes controller profile preparation failed';
-      if (HERMES_PROFILE_AUTH_RE.test(detail) || !this.health.reportRuntimeFailure) {
+      if (HERMES_PROFILE_AUTH_RE.test(detail)) {
         this.health.reportAuthenticationFailure('eng-hermes-cli', detail);
       } else {
-        this.health.reportRuntimeFailure('eng-hermes-cli', detail);
+        this.health.reportRuntimeFailure?.('eng-hermes-cli', detail);
       }
       throw new Error(`Hermes controller profile unavailable: ${detail}`);
     }

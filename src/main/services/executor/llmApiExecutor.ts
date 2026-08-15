@@ -4,7 +4,8 @@
  * - 原生 fetch + 手写 SSE 解析（含 tool_calls delta 合并），零新增依赖
  * - 工具循环：每轮携带 MCP 风格工具声明，模型产生 tool_calls 则执行工具后继续，最多 15 轮
  * - 权限语义：readonly 只注册只读工具；standard 下写/删工具经审批代理挂起等待人工批准；
- *   trusted 全自动；渠道来源任务（source='channel'）写类工具一律审批，不受 trusted 豁免（10.5）
+ *   trusted 全自动；渠道来源任务（source='channel'）写类工具一律审批，不受 trusted 豁免（10.5）。
+ *   team/nested 仅表示来源，不会提升员工权限。
  * - 会话化（P2b）：消息逐条落 task_messages，追问任务按 session_id 重建上下文
  */
 import { randomUUID } from 'node:crypto';
@@ -207,8 +208,9 @@ export class LlmApiExecutor implements ExecutorAdapter {
     const sessionId = task.sessionId ?? `llm-${randomUUID()}`;
     if (!task.sessionId) cb.onSession?.(task.id, sessionId);
 
-    // 专家团任务（source='team'）默认完全自主，无需人工审批，由 AI 自助判断
-    const effectivePermission = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    // Task source describes provenance, not an authorization grant. Nested/team
+    // work must inherit the employee's configured permission mode unchanged.
+    const effectivePermission = agent.permissionMode;
     // 编码引擎就绪时才注册 delegate_coding_task（E-2），避免模型调用必然失败的工具
     const builtInTools = toolsForPermission(effectivePermission, agent.capabilities, this.host?.codingEngineReady?.().ready ?? false);
     const mcpTools = await mcpToolsForAgent(this.mcpManager, agent.id, agent.capabilities, effectivePermission);
@@ -322,8 +324,9 @@ export class LlmApiExecutor implements ExecutorAdapter {
     //   trusted   → 仅 danger（删除等高危）需审批，write 自动通过
     //   autonomous→ 完全跳过，无需任何审批
     // 渠道来源任务（source='channel'）：trusted 降级为 standard（10.5），autonomous 不降级
-    // 专家团任务（source='team'）：effectivePermission 已拾升为 autonomous，完全免审批
-    const effectivePermission = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    // A team task does not elevate the employee. Only the employee policy (and
+    // the channel safety downgrade below) determines the effective permission.
+    const effectivePermission = agent.permissionMode;
     if (tool.risk !== 'safe' && effectivePermission === 'readonly') {
       const msg = '当前员工为只读权限模式，禁止执行写入类操作';
       record('tool_result', { name: call.name, error: msg });

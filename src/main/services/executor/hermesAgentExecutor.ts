@@ -148,8 +148,9 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       ? ['chat', '-Q', '-q', prompt]
       : ['-z', prompt, '--usage-file', usageFile];
 
-    // 权限映射：trusted/autonomous 才免 hook 审批；渠道来源任务的 trusted 降级为 standard（10.5）
-    const baseMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
+    // 权限映射：trusted/autonomous 才免 hook 审批；渠道来源任务的 trusted 降级为 standard（10.5）。
+    // team/nested 来源不得改变员工本身的权限等级。
+    const baseMode = agent.permissionMode;
     const mode = task.source === 'channel' && baseMode === 'trusted' ? 'standard' : baseMode;
     if (mode === 'trusted' || mode === 'autonomous') args.push('--accept-hooks');
     // readonly：限制为只读工具集。名称须与 `hermes tools list` 的内置 toolset 一致

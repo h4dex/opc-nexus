@@ -16,7 +16,7 @@ import type { Orchestrator } from './orchestrator.js';
 import type { KnowledgeManager } from './knowledgeManager.js';
 import type {
   Agent, DeliverableReviewStatus, TeamCollaborationOverview, TeamMemberContribution,
-  TeamRun, TeamRunPhase, TeamRunSubtask, TeamRunTrace, TeamTimelineEvent
+  TeamConfig, TeamRun, TeamRunPhase, TeamRunSubtask, TeamRunTrace, TeamTimelineEvent
 } from '../../shared/types.js';
 
 export interface Team {
@@ -72,6 +72,29 @@ interface DeliverableRefRow {
 /** 单步等待超时（10 分钟） */
 const STEP_TIMEOUT_MS = 10 * 60_000;
 
+const DEFAULT_TEAM_CONFIG: TeamConfig = { timeout: 600, maxRetries: 1, concurrency: 1 };
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim().length > 0
+      ? Number(value)
+      : Number.NaN;
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(numeric)));
+}
+
+function normalizeTeamConfig(value: unknown): TeamConfig {
+  const input = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  return {
+    timeout: boundedInteger(input.timeout, DEFAULT_TEAM_CONFIG.timeout, 60, 3600),
+    maxRetries: boundedInteger(input.maxRetries, DEFAULT_TEAM_CONFIG.maxRetries, 0, 5),
+    concurrency: boundedInteger(input.concurrency, DEFAULT_TEAM_CONFIG.concurrency, 1, 5)
+  };
+}
+
 /** 运行中流水线的控制信号（UI 中途干预：取消/跳过/强制重试/注入指导） */
 interface RunControl {
   cancel: boolean;          // 取消整个运行
@@ -93,6 +116,19 @@ export class TeamEngine {
     let c = this.controls.get(runId);
     if (!c) { c = { cancel: false, skip: new Set(), forceRetry: new Set(), guidance: [] }; this.controls.set(runId, c); }
     return c;
+  }
+
+  /**
+   * A timeout is terminal for the team step. Releasing the child task here
+   * keeps the orchestrator's agent-slot accounting honest; otherwise a timed
+   * out child may keep running while the next round starts.
+   */
+  private async waitForTask(taskId: string, timeoutMs: number, reason = '团队子任务超时') {
+    const done = await this.orchestrator.waitForTask(taskId, timeoutMs);
+    if (done === null) {
+      try { this.orchestrator.cancelTask(taskId, reason); } catch { /* child may have completed concurrently */ }
+    }
+    return done;
   }
 
   // ---------- CRUD ----------
@@ -527,7 +563,7 @@ export class TeamEngine {
 任务：${task}${knowledgeBlock}`;
 
     const clarifyTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws, projectId: this.projectIdForRun(runId) });
-    const done = await this.orchestrator.waitForTask(clarifyTask.id, STEP_TIMEOUT_MS);
+    const done = await this.waitForTask(clarifyTask.id, STEP_TIMEOUT_MS, '团队澄清任务超时');
 
     let spec = '';
     if (done?.status === 'COMPLETED') {
@@ -554,7 +590,7 @@ ${specCtx}
 
     const decompTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws, projectId: this.projectIdForRun(runId) });
 
-    const done = await this.orchestrator.waitForTask(decompTask.id, STEP_TIMEOUT_MS);
+    const done = await this.waitForTask(decompTask.id, STEP_TIMEOUT_MS, '团队拆解任务超时');
     if (done?.status === 'COMPLETED') {
       const result = this.orchestrator.taskResult(decompTask.id) ?? '';
       const parsed = this.parseDecomposition(result, members);
@@ -623,7 +659,7 @@ ${handoffCtx}
 
   /**
    * 调度循环核心：
-   * 1. 将当前所有 pending 子任务并行分派给各成员（各成员使用自己的引擎）
+   * 1. 按 config.concurrency 受限并行分派当前 pending 子任务（各成员使用自己的引擎）
    * 2. 等待本轮全部完成，收集产出
    * 3. 向主Agent汇报全部结果，由主Agent决策：完成（输出结论）/ 继续（追加新任务或重试失败项）
    * 4. 循环直到主Agent判定完成或达到最大轮次
@@ -631,7 +667,7 @@ ${handoffCtx}
   private async executeRounds(
     runId: string, team: Team, coordinator: Agent, members: Agent[],
     task: string, ws: string, subtasks: TeamRunSubtask[],
-    config: { timeout: number; maxRetries: number }, maxRounds: number,
+    config: { timeout: number; maxRetries: number; concurrency: number }, maxRounds: number,
     events: TeamTimelineEvent[], startRound = 0
   ): Promise<string> {
     let round = startRound;
@@ -661,19 +697,37 @@ ${handoffCtx}
       const pending = subtasks.filter((s) => s.status === 'pending');
       if (pending.length === 0) break;
 
-      // ① 并行分派本轮所有待执行子任务
-      for (const st of pending) {
-        st.status = 'running';
-        st.round = round;
-      }
+      // ① 受限并发分派：每个 worker 持有一个执行槽，完成后再领取下一个子任务。
+      // 不要在这里把所有任务预先标记为 running，否则 UI 和取消逻辑都会误以为
+      // 它们已经占用了底层 Agent 的并发配额。
       events.push({ type: 'round_start', round, count: pending.length, ts: Date.now() });
       this.updateRun(runId, { current_step: round, total_steps: subtasks.length, subtasks_json: JSON.stringify(subtasks) });
       this.persistEvents(runId, events);
       this.appendProgress(ws, `══ 第 ${round} 轮调度 ══ 并行分派 ${pending.length} 个子任务：${pending.map((s) => s.agent).join('、')}`);
 
       const stepTimeout = Math.max(60_000, (config.timeout || 600) * 1000);
-      await Promise.all(pending.map(async (st) => {
+      const configuredConcurrency = Number(config.concurrency);
+      const concurrency = Number.isFinite(configuredConcurrency)
+        ? Math.max(1, Math.floor(configuredConcurrency))
+        : 1;
+      let nextPending = 0;
+
+      const runSubtask = async (st: TeamRunSubtask) => {
         const idx = subtasks.indexOf(st);
+        // A task can be skipped/cancelled while it waits for a worker slot.
+        if (this.control(runId).cancel) return;
+        if (this.control(runId).skip.has(idx)) {
+          this.control(runId).skip.delete(idx);
+          st.status = 'skipped';
+          events.push({ type: 'skipped', round, agent: st.agent, ts: Date.now() });
+          this.appendProgress(ws, `${st.agent} 被用户跳过（第 ${round} 轮）`);
+          this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
+          this.persistEvents(runId, events);
+          return;
+        }
+        st.status = 'running';
+        st.round = round;
+        this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
         const member = members.find((m) => m.id === st.agentId);
         if (!member) {
           st.status = 'failed';
@@ -691,7 +745,7 @@ ${handoffCtx}
         st.taskId = subTask.id;
         this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
 
-        const done = await this.orchestrator.waitForTask(subTask.id, stepTimeout);
+        const done = await this.waitForTask(subTask.id, stepTimeout);
         // 干预：若该子任务在执行中被标记跳过，则记为 skipped
         if (this.control(runId).skip.has(idx)) {
           this.control(runId).skip.delete(idx);
@@ -713,7 +767,17 @@ ${handoffCtx}
         this.appendProgress(ws, `${st.agent} ${ok ? '✓ 完成' : '✗ 失败'}（第 ${round} 轮）`);
         this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
         this.persistEvents(runId, events);
-      }));
+      };
+
+      const worker = async () => {
+        while (!this.control(runId).cancel) {
+          const index = nextPending++;
+          if (index >= pending.length) return;
+          await runSubtask(pending[index]);
+        }
+      };
+      const workerCount = Math.min(concurrency, pending.length);
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
       // 干预：本轮执行期间若请求了取消，直接退出
       if (this.control(runId).cancel) break;
@@ -805,7 +869,7 @@ ${report}${guidanceBlock}
 - ${isLastRound ? '这是最后一轮，必须输出 finish' : '如果所有子任务都已完成，直接输出 finish'}`;
 
     const decideTask = this.orchestrator.createTask(coordinator.id, prompt.slice(0, 2000), 'team', { workspaceOverride: ws, projectId: this.projectIdForRun(runId) });
-    const done = await this.orchestrator.waitForTask(decideTask.id, STEP_TIMEOUT_MS);
+      const done = await this.waitForTask(decideTask.id, STEP_TIMEOUT_MS, '团队决策任务超时');
 
     if (done?.status === 'COMPLETED') {
       const result = this.orchestrator.taskResult(decideTask.id) ?? '';
@@ -1087,7 +1151,7 @@ _生成时间：${new Date().toLocaleString()}_
       st.taskId = task.id;
       this.updateRun(runId, { subtasks_json: JSON.stringify(subtasks) });
 
-      const done = await this.orchestrator.waitForTask(task.id, STEP_TIMEOUT_MS);
+      const done = await this.waitForTask(task.id, STEP_TIMEOUT_MS);
       const ok = done?.status === 'COMPLETED';
       st.status = ok ? 'done' : 'failed';
       st.retryCount = (st.retryCount ?? 0) + 1;
@@ -1121,7 +1185,7 @@ ${row.task_text}
 
 请验收各成员的产出：检查是否覆盖任务要求、指出不足与风险，然后给出最终综合结论。`;
       const reviewTask = this.orchestrator.createTask(coordinator.id, reviewPrompt.slice(0, 2000), 'team', { workspaceOverride: ws, projectId: this.projectIdForRun(runId) });
-      const reviewDone = await this.orchestrator.waitForTask(reviewTask.id, STEP_TIMEOUT_MS);
+      const reviewDone = await this.waitForTask(reviewTask.id, STEP_TIMEOUT_MS, '团队验收任务超时');
       const finalResult = reviewDone?.status === 'COMPLETED'
         ? (this.orchestrator.taskResult(reviewTask.id) ?? '（无结论）')
         : `验收任务失败：${reviewDone?.error ?? '超时'}`;
@@ -1145,15 +1209,15 @@ ${row.task_text}
   // ---------- 团队配置 / 统计 ----------
 
   /** 获取团队配置 */
-  getConfig(teamId: string): { timeout: number; maxRetries: number; concurrency: number } {
+  getConfig(teamId: string): TeamConfig {
     const row = this.db.raw.prepare('SELECT config_json FROM teams WHERE id = ?').get(teamId) as { config_json?: string } | undefined;
-    if (!row?.config_json) return { timeout: 600, maxRetries: 1, concurrency: 1 };
-    try { return JSON.parse(row.config_json); } catch { return { timeout: 600, maxRetries: 1, concurrency: 1 }; }
+    if (!row?.config_json) return { ...DEFAULT_TEAM_CONFIG };
+    try { return normalizeTeamConfig(JSON.parse(row.config_json)); } catch { return { ...DEFAULT_TEAM_CONFIG }; }
   }
 
   /** 保存团队配置 */
-  saveConfig(teamId: string, config: { timeout: number; maxRetries: number; concurrency: number }) {
-    this.db.raw.prepare('UPDATE teams SET config_json = ? WHERE id = ?').run(JSON.stringify(config), teamId);
+  saveConfig(teamId: string, config: TeamConfig) {
+    this.db.raw.prepare('UPDATE teams SET config_json = ? WHERE id = ?').run(JSON.stringify(normalizeTeamConfig(config)), teamId);
   }
 
   /** 获取团队统计（累计执行次数/平均耗时/成功率） */

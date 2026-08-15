@@ -17,12 +17,12 @@ GitHub Actions 负责验证、跨平台打包和 Release 发布。正常发布�
 4. 创建并推送与版本一致的标签。
 
 ```bash
-git tag -a v1.8.0 -m "OPC-Nexus 1.8.0"
-git push github main
-git push github v1.8.0
+git tag -a v1.8.1 -m "OPC-Nexus 1.8.1"
+git push github master:main
+git push github v1.8.1
 ```
 
-标签必须严格等于 `v` 加 `package.json` 的版本，例如 `package.json` 为 `1.8.0` 时只能发布 `v1.8.0`。不匹配时 Release 工作流会在打包前失败。
+标签必须严格等于 `v` 加 `package.json` 的版本，例如 `package.json` 为 `1.8.1` 时只能发布 `v1.8.1`。不匹配时 Release 工作流会在打包前失败。
 
 ## 手动重跑
 

@@ -163,8 +163,8 @@ describe('HermesAgentExecutor 权限映射', () => {
     expect(argsFor('autonomous', 'channel')).toContain('--accept-hooks');
   });
 
-  it('专家团任务(source=team)提升为 autonomous', () => {
-    expect(argsFor('standard', 'team')).toContain('--accept-hooks');
+  it('专家团任务(source=team)保留员工权限', () => {
+    expect(argsFor('standard', 'team')).not.toContain('--accept-hooks');
   });
 });
 

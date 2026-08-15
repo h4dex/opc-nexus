@@ -156,8 +156,8 @@ describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
     expect(sandboxFor('autonomous', 'channel')).toBe('danger-full-access');
   });
 
-  it('专家团任务：standard 提升为 autonomous → danger-full-access', () => {
-    expect(sandboxFor('standard', 'team')).toBe('danger-full-access');
+  it('专家团任务保留员工权限：standard 仍为 workspace-write', () => {
+    expect(sandboxFor('standard', 'team')).toBe('workspace-write');
   });
 
   it('始终带 --json 与 --skip-git-repo-check（非交互执行前提）', () => {
@@ -231,11 +231,11 @@ describe('Claude Code Worker 边界', () => {
     expect(args).not.toContain('--allowedTools');
   });
 
-  it('trusted/autonomous 才允许权限绕过；渠道 trusted 仍降级为 standard', () => {
+  it('trusted/autonomous 才允许权限绕过；渠道 trusted 仍降级为 standard；team 不升级', () => {
     expect(argsFor('trusted')).toContain('--dangerously-skip-permissions');
     expect(argsFor('autonomous', 'channel')).toContain('--dangerously-skip-permissions');
     expect(argsFor('trusted', 'channel')).not.toContain('--dangerously-skip-permissions');
-    expect(argsFor('standard', 'team')).toContain('--dangerously-skip-permissions');
+    expect(argsFor('standard', 'team')).not.toContain('--dangerously-skip-permissions');
   });
 
   it('只续接 Claude 命名空间或合法 UUID，不把其他执行器会话传给 --resume', () => {
