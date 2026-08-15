@@ -1,5 +1,5 @@
 /**
- * CLI 执行器：真实拉起本机 Codex CLI / Claude Code / OpenCode / Kimi Code 等（headless 模式）
+ * CLI 执行器：真实拉起本机 Codex CLI / Claude Code / OpenCode（headless 模式）
  * - 安全基线（12.3）：spawn 一律 shell:false，参数数组传递，杜绝命令注入
  * - 工作目录限定在员工 workspace（7.2 边界），不存在则创建
  * - 事件解析对版本差异保持容忍：JSONL 解析失败的行当纯文本输出处理
@@ -12,16 +12,21 @@ import { type ChildProcess } from 'node:child_process';
 import { spawnCli } from '../cliLauncher.js';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { app } from 'electron';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
+import type { ResolvedProvider } from '../providerManager.js';
 import { loadConfig } from '../config.js';
 import {
   childProcessEnv,
   createSensitiveTextRedactor,
   redactSensitiveText,
-  resolveConfiguredEngineEnv,
-  resolveEngineEnv
+  readEngineRuntimeConfig,
+  resolveClaudeEngineEnv,
+  resolveEngineEnv,
+  resolveEngineProvider,
+  resolveOpenCodeEngineEnv
 } from '../engineEnv.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 import { appendProcessOutput, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
@@ -35,6 +40,25 @@ export const CLAUDE_ENGINE_ID = 'eng-claude';
 export const CLAUDE_PROBE_SENTINEL = 'OPC_CLAUDE_OK';
 const CLAUDE_SESSION_PREFIX = 'claude:';
 const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Return an application-owned Codex home for managed invocations.
+ *
+ * Codex's `--ignore-user-config` deliberately does not ignore authentication
+ * files. A dedicated home therefore has to be supplied as well, otherwise a
+ * user's native OAuth login can silently win over the Provider selected in
+ * OPC-Nexus. The profile key is hashed so arbitrary Agent ids cannot escape
+ * the application data directory, while remaining stable for session resume.
+ */
+export function managedCodexProcessEnv(
+  runtimeEnv: NodeJS.ProcessEnv,
+  profileKey: string
+): NodeJS.ProcessEnv {
+  const digest = createHash('sha256').update(profileKey).digest('hex').slice(0, 16);
+  const home = join(app.getPath('userData'), 'aibox-data', 'codex', 'profiles', digest);
+  mkdirSync(home, { recursive: true });
+  return { ...runtimeEnv, CODEX_HOME: home };
+}
 
 function lastJsonRecord(text: string): Record<string, unknown> | null {
   const trimmed = text.trim();
@@ -102,12 +126,45 @@ export function parseClaudeAuthStatus(text: string): { loggedIn: boolean; detail
   };
 }
 
-export function buildClaudeProbeArgs(): string[] {
+export function buildClaudeProbeArgs(model?: string, managedProvider = false): string[] {
   return [
     '-p', '--output-format', 'json', '--safe-mode', '--strict-mcp-config', '--no-chrome',
     '--no-session-persistence', '--max-budget-usd', '0.05', '--permission-mode', 'dontAsk',
-    '--tools=', `Reply with exactly ${CLAUDE_PROBE_SENTINEL}`
+    '--tools=', ...(managedProvider ? ['--bare'] : []), ...(model ? ['--model', model] : []),
+    `Reply with exactly ${CLAUDE_PROBE_SENTINEL}`
   ];
+}
+
+/** Build a Codex probe using an OPC-managed Responses provider. */
+export function buildCodexManagedArgs(
+  prompt: string,
+  model: string,
+  provider: Pick<ResolvedProvider, 'baseUrl'>
+): string[] {
+  return [
+    'exec', '--ignore-user-config', '--json', '--skip-git-repo-check', '--sandbox', 'read-only',
+    '-c', 'model_provider="opcnexus"',
+    '-c', 'model_providers.opcnexus.name="OPC-Nexus"',
+    '-c', `model_providers.opcnexus.base_url=${JSON.stringify(provider.baseUrl.replace(/\/+$/, ''))}`,
+    '-c', 'model_providers.opcnexus.env_key="OPENAI_API_KEY"',
+    '-c', 'model_providers.opcnexus.wire_api="responses"',
+    '--model', model, prompt
+  ];
+}
+
+/** Apply the managed OpenCode route without loading user plugins. */
+export function buildOpenCodeManagedArgs(args: string[], prompt: string, model: string): string[] {
+  const managed = [...args];
+  if (!managed.includes('--pure')) {
+    const runIndex = managed.indexOf('run');
+    managed.splice(runIndex >= 0 ? runIndex + 1 : 0, 0, '--pure');
+  }
+  if (!managed.some((arg) => arg === '-m' || arg === '--model'
+    || arg.startsWith('-m=') || arg.startsWith('--model='))) {
+    const promptIndex = managed.lastIndexOf(prompt);
+    managed.splice(promptIndex >= 0 ? promptIndex : managed.length, 0, '-m', `opcnexus/${model}`);
+  }
+  return managed;
 }
 
 export function parseClaudeProbeOutput(text: string): { ok: boolean; output: string; error: string | null } {
@@ -124,7 +181,9 @@ export function parseClaudeProbeOutput(text: string): { ok: boolean; output: str
 export function buildClaudeTaskArgs(
   prompt: string,
   sessionAnchor: string | null,
-  permissionMode: Agent['permissionMode']
+  permissionMode: Agent['permissionMode'],
+  model?: string,
+  managedProvider = false
 ): string[] {
   const tools = permissionMode === 'readonly'
     ? 'Read,Glob,Grep'
@@ -137,7 +196,8 @@ export function buildClaudeTaskArgs(
   const resumeId = claudeSessionId(sessionAnchor);
   return [
     '-p', '--output-format', 'stream-json', '--verbose', '--safe-mode',
-    '--strict-mcp-config', '--no-chrome', ...permissions, `--tools=${tools}`,
+    '--strict-mcp-config', '--no-chrome', ...(managedProvider ? ['--bare'] : []), ...permissions, `--tools=${tools}`,
+    ...(model ? ['--model', model] : []),
     ...(resumeId ? ['--resume', resumeId] : []), prompt
   ];
 }
@@ -173,7 +233,13 @@ export class CliExecutor implements ExecutorAdapter {
     return row?.path || fallback;
   }
 
-  private buildCommand(prompt: string, task: Task, agent: Agent): { bin: string; args: string[] } {
+  private buildCommand(
+    prompt: string,
+    task: Task,
+    agent: Agent,
+    model?: string,
+    managedProvider: ResolvedProvider | null = null
+  ): { bin: string; args: string[] } {
     // P1a 静态限权：permissionMode → CLI 沙箱/权限参数；渠道来源任务 trusted 降级为 standard（10.5），autonomous 不降级
     // 专家团任务（source='team'）默认完全自主（autonomous），无需人工审批
     const baseMode = task.source === 'team' ? 'autonomous' : agent.permissionMode;
@@ -181,18 +247,51 @@ export class CliExecutor implements ExecutorAdapter {
     if (this.kind === 'codex-cli') {
       // codex exec --json：非交互执行，stdout 输出 JSONL 事件流；有 session 则 resume 续跑（P2b）
       const sandbox = mode === 'readonly' ? 'read-only' : (mode === 'trusted' || mode === 'autonomous') ? 'danger-full-access' : 'workspace-write';
-      const base = task.sessionId ? ['exec', 'resume', task.sessionId] : ['exec'];
-      return { bin: this.resolveBin('codex'), args: [...base, '--json', '--skip-git-repo-check', '--sandbox', sandbox, prompt] };
+      const providerArgs = managedProvider ? [
+        '--ignore-user-config',
+        '-c', 'model_provider="opcnexus"',
+        '-c', 'model_providers.opcnexus.name="OPC-Nexus"',
+        '-c', `model_providers.opcnexus.base_url=${JSON.stringify(managedProvider.baseUrl.replace(/\/+$/, ''))}`,
+        '-c', 'model_providers.opcnexus.env_key="OPENAI_API_KEY"',
+        '-c', 'model_providers.opcnexus.wire_api="responses"'
+      ] : [];
+      const commonArgs = [
+        ...providerArgs,
+        '--json',
+        '--skip-git-repo-check',
+        ...(model ? ['--model', model] : [])
+      ];
+      const args = task.sessionId
+        // `codex exec resume` does not accept `--sandbox`; use its supported
+        // config override so a resumed task keeps the same permission policy.
+        ? ['exec', 'resume', ...commonArgs, '-c', `sandbox_mode=${JSON.stringify(sandbox)}`, task.sessionId, prompt]
+        : ['exec', ...commonArgs, '--sandbox', sandbox, prompt];
+      return {
+        bin: this.resolveBin('codex'),
+        args
+      };
     }
     if (this.kind === 'claude-cli') {
-      return { bin: this.resolveBin('claude'), args: buildClaudeTaskArgs(prompt, task.sessionId, mode) };
+      return {
+        bin: this.resolveBin('claude'),
+        args: buildClaudeTaskArgs(prompt, task.sessionId, mode, model, Boolean(managedProvider))
+      };
     }
     // 泛化 CLI：运行参数模板取配置覆写，否则用目录默认；{prompt} 替换为任务提示词（权限参数由 CLI 自身配置控制）
-    const override = loadConfig().engines[this.engineId]?.runArgs;
+    const override = readEngineRuntimeConfig(this.db, this.engineId)?.runArgs
+      ?? loadConfig().engines[this.engineId]?.runArgs;
     const template = override && override.length > 0 ? override : this.defaultRunArgs;
-    const args = template.map((a) => (a === '{prompt}' ? prompt : a));
+    const args = template.map((a) => {
+      if (a === '{prompt}') return prompt;
+      if (a === '{model}') return model ?? '';
+      if (a === '{provider}') return 'opcnexus';
+      return a;
+    }).filter(Boolean);
     if (!template.includes('{prompt}')) args.push(prompt);
-    return { bin: this.resolveBin(this.engineId.replace(/^eng-/, '')), args };
+    const managedArgs = this.engineId === 'eng-opencode' && managedProvider
+      ? buildOpenCodeManagedArgs(args, prompt, managedProvider.model)
+      : args;
+    return { bin: this.resolveBin(this.engineId.replace(/^eng-/, '')), args: managedArgs };
   }
 
   start(task: Task, agent: Agent, cb: ExecutorCallbacks): void {
@@ -210,16 +309,29 @@ export class CliExecutor implements ExecutorAdapter {
     const prompt = resumableSession
       ? `追问：${task.content || task.title}\n请在之前会话的基础上继续处理，并输出最终结果。`
       : `${agent.systemPrompt}\n\n当前任务：${task.content || task.title}\n请直接执行该任务，并输出最终结构化结果。`;
-    const { bin, args } = this.buildCommand(prompt, task, agent);
-
     let child: ChildProcess;
+    let bin = this.engineId.replace(/^eng-/, '');
+    let args: string[] = [];
     let env: NodeJS.ProcessEnv = {};
     try {
       // 引擎自定义环境变量：敏感项经 safeStorage 解密后在此还原，仅存活于子进程
       const engineEnv = this.kind === 'claude-cli'
-        ? resolveConfiguredEngineEnv(this.db, this.engineId)
-        : resolveEngineEnv(this.db, this.engineId);
+        ? resolveClaudeEngineEnv(this.db, this.engineId, agent)
+        : this.engineId === 'eng-opencode'
+          ? resolveOpenCodeEngineEnv(this.db, this.engineId, agent)
+          : resolveEngineEnv(this.db, this.engineId, agent);
       env = childProcessEnv(engineEnv);
+      const model = this.kind === 'claude-cli' ? env.ANTHROPIC_MODEL : env.OPENAI_MODEL;
+      const provider = resolveEngineProvider(this.db, this.engineId, agent);
+      const managedProvider = provider && (
+        this.kind === 'claude-cli'
+          ? env.ANTHROPIC_API_KEY === provider.key && env.ANTHROPIC_BASE_URL === provider.baseUrl.replace(/\/+$/, '')
+          : env.OPENAI_API_KEY === provider.key && env.OPENAI_BASE_URL === provider.baseUrl.replace(/\/+$/, '')
+      ) ? provider : null;
+      if (managedProvider && this.kind === 'codex-cli') {
+        env = managedCodexProcessEnv(env, `agent:${agent.id}`);
+      }
+      ({ bin, args } = this.buildCommand(prompt, task, agent, model, managedProvider));
       child = spawnCli(bin, args, {
         cwd: workspace,
         shell: false,

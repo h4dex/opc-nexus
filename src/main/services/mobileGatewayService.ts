@@ -36,7 +36,11 @@ import type {
   Task
 } from '../../shared/types.js';
 import type { Database } from './database.js';
-import { MobileProfileService, type MobileProfileCheckpoint } from './mobileProfileService.js';
+import {
+  MobileProfileService,
+  type MobileProfileCheckpoint,
+  type PreparedMobileRuntime
+} from './mobileProfileService.js';
 import {
   MOBILE_PROTOCOL_VERSION,
   MOBILE_TOOL_NAMES,
@@ -391,6 +395,10 @@ export class MobileGatewayService {
       if (host === this.host && port === this.wssPort) return this.getStatus();
       await this.stop();
     }
+    // A process crash cannot leave a live in-memory token or device socket.
+    // Clear persisted leases before accepting a new connection so a queued
+    // Android task is not blocked by a session from the previous process.
+    this.recoverStaleSessions();
     if (!isRfc1918Ipv4(host)) throw new Error('Mobile Gateway must bind to an RFC1918 LAN IPv4 address');
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid Mobile Gateway port');
     this.lastError = null;
@@ -707,7 +715,10 @@ export class MobileGatewayService {
     this.clearPreview(deviceId);
     const now = Date.now();
     this.db.raw.prepare('UPDATE mobile_devices SET last_seen_at = ? WHERE id = ?').run(now, deviceId);
-    this.db.raw.prepare("UPDATE mobile_control_sessions SET status = 'disconnected', ended_at = ? WHERE device_id = ? AND status = 'active'").run(now, deviceId);
+    const sessions = this.db.raw.prepare(
+      "SELECT id FROM mobile_control_sessions WHERE device_id = ? AND status = 'active'"
+    ).all(deviceId) as unknown as { id: string }[];
+    for (const session of sessions) this.endSession(session.id, 'disconnected');
     this.revokeTokensForDevice(deviceId);
     const binding = this.db.raw.prepare('SELECT agent_id FROM mobile_agent_configs WHERE device_id = ?').get(deviceId) as { agent_id: string } | undefined;
     this.emit('device_disconnected', { deviceId, agentId: binding?.agent_id, payload: {} });
@@ -994,6 +1005,11 @@ export class MobileGatewayService {
     this.db.raw.prepare('UPDATE mobile_agent_configs SET allowed_tools_json = ?, authorization_confirmed_at = ?, updated_at = ? WHERE agent_id = ?')
       .run(JSON.stringify(uniqueTools), confirmedAt, Date.now(), agentId);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'mobile.agent.tools', target: agentId, result: `${uniqueTools.length}-tools` });
+    this.emit('binding_changed', {
+      deviceId: config.deviceId ?? undefined,
+      agentId,
+      payload: { bound: Boolean(config.deviceId), authorizationConfirmed: Boolean(confirmedAt) }
+    });
     return this.getAgentConfig(agentId)!;
   }
 
@@ -1008,13 +1024,21 @@ export class MobileGatewayService {
     return { bound: true, ready: true, reason: '' };
   }
 
-  async prepareTask(task: Task, agent: Agent): Promise<{ token: string; gatewayUrl: string; hermesHome: string; sessionId: string }> {
+  async prepareTask(task: Task, agent: Agent): Promise<{
+    token: string;
+    gatewayUrl: string;
+    runtime: PreparedMobileRuntime;
+    sessionId: string;
+  }> {
     if (agent.kind !== 'android_operator') throw new Error('Task is not owned by an Android operator');
     const config = this.getAgentConfig(agent.id);
     if (!config?.deviceId || !config.authorizationConfirmedAt) throw new Error('Android operator is not fully bound and authorized');
     if (!this.connections.has(config.deviceId)) throw new Error('Android device is offline');
     if (!this.pluginPort) throw new Error('Mobile Gateway plugin API is not running');
-    const hermesHome = await this.profiles.ensure(agent);
+    const runtime = await this.profiles.ensure(agent);
+    // Profile preparation can invoke a CLI and yield to a device disconnect;
+    // recheck before creating the lease so the task can be deferred cleanly.
+    if (!this.connections.has(config.deviceId)) throw new Error('Android device is offline');
     const session = this.acquireSession(agent.id, config.deviceId, task.id, config.allowedTools, TASK_TOKEN_TTL_MS);
     const token = randomBytes(32).toString('base64url');
     this.taskTokens.set(token, {
@@ -1026,7 +1050,7 @@ export class MobileGatewayService {
       allowedTools: new Set(config.allowedTools),
       expiresAt: session.expiresAt
     });
-    return { token, gatewayUrl: `http://127.0.0.1:${this.pluginPort}`, hermesHome, sessionId: session.id };
+    return { token, gatewayUrl: `http://127.0.0.1:${this.pluginPort}`, runtime, sessionId: session.id };
   }
 
   finishTask(taskId: string, status: 'completed' | 'failed' | 'cancelled' | 'expired' | 'disconnected' = 'completed'): void {
@@ -1039,6 +1063,7 @@ export class MobileGatewayService {
 
   private acquireSession(agentId: string, deviceId: string, taskId: string | null, allowedTools: MobileToolName[], ttlMs: number): MobileControlSession {
     this.expireSessions();
+    if (!this.connections.has(deviceId)) throw new Error('Android device is offline');
     const now = Date.now();
     const id = randomUUID();
     try {
@@ -1065,6 +1090,19 @@ export class MobileGatewayService {
     const now = Date.now();
     const expired = this.db.raw.prepare("SELECT id FROM mobile_control_sessions WHERE status = 'active' AND expires_at <= ?").all(now) as { id: string }[];
     for (const row of expired) this.endSession(row.id, 'expired');
+  }
+
+  private recoverStaleSessions(): void {
+    const rows = this.db.raw.prepare(
+      "SELECT id FROM mobile_control_sessions WHERE status = 'active'"
+    ).all() as unknown as { id: string }[];
+    for (const row of rows) this.endSession(row.id, 'disconnected');
+    if (rows.length > 0) {
+      this.db.audit({
+        id: randomUUID(), actor: 'system', action: 'mobile.session.recover',
+        target: `${rows.length} stale sessions`, result: 'disconnected'
+      });
+    }
   }
 
   private revokeTokensForDevice(deviceId: string): void {

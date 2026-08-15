@@ -13,12 +13,15 @@ import type { AdvisorAdvice, ControlKernel, DispatchPlanDraft, KernelRequest, Ke
 type RunCliResult = Awaited<ReturnType<typeof runCli>>;
 type KernelRunner = (binPath: string, args: string[], opts: { timeoutMs: number; cwd?: string; env?: NodeJS.ProcessEnv }) => Promise<RunCliResult>;
 
-const NO_SESSIONS: KernelSessionStore = { get: () => null, set: () => {} };
+const NO_SESSIONS: KernelSessionStore = { get: () => null, set: () => {}, clear: () => {} };
 const HERMES_FAILURE_RE = /HTTP\s+(?:400|401|403|408|409|422|429|5\d\d)\b|missing authentication|unauthorized|forbidden|invalid.*key|no usable credentials|api call failed/i;
 const HERMES_AUTH_FAILURE_RE = /HTTP\s+(?:401|403)\b|missing authentication|unauthorized|forbidden|invalid.*key|no usable credentials/i;
+const HERMES_STALE_SESSION_RE = /\bsession(?:\s+id)?\s+(?:not found|does not exist|no longer exists|is invalid|expired)\b|\b(?:invalid|unknown)\s+(?:native\s+)?session(?:\s+id)?\b|failed to (?:load|resume) (?:the )?session\b/i;
+const HERMES_PROFILE_AUTH_RE = /provider|credential|api[\s_-]*key|auth(?:entication)?|decrypt|protocol|模型供应商|供应商|密钥|解密/i;
 
 export interface HermesEngineHealthReporter {
   reportAuthenticationFailure(engineId: string, detail: string): void;
+  reportRuntimeFailure?(engineId: string, detail: string): void;
 }
 
 const NO_HEALTH_REPORTER: HermesEngineHealthReporter = { reportAuthenticationFailure: () => {} };
@@ -47,21 +50,33 @@ export class HermesControlKernel implements ControlKernel {
   }
 
   async plan(request: KernelRequest, advice: AdvisorAdvice[]): Promise<DispatchPlanDraft> {
-    const runtime = this.profiles.ensureController(
-      request.organizationId,
-      request.principalId,
-      request.conversationId
-    );
+    let runtime;
+    try {
+      runtime = this.profiles.ensureController(
+        request.organizationId,
+        request.principalId,
+        request.conversationId
+      );
+    } catch (error) {
+      const detail = (error instanceof Error ? error.message : String(error)).trim().slice(0, 2_000)
+        || 'Hermes controller profile preparation failed';
+      if (HERMES_PROFILE_AUTH_RE.test(detail) || !this.health.reportRuntimeFailure) {
+        this.health.reportAuthenticationFailure('eng-hermes-cli', detail);
+      } else {
+        this.health.reportRuntimeFailure('eng-hermes-cli', detail);
+      }
+      throw new Error(`Hermes controller profile unavailable: ${detail}`);
+    }
     const prompt = buildPlanningPrompt(request, advice);
     const usageFile = join(tmpdir(), `opc-hermes-control-${randomUUID()}.json`);
     const previousSession = this.sessions.get(request.conversationId, this.id);
-    const args = previousSession
+    const buildArgs = (sessionId: string | null): string[] => sessionId
       ? [
           'chat', '-Q', '-q', prompt,
           '-t', 'todo',
           '-m', runtime.model,
           '--provider', runtime.provider,
-          '--resume', previousSession,
+          '--resume', sessionId,
           '--no-restore-cwd'
         ]
       : [
@@ -78,12 +93,21 @@ export class HermesControlKernel implements ControlKernel {
     const env = childProcessEnv(runtime.env);
     const { run, usage } = await this.withProfileLock(runtime.home, async () => {
       try {
-        const result = await this.runner(engine?.path || 'hermes', args, {
-        timeoutMs: 120_000,
-        cwd: runtime.home,
-          env
-        });
-        return { run: result, usage: this.readUsage(usageFile) };
+        const runAttempt = async (sessionId: string | null) => {
+          const result = await this.runner(engine?.path || 'hermes', buildArgs(sessionId), {
+            timeoutMs: 120_000,
+            cwd: runtime.home,
+            env
+          });
+          return { run: result, usage: this.readUsage(usageFile) };
+        };
+        const first = await runAttempt(previousSession);
+        if (previousSession && this.isStaleSessionFailure(first.run, first.usage)) {
+          this.sessions.clear(request.conversationId, this.id);
+          rmSync(usageFile, { force: true });
+          return await runAttempt(null);
+        }
+        return first;
       } finally {
         rmSync(usageFile, { force: true });
       }
@@ -127,6 +151,12 @@ export class HermesControlKernel implements ControlKernel {
     const detail = candidates.find((candidate) => HERMES_AUTH_FAILURE_RE.test(candidate));
     if (!detail) return;
     this.health.reportAuthenticationFailure('eng-hermes-cli', detail.slice(0, 2_000));
+  }
+
+  private isStaleSessionFailure(run: RunCliResult, usage: HermesControlUsage | null): boolean {
+    if (run.code === 0 && usage?.failed !== true) return false;
+    const usageFailure = typeof usage?.failure === 'string' ? usage.failure : '';
+    return HERMES_STALE_SESSION_RE.test([usageFailure, run.stderr, run.error, run.stdout].filter(Boolean).join('\n'));
   }
 
   private readUsage(path: string): HermesControlUsage | null {

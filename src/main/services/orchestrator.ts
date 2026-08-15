@@ -23,6 +23,7 @@ import type { DispatchPlan, KernelRequest } from './kernel/types.js';
 import { notify } from './notifier.js';
 import { loadUserConfig } from './userConfig.js';
 import { MAX_TASK_OUTPUT_CHARS } from './textEncoding.js';
+import { ANDROID_OPERATOR_ENGINE_ID, assertAndroidOperatorEngine } from './mobileEnginePolicy.js';
 import type {
   Agent, AgentCardView, Approval, ApprovalScope, CreateAgentInput, DashboardStats, DerivedAgentStatus,
   Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
@@ -352,6 +353,12 @@ export class Orchestrator {
       for (const t of interrupted) {
         this.db.raw.prepare("UPDATE tasks SET status = 'INTERRUPTED', ended_at = ?, error = '客户端异常退出，任务中断' WHERE id = ?").run(now, t.id);
         this.db.raw.prepare("UPDATE agent_runs SET ended_at = ?, status = 'INTERRUPTED' WHERE task_id = ? AND ended_at IS NULL").run(now, t.id);
+        // Mobile leases live in SQLite, while the gateway's in-memory token
+        // map cannot survive a process restart. Close the lease together with
+        // the interrupted task so a reconnect is not blocked by stale state.
+        this.db.raw.prepare(
+          "UPDATE mobile_control_sessions SET status = 'disconnected', ended_at = COALESCE(ended_at, ?) WHERE task_id = ? AND status = 'active'"
+        ).run(now, t.id);
         this.recordEvent(t.id, 'interrupted', { reason: 'app-restart' }, now);
         for (const approval of pendingApprovals.filter((item) => item.task_id === t.id)) {
           this.db.raw.prepare("UPDATE approvals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'").run('rejected', now, approval.id as string);
@@ -644,9 +651,13 @@ export class Orchestrator {
     if (patch.userMd !== undefined) { fields.push('user_md = ?'); values.push(patch.userMd); }
     if (patch.permissionMode !== undefined) { fields.push('permission_mode = ?'); values.push(patch.permissionMode); }
     const nextKind = patch.kind ?? agent.kind;
+    const nextEngineId = patch.kind === 'android_operator'
+      ? ANDROID_OPERATOR_ENGINE_ID
+      : patch.engineId ?? agent.engineId;
+    assertAndroidOperatorEngine(nextKind, nextEngineId);
     if (patch.kind !== undefined) {
       fields.push('agent_kind = ?'); values.push(patch.kind);
-      fields.push('engine_id = ?'); values.push(patch.kind === 'android_operator' ? 'eng-hermes-cli' : (patch.engineId ?? agent.engineId));
+      fields.push('engine_id = ?'); values.push(nextEngineId);
       fields.push('concurrency_limit = ?'); values.push(patch.kind === 'android_operator' ? 1 : agent.concurrencyLimit);
     }
     if (patch.capabilities !== undefined || patch.kind !== undefined) {
@@ -658,7 +669,6 @@ export class Orchestrator {
     if (patch.tags !== undefined) { fields.push('tags_json = ?'); values.push(JSON.stringify(patch.tags)); }
     if (patch.modelOverrides !== undefined) { fields.push('model_overrides_json = ?'); values.push(JSON.stringify(patch.modelOverrides)); }
     if (patch.engineId !== undefined && patch.kind === undefined) {
-      if (agent.kind === 'android_operator' && patch.engineId !== 'eng-hermes-cli') throw new Error('Android 手机操作员固定使用 Hermes Agent 引擎');
       fields.push('engine_id = ?'); values.push(patch.engineId);
     }
     if (patch.modelOverride !== undefined) { fields.push('model_override = ?'); values.push(patch.modelOverride || ''); }
@@ -860,7 +870,7 @@ export class Orchestrator {
     if (input.name.length < 2 || input.name.length > 30) throw new Error('名称需为 2—30 字');
     if (input.role.length < 2 || input.role.length > 500) throw new Error('职责描述需为 2—500 字');
     const kind = input.kind ?? 'general';
-    const engineId = kind === 'android_operator' ? 'eng-hermes-cli' : input.engineId;
+    const engineId = kind === 'android_operator' ? ANDROID_OPERATOR_ENGINE_ID : input.engineId;
     if (kind === 'android_operator' && input.concurrencyLimit !== 1) throw new Error('Android 手机操作员并发数必须为 1');
     const engine = this.db.raw.prepare("SELECT status FROM engines WHERE id = ?").get(engineId) as { status: string } | undefined;
     if (!engine || !['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(engine.status)) {
@@ -975,6 +985,7 @@ export class Orchestrator {
     }
     const agent = this.getAgent(agentId);
     if (!agent) throw new Error('员工不存在');
+    assertAndroidOperatorEngine(agent.kind, agent.engineId);
     const mobileState = agent.kind === 'android_operator'
       ? this.mobileDispatchPolicy?.canDispatch(agentId) ?? { bound: false, ready: false, reason: '手机控制服务尚未启动' }
       : null;
@@ -1075,6 +1086,7 @@ export class Orchestrator {
     const agent = this.getAgent(plan.workerAgentId);
     if (!agent || agent.archived || agent.lifecycle !== 'READY') throw new Error('调度计划选择的员工当前不可执行');
     if (agent.engineId !== plan.workerEngineId) throw new Error('员工执行引擎在规划后发生变化，请重新规划');
+    assertAndroidOperatorEngine(agent.kind, plan.workerEngineId);
 
     stored ??= state.savePlan(request, plan);
     if (stored.status === 'failed') throw new Error('调度计划已标记失败');
@@ -1195,7 +1207,7 @@ export class Orchestrator {
     this.executors.dispatch(
       task,
       { ...agent, engineId: requestedEngineId },
-      this.makeCallbacks(task.id, agent.id, binding),
+      this.makeCallbacks(task.id, agent.id, binding, agent.kind),
       (resolved) => {
         Object.assign(binding, resolved);
         this.db.raw.prepare(
@@ -1219,6 +1231,28 @@ export class Orchestrator {
       .run(randomUUID(), taskId, eventType, JSON.stringify(payload), now);
   }
 
+  /** Return a mobile task to FIFO while its process has not acquired a lease.
+   * Retrying an already-issued non-idempotent phone command would be unsafe;
+   * this path is limited to preparation-time offline/lease races. */
+  private deferMobilePreparation(taskId: string, reason: string): boolean {
+    const now = Date.now();
+    let changed = false;
+    this.db.transaction(() => {
+      changed = this.db.raw.prepare(
+        `UPDATE tasks
+         SET status = 'QUEUED', stage = ?, error = NULL, started_at = NULL, ended_at = NULL
+         WHERE id = ? AND status = 'RUNNING'`
+      ).run(reason, taskId).changes > 0;
+      if (!changed) return;
+      this.db.raw.prepare(
+        "UPDATE agent_runs SET ended_at = ?, status = 'INTERRUPTED' WHERE task_id = ? AND ended_at IS NULL"
+      ).run(now, taskId);
+      this.recordEvent(taskId, 'queued', { reason: 'mobile-preparation-deferred', detail: reason }, now);
+    });
+    if (changed) this.emit();
+    return changed;
+  }
+
   /** Ignore output arriving after cancellation/timeout and release the small
    * per-task accounting entry after late child-process callbacks settle. */
   private closeOutputState(taskId: string) {
@@ -1231,7 +1265,7 @@ export class Orchestrator {
   }
 
   /** 执行器回调：统一走“状态更新 + task_events 同事务”模式；终态触发该员工 FIFO 补位 */
-  private makeCallbacks(taskId: string, agentId: string, binding: ExecutionBinding): ExecutorCallbacks {
+  private makeCallbacks(taskId: string, agentId: string, binding: ExecutionBinding, agentKind: Agent['kind']): ExecutorCallbacks {
     const finish = (status: 'COMPLETED' | 'FAILED' | 'INTERRUPTED', info: { result?: string; error?: string }) => {
       const now = Date.now();
       this.closeOutputState(taskId);
@@ -1332,7 +1366,12 @@ export class Orchestrator {
         this.scheduleNext(agentId);
       },
       onDone: (id, result) => finish('COMPLETED', { result }),
-      onError: (id, message) => finish(/超时|中断/.test(message) ? 'INTERRUPTED' : 'FAILED', { error: message })
+      onError: (id, message) => {
+        const preparationRace = agentKind === 'android_operator'
+          && /手机任务准备失败：.*(?:Android device is offline|active control lease)/i.test(message);
+        if (preparationRace && this.deferMobilePreparation(taskId, '手机暂时不可用，等待连接或当前控制会话释放')) return;
+        finish(/超时|中断/.test(message) ? 'INTERRUPTED' : 'FAILED', { error: message });
+      }
     };
   }
 

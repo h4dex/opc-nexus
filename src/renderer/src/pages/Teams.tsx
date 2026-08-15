@@ -6,7 +6,7 @@ import { IconAlert, IconCheck, IconClock, IconFile, IconFlow, IconFolder, IconHi
 import { toast } from '../components/Toast';
 import { TEAM_TEMPLATES, type TeamTemplate, type TeamTemplateAgent } from '../data/teamTemplates';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
-import type { TeamCollaborationOverview, TeamRun, TeamRunSubtask } from '../../../shared/types';
+import { NEXUS_ENGINE_ID, type TeamCollaborationOverview, type TeamRun, type TeamRunSubtask } from '../../../shared/types';
 
 interface TeamData {
   id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; workspace: string; createdAt: number;
@@ -92,7 +92,7 @@ export function Teams() {
     setDeployMsg('');
     try {
       const existingNames = new Set(snapshot?.agentCards.map((c) => c.agent.name) ?? []);
-      const engineId = snapshot?.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? 'eng-hermes';
+      const engineId = snapshot?.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? NEXUS_ENGINE_ID;
       const allAgents = [coordinator, ...members];
       const nameToId = new Map<string, string>();
 
@@ -658,7 +658,7 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
     try {
       // 从员工市场实例化专家：已存在同名员工则复用，否则创建
       const existingNames = new Set(snapshot.agentCards.map((c) => c.agent.name));
-      const engineId = snapshot.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? 'eng-hermes';
+      const engineId = snapshot.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? NEXUS_ENGINE_ID;
       const allRoles = [coordRole, ...memberRoles.filter((r) => r.id !== coordRole.id)];
       const nameToId = new Map<string, string>();
 

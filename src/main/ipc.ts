@@ -47,8 +47,9 @@ import type {
   MemoryForgetInput, MemoryListInput, MemoryProposalDecisionInput, MemoryProposalListInput,
   MemoryRecallInput, MemoryRememberInput, MemoryUpdateInput,
   TaskScheduleProposalDecisionInput, TaskScheduleProposalListInput,
-  MobileScriptDefinition, MobileToolName
+  MobileScriptDefinition, MobileToolName, EngineRuntimeConfig
 } from '../shared/types.js';
+import { NEXUS_ENGINE_ID } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -678,7 +679,7 @@ export function registerIpc(deps: IpcDeps) {
     // 引擎优先级：显式指定 > 默认引擎 > 任一可用引擎
     const engineId = input.engineId
       ?? (db.raw.prepare("SELECT id FROM engines WHERE is_default = 1 LIMIT 1").get() as { id: string } | undefined)?.id
-      ?? 'eng-hermes';
+      ?? NEXUS_ENGINE_ID;
     const agent = orchestrator.createAgent({
       name: draft.name, role: draft.role, systemPrompt: draft.systemPrompt,
       soulMd: draft.soulMd, agentsMd: draft.agentsMd,
@@ -762,7 +763,7 @@ export function registerIpc(deps: IpcDeps) {
       const agent = orchestrator.createAgent({
         name: data.name, role: data.role ?? '', systemPrompt: data.systemPrompt ?? '',
         soulMd: data.soulMd ?? '', agentsMd: data.agentsMd ?? '', userMd: data.userMd ?? '',
-        engineId: data.engineId ?? 'eng-hermes', workspace: data.workspace ?? '',
+        engineId: data.engineId ?? NEXUS_ENGINE_ID, workspace: data.workspace ?? '',
         permissionMode: (data.permissionMode as 'readonly' | 'standard' | 'trusted' | 'autonomous') ?? 'standard',
         concurrencyLimit: data.concurrencyLimit ?? 1, channelIds: []
       });
@@ -962,8 +963,9 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
   });
   ipcMain.handle('aibox:getEngineConfig', (_e, id: string) => engines.getConfig(id));
-  ipcMain.handle('aibox:saveEngineConfig', (_e, id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }) => {
+  ipcMain.handle('aibox:saveEngineConfig', (_e, id: string, config: EngineRuntimeConfig) => {
     engines.saveConfig(id, config);
+    pushSnapshot();
     return { ok: true };
   });
   ipcMain.handle('aibox:getEngineLogs', (_e, id: string) => engines.getLogs(id));
@@ -981,12 +983,12 @@ export function registerIpc(deps: IpcDeps) {
     return { ok: true };
   });
 
-  // ---------- 模型供应商（Hermes；密钥仅存 safeStorage，Renderer 只见脱敏视图） ----------
+  // ---------- 应用默认模型供应商（密钥仅存 safeStorage，Renderer 只见脱敏视图） ----------
   ipcMain.handle('aibox:getProviderConfig', () => getProviderConfig(db));
   ipcMain.handle('aibox:saveProviderConfig', async (_e, input: { baseUrl: string; model: string; apiKey?: string }) => {
     saveProviderConfig(db, input);
     db.audit({ id: randomUUID(), actor: 'admin', action: 'provider.save', target: input.baseUrl, result: 'ok' });
-    await engines.detect(); // 配置齐备后 Hermes 转 HEALTHY
+    await engines.detect(); // 配置齐备后重新计算所有受管引擎状态
     pushSnapshot();
     return getProviderConfig(db);
   });
@@ -1255,7 +1257,7 @@ function buildSnapshot(deps: IpcDeps) {
   if (!executorAvailable) {
     systemTodos.push({
       id: 'sys-no-executor',
-      title: '未检测到可用执行引擎，请到引擎中心安装 CLI 或配置 Hermes 供应商',
+      title: '未检测到可用执行引擎，请到引擎中心安装并验证 CLI，或配置受管模型供应商',
       owner: '引擎中心', dueText: '尽快处理', severity: 'high', kind: 'system'
     });
   }
@@ -1275,7 +1277,7 @@ function buildSnapshot(deps: IpcDeps) {
     engines: deps.engines.list(),
     channels: deps.channels.list(),
     schedules: deps.scheduler.list(),
-    // 至少一个可用执行器（CLI 健康或 Hermes 已配置）才能支持系统正常运行
+    // 至少一个已验证可用的执行器才能支持系统正常运行
     executorAvailable
   };
 }

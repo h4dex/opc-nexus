@@ -32,13 +32,13 @@ const mockBroker = () => ({ decide: vi.fn(), abandonTask: vi.fn(), onChange: vi.
 function setup(opencodeStatus = 'HEALTHY') {
   const db = createMockDb();
   // seedEngine 只接受 id，其余字段在此按用例需要覆写
-  seedEngine(db, 'eng-hermes');
+  seedEngine(db, 'eng-nexus');
   seedEngine(db, 'eng-opencode');
   Object.assign(db.tables.engines.get('eng-opencode'), {
     type: 'opencode', name: 'OpenCode', status: opencodeStatus, is_default: 0
   });
-  Object.assign(db.tables.engines.get('eng-hermes'), { name: 'Nexus Agent' });
-  const agentId = seedAgent(db, { name: '测试员工', engine_id: 'eng-hermes' });
+  Object.assign(db.tables.engines.get('eng-nexus'), { type: 'nexus', name: 'Nexus Agent' });
+  const agentId = seedAgent(db, { name: '测试员工', engine_id: 'eng-nexus' });
   const executors = mockExecutors();
   const orch = new Orchestrator(db, executors, mockBroker());
   return { db, orch, agentId, executors };
@@ -210,13 +210,13 @@ describe('engine_routing 规则消费', () => {
 
   it('路由目标与员工自身引擎相同时不设覆盖', () => {
     const { db, orch, agentId } = setup();
-    db.tables.settings.set('engine_routing', { desktop: 'eng-hermes' });
+    db.tables.settings.set('engine_routing', { desktop: 'eng-nexus' });
     expect(orch.createTask(agentId, '任务', 'desktop').engineOverride).toBeNull();
   });
 
   it('显式 engineOverride（编码委派）优先于路由规则', () => {
     const { db, orch, agentId } = setup();
-    db.tables.settings.set('engine_routing', { delegated: 'eng-hermes' });
+    db.tables.settings.set('engine_routing', { delegated: 'eng-nexus' });
     const parent = orch.createTask(agentId, '父任务');
     const sub = orch.toolHost().createEngineDelegatedTask(agentId, '改代码', parent.id, 'eng-opencode');
     expect(sub.engineOverride).toBe('eng-opencode');

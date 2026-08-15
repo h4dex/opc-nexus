@@ -5,6 +5,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { Database } from './database.js';
+import { NEXUS_ENGINE_ID } from '../../shared/types.js';
 
 // ==================== 常用 MCP 服务器预置 ====================
 
@@ -289,7 +290,7 @@ export function seedIfEmpty(db: Database) {
     }
     const insertAgent = db.raw.prepare(
       `INSERT INTO agents(id, name, role, system_prompt, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at, is_demo)
-       VALUES(?, ?, ?, ?, 'READY', 'eng-hermes', ?, 'standard', 1, 0, ?, ?, ?, 1)`
+       VALUES(?, ?, ?, ?, 'READY', '${NEXUS_ENGINE_ID}', ?, 'standard', 1, 0, ?, ?, ?, 1)`
     );
     const insertTask = db.raw.prepare(
       `INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result, is_demo)

@@ -710,6 +710,9 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
 }
 
 function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: number } {
+  if (/DELETE FROM settings WHERE key = \?/.test(sql)) {
+    return { changes: tables.settings.delete(args[0] as string) ? 1 : 0 };
+  }
   if (/INSERT INTO organizations/.test(sql)) {
     const [id, slug, name, createdAt, updatedAt] = args;
     const duplicate = [...tables.organizations.values()].some((row) => row.id === id || row.slug === slug);
@@ -1418,8 +1421,8 @@ export function seedAgent(db: ReturnType<typeof createMockDb>, overrides: Partia
 export function seedEngine(db: ReturnType<typeof createMockDb>, id = 'engine-sim'): void {
   db.tables.engines.set(id, {
     id,
-    type: 'hermes',
-    name: 'Hermes (内置)',
+    type: id === 'eng-hermes-cli' ? 'hermes-cli' : 'nexus',
+    name: id === 'eng-hermes-cli' ? 'Hermes Agent' : 'Nexus Agent',
     version: '1.0.0',
     path: null,
     status: 'HEALTHY',

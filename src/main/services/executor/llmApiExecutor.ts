@@ -11,9 +11,10 @@ import { randomUUID } from 'node:crypto';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
-import { redactSensitiveText } from '../engineEnv.js';
+import { redactSensitiveText, resolveEngineProvider } from '../engineEnv.js';
 import { getProviderSettings, readProviderKey, type ProviderSettings } from '../provider.js';
-import type { ProviderManager } from '../providerManager.js';
+import type { ProviderManager, ResolvedProvider } from '../providerManager.js';
+import { NEXUS_ENGINE_ID } from '../../../shared/types.js';
 import { toolsForPermission, toOpenAiTools, type ToolContext, type ToolDef, type ToolHost } from './tools.js';
 import { mcpToolsForAgent } from './mcpTools.js';
 import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
@@ -76,28 +77,55 @@ export class LlmApiExecutor implements ExecutorAdapter {
     return readProviderKey(this.db);
   }
 
+  /** Resolve the same managed Provider precedence used by CLI/Harness runtimes.
+   * Tests that construct this adapter without the application ProviderManager
+   * retain the legacy provider.js mock path. */
+  private resolveManagedProvider(agent?: Agent): { provider: ResolvedProvider | null; error: string | null } {
+    if (this.providerMgr) {
+      try {
+        return {
+          provider: resolveEngineProvider(this.db, NEXUS_ENGINE_ID, agent, this.providerMgr),
+          error: null
+        };
+      } catch (error) {
+        return { provider: null, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    return { provider: null, error: null };
+  }
+
   isReady(): boolean {
+    const managed = this.resolveManagedProvider();
+    if (this.providerMgr) return managed.error === null && managed.provider !== null;
     const c = this.config();
     return !!c.baseUrl.trim() && !!c.model.trim() && !!this.apiKey()?.trim();
   }
 
   start(task: Task, agent: Agent, cb: ExecutorCallbacks): void {
-    // 多供应商：优先用助手绑定的供应商，否则回退全局默认
+    // 多供应商：员工绑定 > 引擎级绑定 > 应用默认 Provider。
     let baseUrl = '', model = '', key: string | null = null;
-    const row = this.db.raw.prepare('SELECT provider_id, model_override FROM agents WHERE id = ?').get(agent.id) as
-      | { provider_id: string | null; model_override: string | null }
-      | undefined;
-    const providerId = row?.provider_id ?? null;
-    const modelOverride = agent.modelOverride ?? row?.model_override ?? null;
-    const resolved = this.providerMgr?.resolveForAgent(
-      providerId,
-      modelOverride
-    );
-    if (resolved) {
-      baseUrl = resolved.baseUrl;
-      model = resolved.model;
-      key = resolved.key;
-    } else if (!providerId) {
+    const managed = this.resolveManagedProvider(agent);
+    if (managed.error) {
+      cb.onError(task.id, `模型供应商配置无效：${managed.error}`);
+      return;
+    }
+    if (managed.provider) {
+      ({ baseUrl, model, key } = managed.provider);
+    } else if (this.providerMgr) {
+      cb.onError(task.id, '模型供应商配置不完整，请检查员工、引擎和默认 Provider 的 Base URL、模型及 API Key');
+      return;
+    } else {
+      // Compatibility path for isolated unit tests/legacy callers that do not
+      // inject ProviderManager. Production always supplies it from main/index.
+      const row = this.db.raw.prepare('SELECT provider_id, model_override FROM agents WHERE id = ?').get(agent.id) as
+        | { provider_id: string | null; model_override: string | null }
+        | undefined;
+      const providerId = row?.provider_id ?? null;
+      const modelOverride = agent.modelOverride ?? row?.model_override ?? null;
+      if (providerId) {
+        cb.onError(task.id, 'API Key 未配置，请在设置中完成模型供应商配置');
+        return;
+      }
       const providerCount = (this.db.raw.prepare('SELECT COUNT(*) c FROM providers').get() as { c?: number } | undefined)?.c ?? 0;
       if (providerCount > 0) {
         cb.onError(task.id, '模型供应商配置不完整，请检查默认供应商的 Base URL、模型和 API Key');
@@ -105,9 +133,9 @@ export class LlmApiExecutor implements ExecutorAdapter {
       }
       const cfg = this.config();
       baseUrl = cfg.baseUrl;
-      model = cfg.model;
+      model = modelOverride || cfg.model;
       key = this.apiKey()?.trim() || null;
-    } else key = null;
+    }
     if (!key) {
       cb.onError(task.id, 'API Key 未配置，请在设置中完成模型供应商配置');
       return;

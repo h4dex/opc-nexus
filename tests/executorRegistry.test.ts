@@ -116,6 +116,56 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.kindFor('eng-hermes-cli')).toBe('generic-cli');
   });
 
+  it('Android 手机操作员配置为 DSH 时明确失败且不启动 ACP', () => {
+    const db = makeDb({
+      'eng-deepseek-harness': {
+        type: 'external', status: 'HEALTHY',
+        config_json: JSON.stringify({ acpCommand: ['dsh', 'acp'] })
+      }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    const start = vi.spyOn(reg['acp'], 'start').mockImplementation(() => undefined);
+    const onError = vi.fn();
+    const onResolved = vi.fn();
+
+    expect(reg.dispatch(
+      { id: 't-mobile-dsh', agentId: 'a-mobile', title: '操作手机' } as never,
+      { id: 'a-mobile', kind: 'android_operator', engineId: 'eng-deepseek-harness' } as never,
+      { onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(), onError } as never,
+      onResolved
+    )).toBe('unavailable');
+
+    expect(start).not.toHaveBeenCalled();
+    expect(onResolved).toHaveBeenCalledWith({
+      requestedEngineId: 'eng-deepseek-harness', resolvedEngineId: null,
+      executorKind: 'unavailable', usedFallback: false
+    });
+    expect(onError).toHaveBeenCalledWith('t-mobile-dsh', expect.stringContaining('没有 Android 工具桥接'));
+  });
+
+  it('Hermes 不可用时手机任务禁止回退到其他健康执行器', () => {
+    userCfg.engine.fallbackEngineId = 'eng-harness';
+    const db = makeDb({
+      'eng-hermes-cli': { type: 'hermes-cli', status: 'AUTH_REQUIRED' },
+      'eng-harness': {
+        type: 'external', status: 'HEALTHY',
+        config_json: JSON.stringify({ acpCommand: ['dsh', 'acp'] })
+      }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    const fallback = vi.spyOn(reg['acp'], 'start').mockImplementation(() => undefined);
+    const onError = vi.fn();
+
+    expect(reg.dispatch(
+      { id: 't-mobile-no-hermes', agentId: 'a-mobile', title: '操作手机' } as never,
+      { id: 'a-mobile', kind: 'android_operator', engineId: 'eng-hermes-cli' } as never,
+      { onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(), onDone: vi.fn(), onError } as never
+    )).toBe('unavailable');
+
+    expect(fallback).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith('t-mobile-no-hermes', expect.stringContaining('不会降级到 DeepSeek Harness'));
+  });
+
   it('Pi Agent uses its dedicated JSONL executor when healthy', () => {
     const db = makeDb({
       'eng-pi': { type: 'pi', status: 'HEALTHY' }

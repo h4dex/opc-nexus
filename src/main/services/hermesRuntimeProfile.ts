@@ -5,6 +5,9 @@ import { app } from 'electron';
 import type { Agent } from '../../shared/types.js';
 import type { Database } from './database.js';
 import { ProviderManager, type ResolvedProvider } from './providerManager.js';
+import { resolveEngineProvider } from './engineEnv.js';
+
+export const HERMES_AGENT_ENGINE_ID = 'eng-hermes-cli';
 
 export interface PreparedHermesRuntime {
   home: string;
@@ -19,11 +22,6 @@ interface HermesProfileIdentity {
   soulMd: string;
   agentsMd: string;
   userMd: string;
-}
-
-interface AgentProviderRow {
-  provider_id: string | null;
-  model_override: string | null;
 }
 
 function defaultManagedRoot(): string {
@@ -80,10 +78,7 @@ export class HermesRuntimeProfileService {
   }
 
   private resolveProvider(agent: Agent): ResolvedProvider | null {
-    const row = this.db.raw.prepare('SELECT provider_id, model_override FROM agents WHERE id = ?').get(agent.id) as
-      | AgentProviderRow
-      | undefined;
-    return this.providers.resolveForAgent(row?.provider_id ?? null, row?.model_override ?? agent.modelOverride ?? null);
+    return resolveEngineProvider(this.db, HERMES_AGENT_ENGINE_ID, agent, this.providers);
   }
 
   private prepare(profileKey: string, identity: HermesProfileIdentity, provider: ResolvedProvider | null): PreparedHermesRuntime {
@@ -156,7 +151,7 @@ export class HermesRuntimeProfileService {
         'OPC-Nexus owns task state, approvals, memory, scheduling, and auditing.'
       ].join('\n'),
       userMd: ''
-    }, this.providers.resolveForAgent(null, null));
+    }, resolveEngineProvider(this.db, HERMES_AGENT_ENGINE_ID, null, this.providers));
   }
 
   /** A fixed profile is recreated before each probe so health checks cannot
@@ -171,6 +166,6 @@ export class HermesRuntimeProfileService {
       soulMd: '',
       agentsMd: 'Do not use tools during the engine health probe.',
       userMd: ''
-    }, this.providers.resolveForAgent(null, null));
+    }, resolveEngineProvider(this.db, HERMES_AGENT_ENGINE_ID, null, this.providers));
   }
 }

@@ -72,17 +72,18 @@ renderer → preload → main → shared
 |---|---|
 | Agent(`AgentLifecycle`) | DISABLED → STARTING → READY → STOPPING;异常 → ERROR |
 | Task(`TaskStatus`) | QUEUED → RUNNING → COMPLETED/FAILED/CANCELLED/INTERRUPTED;可经 WAITING_APPROVAL/PAUSED |
-| Engine(`EngineStatus`) | NOT_INSTALLED → INSTALLING → AUTH_REQUIRED → HEALTHY/DEGRADED/ERROR |
+| Engine(`EngineStatus`) | NOT_INSTALLED → INSTALLING → SETUP_REQUIRED/AUTH_REQUIRED → HEALTHY/DEGRADED/ERROR |
 | Channel(`ChannelStatus`) | UNCONFIGURED → CONNECTING → ONLINE/RECONNECTING/AUTH_EXPIRED/DISABLED/ERROR |
 
 状态转换只能发生在主进程 `orchestrator.ts` 或对应 Manager 中,Renderer 不可直接修改。首页派生状态 `DerivedAgentStatus` 由编排器计算,互斥优先级 `error > running > paused > starting > idle`。**状态机变更必须有对应测试覆盖。**
 
 ### 执行器选择(`executor/index.ts`,按优先级)
 
-1. Hermes 内置引擎 → `LlmApiExecutor`(已配置供应商时)
-2. 本机 CLI 引擎 → `CliExecutor`
-3. 外部引擎 → `AcpExecutor`(ACP 协议)
-4. 回退 → `SimulatedExecutor`(演示模式)
+1. Nexus 内置 Worker → `LlmApiExecutor`(已配置供应商时)
+2. Hermes / Pi → 专用 CLI Executor
+3. Codex / Claude Code / OpenCode → 对应 CLI Executor
+4. DeepSeek Harness / 自定义引擎 → `AcpExecutor`(ACP 协议)
+5. 回退 → `SimulatedExecutor`(仅演示模式)
 
 ### 持久化
 

@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { useApp } from '../store';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
 import { IconPlus, IconUser } from '../components/icons';
+import { NEXUS_ENGINE_ID } from '../../../shared/types';
 
 export function Market() {
   const { snapshot } = useApp();
@@ -21,7 +22,7 @@ export function Market() {
     setHiring(role.id);
     try {
       const engines = snapshot?.engines.filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)) ?? [];
-      const engineId = engines[0]?.id ?? 'eng-hermes';
+      const engineId = engines[0]?.id ?? NEXUS_ENGINE_ID;
       await window.aibox.createAgent({
         name: role.name,
         role: role.role,

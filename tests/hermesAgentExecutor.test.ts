@@ -99,6 +99,19 @@ describe('HermesAgentExecutor headless 参数构造', () => {
     expect(args[args.indexOf('--provider') + 1]).toBe('opcnexus');
   });
 
+  it('pins the resolved model and provider for Android tasks too', () => {
+    const exec = new HermesAgentExecutor(makeDb());
+    const args = exec['buildArgs'](
+      'PROMPT',
+      baseTask,
+      { ...baseAgent, kind: 'android_operator', modelOverride: 'must-not-win' },
+      '/tmp/u.json',
+      { model: 'mobile-model', provider: 'opcnexus' }
+    );
+    expect(args[args.indexOf('-m') + 1]).toBe('mobile-model');
+    expect(args[args.indexOf('--provider') + 1]).toBe('opcnexus');
+  });
+
   it('配置文件 runArgs 覆写时完全接管参数模板', () => {
     appCfg.engines['eng-hermes-cli'] = { runArgs: ['--custom', '{prompt}'] };
     const args = buildArgs(new HermesAgentExecutor(makeDb()), baseTask, baseAgent);

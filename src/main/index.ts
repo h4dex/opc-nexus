@@ -211,7 +211,7 @@ app.whenReady().then(async () => {
   const broker = new ApprovalBroker(db);
   const engines = new EngineManager(db);
   const channels = new ChannelManager(db);
-  const providerManager = new ProviderManager(db, () => engines.invalidateHarnessProviderVerification());
+  const providerManager = new ProviderManager(db, (change) => engines.invalidateProviderVerification(change));
   const executors = new ExecutorRegistry(db, broker, providerManager);
   const orchestrator = new Orchestrator(db, executors, broker);
   const scheduler = new Scheduler(db, orchestrator);
@@ -309,7 +309,7 @@ app.whenReady().then(async () => {
   knowledgeManager.syncAcceptedDeliverables(deliverableManager);
   // 凭据引导文件自动导入（credentials.bootstrap.json → safeStorage，导入后重命名）
   importCredentialsBootstrap(db);
-  // 旧版供应商配置（settings provider:hermes）→ providers 表（P0：单一数据源）
+  // 兼容迁移：旧版 settings provider:hermes（历史键名）→ providers 表；运行时统一使用 Nexus/Provider ID
   migrateLegacyProvider(db);
   // user/config.yaml 的 provider 段 → providers 表 + safeStorage
   // 顺序在 migrateLegacyProvider 之后：文件是用户显式意图，优先级高于历史迁移值

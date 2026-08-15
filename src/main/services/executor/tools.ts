@@ -252,7 +252,7 @@ export const TOOLS: ToolDef[] = [
     }
   },
   {
-    // E-2 编码专家委派：主引擎（Hermes/Nexus）负责规划与通用任务，
+    // E-2 编码专家委派：Nexus 内置 Worker 负责通用任务，
     // 遇到需要真正改代码、跑测试、分析仓库的工作时交给 OpenCode 执行。
     // 与 delegate_task 的区别：不换员工（归属与审批链路不变），只换执行引擎。
     name: 'delegate_coding_task',

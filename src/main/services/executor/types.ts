@@ -1,7 +1,7 @@
 /**
  * 执行器适配层（PRD 9.4 ExecutorAdapter）
  * 真实执行路径：
- *  - Hermes 内置引擎 → OpenAI 兼容 API 流式调用（参考 Cherry Studio 供应商直连模式）
+ *  - Nexus 内置引擎 → OpenAI 兼容 API 流式调用（参考 Cherry Studio 供应商直连模式）
  *  - Codex CLI / Claude Code → child_process headless 拉起（shell:false）
  *  - simulated → 演示回退（引擎未就绪时保持界面鲜活，UI 明确标注"演示模式"）
  */

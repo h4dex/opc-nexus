@@ -39,32 +39,63 @@ export function parseKernelJsonObject(text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+function requiredText(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw new Error(`${field} must be a string`);
+  if (!value.trim()) throw new Error(`${field} cannot be empty`);
+  return value;
+}
+
+function requiredArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
+  return value;
+}
+
 export function parseDispatchPlanDraft(text: string): DispatchPlanDraft {
   const value = parseKernelJsonObject(text);
-  const proposals = Array.isArray(value.memoryProposals) ? value.memoryProposals : [];
-  if (value.taskScheduleProposals !== undefined && !Array.isArray(value.taskScheduleProposals)) {
-    throw new Error('taskScheduleProposals must be an array');
+  const workerAgentId = requiredText(value.workerAgentId, 'workerAgentId');
+  const title = requiredText(value.title, 'title');
+  const objective = requiredText(value.objective, 'objective');
+  const rationale = requiredText(value.rationale, 'rationale');
+  if (typeof value.priority !== 'number' || !Number.isFinite(value.priority)) {
+    throw new Error('priority must be a finite number');
   }
-  const taskScheduleProposals = value.taskScheduleProposals ?? [];
+  const expectedOutputs = requiredArray(value.expectedOutputs, 'expectedOutputs');
+  if (expectedOutputs.some((item) => typeof item !== 'string')) {
+    throw new Error('expectedOutputs must contain only strings');
+  }
+  if (typeof value.requiresHumanApproval !== 'boolean') {
+    throw new Error('requiresHumanApproval must be a boolean');
+  }
+  const proposals = requiredArray(value.memoryProposals, 'memoryProposals');
+  const taskScheduleProposals = requiredArray(value.taskScheduleProposals, 'taskScheduleProposals');
   return {
-    workerAgentId: String(value.workerAgentId ?? ''),
-    title: String(value.title ?? ''),
-    objective: String(value.objective ?? ''),
-    rationale: String(value.rationale ?? ''),
-    priority: Number(value.priority ?? 0),
-    expectedOutputs: Array.isArray(value.expectedOutputs) ? value.expectedOutputs.map(String) : [],
-    requiresHumanApproval: value.requiresHumanApproval === true,
-    memoryProposals: proposals.map((proposal) => {
-      const item = proposal && typeof proposal === 'object' ? proposal as Record<string, unknown> : {};
+    workerAgentId,
+    title,
+    objective,
+    rationale,
+    priority: value.priority,
+    expectedOutputs: expectedOutputs as string[],
+    requiresHumanApproval: value.requiresHumanApproval,
+    memoryProposals: proposals.map((proposal, index) => {
+      if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) {
+        throw new Error(`memoryProposals[${index}] must be an object`);
+      }
+      const item = proposal as Record<string, unknown>;
+      for (const field of ['operation', 'kind', 'content', 'scope']) {
+        if (typeof item[field] !== 'string') throw new Error(`memoryProposals[${index}].${field} must be a string`);
+      }
+      if (typeof item.importance !== 'number' || !Number.isFinite(item.importance)) {
+        throw new Error(`memoryProposals[${index}].importance must be a finite number`);
+      }
       return {
-        operation: String(item.operation ?? '') as MemoryProposal['operation'],
-        kind: String(item.kind ?? ''),
-        content: String(item.content ?? ''),
-        scope: String(item.scope ?? '') as MemoryProposal['scope'],
-        importance: Number(item.importance ?? 0)
+        operation: item.operation as MemoryProposal['operation'],
+        kind: item.kind as string,
+        content: item.content as string,
+        scope: item.scope as MemoryProposal['scope'],
+        importance: item.importance
       };
     }),
-    taskScheduleProposals: (taskScheduleProposals as unknown[]).map((proposal, index) => {
+    taskScheduleProposals: taskScheduleProposals.map((proposal, index) => {
       if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) {
         throw new Error(`taskScheduleProposals[${index}] must be an object`);
       }

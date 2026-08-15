@@ -10,7 +10,7 @@
  *     "Authentication Fails, Your api key: ****robe is invalid"）
  * 结论：必须按供应商注入其专属变量名，仅 OpenAI 兼容名不够。
  *
- * 本文件锁住：专属变量名映射、用户手填值优先、以及凭据不落 config_json。
+ * 本文件锁住：专属变量名映射、受管 Provider 原子覆盖，以及凭据不落 config_json。
  *
  * @author liyingjie <y@senke.com>
  */
@@ -34,7 +34,11 @@ function makeDb(opts: { provider?: { baseUrl: string; model: string; key: string
     settings.set('secret:provider:prov-1', Buffer.from(`enc:${opts.provider.key}`).toString('base64'));
   }
   if (opts.engineEnv || opts.engineSecrets) {
-    engines.set('eng-hermes-cli', { id: 'eng-hermes-cli', config_json: JSON.stringify({ env: opts.engineEnv ?? {} }) });
+    const placeholders = Object.fromEntries(Object.keys(opts.engineSecrets ?? {}).map((key) => [key, '***']));
+    engines.set('eng-hermes-cli', {
+      id: 'eng-hermes-cli', type: 'hermes-cli',
+      config_json: JSON.stringify({ env: { ...(opts.engineEnv ?? {}), ...placeholders } })
+    });
     if (opts.engineSecrets) {
       settings.set('secret:engine:eng-hermes-cli:env', Buffer.from(`enc:${JSON.stringify(opts.engineSecrets)}`).toString('base64'));
     }
@@ -124,13 +128,13 @@ describe('供应商专属环境变量映射（按实测规则）', () => {
   });
 });
 
-describe('用户手填的引擎变量优先于自动下发', () => {
-  it('引擎配置页填了 DEEPSEEK_API_KEY 时不被供应商值覆盖', () => {
+describe('受管 Provider 路由保持原子一致', () => {
+  it('旧引擎密钥不会覆盖当前受管 Provider 密钥', () => {
     const db = makeDb({
       provider: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat', key: 'sk-real-key' },
       engineSecrets: { DEEPSEEK_API_KEY: 'sk-user-own' }
     });
-    expect(resolveEngineEnv(db, 'eng-hermes-cli').DEEPSEEK_API_KEY).toBe('sk-user-own');
+    expect(resolveEngineEnv(db, 'eng-hermes-cli').DEEPSEEK_API_KEY).toBe('sk-real-key');
   });
 
   it('用户未填的变量仍由供应商补齐', () => {

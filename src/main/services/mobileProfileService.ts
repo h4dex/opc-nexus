@@ -3,13 +3,26 @@ import { existsSync, mkdirSync, cpSync, copyFileSync, writeFileSync, rmSync, ren
 import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runCli, spawnCli } from './cliLauncher.js';
+import { spawnCli } from './cliLauncher.js';
 import type { Agent } from '../../shared/types.js';
 import type { Database } from './database.js';
-import { getProviderSettings, providerReady } from './provider.js';
+import { childProcessEnv, resolveEngineProvider } from './engineEnv.js';
+import { ProviderManager, type ResolvedProvider } from './providerManager.js';
 import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 
 const PROFILE_PREFIX = 'opcnexus-mobile-';
+const HERMES_AGENT_ENGINE_ID = 'eng-hermes-cli';
+
+interface ProviderResolver {
+  resolveForAgent(providerId: string | null, modelOverride: string | null): ResolvedProvider | null;
+}
+
+export interface PreparedMobileRuntime {
+  home: string;
+  model: string;
+  provider: 'opcnexus';
+  env: Record<string, string>;
+}
 
 export interface MobileProfileCheckpoint {
   agentId: string;
@@ -34,7 +47,11 @@ function mobileResourcesRoot(): string {
 }
 
 export class MobileProfileService {
-  constructor(private db: Database, private hermesRoot = defaultHermesRoot()) {}
+  constructor(
+    private db: Database,
+    private hermesRoot = defaultHermesRoot(),
+    private providers: ProviderResolver = new ProviderManager(db)
+  ) {}
 
   profileName(agentId: string): string {
     return `${PROFILE_PREFIX}${agentId.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 12)}`;
@@ -100,82 +117,33 @@ export class MobileProfileService {
     return row?.path || 'hermes';
   }
 
-  private safeBaseUrl(value: unknown): string | null {
-    if (typeof value !== 'string' || !value.trim() || value.length > 2048) return null;
-    try {
-      const url = new URL(value.trim());
-      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
-      return url.toString().replace(/\/$/, '');
-    } catch {
-      return null;
-    }
-  }
-
-  private safeName(value: unknown, max = 200): string | null {
-    return typeof value === 'string' && value.trim() && value.trim().length <= max ? value.trim() : null;
-  }
-
-  private async readRootModelConfig(): Promise<Record<string, unknown>> {
-    const result = await runCli(this.hermesBin(), ['config', 'get', 'model', '--json'], {
-      timeoutMs: 15_000,
-      env: { ...process.env, HERMES_HOME: this.hermesRoot }
-    });
-    if (!result.ok || !result.stdout.trim()) return {};
-    try {
-      const parsed = JSON.parse(result.stdout) as unknown;
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-    } catch {
-      return {};
-    }
-  }
-
-  private async buildManagedConfig(agent: Agent): Promise<Record<string, unknown>> {
-    const root = await this.readRootModelConfig();
-    const rootModel = this.safeName(root.default ?? root.model);
-    const rootProvider = this.safeName(root.provider, 80);
-    const rootBaseUrl = this.safeBaseUrl(root.base_url);
-
-    let injectedBaseUrl: string | null = null;
-    let injectedModel: string | null = null;
-    if (providerReady(this.db)) {
-      const configured = getProviderSettings(this.db);
-      injectedBaseUrl = this.safeBaseUrl(configured.baseUrl);
-      injectedModel = this.safeName(configured.model);
-    } else if (process.env.OPENAI_API_KEY) {
-      injectedBaseUrl = this.safeBaseUrl(process.env.OPENAI_BASE_URL ?? process.env.OPENAI_API_BASE);
-      injectedModel = this.safeName(process.env.OPENAI_CHAT_MODEL ?? process.env.OPENAI_MODEL);
-    }
-
-    const modelOverride = this.safeName(agent.modelOverride);
-    const useInjectedProvider = !!injectedBaseUrl && !!injectedModel;
-    const config: Record<string, unknown> = {
+  private buildManagedConfig(provider: ResolvedProvider): Record<string, unknown> {
+    return {
       model: {
-        default: modelOverride ?? injectedModel ?? rootModel ?? 'gpt-4o-mini',
-        provider: useInjectedProvider ? 'opcnexus' : rootProvider ?? 'auto',
-        ...(!useInjectedProvider && rootBaseUrl ? { base_url: rootBaseUrl } : {})
+        default: provider.model,
+        provider: 'opcnexus'
       },
       plugins: {
         enabled: ['opcnexus-android'],
         disabled: [],
         entries: { 'opcnexus-android': { allow_tool_override: false } }
-      }
-    };
-    if (useInjectedProvider) {
-      config.providers = {
+      },
+      providers: {
         opcnexus: {
           name: 'OPC-Nexus',
-          api: injectedBaseUrl,
+          api: provider.baseUrl,
           key_env: 'OPENAI_API_KEY',
-          default_model: modelOverride ?? injectedModel,
+          default_model: provider.model,
           transport: 'chat_completions'
         }
-      };
-    }
-    return config;
+      }
+    };
   }
 
-  async ensure(agent: Agent): Promise<string> {
+  async ensure(agent: Agent): Promise<PreparedMobileRuntime> {
     if (agent.kind !== 'android_operator') throw new Error('Only Android operators have a mobile Hermes profile');
+    const provider = resolveEngineProvider(this.db, HERMES_AGENT_ENGINE_ID, agent, this.providers);
+    if (!provider) throw new Error('该员工没有可用的模型供应商、模型或密钥');
     const name = this.profileName(agent.id);
     const home = this.profileHome(agent.id);
     const checkpoint = this.checkpoint(agent.id);
@@ -185,7 +153,7 @@ export class MobileProfileService {
           const child = spawnCli(this.hermesBin(), ['profile', 'create', name, '--no-alias', '--no-skills', '--description', `OPC-Nexus Android operator ${agent.name}`], {
             shell: false,
             windowsHide: true,
-            env: { ...process.env, HERMES_HOME: this.hermesRoot }
+            env: childProcessEnv({ HERMES_HOME: this.hermesRoot })
           });
           const stderrOutput = createProcessOutputBuffer();
           let stderr = '';
@@ -205,20 +173,25 @@ export class MobileProfileService {
       writeFileSync(join(home, 'SOUL.md'), agent.soulMd || agent.systemPrompt || `You are ${agent.name}.`, 'utf8');
       writeFileSync(join(home, 'AGENTS.md'), agent.agentsMd || 'Operate only the Android device assigned by OPC-Nexus.', 'utf8');
       writeFileSync(join(home, 'USER.md'), agent.userMd || '', 'utf8');
-      writeFileSync(join(home, 'memories', 'USER.md'), agent.userMd || '', 'utf8');
+      const hermesUserMemory = join(home, 'memories', 'USER.md');
+      // Hermes owns this file after profile creation: its memory tool updates
+      // the user profile between tasks. Seed it once, then preserve what the
+      // runtime has learned instead of resetting it on every dispatch.
+      if (!existsSync(hermesUserMemory)) {
+        writeFileSync(hermesUserMemory, agent.userMd || '', 'utf8');
+      }
 
       const resources = mobileResourcesRoot();
       const pluginTarget = join(home, 'plugins', 'opcnexus-android');
       cpSync(join(resources, 'hermes-plugin'), pluginTarget, { recursive: true, force: true });
       copyFileSync(join(resources, 'tool-catalog.json'), join(pluginTarget, 'tool-catalog.json'));
 
-      // Hermes creates an empty per-profile .env. OPC-Nexus injects task-scoped
-      // credentials into the child process and lets Hermes use global auth.json's
-      // native profile fallback, so neither secret file belongs in this profile.
+      // Hermes creates an empty per-profile .env. OPC-Nexus injects the resolved
+      // Provider credential into the task process, so no secret file belongs here.
       rmSync(join(home, '.env'), { force: true });
       rmSync(join(home, 'auth.json'), { force: true });
 
-      const managedConfig = await this.buildManagedConfig(agent);
+      const managedConfig = this.buildManagedConfig(provider);
       // JSON is valid YAML. Keep the generated profile structured so arbitrary
       // root config keys such as inline credentials and headers are never copied.
       writeFileSync(
@@ -234,7 +207,19 @@ export class MobileProfileService {
          ON CONFLICT(agent_id) DO UPDATE SET hermes_profile = excluded.hermes_profile, updated_at = excluded.updated_at`
       ).run(agent.id, name, now, now);
       this.commit(checkpoint);
-      return home;
+      return {
+        home,
+        model: provider.model,
+        provider: 'opcnexus',
+        env: {
+          HERMES_HOME: home,
+          HERMES_INFERENCE_MODEL: provider.model,
+          HERMES_INFERENCE_PROVIDER: 'opcnexus',
+          OPENAI_API_KEY: provider.key,
+          OPENAI_BASE_URL: provider.baseUrl,
+          OPENAI_API_BASE: provider.baseUrl
+        }
+      };
     } catch (error) {
       this.rollback(checkpoint);
       throw error;

@@ -191,7 +191,10 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
           <div className="field">
             <label>{androidOperator ? '执行引擎（手机操作员固定）' : '默认执行引擎（未就绪引擎将以演示模式执行，配置完成后自动切换真实执行）*'}</label>
             {androidOperator
-              ? <div className="chip-row"><button className="chip on" disabled>Hermes Agent CLI</button></div>
+              ? <>
+                  <div className="chip-row"><button className="chip on" disabled>Hermes Agent CLI</button></div>
+                  <div className="hint">手机工具仅通过 Hermes Agent 的受管插件接入；DeepSeek Harness 和其他 Runtime 当前不能操控 Android 设备。</div>
+                </>
               : <div className="chip-row">
                 {selectableEngines.map((e) => (
                   <button key={e.id} className={`chip ${form.engineId === e.id ? 'on' : ''}`} onClick={() => setForm({ ...form, engineId: e.id })}>

@@ -84,7 +84,7 @@ describe('HermesRuntimeProfileService', () => {
       { resolveForAgent: () => null } as never,
       root
     );
-    expect(() => service.ensure(agent() as never)).toThrow('没有可用的模型供应商或密钥');
+    expect(() => service.ensure(agent() as never)).toThrow('Configured model Provider is unavailable');
   });
 
   it('isolates controller native memory by organization, principal and conversation', () => {

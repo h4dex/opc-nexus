@@ -223,7 +223,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
               <button className={`chip ${kind === 'general' ? 'on' : ''}`} onClick={() => chooseKind('general')}>通用数字员工</button>
               <button className={`chip ${kind === 'android_operator' ? 'on' : ''}`} onClick={() => chooseKind('android_operator')}>Android 手机操作员</button>
             </div>
-            {kind === 'android_operator' && <div className="hint">固定 Hermes Agent CLI、并发 1，关闭网络、Shell、安装、浏览器和桌面操控能力。</div>}
+            {kind === 'android_operator' && <div className="hint">固定 Hermes Agent CLI、并发 1，关闭网络、Shell、安装、浏览器和桌面操控能力。DeepSeek Harness 和其他 Runtime 当前没有 Android 工具桥接。</div>}
           </div>
           <div className="field">
             <label>职责描述</label>

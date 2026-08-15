@@ -173,7 +173,9 @@ export function Tasks() {
                         <div style={{ flex: 1 }}><ProgressBar percent={t.progress} color={t.status === 'PAUSED' ? 'var(--warning)' : 'var(--accent)'} /></div>
                         <span style={{ fontSize: 11.5, color: 'var(--text-2)', minWidth: 32 }}>{t.progress}%</span>
                       </div>
-                    ) : t.status === 'COMPLETED' ? '100%' : '—'}
+                    ) : t.status === 'COMPLETED' ? '100%' : t.status === 'QUEUED' ? (
+                      <span style={{ color: 'var(--text-2)', fontSize: 12 }} title={t.stage}>{t.stage}</span>
+                    ) : '—'}
                   </td>
                   <td style={{ color: 'var(--text-2)', fontSize: 12 }}>{t.startedAt ? new Date(t.startedAt).toLocaleString('zh-CN', { hour12: false }) : '—'}</td>
                   <td>

@@ -26,6 +26,12 @@ export interface ResolvedProvider {
   key: string;
 }
 
+export interface ProviderRuntimeChange {
+  providerId: string;
+  providerUpdated: boolean;
+  defaultRouteChanged: boolean;
+}
+
 interface ProviderRow {
   id: string;
   name: string;
@@ -37,7 +43,10 @@ interface ProviderRow {
 }
 
 export class ProviderManager {
-  constructor(private db: Database, private onRuntimeConfigChanged: () => void = () => {}) {}
+  constructor(
+    private db: Database,
+    private onRuntimeConfigChanged: (change: ProviderRuntimeChange) => void = () => {}
+  ) {}
 
   list(): Provider[] {
     return (this.db.raw.prepare('SELECT * FROM providers ORDER BY is_default DESC, created_at').all() as unknown as ProviderRow[])
@@ -76,7 +85,11 @@ export class ProviderManager {
       this.audit('provider.create', id, isDefault ? 'default' : 'ok');
       if (encryptedKey) this.audit('provider.secret.store', id, 'ok');
     });
-    this.onRuntimeConfigChanged();
+    // A non-default Provider cannot be referenced before its generated id is
+    // returned, so creating it does not affect any active runtime route.
+    if (isDefault) {
+      this.onRuntimeConfigChanged({ providerId: id, providerUpdated: false, defaultRouteChanged: true });
+    }
 
     return { id, name, baseUrl, model, isDefault, hasKey: !!key, createdAt: now };
   }
@@ -134,8 +147,10 @@ export class ProviderManager {
     if (fields.length === 0) return;
 
     values.push(id);
-    const runtimeConfigChanged = patch.baseUrl !== undefined || patch.model !== undefined
-      || patch.apiKey !== undefined || patch.isDefault !== undefined;
+    const providerUpdated = patch.baseUrl !== undefined || patch.model !== undefined || Boolean(key);
+    const defaultSelectionChanged = (patch.isDefault === true && existing.is_default !== 1)
+      || (patch.isDefault === false && existing.is_default === 1 && Boolean(successor));
+    const defaultRouteChanged = defaultSelectionChanged || (existing.is_default === 1 && providerUpdated);
     this.db.transaction(() => {
       if (encryptedKey) this.db.setSetting(keyRef, encryptedKey);
       if (effectiveDefault === true) this.db.raw.prepare('UPDATE providers SET is_default = 0').run();
@@ -154,15 +169,39 @@ export class ProviderManager {
       this.audit('provider.update', id, 'ok');
       if (encryptedKey) this.audit('provider.secret.store', id, 'replaced');
     });
-    if (runtimeConfigChanged) this.onRuntimeConfigChanged();
+    if (providerUpdated || defaultRouteChanged) {
+      this.onRuntimeConfigChanged({ providerId: id, providerUpdated, defaultRouteChanged });
+    }
   }
 
   remove(id: string): void {
     const existing = this.db.raw.prepare('SELECT * FROM providers WHERE id = ?').get(id) as ProviderRow | undefined;
     if (!existing) throw new Error('供应商不存在');
 
+    // Keep explicit employee bindings fail-closed. Clearing provider_id here
+    // would silently redirect those employees to the application default,
+    // potentially sending work to a different credential domain. Reassign
+    // every bound employee before removing this Provider.
+    const bound = this.db.raw.prepare('SELECT COUNT(*) c FROM agents WHERE provider_id = ?').get(id) as
+      | { c?: number }
+      | undefined;
+    if ((bound?.c ?? 0) > 0) {
+      throw new Error('无法删除仍被数字员工显式绑定的供应商，请先重新绑定员工');
+    }
+    const engineBound = (this.db.raw.prepare(
+      'SELECT id, config_json FROM engines WHERE config_json IS NOT NULL'
+    ).all() as unknown as { id: string; config_json: string }[]).some((engine) => {
+      try {
+        return (JSON.parse(engine.config_json) as { providerId?: unknown }).providerId === id;
+      } catch {
+        return false;
+      }
+    });
+    if (engineBound) {
+      throw new Error('无法删除仍被执行引擎显式绑定的供应商，请先重新配置引擎');
+    }
+
     this.db.transaction(() => {
-      this.db.raw.prepare('UPDATE agents SET provider_id = NULL WHERE provider_id = ?').run(id);
       this.db.raw.prepare('DELETE FROM providers WHERE id = ?').run(id);
       if (existing.is_default === 1) {
         const successor = this.db.raw.prepare('SELECT id FROM providers ORDER BY created_at LIMIT 1').get() as { id: string } | undefined;
@@ -179,7 +218,11 @@ export class ProviderManager {
       }
       this.audit('provider.remove', id, 'ok');
     });
-    this.onRuntimeConfigChanged();
+    this.onRuntimeConfigChanged({
+      providerId: id,
+      providerUpdated: true,
+      defaultRouteChanged: existing.is_default === 1
+    });
   }
 
   /** Resolve Agent binding, then the default Provider. Explicit bindings fail closed. */

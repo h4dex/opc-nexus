@@ -120,7 +120,7 @@ describe('PiRuntimeProfileService', () => {
     const root = mkdtempSync(join(tmpdir(), 'opc-pi-profile-'));
     const service = new PiRuntimeProfileService(db() as never, { resolveForAgent: () => null }, root);
 
-    expect(() => service.ensure({ id: 'agent-1', modelOverride: undefined })).toThrow('No usable model provider');
+    expect(() => service.ensure({ id: 'agent-1', modelOverride: undefined })).toThrow('Configured model Provider is unavailable');
   });
 
   it('creates an isolated default-provider probe profile', () => {

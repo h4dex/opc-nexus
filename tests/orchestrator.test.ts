@@ -304,6 +304,36 @@ describe('Orchestrator 状态机', () => {
       expect(executors.dispatch).not.toHaveBeenCalled();
     });
 
+    it('手机离线时显示等待连接并在设备上线后唤醒队列', () => {
+      seedEngine(db, 'eng-hermes-cli');
+      let ready = false;
+      orch.setMobileDispatchPolicy({
+        canDispatch: () => ({ bound: true, ready, reason: ready ? '' : '手机离线，等待连接' })
+      });
+      const agentId = seedAgent(db, {
+        agent_kind: 'android_operator', engine_id: 'eng-hermes-cli', concurrency_limit: 1
+      });
+
+      const task = orch.createTask(agentId, '操作手机');
+      expect(task).toMatchObject({ status: 'QUEUED', stage: '手机离线，等待连接' });
+      expect(executors.dispatch).not.toHaveBeenCalled();
+
+      ready = true;
+      orch.wakeAgentQueue(agentId);
+      expect(db.tables.tasks.get(task.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+    });
+
+    it('旧数据库中的 Android 操作员若错误绑定 DSH 则拒绝创建任务', () => {
+      const agentId = seedAgent(db, {
+        agent_kind: 'android_operator', engine_id: 'eng-deepseek-harness', concurrency_limit: 1
+      });
+      orch.setMobileDispatchPolicy({ canDispatch: () => ({ bound: true, ready: true, reason: '' }) });
+
+      expect(() => orch.createTask(agentId, '操作手机')).toThrow('DeepSeek Harness 和其他执行引擎目前没有 Android 工具桥接');
+      expect(executors.dispatch).not.toHaveBeenCalled();
+    });
+
     it('拒绝计划审批会终止任务并记录决策事件', () => {
       const agentId = seedAgent(db);
       const { task, approvalId } = createPlanApproval(agentId);
@@ -784,6 +814,44 @@ describe('Orchestrator 状态机', () => {
       expect(after?.status).toBe('INTERRUPTED');
       expect(after?.error).toBe('客户端异常退出，任务中断');
       expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: task.id, status: 'INTERRUPTED' }));
+    });
+
+    it('recoverAfterRestart 关闭中断任务的手机租约但保留历史租约', () => {
+      const agentId = seedAgent(db);
+      const task = orch.createTask(agentId, '带手机租约的崩溃任务');
+      const terminalTask = orch.createTask(agentId, '已结束的历史手机任务');
+      db.tables.tasks.get(terminalTask.id)!.status = 'COMPLETED';
+
+      const leases = new Map([
+        ['stale-lease', { task_id: task.id, status: 'active', ended_at: null }],
+        ['history-lease', { task_id: terminalTask.id, status: 'completed', ended_at: 123 }]
+      ]);
+      const originalPrepare = db.raw.prepare;
+      db.raw.prepare = (sql: string) => {
+        if (/UPDATE mobile_control_sessions SET status = 'disconnected'/.test(sql)) {
+          return {
+            get: () => undefined,
+            all: () => [],
+            run: (endedAt: number, taskId: string) => {
+              let changes = 0;
+              for (const lease of leases.values()) {
+                if (lease.task_id === taskId && lease.status === 'active') {
+                  lease.status = 'disconnected';
+                  lease.ended_at = endedAt;
+                  changes++;
+                }
+              }
+              return { changes };
+            }
+          };
+        }
+        return originalPrepare(sql);
+      };
+
+      orch.recoverAfterRestart();
+
+      expect(leases.get('stale-lease')).toMatchObject({ status: 'disconnected', ended_at: expect.any(Number) });
+      expect(leases.get('history-lease')).toEqual({ task_id: terminalTask.id, status: 'completed', ended_at: 123 });
     });
 
     it('recoverAfterRestart 保留计划审批，重启后批准仍可派发', () => {

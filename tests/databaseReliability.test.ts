@@ -126,7 +126,7 @@ function v35Database(): { db: Database; inner: InstanceType<Awaited<ReturnType<t
   return { db: database(inner), inner };
 }
 
-describe('database v38 reliability gates', () => {
+describe('database v39 reliability gates', () => {
   it.each(['', '0', '-1', '35.5', 'not-a-version'])('rejects illegal schema version %j before running DDL', (version) => {
     const inner = new SQL.Database();
     inner.exec('CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -139,7 +139,7 @@ describe('database v38 reliability gates', () => {
 
   it('rejects a future schema before running DDL', () => {
     const inner = new SQL.Database();
-    inner.exec("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '39')");
+    inner.exec("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '40')");
     const db = database(inner);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).toThrow('高于当前应用支持');
@@ -155,12 +155,12 @@ describe('database v38 reliability gates', () => {
     expect(count(inner, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_meta'")).toBe(0);
   });
 
-  it('migrates a truly empty database to v38 with foreign keys enabled', () => {
+  it('migrates a truly empty database to v39 with foreign keys enabled', () => {
     const inner = new SQL.Database();
     const db = database(inner);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('38');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('39');
     expect(value(inner, 'PRAGMA foreign_keys')).toBe(1);
     expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
 
@@ -172,15 +172,193 @@ describe('database v38 reliability gates', () => {
     expect(count(inner, "SELECT COUNT(*) FROM workflow_runs WHERE id='workflow-run-1'")).toBe(0);
   });
 
+  it('renames the legacy built-in Hermes engine and every live engine reference to Nexus', () => {
+    const inner = new SQL.Database();
+    const db = database(inner);
+    (db as unknown as { migrate: () => void }).migrate();
+
+    inner.exec(`
+      INSERT INTO engines(
+        id, type, name, status, auth_status, is_default, data_boundary, config_json
+      ) VALUES(
+        'eng-hermes', 'hermes', 'Nexus Agent', 'HEALTHY', 'authed', 1, 'local',
+        '{"providerId":"prov-default","modelOverride":"legacy-model"}'
+      );
+      INSERT INTO organizations(id, slug, name, created_at, updated_at)
+        VALUES('org-migration','org-migration','Migration',1,1);
+      INSERT INTO principals(id, organization_id, kind, display_name, created_at, updated_at)
+        VALUES('principal-migration','org-migration','person','Migration',1,1);
+      INSERT INTO agents(id, organization_id, name, role, engine_id, created_at, updated_at)
+        VALUES('agent-migration','org-migration','Migration Agent','test','eng-hermes',1,1);
+      INSERT INTO agents(
+        id, organization_id, name, role, engine_id, agent_kind, created_at, updated_at
+      ) VALUES(
+        'agent-mobile-migration','org-migration','Migration Mobile Agent','test',
+        'eng-deepseek-harness','android_operator',1,1
+      );
+      INSERT INTO conversations(
+        id, agent_id, organization_id, principal_id, title, last_message_at,
+        message_count, created_at, updated_at
+      ) VALUES(
+        'conversation-migration','agent-migration','org-migration','principal-migration','',1,1,1,1
+      );
+      INSERT INTO messages(
+        id, organization_id, principal_id, conversation_id, dedupe_key,
+        direction, role, content, created_at
+      ) VALUES
+        ('message-migration','org-migration','principal-migration','conversation-migration',
+         'migration-dedupe','inbound','user','test',1),
+        ('message-mobile-active','org-migration','principal-migration','conversation-migration',
+         'migration-mobile-active','inbound','user','active mobile',2),
+        ('message-mobile-terminal','org-migration','principal-migration','conversation-migration',
+         'migration-mobile-terminal','inbound','user','completed mobile',3);
+      INSERT INTO tasks(
+        id, agent_id, conversation_id, title, engine_override, created_at
+      ) VALUES(
+        'task-migration','agent-migration','conversation-migration','test','eng-hermes',1
+      );
+      INSERT INTO tasks(
+        id, agent_id, title, status, engine_override, created_at, ended_at
+      ) VALUES
+        ('task-mobile-active','agent-mobile-migration','active mobile','QUEUED','eng-deepseek-harness',2,NULL),
+        ('task-mobile-terminal','agent-mobile-migration','completed mobile','COMPLETED','eng-deepseek-harness',3,3);
+      INSERT INTO agent_runs(
+        id, agent_id, task_id, session_id, requested_engine_id,
+        resolved_engine_id, status, started_at
+      ) VALUES(
+        'run-migration','agent-migration','task-migration','session-migration',
+        'eng-hermes','eng-hermes','COMPLETED',1
+      );
+      INSERT INTO dispatch_plans(
+        id, request_id, organization_id, principal_id, conversation_id,
+        input_message_id, leader_kernel, worker_agent_id, worker_engine_id,
+        status, task_id, plan_json, created_at
+      ) VALUES(
+        'plan-migration','request-migration','org-migration','principal-migration',
+        'conversation-migration','message-migration','nexus','agent-migration',
+        'eng-hermes','committed','task-migration','{"workerEngineId":"eng-hermes"}',1
+      );
+      INSERT INTO dispatch_plans(
+        id, request_id, organization_id, principal_id, conversation_id,
+        input_message_id, leader_kernel, worker_agent_id, worker_engine_id,
+        status, task_id, plan_json, created_at
+      ) VALUES
+        ('plan-mobile-active','request-mobile-active','org-migration','principal-migration',
+         'conversation-migration','message-mobile-active','hermes','agent-mobile-migration',
+         'eng-deepseek-harness','planned',NULL,'{"workerEngineId":"eng-deepseek-harness"}',2),
+        ('plan-mobile-terminal','request-mobile-terminal','org-migration','principal-migration',
+         'conversation-migration','message-mobile-terminal','hermes','agent-mobile-migration',
+         'eng-deepseek-harness','committed','task-mobile-terminal','{"workerEngineId":"eng-deepseek-harness"}',3);
+      INSERT INTO task_events(id, task_id, event_type, payload, created_at)
+        VALUES('event-migration','task-migration','engine','{"engineId":"eng-hermes"}',1);
+      INSERT INTO engine_logs(id, engine_id, level, message, timestamp)
+        VALUES('log-migration','eng-hermes','info','legacy',1);
+      INSERT INTO settings(key, value_json, updated_at) VALUES
+        ('engine:health:eng-hermes','{"engineId":"eng-hermes"}',1),
+        ('engine_routing','{"desktop":"eng-hermes"}',1),
+        ('provider:hermes','{"baseUrl":"https://legacy.example/v1","model":"legacy"}',1),
+        ('secret:provider:hermes:key','"encrypted-legacy-key"',1);
+      INSERT INTO providers(
+        id, name, base_url, model, api_key_ref, is_default, created_at
+      ) VALUES(
+        'provider-migration','Legacy Provider','https://legacy.example/v1','legacy',
+        'secret:provider:hermes:key',1,1
+      );
+      UPDATE schema_meta SET value = '38' WHERE key = 'schema_version';
+    `);
+
+    expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('39');
+    expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-hermes'")).toBe(0);
+    expect(value(inner, "SELECT type FROM engines WHERE id='eng-nexus'")).toBe('nexus');
+    expect(value(inner, "SELECT config_json FROM engines WHERE id='eng-nexus'")).toContain('legacy-model');
+    expect(value(inner, "SELECT engine_id FROM agents WHERE id='agent-migration'")).toBe('eng-nexus');
+    expect(value(inner, "SELECT engine_id FROM agents WHERE id='agent-mobile-migration'")).toBe('eng-hermes-cli');
+    expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-migration'")).toBe('eng-nexus');
+    expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-mobile-active'")).toBeNull();
+    expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-mobile-terminal'")).toBe('eng-deepseek-harness');
+    expect(value(inner, "SELECT requested_engine_id FROM agent_runs WHERE id='run-migration'")).toBe('eng-nexus');
+    expect(value(inner, "SELECT resolved_engine_id FROM agent_runs WHERE id='run-migration'")).toBe('eng-nexus');
+    expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-migration'")).toBe('eng-nexus');
+    expect(value(inner, "SELECT plan_json FROM dispatch_plans WHERE id='plan-migration'")).toContain('eng-nexus');
+    expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-mobile-active'")).toBe('eng-hermes-cli');
+    expect(value(inner, "SELECT plan_json FROM dispatch_plans WHERE id='plan-mobile-active'")).toContain('eng-hermes-cli');
+    expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-mobile-terminal'")).toBe('eng-deepseek-harness');
+    expect(value(inner, "SELECT payload FROM task_events WHERE id='event-migration'")).toContain('eng-nexus');
+    expect(value(inner, "SELECT engine_id FROM engine_logs WHERE id='log-migration'")).toBe('eng-nexus');
+    expect(count(inner, "SELECT COUNT(*) FROM settings WHERE key='engine:health:eng-hermes'")).toBe(0);
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='engine:health:eng-nexus'")).toContain('eng-nexus');
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='engine_routing'")).toContain('eng-nexus');
+    expect(count(inner, "SELECT COUNT(*) FROM settings WHERE key IN ('provider:hermes','secret:provider:hermes:key')")).toBe(0);
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='provider:nexus'")).toContain('legacy.example');
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='secret:provider:nexus:key'")).toContain('encrypted-legacy-key');
+    expect(value(inner, "SELECT api_key_ref FROM providers WHERE id='provider-migration'")).toBe('secret:provider:nexus:key');
+  });
+
+  it('preserves distinct Provider credentials and canonical Nexus config when v39 target rows already exist', () => {
+    const inner = new SQL.Database();
+    const db = database(inner);
+    (db as unknown as { migrate: () => void }).migrate();
+
+    inner.exec(`
+      INSERT INTO engines(id, type, name, status, config_json) VALUES
+        ('eng-nexus','nexus','Nexus Agent','HEALTHY','{"modelOverride":"canonical-model"}'),
+        ('eng-hermes','hermes','Legacy Nexus','AUTH_REQUIRED','{"modelOverride":"legacy-model"}');
+      INSERT INTO settings(key, value_json, updated_at) VALUES
+        ('provider:nexus','{"baseUrl":"https://canonical.example/v1","model":"canonical"}',20),
+        ('provider:hermes','{"baseUrl":"https://legacy.example/v1","model":"legacy"}',10),
+        ('secret:provider:nexus:key','"canonical-encrypted-key"',20),
+        ('secret:provider:hermes:key','"legacy-encrypted-key"',10);
+      INSERT INTO providers(id, name, base_url, model, api_key_ref, is_default, created_at) VALUES
+        ('provider-canonical','Canonical','https://canonical.example/v1','canonical','secret:provider:nexus:key',1,1),
+        ('provider-legacy','Legacy','https://legacy.example/v1','legacy','secret:provider:hermes:key',0,2);
+      UPDATE schema_meta SET value = '38' WHERE key = 'schema_version';
+    `);
+
+    expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
+    expect(value(inner, "SELECT config_json FROM engines WHERE id='eng-nexus'")).toContain('canonical-model');
+    expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-hermes'")).toBe(0);
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='provider:nexus'")).toContain('canonical.example');
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='secret:provider:nexus:key'")).toContain('canonical-encrypted-key');
+    expect(value(inner, "SELECT value_json FROM settings WHERE key='secret:provider:nexus:migrated-v39-key'")).toContain('legacy-encrypted-key');
+    expect(value(inner, "SELECT api_key_ref FROM providers WHERE id='provider-canonical'")).toBe('secret:provider:nexus:key');
+    expect(value(inner, "SELECT api_key_ref FROM providers WHERE id='provider-legacy'")).toBe('secret:provider:nexus:migrated-v39-key');
+    expect(count(inner, "SELECT COUNT(*) FROM settings WHERE key LIKE '%hermes%'")).toBe(0);
+  });
+
+  it('fails closed on a stamped-but-malformed v38 schema instead of deleting legacy references', () => {
+    const inner = new SQL.Database();
+    inner.exec(`
+      CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO schema_meta VALUES('schema_version', '38');
+      CREATE TABLE engines(
+        id TEXT PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL, version TEXT,
+        path TEXT, status TEXT NOT NULL DEFAULT 'NOT_INSTALLED',
+        auth_status TEXT NOT NULL DEFAULT 'unknown', is_default INTEGER NOT NULL DEFAULT 0,
+        data_boundary TEXT NOT NULL DEFAULT '', config_json TEXT
+      );
+      INSERT INTO engines(id, type, name) VALUES('eng-hermes', 'hermes', 'Nexus Agent');
+      -- This table is missing the historical engine_id reference on purpose.
+      CREATE TABLE agents(id TEXT PRIMARY KEY, agent_kind TEXT NOT NULL DEFAULT 'general');
+    `);
+    const db = database(inner);
+
+    expect(() => (db as unknown as { migrate: () => void }).migrate()).toThrow(/v39/);
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('38');
+    expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-hermes'")).toBe(1);
+    expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-nexus'")).toBe(0);
+  });
+
   it('keeps optional demo approvals attached to real demo tasks under foreign keys', () => {
     const inner = new SQL.Database();
     const db = database(inner);
     (db as unknown as { migrate: () => void }).migrate();
-    inner.exec("INSERT INTO engines(id, type, name) VALUES('eng-hermes','hermes','Nexus Agent')");
+    inner.exec("INSERT INTO engines(id, type, name) VALUES('eng-nexus','nexus','Nexus Agent')");
     db.setSetting('seedDemoData', true);
 
     expect(() => seedIfEmpty(db)).not.toThrow();
     expect(count(inner, 'SELECT COUNT(*) FROM approvals')).toBe(8);
+    expect(count(inner, "SELECT COUNT(*) FROM agents WHERE engine_id <> 'eng-nexus'")).toBe(0);
     expect(count(inner, `SELECT COUNT(*) FROM approvals ap
       LEFT JOIN tasks t ON t.id = ap.task_id WHERE t.id IS NULL`)).toBe(0);
     expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
@@ -190,7 +368,7 @@ describe('database v38 reliability gates', () => {
     const { db, inner } = v35Database();
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
 
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('38');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('39');
     expect(value(inner, 'PRAGMA foreign_keys')).toBe(1);
     expect(value(inner, "SELECT input_message_id FROM tasks WHERE id='task-winner'")).toBe('message-1');
     expect(value(inner, "SELECT input_message_id FROM tasks WHERE id='task-duplicate'")).toBeNull();
@@ -282,7 +460,7 @@ describe('database v38 reliability gates', () => {
         status, plan_json, created_at
       ) VALUES(
         'plan-local','kernel:message-local','org-local','principal-local-admin',NULL,
-        'conversation-local','message-local','hermes','agent-local','eng-hermes',
+        'conversation-local','message-local','hermes','agent-local','eng-nexus',
         'planned','{}',3
       );
     `);

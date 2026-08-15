@@ -4,11 +4,11 @@
  * 否则辅助引擎（user/config.yaml engine.fallbackEngineId，默认 eng-opencode）就绪 → 回退辅助引擎；
  * 两者均不可用时按执行模式分流：production = 返回 null（任务如实 FAILED，绝不伪装完成）；
  * demo = SimulatedExecutor（UI 标注演示模式）。
- * Codex 使用专属 JSONL 解析；Hermes CLI / OpenCode 走泛化 CLI（参数可配置文件覆写）。
+ * Hermes 与 Pi 使用专属执行器；Codex、Claude Code、OpenCode 使用对应 CLI 适配器；DSH 与自定义引擎走 ACP。
  *
  * @author liyingjie <y@senke.com>
  */
-import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
+import { NEXUS_ENGINE_ID, type Agent, type ExecutorKind, type Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { LlmApiExecutor } from './llmApiExecutor.js';
@@ -21,6 +21,11 @@ import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
 import type { ExecutionBinding, ExecutorAdapter, ExecutorCallbacks } from './types.js';
 import { PiRuntimeProfileService } from '../piRuntimeProfile.js';
+import {
+  ANDROID_OPERATOR_ENGINE_ID,
+  androidOperatorEngineError,
+  androidOperatorRuntimeUnavailableError
+} from '../mobileEnginePolicy.js';
 
 interface ResolvedExecutor {
   adapter: ExecutorAdapter;
@@ -82,12 +87,12 @@ export class ExecutorRegistry {
 
   /** Dynamic MCP tools currently run inside the built-in Nexus/LLM tool loop. */
   supportsMcp(engineId: string): boolean {
-    return this.engineType(engineId) === 'hermes';
+    return this.engineType(engineId) === 'nexus';
   }
 
   private engineType(engineId: string): string {
     const row = this.db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as { type: string } | undefined;
-    return row?.type ?? 'hermes';
+    return row?.type ?? (engineId === NEXUS_ENGINE_ID ? 'nexus' : '');
   }
 
   /** 单引擎就绪解析：就绪返回适配器，否则 null（不做任何回退） */
@@ -100,7 +105,7 @@ export class ExecutorRegistry {
     // 内置 Nexus：engines.status 由 detect() 按供应商配置维护（HEALTHY / SETUP_REQUIRED），
     // 与 llm.isReady() 判据同源。此处一并校验状态，避免「引擎页显示待配置、任务却照常派发」
     // 的语义分裂 —— 引擎状态必须是唯一真相来源。
-    if (type === 'hermes' && this.engineStatus(engineId) === 'HEALTHY' && this.llm.isReady()) return this.llm;
+    if (type === 'nexus' && this.engineStatus(engineId) === 'HEALTHY' && this.llm.isReady()) return this.llm;
     if (type === 'external' && this.acp.engineReady(engineId)) return this.acp;
     return null;
   }
@@ -143,12 +148,17 @@ export class ExecutorRegistry {
   ): ExecutorKind {
     // P1 修复：编码委派优先 —— task.engineOverride 覆盖 agent.engineId
     const targetEngineId = task.engineOverride || agent.engineId;
+    const mobileEngineError = androidOperatorEngineError(agent.kind, targetEngineId);
     // A canonical DispatchPlan or explicit task-level override approves one
     // concrete Worker engine. Replacing it here would cross the selected
     // provider/permission boundary. Retries intentionally keep the override
     // while receiving a new task identity.
     const exactEngineBinding = Boolean(task.inputMessageId || task.engineOverride);
-    const resolved = this.resolve(targetEngineId, !exactEngineBinding);
+    // Android tools are exposed only by the managed Hermes + Mobile Gateway
+    // path. Never substitute another healthy executor for a mobile task.
+    const resolved = mobileEngineError
+      ? null
+      : this.resolve(targetEngineId, agent.kind !== 'android_operator' && !exactEngineBinding);
     const binding: ExecutionBinding = resolved
       ? {
           requestedEngineId: targetEngineId,
@@ -166,9 +176,13 @@ export class ExecutorRegistry {
     // callbacks synchronously, and those callbacks need the actual engine.
     onResolved?.(binding);
     if (!resolved) {
-      cb.onError(task.id, exactEngineBinding
-        ? `任务固定的执行引擎不可用：${targetEngineId}（已禁止静默切换到其他引擎）`
-        : '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
+      const message = mobileEngineError
+        ?? (agent.kind === 'android_operator' && targetEngineId === ANDROID_OPERATOR_ENGINE_ID
+          ? androidOperatorRuntimeUnavailableError()
+          : exactEngineBinding
+            ? `任务固定的执行引擎不可用：${targetEngineId}（已禁止静默切换到其他引擎）`
+            : '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
+      cb.onError(task.id, message);
       return 'unavailable';
     }
     const { adapter, engineId } = resolved;

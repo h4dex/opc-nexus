@@ -20,7 +20,7 @@ export function harnessProviderFingerprint(db: Database): string {
   const rows = db.raw.prepare(
     'SELECT id, base_url, model, api_key_ref, is_default FROM providers ORDER BY id'
   ).all() as unknown as ProviderFingerprintRow[];
-  const material = rows.map((row) => ({
+  const providers = rows.map((row) => ({
     id: row.id,
     baseUrl: row.base_url?.trim() ?? '',
     model: row.model?.trim() ?? '',
@@ -28,6 +28,13 @@ export function harnessProviderFingerprint(db: Database): string {
     encryptedKey: row.api_key_ref ? db.getSetting<string | null>(row.api_key_ref, null) : null,
     isDefault: row.is_default === 1
   }));
+  const engine = db.raw.prepare('SELECT config_json FROM engines WHERE id = ?')
+    .get('eng-deepseek-harness') as { config_json?: string | null } | undefined;
+  const material = {
+    providers,
+    engineConfig: engine?.config_json ?? null,
+    encryptedEngineEnv: db.getSetting<string | null>('secret:engine:eng-deepseek-harness:env', null)
+  };
   return createHash('sha256').update(JSON.stringify(material)).digest('hex');
 }
 

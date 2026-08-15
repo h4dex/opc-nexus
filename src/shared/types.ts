@@ -19,7 +19,7 @@ export type TaskStatus =
   | 'CANCELLED'
   | 'INTERRUPTED';
 
-/** 引擎状态（SETUP_REQUIRED：内置 Hermes 未配置供应商，处于演示模式） */
+/** 引擎状态（SETUP_REQUIRED：内置 Nexus 未配置供应商，处于演示模式） */
 export type EngineStatus =
   | 'NOT_INSTALLED'
   | 'INSTALLING'
@@ -258,9 +258,30 @@ export interface MobileApkInfo {
   error: string | null;
 }
 
-/** Runtime types: Nexus/Hermes are control-capable runtimes; Codex, Claude,
- * Pi and OpenCode are Worker CLIs; external is an ACP adapter. */
-export type EngineType = 'hermes' | 'hermes-cli' | 'codex' | 'claude' | 'pi' | 'opencode' | 'external';
+export const NEXUS_ENGINE_ID = 'eng-nexus' as const;
+export const LEGACY_NEXUS_ENGINE_ID = 'eng-hermes' as const;
+
+/** Worker engine types. Control-kernel identity is modeled separately. */
+export type EngineType = 'nexus' | 'hermes-cli' | 'codex' | 'claude' | 'pi' | 'opencode' | 'external';
+
+/** Provider wire protocol expected by a managed runtime. */
+export type ProviderProtocol = 'openai-chat' | 'openai-responses' | 'anthropic-messages';
+export type EngineProviderMode = 'native' | 'managed';
+
+/** Renderer-safe engine runtime configuration. Provider credentials remain in safeStorage. */
+export interface EngineRuntimeConfig {
+  runArgs?: string[];
+  env?: Record<string, string>;
+  maxConcurrency?: number;
+  /** Native CLI login or an OPC-Nexus managed Provider. Managed-only engines reject native. */
+  providerMode?: EngineProviderMode;
+  /** Empty/undefined means the application default Provider. */
+  providerId?: string;
+  /** Optional engine-wide model override; an employee override still wins. */
+  modelOverride?: string;
+  /** Explicit API protocol; omitted legacy configs default to OpenAI Chat. */
+  protocol?: ProviderProtocol;
+}
 
 export type ChannelType = 'weixin' | 'wecom' | 'feishu' | 'qq';
 

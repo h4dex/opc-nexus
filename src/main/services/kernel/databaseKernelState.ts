@@ -61,6 +61,12 @@ export class DatabaseKernelState implements KernelAttemptRecorder, KernelSession
     ).run(conversationId, kernelId, sessionId, this.now());
   }
 
+  clear(conversationId: string, kernelId: ControlKernelId): void {
+    this.db.raw.prepare(
+      'DELETE FROM kernel_sessions WHERE conversation_id = ? AND kernel_id = ?'
+    ).run(conversationId, kernelId);
+  }
+
   savePlan(request: KernelRequest, plan: DispatchPlan): StoredDispatchPlan {
     if (request.requestId !== plan.requestId || request.conversationId !== plan.conversationId) {
       throw new Error('dispatch plan does not belong to the kernel request');

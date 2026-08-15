@@ -131,9 +131,11 @@ interface Agent {
 | `llm-api` | OpenAI 兼容 API 直连（支持工具调用） |
 | `codex-cli` | Codex CLI 引擎 |
 | `claude-cli` | Claude Code CLI |
-| `generic-cli` | 泛化 CLI（ZCode/OpenCode/Kimi） |
+| `pi-cli` | Pi Agent CLI |
+| `generic-cli` | Hermes Agent / OpenCode CLI |
 | `acp` | ACP 协议外部引擎 |
 | `simulated` | 演示模拟 |
+| `unavailable` | 生产模式下无可用执行器 |
 
 ### 2.5 IPC 接口
 
@@ -157,18 +159,19 @@ interface Agent {
 
 ### 3.1 功能概述
 
-引擎中心管理所有 AI 执行引擎的安装、检测、认证和配置。支持 7 种引擎类型。
+引擎中心管理所有 AI 执行引擎的安装、检测、真实任务验证和配置。内置 7 个 Runtime，并支持注册自定义 ACP 引擎。
 
 ### 3.2 支持的引擎
 
 | 引擎 | 类型标识 | 说明 |
 |------|----------|------|
-| Hermes | `hermes` | 内置 LLM API 引擎（需配置供应商） |
-| Codex | `codex` | OpenAI Codex CLI |
-| Claude Code | `claude-code` | Anthropic Claude Code CLI |
-| ZCode | `zcode` | 智谱 ZCode CLI |
-| OpenCode | `opencode` | OpenCode CLI |
-| Kimi Code | `kimicode` | Moonshot Kimi Code CLI |
+| Nexus Agent | `nexus` | 内置 LLM/tool-loop Runtime；作为 Hermes 失效时的本地执行回退（需配置供应商） |
+| DeepSeek Harness | `external` | OPC-Nexus 受管 ACP Runtime；可作为 Advisor/Reviewer 或普通 Worker，不具备 Android 手机工具桥 |
+| Hermes Agent | `hermes-cli` | 真实 Hermes Agent CLI；主控制核和 Android 手机操作员的固定执行器 |
+| Pi Agent | `pi` | Pi Agent CLI Worker |
+| Codex | `codex` | OpenAI Codex CLI Worker |
+| Claude Code | `claude` | Anthropic Claude Code CLI Worker |
+| OpenCode | `opencode` | OpenCode CLI Worker |
 | 外部引擎 | `external` | ACP 协议自定义引擎 |
 
 ### 3.3 核心能力
@@ -177,9 +180,9 @@ interface Agent {
 - **一键安装**: npm -g 自动安装（下载地址可配置）
 - **版本管理**: 检测当前版本、查询最新版本、一键更新
 - **卸载**: 安全卸载引擎
-- **认证管理**: 标记认证状态
+- **认证管理**: 运行最小真实模型任务验证凭据与产出
 - **默认引擎**: 设置全局默认引擎
-- **运行配置**: runArgs / env / maxConcurrency
+- **运行配置**: runArgs / env / maxConcurrency / providerMode / providerId / modelOverride / protocol
 - **性能指标**: avgLatencyMs / successRate / totalRuns
 - **日志查看**: 引擎运行日志
 - **自定义引擎注册**: 通过 ACP 命令注册外部引擎
@@ -845,7 +848,7 @@ api_key = <bridge_key>
 
 | 配置 | 说明 |
 |------|------|
-| 模型供应商 | Hermes 默认供应商配置 |
+| 模型供应商 | Nexus、Hermes、Pi、DSH 及其他受管执行器的应用默认 Provider |
 | 多供应商管理 | 添加/管理多个 API 供应商 |
 | API Bridge | 代理服务开关与 Key |
 | npm 下载源 | 引擎安装使用的 registry |

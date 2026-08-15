@@ -125,4 +125,5 @@ export interface KernelAttemptRecorder {
 export interface KernelSessionStore {
   get(conversationId: string, kernelId: ControlKernelId): string | null;
   set(conversationId: string, kernelId: ControlKernelId, sessionId: string): void;
+  clear(conversationId: string, kernelId: ControlKernelId): void;
 }

@@ -40,6 +40,7 @@ describe('planning prompt and parser', () => {
   it('parses a fenced JSON plan without evaluating surrounding text', () => {
     expect(parseDispatchPlanDraft(`prefix\n\`\`\`json\n${validPlan}\n\`\`\``)).toMatchObject({ workerAgentId: 'agent-1' });
     expect(() => parseDispatchPlanDraft('{"workerAgentId":')).toThrow('Invalid kernel JSON');
+    expect(() => parseDispatchPlanDraft('{"error":{"message":"HTTP 403 Forbidden"}}')).toThrow('workerAgentId must be a string');
   });
 
   it('parses task schedule suggestions but rejects malformed or target-bearing items', () => {
@@ -79,7 +80,7 @@ describe('HermesControlKernel', () => {
       home, model: 'deepseek-chat', provider: 'opcnexus',
       env: { HERMES_HOME: home, OPENAI_API_KEY: 'secret-key' }
     })) };
-    const sessions = { get: vi.fn(() => 'native-session-1'), set: vi.fn() };
+    const sessions = { get: vi.fn(() => 'native-session-1'), set: vi.fn(), clear: vi.fn() };
     const db = statusDb({ 'eng-hermes-cli': 'HEALTHY' });
     db.raw.prepare = (sql: string) => ({
       get: (id: string) => /SELECT path/.test(sql)
@@ -170,7 +171,7 @@ describe('HermesControlKernel', () => {
     const profiles = { ensureController: () => ({
       home, model: 'deepseek-chat', provider: 'opcnexus', env: { HERMES_HOME: home }
     }) };
-    const sessions = { get: vi.fn(() => null), set: vi.fn() };
+    const sessions = { get: vi.fn(() => null), set: vi.fn(), clear: vi.fn() };
     const health = { reportAuthenticationFailure: vi.fn() };
     const runner = vi.fn(async (_bin: string, args: string[]) => {
       const usageFile = args[args.indexOf('--usage-file') + 1];
@@ -190,6 +191,105 @@ describe('HermesControlKernel', () => {
     await expect(kernel.plan(request(), [])).rejects.toThrow('HTTP 403 Forbidden');
     expect(sessions.set).not.toHaveBeenCalled();
     expect(health.reportAuthenticationFailure).toHaveBeenCalledWith('eng-hermes-cli', 'HTTP 403 Forbidden');
+  });
+
+  it('treats a zero-exit JSON 403 error envelope as auth failure before saving a session', async () => {
+    const home = 'C:/opc/controller';
+    const profiles = { ensureController: () => ({
+      home, model: 'deepseek-chat', provider: 'opcnexus', env: { HERMES_HOME: home }
+    }) };
+    const sessions = { get: vi.fn(() => null), set: vi.fn(), clear: vi.fn() };
+    const health = { reportAuthenticationFailure: vi.fn() };
+    const runner = vi.fn(async (_bin: string, args: string[]) => {
+      const usageFile = args[args.indexOf('--usage-file') + 1];
+      writeFileSync(usageFile, JSON.stringify({ session_id: 'invalid-session' }));
+      return { ok: true, code: 0, stdout: '{"error":{"message":"HTTP 403 Forbidden"}}', stderr: '' };
+    });
+    const kernel = new HermesControlKernel(
+      statusDb({ 'eng-hermes-cli': 'HEALTHY' }) as never,
+      profiles as never,
+      sessions,
+      runner as never,
+      health
+    );
+
+    await expect(kernel.plan(request(), [])).rejects.toThrow('Hermes planning failed');
+    expect(health.reportAuthenticationFailure).toHaveBeenCalledWith('eng-hermes-cli', expect.stringContaining('HTTP 403 Forbidden'));
+    expect(sessions.set).not.toHaveBeenCalled();
+  });
+
+  it('revokes Hermes health when the managed controller profile cannot be prepared', async () => {
+    const profiles = {
+      ensureController: vi.fn(() => { throw new Error('Configured model Provider credential cannot be decrypted'); })
+    };
+    const health = { reportAuthenticationFailure: vi.fn() };
+    const runner = vi.fn();
+    const kernel = new HermesControlKernel(
+      statusDb({ 'eng-hermes-cli': 'HEALTHY' }) as never,
+      profiles as never,
+      undefined,
+      runner as never,
+      health
+    );
+
+    await expect(kernel.plan(request(), [])).rejects.toThrow('Hermes controller profile unavailable');
+    expect(health.reportAuthenticationFailure).toHaveBeenCalledWith(
+      'eng-hermes-cli',
+      'Configured model Provider credential cannot be decrypted'
+    );
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('reports local controller profile I/O failures as runtime degradation, not authentication failure', async () => {
+    const profiles = {
+      ensureController: vi.fn(() => { throw new Error('EACCES: permission denied, rename config.yaml'); })
+    };
+    const health = { reportAuthenticationFailure: vi.fn(), reportRuntimeFailure: vi.fn() };
+    const kernel = new HermesControlKernel(
+      statusDb({ 'eng-hermes-cli': 'HEALTHY' }) as never,
+      profiles as never,
+      undefined,
+      vi.fn() as never,
+      health
+    );
+
+    await expect(kernel.plan(request(), [])).rejects.toThrow('EACCES');
+    expect(health.reportRuntimeFailure).toHaveBeenCalledWith(
+      'eng-hermes-cli',
+      'EACCES: permission denied, rename config.yaml'
+    );
+    expect(health.reportAuthenticationFailure).not.toHaveBeenCalled();
+  });
+
+  it('clears a stale native session and retries exactly once with a fresh one-shot request', async () => {
+    const home = 'C:/opc/controller';
+    const profiles = { ensureController: () => ({
+      home, model: 'deepseek-chat', provider: 'opcnexus', env: { HERMES_HOME: home }
+    }) };
+    const sessions = { get: vi.fn(() => 'stale-session'), set: vi.fn(), clear: vi.fn() };
+    const runner = vi.fn(async (_bin: string, args: string[]) => {
+      if (runner.mock.calls.length === 1) {
+        return { ok: false, code: 1, stdout: '', stderr: 'Session not found: stale-session' };
+      }
+      const usageFile = args[args.indexOf('--usage-file') + 1];
+      writeFileSync(usageFile, JSON.stringify({ session_id: 'fresh-session' }));
+      return { ok: true, code: 0, stdout: validPlan, stderr: '' };
+    });
+    const kernel = new HermesControlKernel(
+      statusDb({ 'eng-hermes-cli': 'HEALTHY' }) as never,
+      profiles as never,
+      sessions,
+      runner as never
+    );
+
+    await expect(kernel.plan(request(), [])).resolves.toMatchObject({ workerAgentId: 'agent-1' });
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(runner.mock.calls[0][1]).toEqual(expect.arrayContaining(['--resume', 'stale-session']));
+    expect(runner.mock.calls[1][1]).toEqual(expect.arrayContaining(['-z', '--usage-file']));
+    expect(runner.mock.calls[1][1]).not.toContain('--resume');
+    expect(sessions.clear).toHaveBeenCalledOnce();
+    expect(sessions.clear).toHaveBeenCalledWith('conv-1', 'hermes');
+    expect(sessions.set).toHaveBeenCalledWith('conv-1', 'hermes', 'fresh-session');
   });
 });
 

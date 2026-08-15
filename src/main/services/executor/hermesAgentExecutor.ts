@@ -34,7 +34,7 @@ import { loadConfig } from '../config.js';
 import {
   childProcessEnv,
   createSensitiveTextRedactor,
-  providerEnvFor,
+  readEngineRuntimeConfig,
   redactSensitiveText
 } from '../engineEnv.js';
 import { HermesRuntimeProfileService, type PreparedHermesRuntime } from '../hermesRuntimeProfile.js';
@@ -127,14 +127,20 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       const args = resumedSession
         ? ['chat', '-Q', '-q', prompt, '--accept-hooks', '-t', 'android', '--resume', resumedSession, '--no-restore-cwd']
         : ['-z', prompt, '--usage-file', usageFile, '--accept-hooks', '-t', 'android'];
-      if (agent.modelOverride) args.push('-m', agent.modelOverride);
+      const model = runtime?.model ?? agent.modelOverride;
+      if (model) args.push('-m', model);
+      if (runtime) args.push('--provider', runtime.provider);
       return args;
     }
-    const override = loadConfig().engines[ENGINE_ID]?.runArgs;
+    const override = readEngineRuntimeConfig(this.db, ENGINE_ID)?.runArgs
+      ?? loadConfig().engines[ENGINE_ID]?.runArgs;
     if (override && override.length > 0) {
       // 用户完全接管参数模板：仅做 {prompt} 占位替换，不再叠加本应用的默认策略
       const args = override.map((a) => (a === '{prompt}' ? prompt : a));
       if (!override.includes('{prompt}')) args.push(prompt);
+      const model = runtime?.model ?? agent.modelOverride;
+      if (model && !args.some((arg) => arg === '-m' || arg === '--model' || arg.startsWith('--model='))) args.push('-m', model);
+      if (runtime && !args.some((arg) => arg === '--provider')) args.push('--provider', runtime.provider);
       return args;
     }
 
@@ -183,10 +189,9 @@ export class HermesAgentExecutor implements ExecutorAdapter {
         return;
       }
       this.startProcess(task, agent, cb, {
-        HERMES_HOME: mobile.hermesHome,
         OPCNEXUS_MOBILE_GATEWAY_URL: mobile.gatewayUrl,
         OPCNEXUS_MOBILE_TASK_TOKEN: mobile.token
-      });
+      }, mobile.runtime);
     } catch (error) {
       this.preparingTasks.delete(task.id);
       gateway.finishTask(task.id, 'cancelled');
@@ -194,7 +199,13 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     }
   }
 
-  private startProcess(task: Task, agent: Agent, cb: ExecutorCallbacks, mobileEnv: Record<string, string> | null): void {
+  private startProcess(
+    task: Task,
+    agent: Agent,
+    cb: ExecutorCallbacks,
+    mobileEnv: Record<string, string> | null,
+    preparedRuntime: PreparedHermesRuntime | null = null
+  ): void {
     const workspace = task.workspaceOverride || agent.workspace || join(app.getPath('userData'), 'workspaces', agent.id);
     try {
       mkdirSync(workspace, { recursive: true });
@@ -204,8 +215,8 @@ export class HermesAgentExecutor implements ExecutorAdapter {
       return;
     }
 
-    let runtime: PreparedHermesRuntime | null = null;
-    if (!mobileEnv) {
+    let runtime: PreparedHermesRuntime | null = preparedRuntime;
+    if (!runtime) {
       try {
         runtime = this.profiles.ensure(agent);
       } catch (error) {
@@ -221,7 +232,7 @@ export class HermesAgentExecutor implements ExecutorAdapter {
     const args = this.buildArgs(prompt, task, agent, usageFile, runtime);
     const bin = this.resolveBin();
     const env = childProcessEnv({
-      ...(runtime?.env ?? providerEnvFor(this.db)),
+      ...runtime.env,
       ...mobileEnv
     });
 

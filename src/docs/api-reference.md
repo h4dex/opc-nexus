@@ -129,9 +129,9 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:restartEngine` | `id: string` | `EngineInstallResult` | 重启 |
 | `aibox:checkRuntime` | 无 | `RuntimeInfo[]` | 检测运行环境 |
 | `aibox:installRuntime` | `name: string` | `EngineInstallResult` | 安装运行环境 |
-| `aibox:authEngine` | `id: string` | `void` | 标记认证 |
+| `aibox:authEngine` | `id: string` | `{ ok, message }` | 运行最小真实任务验证可用性 |
 | `aibox:setDefaultEngine` | `id: string` | `void` | 设为默认 |
-| `aibox:getEngineConfig` | `id: string` | `EngineConfig` | 获取配置 |
+| `aibox:getEngineConfig` | `id: string` | `EngineRuntimeConfig \| null` | 获取脱敏运行配置 |
 | `aibox:saveEngineConfig` | `id, config` | `{ ok }` | 保存配置 |
 | `aibox:getEngineLogs` | `id: string` | `EngineLogEntry[]` | 日志 |
 | `aibox:getEngineMetrics` | `id: string` | `EngineMetrics` | 性能指标 |
@@ -150,11 +150,11 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:updateProvider` | `id, patch` | `void` | 更新 |
 | `aibox:removeProvider` | `id: string` | `void` | 删除 |
 | `aibox:testProviderById` | `id: string` | `ProviderTestResult` | 测试连接 |
-| `aibox:fetchProviderModels` | `id: string` | `string[]` | 获取模型列表 |
+| `aibox:fetchProviderModels` | `id: string` | `{ ok, models, error? }` | 获取模型列表 |
 
 ---
 
-## 模型供应商（Hermes 默认）
+## 应用默认模型供应商（兼容接口）
 
 | Channel | 参数 | 返回值 | 说明 |
 |---------|------|--------|------|

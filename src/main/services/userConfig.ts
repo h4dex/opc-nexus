@@ -13,6 +13,7 @@
 import { app } from 'electron';
 import { dirname, join } from 'node:path';
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { LEGACY_NEXUS_ENGINE_ID, NEXUS_ENGINE_ID } from '../../shared/types.js';
 
 export interface UserConfig {
   wecom: {
@@ -68,7 +69,7 @@ wecom:
 
 # 引擎策略
 engine:
-  fallbackEngineId: "eng-opencode"   # 辅助引擎：主引擎不可用时回退（eng-opencode / eng-codex / eng-hermes-cli / eng-hermes）
+  fallbackEngineId: "eng-opencode"   # 辅助引擎：主引擎不可用时回退（eng-opencode / eng-codex / eng-hermes-cli / eng-nexus）
   executionMode: "production"        # production(默认) = 引擎不可用任务直接失败；demo = 回退演示模式(仅演示用，会生成虚构产物)
 
 # 任务保护（防长任务卡死 / 死循环）
@@ -174,6 +175,7 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
   const task = (parsed.task ?? {}) as Record<string, unknown>;
   const provider = (parsed.provider ?? {}) as Record<string, unknown>;
   const mode = str(engine.executionMode, d.engine.executionMode);
+  const configuredFallback = str(engine.fallbackEngineId, d.engine.fallbackEngineId);
   const maxRun = typeof task.maxRunMinutes === 'number' && task.maxRunMinutes >= 0 ? task.maxRunMinutes : d.task.maxRunMinutes;
   return {
     wecom: {
@@ -182,7 +184,7 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
       webhookUrl: sanitizeWebhookUrl(str(wecom.webhookUrl, ''))
     },
     engine: {
-      fallbackEngineId: str(engine.fallbackEngineId, d.engine.fallbackEngineId),
+      fallbackEngineId: configuredFallback === LEGACY_NEXUS_ENGINE_ID ? NEXUS_ENGINE_ID : configuredFallback,
       executionMode: mode === 'production' ? 'production' : 'demo'
     },
     task: { maxRunMinutes: maxRun },

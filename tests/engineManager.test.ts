@@ -14,6 +14,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
+const { safeStorage } = await import('electron');
 
 const appCfg: { engines: Record<string, unknown>; npmRegistry: string } = { engines: {}, npmRegistry: 'https://registry.npmmirror.com' };
 vi.mock('../src/main/services/config.js', () => ({
@@ -25,8 +26,10 @@ vi.mock('../src/main/services/config.js', () => ({
 let providerIsReady = false;
 vi.mock('../src/main/services/provider.js', () => ({
   providerReady: () => providerIsReady,
-  getProviderSettings: () => ({ baseUrl: '', model: '' }),
-  readProviderKey: () => null
+  getProviderSettings: () => providerIsReady
+    ? { baseUrl: 'https://provider.test/v1', model: 'test-model' }
+    : { baseUrl: '', model: '' },
+  readProviderKey: () => providerIsReady ? 'test-provider-key' : null
 }));
 
 const acpProbeMocks = vi.hoisted(() => ({
@@ -39,7 +42,14 @@ vi.mock('../src/main/services/executor/acpExecutor.js', async (importOriginal) =
   probeAcpTask: acpProbeMocks.task
 }));
 
-const { EngineManager, ENGINE_CATALOG, RETIRED_ENGINE_IDS, CLI_FAILURE_BODY_PATTERN, cliLaunchProbeTimeoutMs } = await import('../src/main/services/engineManager.js');
+const {
+  EngineManager,
+  ENGINE_CATALOG,
+  RETIRED_ENGINE_IDS,
+  CLI_FAILURE_BODY_PATTERN,
+  cliInstallWasDetected,
+  cliLaunchProbeTimeoutMs
+} = await import('../src/main/services/engineManager.js');
 const {
   HARNESS_PROVIDER_FINGERPRINT_SETTING,
   harnessProviderFingerprint
@@ -48,7 +58,8 @@ const {
 /** 内存 engines 表桩:支持状态读写,便于断言状态迁移 */
 function makeDb(
   engines: Record<string, Record<string, unknown>> = {},
-  providers: Record<string, unknown>[] = []
+  providers: Record<string, unknown>[] = [],
+  agents: Record<string, unknown>[] = []
 ) {
   const settings: Record<string, unknown> = {};
   return {
@@ -56,6 +67,12 @@ function makeDb(
     raw: {
       prepare: (sql: string) => ({
         get: (id: string) => {
+          if (/FROM providers/.test(sql)) {
+            if (/COUNT\(\*\)/.test(sql)) return { c: providers.length };
+            if (/WHERE id = \?/.test(sql)) return providers.find((provider) => provider.id === id);
+            if (/is_default = 1/.test(sql)) return providers.find((provider) => provider.is_default === 1);
+            return providers[0];
+          }
           const e = engines[id];
           if (!e) return undefined;
           if (/SELECT status FROM engines/.test(sql)) return { status: e.status };
@@ -63,7 +80,15 @@ function makeDb(
           if (/SELECT config_json FROM engines/.test(sql)) return { config_json: e.config_json };
           return e;
         },
-        all: () => /FROM providers/.test(sql) ? providers : Object.values(engines),
+        all: (...args: unknown[]) => {
+          if (/FROM providers/.test(sql)) return providers;
+          if (/FROM agents/.test(sql)) {
+            return agents.filter((agent) => agent.engine_id === args[0]
+              && agent.archived === 0
+              && (agent.provider_id != null || String(agent.model_override ?? '').trim() !== ''));
+          }
+          return Object.values(engines);
+        },
         run: (...args: unknown[]) => {
           if (/INSERT INTO engines/.test(sql) && /ON CONFLICT\(id\) DO UPDATE/.test(sql)) {
             const [id, type, name, status, isDefault, dataBoundary] = args;
@@ -146,10 +171,26 @@ function makeDb(
             });
             return { changes: 1 };
           }
+          if (/UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required', version = \?, path = \? WHERE id = \?/.test(sql)) {
+            const [version, path, id] = args;
+            if (engines[id as string]) Object.assign(engines[id as string], {
+              status: 'AUTH_REQUIRED',
+              auth_status: 'required',
+              version,
+              path
+            });
+            return { changes: engines[id as string] ? 1 : 0 };
+          }
           if (/UPDATE engines SET config_json = \? WHERE id = \?/.test(sql)) {
             const [json, id] = args;
             if (engines[id as string]) engines[id as string].config_json = json;
             return { changes: 1 };
+          }
+          if (/DELETE FROM settings WHERE key = \?/.test(sql)) {
+            const [key] = args;
+            const existed = key as string in settings;
+            delete settings[key as string];
+            return { changes: existed ? 1 : 0 };
           }
           return { changes: 1 };
         }
@@ -179,9 +220,16 @@ beforeEach(() => {
 });
 
 describe('引擎目录收敛(E-1)', () => {
+  it('CLI 安装成功后允许处于待真实验证状态', () => {
+    expect(cliInstallWasDetected('AUTH_REQUIRED')).toBe(true);
+    expect(cliInstallWasDetected('HEALTHY')).toBe(true);
+    expect(cliInstallWasDetected('NOT_INSTALLED')).toBe(false);
+    expect(cliInstallWasDetected('ERROR')).toBe(false);
+  });
+
   it('目录包含控制内核与已验证的 Worker runtime', () => {
     expect(ENGINE_CATALOG.map((e) => e.id).sort()).toEqual(
-      ['eng-claude', 'eng-codex', 'eng-deepseek-harness', 'eng-hermes', 'eng-hermes-cli', 'eng-opencode', 'eng-pi'].sort()
+      ['eng-claude', 'eng-codex', 'eng-deepseek-harness', 'eng-hermes-cli', 'eng-nexus', 'eng-opencode', 'eng-pi'].sort()
     );
     expect(ENGINE_CATALOG.find((e) => e.id === 'eng-deepseek-harness')).toMatchObject({
       type: 'external',
@@ -196,7 +244,7 @@ describe('引擎目录收敛(E-1)', () => {
   });
 
   it('Nexus 为内置引擎(无 bin,不做 CLI 检测)', () => {
-    expect(ENGINE_CATALOG.find((e) => e.id === 'eng-hermes')?.bin).toBeNull();
+    expect(ENGINE_CATALOG.find((e) => e.id === 'eng-nexus')?.bin).toBeNull();
   });
 
   it('Hermes CLI 走 hermes 二进制且无 npm 包(PowerShell 脚本安装)', () => {
@@ -255,22 +303,42 @@ describe('鉴权探测状态迁移(H-4)', () => {
     }));
   });
 
+  it('本地 Runtime 准备失败会降级但保留已验证的 Provider 鉴权', () => {
+    const db = makeDb({
+      'eng-hermes-cli': { id: 'eng-hermes-cli', status: 'HEALTHY', auth_status: 'authed' }
+    });
+    const manager = new EngineManager(db as never);
+
+    manager.reportRuntimeFailure('eng-hermes-cli', 'EACCES: profile is not writable');
+    manager.reportRuntimeFailure('eng-hermes-cli', 'EACCES: profile is not writable');
+
+    expect(db._engines['eng-hermes-cli']).toMatchObject({ status: 'DEGRADED', auth_status: 'authed' });
+    expect(manager.getHealthSignals('eng-hermes-cli')).toMatchObject({
+      detected: true, launchable: true, authenticated: true, taskVerified: false,
+      detail: 'EACCES: profile is not writable'
+    });
+    expect(db.audit).toHaveBeenCalledTimes(1);
+    expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'engine.runtimeFailure', target: 'eng-hermes-cli', result: 'DEGRADED'
+    }));
+  });
+
   it('内置 Nexus:供应商就绪 → HEALTHY + authed', async () => {
     providerIsReady = true;
-    const db = makeDb({ 'eng-hermes': { id: 'eng-hermes', status: 'SETUP_REQUIRED', auth_status: 'required' } });
-    const r = await new EngineManager(db as never).probeAuth('eng-hermes');
+    const db = makeDb({ 'eng-nexus': { id: 'eng-nexus', status: 'SETUP_REQUIRED', auth_status: 'required' } });
+    const r = await new EngineManager(db as never).probeAuth('eng-nexus');
     expect(r.ok).toBe(true);
-    expect(db._engines['eng-hermes'].status).toBe('HEALTHY');
-    expect(db._engines['eng-hermes'].auth_status).toBe('authed');
+    expect(db._engines['eng-nexus'].status).toBe('HEALTHY');
+    expect(db._engines['eng-nexus'].auth_status).toBe('authed');
   });
 
   it('内置 Nexus:供应商未配置 → SETUP_REQUIRED,不伪装成已登录', async () => {
     providerIsReady = false;
-    const db = makeDb({ 'eng-hermes': { id: 'eng-hermes', status: 'SETUP_REQUIRED', auth_status: 'required' } });
-    const r = await new EngineManager(db as never).probeAuth('eng-hermes');
+    const db = makeDb({ 'eng-nexus': { id: 'eng-nexus', status: 'SETUP_REQUIRED', auth_status: 'required' } });
+    const r = await new EngineManager(db as never).probeAuth('eng-nexus');
     expect(r.ok).toBe(false);
-    expect(db._engines['eng-hermes'].status).toBe('SETUP_REQUIRED');
-    expect(db._engines['eng-hermes'].auth_status).toBe('required');
+    expect(db._engines['eng-nexus'].status).toBe('SETUP_REQUIRED');
+    expect(db._engines['eng-nexus'].auth_status).toBe('required');
   });
 
   it('未知引擎如实返回失败', async () => {
@@ -286,6 +354,19 @@ describe('鉴权探测状态迁移(H-4)', () => {
     const r = await new EngineManager(db as never).probeAuth('eng-opencode');
     expect(r.ok).toBe(false);
     expect(db._engines['eng-opencode'].auth_status).not.toBe('authed');
+  }, 20_000);
+
+  it('CLI 重启只证明可启动，必须回到 AUTH_REQUIRED 等待真实探活', async () => {
+    appCfg.engines['eng-opencode'] = { bin: 'node' };
+    const db = makeDb({
+      'eng-opencode': { id: 'eng-opencode', status: 'HEALTHY', auth_status: 'authed' }
+    });
+    const r = await new EngineManager(db as never).restart('eng-opencode');
+    expect(r.ok).toBe(true);
+    expect(db._engines['eng-opencode']).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    expect(db._settings['engine:health:eng-opencode']).toMatchObject({
+      detected: true, launchable: true, authenticated: false, taskVerified: false
+    });
   }, 20_000);
 
   it('Harness 重新检测只有握手时保持 AUTH_REQUIRED', async () => {
@@ -345,7 +426,7 @@ describe('鉴权探测状态迁移(H-4)', () => {
       status: 'HEALTHY',
       auth_status: 'authed'
     });
-    expect(db._engines['eng-hermes']).toMatchObject({
+    expect(db._engines['eng-nexus']).toMatchObject({
       status: 'HEALTHY',
       auth_status: 'authed'
     });
@@ -354,6 +435,21 @@ describe('鉴权探测状态迁移(H-4)', () => {
       taskVerified: true,
       detail: 'OPC_HARNESS_OK'
     });
+  });
+
+  it('Harness 指纹包含引擎级 Provider/模型配置', () => {
+    const db = makeDb({
+      'eng-deepseek-harness': {
+        id: 'eng-deepseek-harness',
+        config_json: JSON.stringify({ providerId: 'provider-a', modelOverride: 'model-a' })
+      }
+    });
+    const before = harnessProviderFingerprint(db as never);
+    db._engines['eng-deepseek-harness'].config_json = JSON.stringify({
+      providerId: 'provider-a',
+      modelOverride: 'model-b'
+    });
+    expect(harnessProviderFingerprint(db as never)).not.toBe(before);
   });
 
   it('自动检测会让缺少当前 Provider 指纹的旧 Harness 验证失效', async () => {
@@ -494,9 +590,176 @@ describe('鉴权探测状态迁移(H-4)', () => {
       authenticated: false, taskVerified: false
     });
   });
+
+  it('Provider 配置变更会清除 Nexus 与显式受管 CLI 的健康证明', () => {
+    const db = makeDb({
+      'eng-nexus': { id: 'eng-nexus', type: 'nexus', status: 'HEALTHY', auth_status: 'authed' },
+      'eng-codex': {
+        id: 'eng-codex', type: 'codex', status: 'HEALTHY', auth_status: 'authed',
+        config_json: JSON.stringify({ providerId: 'provider-missing', protocol: 'openai-responses' })
+      },
+      'eng-claude': { id: 'eng-claude', type: 'claude', status: 'HEALTHY', auth_status: 'authed' }
+    });
+    new EngineManager(db as never).invalidateProviderVerification();
+
+    expect(db._engines['eng-nexus']).toMatchObject({ status: 'SETUP_REQUIRED', auth_status: 'required' });
+    expect(db._engines['eng-codex']).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    // No managed Provider or engine binding: native Claude login remains valid.
+    expect(db._engines['eng-claude']).toMatchObject({ status: 'HEALTHY', auth_status: 'authed' });
+  });
+
+  it('首个完整默认 Provider 让已启动的 managed runtime 进入待真实验证状态', () => {
+    const provider = {
+      id: 'provider-default', base_url: 'https://provider.test/v1', model: 'model',
+      api_key_ref: 'secret:provider:default', is_default: 1
+    };
+    const db = makeDb({
+      'eng-nexus': { id: 'eng-nexus', type: 'nexus', status: 'SETUP_REQUIRED', auth_status: 'required' },
+      'eng-deepseek-harness': { id: 'eng-deepseek-harness', type: 'external', status: 'SETUP_REQUIRED', auth_status: 'required' },
+      'eng-hermes-cli': { id: 'eng-hermes-cli', type: 'hermes-cli', status: 'SETUP_REQUIRED', auth_status: 'required' },
+      'eng-pi': { id: 'eng-pi', type: 'pi', status: 'SETUP_REQUIRED', auth_status: 'required' }
+    }, [provider]);
+    db._settings['secret:provider:default'] = Buffer.from('enc:provider-key').toString('base64');
+    for (const id of ['eng-deepseek-harness', 'eng-hermes-cli', 'eng-pi']) {
+      db._settings[`engine:health:${id}`] = {
+        detected: true, launchable: true, authenticated: false, taskVerified: false, detail: 'provider missing'
+      };
+    }
+
+    new EngineManager(db as never).invalidateProviderVerification({
+      providerId: provider.id,
+      providerUpdated: false,
+      defaultRouteChanged: true
+    });
+
+    expect(db._engines['eng-nexus']).toMatchObject({ status: 'HEALTHY', auth_status: 'authed' });
+    for (const id of ['eng-deepseek-harness', 'eng-hermes-cli', 'eng-pi']) {
+      expect(db._engines[id]).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    }
+  });
+
+  it('员工级 Provider 变更会失效对应 CLI，但不影响未绑定的外部 ACP', () => {
+    const db = makeDb({
+      'eng-codex': {
+        id: 'eng-codex', type: 'codex', status: 'HEALTHY', auth_status: 'authed',
+        config_json: JSON.stringify({ providerMode: 'native' })
+      },
+      'eng-hermes-cli': {
+        id: 'eng-hermes-cli', type: 'hermes-cli', status: 'HEALTHY', auth_status: 'authed'
+      },
+      'eng-custom-local': {
+        id: 'eng-custom-local', type: 'external', status: 'HEALTHY', auth_status: 'authed',
+        config_json: JSON.stringify({ providerMode: 'native' })
+      }
+    }, [{
+      id: 'provider-default', base_url: 'https://default.test/v1', model: 'default-model',
+      api_key_ref: 'secret:provider:default', is_default: 1
+    }, {
+      id: 'provider-agent', base_url: 'https://agent.test/v1', model: 'agent-model',
+      api_key_ref: 'secret:provider:agent', is_default: 0
+    }], [{
+      id: 'agent-codex', engine_id: 'eng-codex', provider_id: 'provider-agent', model_override: null, archived: 0
+    }, {
+      id: 'agent-hermes', engine_id: 'eng-hermes-cli', provider_id: 'provider-agent', model_override: null, archived: 0
+    }]);
+    db._settings['secret:provider:default'] = Buffer.from('enc:default-key').toString('base64');
+    db._settings['engine:health:eng-hermes-cli'] = {
+      detected: true, launchable: true, authenticated: true, taskVerified: true, detail: 'ok'
+    };
+
+    new EngineManager(db as never).invalidateProviderVerification({
+      providerId: 'provider-agent',
+      providerUpdated: true,
+      defaultRouteChanged: false
+    });
+
+    expect(db._engines['eng-codex']).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    expect(db._engines['eng-hermes-cli']).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+    expect(db._settings['engine:health:eng-hermes-cli']).toMatchObject({
+      authenticated: false, taskVerified: false
+    });
+    expect(db._engines['eng-custom-local']).toMatchObject({ status: 'HEALTHY', auth_status: 'authed' });
+  });
+
+  it('keeps a native custom ACP healthy when only its employee model preference exists', () => {
+    const db = makeDb({
+      'eng-custom-local': {
+        id: 'eng-custom-local', type: 'external', status: 'HEALTHY', auth_status: 'authed',
+        config_json: JSON.stringify({ providerMode: 'native' })
+      }
+    }, [{
+      id: 'provider-default', base_url: 'https://default.test/v1', model: 'default-model',
+      api_key_ref: 'secret:provider:default', is_default: 1
+    }], [{
+      id: 'agent-custom', engine_id: 'eng-custom-local', provider_id: null,
+      model_override: 'runtime-owned-model', archived: 0
+    }]);
+
+    new EngineManager(db as never).invalidateProviderVerification({
+      providerId: 'provider-default',
+      providerUpdated: true,
+      defaultRouteChanged: true
+    });
+
+    expect(db._engines['eng-custom-local']).toMatchObject({ status: 'HEALTHY', auth_status: 'authed' });
+  });
 });
 
 describe('引擎配置凭据脱敏(S-4)', () => {
+  it('持久化 Provider、模型和协议，并保留外部 ACP 启动命令', () => {
+    const db = makeDb({
+      'eng-codex': {
+        id: 'eng-codex', status: 'HEALTHY', auth_status: 'authed',
+        config_json: JSON.stringify({ acpCommand: ['adapter', '--stdio'] })
+      }
+    }, [{
+      id: 'provider-responses', base_url: 'https://provider.test/v1', model: 'base-model',
+      api_key_ref: 'secret:provider:responses', is_default: 1
+    }]);
+    const manager = new EngineManager(db as never);
+
+    manager.saveConfig('eng-codex', {
+      providerId: 'provider-responses',
+      modelOverride: 'worker-model',
+      protocol: 'openai-responses'
+    });
+
+    expect(manager.getConfig('eng-codex')).toMatchObject({
+      providerId: 'provider-responses',
+      modelOverride: 'worker-model',
+      protocol: 'openai-responses',
+      acpCommand: ['adapter', '--stdio']
+    });
+    expect(db._engines['eng-codex']).toMatchObject({ status: 'AUTH_REQUIRED', auth_status: 'required' });
+  });
+
+  it('拒绝不存在的 Provider 和不兼容协议且不修改旧配置', () => {
+    const original = JSON.stringify({ runArgs: ['exec'] });
+    const db = makeDb({
+      'eng-codex': { id: 'eng-codex', status: 'HEALTHY', config_json: original }
+    });
+    const manager = new EngineManager(db as never);
+
+    expect(() => manager.saveConfig('eng-codex', {
+      providerId: 'missing', protocol: 'openai-responses'
+    })).toThrow('does not exist');
+    expect(() => manager.saveConfig('eng-codex', {
+      protocol: 'openai-chat'
+    })).toThrow(/requires openai-responses/);
+    expect(db._engines['eng-codex'].config_json).toBe(original);
+  });
+
+  it('保存配置前拒绝不存在的引擎，且不写入任何配置或密钥', () => {
+    const db = makeDb();
+    const manager = new EngineManager(db as never);
+    expect(() => manager.saveConfig('eng-missing', {
+      env: { OPENAI_API_KEY: 'must-not-persist' },
+      modelOverride: 'model'
+    })).toThrow(/Engine does not exist/);
+    expect(db._engines['eng-missing']).toBeUndefined();
+    expect(JSON.stringify(db._settings)).not.toContain('must-not-persist');
+  });
+
   it('敏感 env 不写入 config_json,只留占位符', () => {
     const db = makeDb({ 'eng-opencode': { id: 'eng-opencode', status: 'HEALTHY' } });
     new EngineManager(db as never).saveConfig('eng-opencode', {
@@ -513,6 +776,133 @@ describe('引擎配置凭据脱敏(S-4)', () => {
     const mgr = new EngineManager(db as never);
     mgr.saveConfig('eng-opencode', { env: { GITHUB_TOKEN: 'ghp_realtoken' } });
     expect(JSON.stringify(mgr.getConfig('eng-opencode'))).not.toContain('ghp_realtoken');
+  });
+
+  it('只替换一个敏感变量时保留其他占位符对应的已加密值', () => {
+    const db = makeDb({ 'eng-opencode': { id: 'eng-opencode', type: 'opencode', status: 'HEALTHY' } });
+    const manager = new EngineManager(db as never);
+    manager.saveConfig('eng-opencode', {
+      env: { OPENAI_API_KEY: 'first-key', SERVICE_TOKEN: 'retained-token' }
+    });
+
+    manager.saveConfig('eng-opencode', {
+      env: { OPENAI_API_KEY: 'replacement-key', SERVICE_TOKEN: '***' }
+    });
+
+    expect(manager.resolveEnv('eng-opencode')).toMatchObject({
+      OPENAI_API_KEY: 'replacement-key',
+      SERVICE_TOKEN: 'retained-token'
+    });
+  });
+
+  it('占位符对应密文缺失时拒绝保存，不会借用默认 Provider 凭据', () => {
+    providerIsReady = true;
+    const original = JSON.stringify({ providerMode: 'native', env: { API_KEY: '***' } });
+    const db = makeDb({
+      'eng-opencode': { id: 'eng-opencode', type: 'opencode', status: 'HEALTHY', config_json: original }
+    });
+
+    expect(() => new EngineManager(db as never).saveConfig('eng-opencode', {
+      providerMode: 'native', env: { API_KEY: '***' }
+    })).toThrow('Configured engine credential is unavailable: API_KEY');
+    expect(db._engines['eng-opencode'].config_json).toBe(original);
+  });
+
+  it('提交空 env 会删除旧密文及配置中的占位符', () => {
+    const db = makeDb({ 'eng-opencode': { id: 'eng-opencode', type: 'opencode', status: 'HEALTHY' } });
+    const manager = new EngineManager(db as never);
+    manager.saveConfig('eng-opencode', { env: { API_KEY: 'remove-me' } });
+    expect(db._settings['secret:engine:eng-opencode:env']).toBeTruthy();
+
+    manager.saveConfig('eng-opencode', { env: {} });
+
+    expect(db._settings['secret:engine:eng-opencode:env']).toBeUndefined();
+    expect(manager.getConfig('eng-opencode')?.env).toEqual({});
+  });
+
+  it('系统加密不可用时在任何数据库写入前拒绝新密钥', () => {
+    const original = JSON.stringify({ providerMode: 'native', runArgs: ['run'] });
+    const db = makeDb({
+      'eng-opencode': { id: 'eng-opencode', type: 'opencode', status: 'HEALTHY', config_json: original }
+    });
+    const unavailable = vi.spyOn(safeStorage, 'isEncryptionAvailable').mockReturnValue(false);
+    try {
+      expect(() => new EngineManager(db as never).saveConfig('eng-opencode', {
+        env: { API_KEY: 'must-not-persist' }
+      })).toThrow('系统加密不可用');
+      expect(db._engines['eng-opencode'].config_json).toBe(original);
+      expect(JSON.stringify(db._settings)).not.toContain('must-not-persist');
+    } finally {
+      unavailable.mockRestore();
+    }
+  });
+
+  it('保存无关字段时保留 Codex 的原生登录模式', () => {
+    const db = makeDb({
+      'eng-codex': {
+        id: 'eng-codex', type: 'codex', status: 'HEALTHY',
+        config_json: JSON.stringify({ runArgs: ['exec'] })
+      }
+    });
+    const manager = new EngineManager(db as never);
+
+    manager.saveConfig('eng-codex', { maxConcurrency: 4 });
+
+    expect(manager.getConfig('eng-codex')).toMatchObject({ providerMode: 'native', maxConcurrency: 4 });
+    expect(manager.getConfig('eng-codex')).not.toHaveProperty('providerId');
+    expect(manager.getConfig('eng-codex')).not.toHaveProperty('protocol');
+  });
+
+  it('managed 模式可显式使用应用默认 Provider', () => {
+    const db = makeDb({
+      'eng-codex': { id: 'eng-codex', type: 'codex', status: 'HEALTHY' }
+    });
+    const manager = new EngineManager(db as never);
+
+    manager.saveConfig('eng-codex', {
+      providerMode: 'managed', providerId: '', modelOverride: '', protocol: 'openai-responses'
+    });
+
+    expect(manager.getConfig('eng-codex')).toMatchObject({
+      providerMode: 'managed', protocol: 'openai-responses'
+    });
+    expect(manager.getConfig('eng-codex')).not.toHaveProperty('providerId');
+  });
+
+  it('自定义 ACP 保存无关字段时默认保持 Runtime 自主管理', () => {
+    const db = makeDb({
+      'eng-custom-local': {
+        id: 'eng-custom-local', type: 'external', status: 'HEALTHY',
+        config_json: JSON.stringify({ acpCommand: ['local-acp'] })
+      }
+    });
+    const manager = new EngineManager(db as never);
+
+    manager.saveConfig('eng-custom-local', { maxConcurrency: 1 });
+
+    expect(manager.getConfig('eng-custom-local')).toMatchObject({ providerMode: 'native', maxConcurrency: 1 });
+  });
+
+  it.each([
+    ['model override', { modelOverride: 'legacy-model' }],
+    ['protocol', { protocol: 'openai-chat' as const }]
+  ])('cleans a legacy custom ACP %s when saving an unrelated field', (_label, legacyFields) => {
+    const db = makeDb({
+      'eng-custom-local': {
+        id: 'eng-custom-local', type: 'external', status: 'HEALTHY',
+        config_json: JSON.stringify({ acpCommand: ['local-acp'], ...legacyFields })
+      }
+    });
+    const manager = new EngineManager(db as never);
+
+    manager.saveConfig('eng-custom-local', { maxConcurrency: 2 });
+
+    expect(manager.getConfig('eng-custom-local')).toMatchObject({
+      acpCommand: ['local-acp'], providerMode: 'native', maxConcurrency: 2
+    });
+    expect(manager.getConfig('eng-custom-local')).not.toHaveProperty('providerId');
+    expect(manager.getConfig('eng-custom-local')).not.toHaveProperty('modelOverride');
+    expect(manager.getConfig('eng-custom-local')).not.toHaveProperty('protocol');
   });
 
   it.each([

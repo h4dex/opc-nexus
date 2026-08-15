@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
-const { clipboard, ipcMain } = await import('electron');
+const { BrowserWindow, clipboard, ipcMain } = await import('electron');
 const { registerIpc } = await import('../src/main/ipc.js');
 const { BRIDGE_KEY_SECRET_REF } = await import('../src/main/services/apiBridge.js');
 const { WEB_TOKEN_SECRET_REF } = await import('../src/main/services/webServer.js');
@@ -66,6 +66,11 @@ function register(webOverrides: Record<string, unknown> = {}, bridgeOverrides: R
   const desktopControlPlane = service({
     dispatch: vi.fn(async () => ({ conversationId: 'conversation-local', task: { id: 'task-control-plane' } }))
   });
+  const engines = service({
+    hasUsableExecutor: vi.fn(() => true),
+    list: vi.fn(() => []),
+    saveConfig: vi.fn()
+  });
   const deps = service({
     db,
     apiBridge,
@@ -73,7 +78,7 @@ function register(webOverrides: Record<string, unknown> = {}, bridgeOverrides: R
     memory,
     memoryProposals,
     taskScheduleProposals,
-    engines: service({ hasUsableExecutor: vi.fn(() => true), list: vi.fn(() => []) }),
+    engines,
     projects: service({ list: vi.fn(() => []) }),
     channels: service({ list: vi.fn(() => []) }),
     scheduler: service({ list: vi.fn(() => []) }),
@@ -91,7 +96,7 @@ function register(webOverrides: Record<string, unknown> = {}, bridgeOverrides: R
   const handlers = new Map(ipcMain.handle.mock.calls.map(([name, handler]) => [name, handler]));
   return {
     audit, handlers, webServer, memory, memoryProposals, taskScheduleProposals,
-    orchestrator, desktopControlPlane
+    orchestrator, desktopControlPlane, engines
   };
 }
 
@@ -100,6 +105,26 @@ beforeEach(() => {
 });
 
 describe('IPC credential boundary', () => {
+  it('pushes a fresh snapshot immediately after engine configuration is saved', () => {
+    vi.useFakeTimers();
+    const window = { isDestroyed: () => false, webContents: { send: vi.fn() } };
+    const windows = vi.spyOn(BrowserWindow, 'getAllWindows').mockReturnValue([window as never]);
+    try {
+      const { handlers, engines } = register();
+      expect(handlers.get('aibox:saveEngineConfig')({}, 'eng-codex', {
+        providerMode: 'native', env: {}
+      })).toEqual({ ok: true });
+      expect(engines.saveConfig).toHaveBeenCalledWith('eng-codex', {
+        providerMode: 'native', env: {}
+      });
+      expect(window.webContents.send).toHaveBeenCalledWith('aibox:snapshot', expect.any(Object));
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      windows.mockRestore();
+    }
+  });
+
   it('routes generic desktop tasks through the canonical control plane', async () => {
     const { handlers, orchestrator, desktopControlPlane } = register();
 

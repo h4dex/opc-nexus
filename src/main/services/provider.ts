@@ -1,6 +1,7 @@
 /**
  * 模型供应商配置与凭据 — providers 表为唯一数据源（P0 修复）。
- * 历史上 Hermes 供应商配置存 settings（provider:hermes），设置页新版已改用 providers 表，
+ * 历史上内置 Nexus 被误称为 Hermes，供应商配置因此存入 provider:hermes。
+ * v39 已将该兼容键迁移为 provider:nexus；设置页新版使用 providers 表，
  * 两处数据源不一致导致「设置页配好供应商但引擎仍 SETUP_REQUIRED」。
  * 现统一：读取一律走 providers 表（默认供应商行），旧 settings 仅作只读兜底；
  * 写入一律落 providers 表；启动时 migrateLegacyProvider 把旧配置迁入 providers 表。
@@ -17,8 +18,10 @@ import {
   tryNormalizeProviderBaseUrl
 } from './providerEndpoint.js';
 
-export const PROVIDER_SETTING = 'provider:hermes';
-export const PROVIDER_KEY_REF = 'provider:hermes:key';
+export const PROVIDER_SETTING = 'provider:nexus';
+export const PROVIDER_KEY_REF = 'provider:nexus:key';
+export const LEGACY_PROVIDER_SETTING = 'provider:hermes';
+export const LEGACY_PROVIDER_KEY_REF = 'provider:hermes:key';
 
 export interface ProviderSettings {
   baseUrl: string;

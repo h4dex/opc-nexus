@@ -5,9 +5,8 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } 
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { Agent } from '../../shared/types.js';
 import type { Database } from './database.js';
-import { childProcessEnv } from './engineEnv.js';
-import { ProviderManager, type ResolvedProvider } from './providerManager.js';
-import { getProviderSettings, readProviderKey } from './provider.js';
+import { childProcessEnv, resolveEngineProvider } from './engineEnv.js';
+import type { ResolvedProvider } from './providerManager.js';
 
 export const DEEPSEEK_HARNESS_ENGINE_ID = 'eng-deepseek-harness';
 export const DEEPSEEK_HARNESS_VERSION = '0.1.0-rc.6';
@@ -261,28 +260,15 @@ function providerEnv(provider: ResolvedProvider | null, fallbackModel: string): 
 }
 
 function resolveAgentProvider(db: Database, agent: Agent): ResolvedProvider | null {
-  const row = db.raw.prepare('SELECT provider_id, model_override FROM agents WHERE id = ?').get(agent.id) as
-    | { provider_id: string | null; model_override: string | null }
-    | undefined;
-  const modelOverride = agent.modelOverride ?? row?.model_override ?? null;
-  const providerId = row?.provider_id ?? null;
-  const resolved = new ProviderManager(db).resolveForAgent(providerId, modelOverride);
-  if (resolved) return resolved;
-
-  // An explicit binding must fail closed; never substitute another Provider.
-  if (providerId) return null;
-  const count = (db.raw.prepare('SELECT COUNT(*) c FROM providers').get() as { c?: number } | undefined)?.c ?? 0;
-  if (count > 0) return null;
-
-  const legacy = getProviderSettings(db);
-  const key = readProviderKey(db)?.trim() || null;
-  return legacy.baseUrl.trim() && legacy.model.trim() && key
-    ? { baseUrl: legacy.baseUrl.trim().replace(/\/+$/, ''), model: modelOverride || legacy.model.trim(), key }
-    : null;
+  return resolveEngineProvider(db, DEEPSEEK_HARNESS_ENGINE_ID, agent);
 }
 
 export function deepseekHarnessProviderReady(db: Database, agent: Agent): boolean {
-  return resolveAgentProvider(db, agent) !== null;
+  try {
+    return resolveAgentProvider(db, agent) !== null;
+  } catch {
+    return false;
+  }
 }
 
 function assertSnapshotCleanupPath(userData: string, target: string): void {
@@ -358,13 +344,7 @@ export function deepseekHarnessSnapshotEnv(db: Database, agent: Agent): Record<s
 }
 
 export function deepseekHarnessProbeEnv(db: Database): Record<string, string> {
-  const provider = new ProviderManager(db).resolveForAgent(null, null);
-  const count = (db.raw.prepare('SELECT COUNT(*) c FROM providers').get() as { c?: number } | undefined)?.c ?? 0;
-  const legacy = provider || count > 0 ? null : getProviderSettings(db);
-  const legacyKey = provider || count > 0 ? null : (readProviderKey(db)?.trim() || null);
-  const effectiveProvider = provider ?? (legacy?.baseUrl.trim() && legacy.model.trim() && legacyKey
-    ? { baseUrl: legacy.baseUrl.trim().replace(/\/+$/, ''), model: legacy.model.trim(), key: legacyKey }
-    : null);
+  const effectiveProvider = resolveEngineProvider(db, DEEPSEEK_HARNESS_ENGINE_ID);
 
   const userData = app.getPath('userData');
   const root = join(userData, 'aibox-data', 'deepseek-harness');

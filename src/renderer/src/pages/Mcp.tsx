@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Modal } from '../components/common';
 import { IconPlus, IconPlay, IconStop, IconX } from '../components/icons';
 import { useApp } from '../store';
+import { NEXUS_ENGINE_ID } from '../../../shared/types';
 
 interface McpServer {
   id: string;
@@ -27,7 +28,7 @@ interface McpTool {
 export function Mcp() {
   const agentCards = useApp((state) => state.snapshot?.agentCards);
   const agents = useMemo(() => agentCards?.map((card) => card.agent) ?? [], [agentCards]);
-  const browserAgents = useMemo(() => agents.filter((agent) => agent.engineId === 'eng-hermes'), [agents]);
+  const browserAgents = useMemo(() => agents.filter((agent) => agent.engineId === NEXUS_ENGINE_ID), [agents]);
   const [servers, setServers] = useState<McpServer[]>([]);
   const [tools, setTools] = useState<McpTool[]>([]);
   const [addOpen, setAddOpen] = useState(false);

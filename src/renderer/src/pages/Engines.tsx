@@ -1,8 +1,36 @@
 /** 引擎中心：检测、安装、登录、默认引擎、健康状态 + 配置面板 + 日志 + 指标 + 自定义注册 */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconAlert, IconChip, IconRefresh, IconPlus } from '../components/icons';
-import type { Engine } from '@shared/types';
+import type { Engine, EngineProviderMode, EngineRuntimeConfig, ProviderProtocol } from '@shared/types';
+
+interface ProviderOption {
+  id: string;
+  name: string;
+  model: string;
+  isDefault: boolean;
+  hasKey: boolean;
+}
+
+function defaultProviderProtocol(engine: Engine): ProviderProtocol {
+  if (engine.type === 'codex') return 'openai-responses';
+  if (engine.type === 'claude') return 'anthropic-messages';
+  return 'openai-chat';
+}
+
+function supportsNativeProviderAuth(engine: Engine): boolean {
+  return engine.id === 'eng-codex'
+    || engine.id === 'eng-claude'
+    || engine.id === 'eng-opencode'
+    || (engine.type === 'external' && engine.id !== 'eng-deepseek-harness');
+}
+
+function inferredProviderMode(engine: Engine, config: EngineRuntimeConfig | null): EngineProviderMode {
+  if (!supportsNativeProviderAuth(engine)) return 'managed';
+  if (config?.providerMode) return config.providerMode;
+  if (engine.type === 'external') return config?.providerId ? 'managed' : 'native';
+  return config?.providerId || config?.modelOverride || config?.protocol ? 'managed' : 'native';
+}
 
 const STATUS_META: Record<Engine['status'], { label: string; tag: string }> = {
   NOT_INSTALLED: { label: '未安装', tag: 'gray' },
@@ -242,20 +270,43 @@ function EngineConfigPanel({ engine, onClose }: { engine: Engine; onClose: () =>
   const [runArgs, setRunArgs] = useState('');
   const [envText, setEnvText] = useState('');
   const [maxConcurrency, setMaxConcurrency] = useState(2);
+  const [providerId, setProviderId] = useState('');
+  const [modelOverride, setModelOverride] = useState('');
+  const [protocol, setProtocol] = useState<ProviderProtocol>(() => defaultProviderProtocol(engine));
+  const [providerMode, setProviderMode] = useState<EngineProviderMode>(() =>
+    supportsNativeProviderAuth(engine) ? 'native' : 'managed'
+  );
+  const [providers, setProviders] = useState<ProviderOption[]>([]);
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState('');
 
-  if (!loaded) {
-    void window.aibox.getEngineConfig(engine.id).then((c) => {
-      if (c) {
-        setRunArgs((c.runArgs ?? []).join(' '));
-        setEnvText(Object.entries(c.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'));
-        setMaxConcurrency(c.maxConcurrency ?? 2);
+  useEffect(() => {
+    let active = true;
+    void Promise.all([
+      window.aibox.getEngineConfig(engine.id),
+      window.aibox.listProviders()
+    ]).then(([config, providerList]) => {
+      if (!active) return;
+      setProviderMode(inferredProviderMode(engine, config));
+      if (config) {
+        setRunArgs((config.runArgs ?? []).join(' '));
+        setEnvText(Object.entries(config.env ?? {}).map(([key, value]) => `${key}=${value}`).join('\n'));
+        setMaxConcurrency(config.maxConcurrency ?? 2);
+        setProviderId(config.providerId ?? '');
+        setModelOverride(config.modelOverride ?? '');
+        setProtocol(config.protocol ?? defaultProviderProtocol(engine));
       }
-      setLoaded(true);
+      setProviders(providerList);
+    }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : String(reason));
+    }).finally(() => {
+      if (active) setLoaded(true);
     });
-    return null;
-  }
+    return () => { active = false; };
+  }, [engine.id]);
+
+  if (!loaded) return null;
 
   const save = async () => {
     const env: Record<string, string> = {};
@@ -263,19 +314,29 @@ function EngineConfigPanel({ engine, onClose }: { engine: Engine; onClose: () =>
       const idx = line.indexOf('=');
       if (idx > 0) env[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
     });
-    await window.aibox.saveEngineConfig(engine.id, {
-      runArgs: runArgs.split(' ').filter(Boolean),
-      env: Object.keys(env).length > 0 ? env : undefined,
-      maxConcurrency
-    });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    setError('');
+    try {
+      await window.aibox.saveEngineConfig(engine.id, {
+        runArgs: runArgs.split(' ').filter(Boolean),
+        env,
+        maxConcurrency,
+        providerMode,
+        providerId: providerMode === 'managed' ? providerId : '',
+        modelOverride: providerMode === 'managed' ? modelOverride : '',
+        protocol: providerMode === 'managed' ? protocol : undefined
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const inputStyle: React.CSSProperties = {
     width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--border)',
     background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5, outline: 'none'
   };
+  const managedProvider = providerMode === 'managed';
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }} onClick={onClose}>
@@ -286,6 +347,66 @@ function EngineConfigPanel({ engine, onClose }: { engine: Engine; onClose: () =>
         </div>
         <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>运行参数（空格分隔）</label>
         <input style={{ ...inputStyle, marginBottom: 12 }} value={runArgs} onChange={(e) => setRunArgs(e.target.value)} placeholder="--model gpt-4o --verbose" />
+        {supportsNativeProviderAuth(engine) && (
+          <>
+            <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>认证方式</label>
+            <div className="automation-segmented" role="group" aria-label="引擎认证方式" style={{ marginBottom: 12 }}>
+              <button
+                type="button"
+                className={providerMode === 'native' ? 'active' : ''}
+                aria-pressed={providerMode === 'native'}
+                onClick={() => setProviderMode('native')}
+              >{engine.type === 'external' ? 'Runtime 自主管理' : 'CLI 原生登录'}</button>
+              <button
+                type="button"
+                className={providerMode === 'managed' ? 'active' : ''}
+                aria-pressed={providerMode === 'managed'}
+                onClick={() => setProviderMode('managed')}
+              >OPC 托管供应商</button>
+            </div>
+          </>
+        )}
+        <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>模型供应商</label>
+        <select disabled={!managedProvider} style={{ ...inputStyle, marginBottom: 6 }} value={providerId} onChange={(e) => setProviderId(e.target.value)}>
+          <option value="">使用应用默认供应商</option>
+          {providerId && !providers.some((provider) => provider.id === providerId) && (
+            <option value={providerId}>不可用的供应商（{providerId}）</option>
+          )}
+          {providers.map((provider) => (
+            <option key={provider.id} value={provider.id}>
+              {provider.name}{provider.isDefault ? '（默认）' : ''} · {provider.model}{provider.hasKey ? '' : '（未配置密钥）'}
+            </option>
+          ))}
+        </select>
+        <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 12 }}>
+          未绑定时使用应用默认供应商。员工单独设置的供应商和模型优先于这里的引擎设置。
+        </div>
+        <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>供应商协议</label>
+        <select
+          disabled={!managedProvider}
+          style={{ ...inputStyle, marginBottom: 6 }}
+          value={protocol}
+          onChange={(e) => setProtocol(e.target.value as ProviderProtocol)}
+        >
+          <option value="openai-chat">OpenAI Chat Completions</option>
+          <option value="openai-responses">OpenAI Responses</option>
+          <option value="anthropic-messages">Anthropic Messages</option>
+        </select>
+        <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 12 }}>
+          协议必须与供应商端点一致；不兼容的组合会拒绝执行，不会静默改用其他凭据。
+        </div>
+        <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>引擎模型覆盖</label>
+        <input
+          disabled={!managedProvider}
+          style={{ ...inputStyle, marginBottom: 6 }}
+          value={modelOverride}
+          onChange={(e) => setModelOverride(e.target.value)}
+          placeholder="留空使用供应商默认模型"
+          maxLength={200}
+        />
+        <div style={{ fontSize: 11, color: 'var(--text-3)', lineHeight: 1.6, marginBottom: 12 }}>
+          此模型与上方供应商的 URL 和密钥作为一个配置使用，不会借用其他供应商的凭据。
+        </div>
         <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>环境变量（每行 KEY=VALUE）</label>
         <textarea style={{ ...inputStyle, minHeight: 80, resize: 'vertical', marginBottom: 12, fontFamily: 'monospace' }} value={envText} onChange={(e) => setEnvText(e.target.value)} placeholder={'API_KEY=sk-...\nDEBUG=1'} />
         <label style={{ fontSize: 11.5, color: 'var(--text-2)', display: 'block', marginBottom: 4 }}>最大并发数</label>
@@ -294,6 +415,7 @@ function EngineConfigPanel({ engine, onClose }: { engine: Engine; onClose: () =>
           <button className="btn primary" onClick={() => void save()}>保存配置</button>
           {saved && <span style={{ fontSize: 12, color: 'var(--success)' }}>✓ 已保存</span>}
         </div>
+        {error && <div style={{ marginTop: 10, fontSize: 12, color: 'var(--danger)', lineHeight: 1.6 }}>{error}</div>}
       </div>
     </div>
   );

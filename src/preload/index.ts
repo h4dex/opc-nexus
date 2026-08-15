@@ -6,7 +6,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import { randomUUID } from 'node:crypto';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, AppMemorySnapshot, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
-  Engine, EngineInstallGuide, EngineInstallResult, ProviderConfig, ProviderTestResult,
+  Engine, EngineInstallGuide, EngineInstallResult, EngineRuntimeConfig, ProviderConfig, ProviderTestResult,
   ApiBridgeStatus, RendererSettingKey, RendererSettingMap, WebAdminStatus,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
   KnowledgeDetail, KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeSummary, KnowledgeVersionInput,
@@ -40,7 +40,7 @@ export interface Snapshot {
   engines: Engine[];
   channels: Channel[];
   schedules: Schedule[];
-  /** 至少一个可用执行器（CLI 健康或 Hermes 已配置）才能支持系统正常运行 */
+  /** 至少一个已验证可用的执行器才能支持系统正常运行 */
   executorAvailable: boolean;
 }
 
@@ -363,8 +363,8 @@ const api = {
   /** 鉴权探测：真实跑一次最小请求验证凭据，返回结果而非静默标记 */
   authEngine: (id: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:authEngine', id),
   setDefaultEngine: (id: string): Promise<void> => ipcRenderer.invoke('aibox:setDefaultEngine', id),
-  getEngineConfig: (id: string): Promise<{ runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null> => ipcRenderer.invoke('aibox:getEngineConfig', id),
-  saveEngineConfig: (id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveEngineConfig', id, config),
+  getEngineConfig: (id: string): Promise<EngineRuntimeConfig | null> => ipcRenderer.invoke('aibox:getEngineConfig', id),
+  saveEngineConfig: (id: string, config: EngineRuntimeConfig): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:saveEngineConfig', id, config),
   getEngineLogs: (id: string): Promise<{ id: string; engineId: string; level: string; message: string; timestamp: number }[]> => ipcRenderer.invoke('aibox:getEngineLogs', id),
   getEngineMetrics: (id: string): Promise<{ avgLatencyMs: number; successRate: number; totalRuns: number }> => ipcRenderer.invoke('aibox:getEngineMetrics', id),
   registerCustomEngine: (input: { name: string; command: string; args?: string; dataBoundary?: string }): Promise<{ ok: boolean; message: string; id?: string }> => ipcRenderer.invoke('aibox:registerCustomEngine', input),

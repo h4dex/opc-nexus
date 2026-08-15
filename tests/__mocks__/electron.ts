@@ -1,12 +1,20 @@
 /**
  * Electron 模块 mock（vitest 环境无 Electron 运行时）
  */
+import { mkdirSync } from 'node:fs';
 import { vi } from 'vitest';
+
+function testPath(name: string): string {
+  const path = `/tmp/test-${name}`;
+  // Electron guarantees that userData exists before services use it.
+  if (name === 'userData') mkdirSync(path, { recursive: true });
+  return path;
+}
 
 export const app = {
   isPackaged: false,
   getAppPath: () => process.cwd(),
-  getPath: (name: string) => `/tmp/test-${name}`,
+  getPath: testPath,
   getName: () => 'aibox-test',
   getVersion: () => '1.0.0'
 };

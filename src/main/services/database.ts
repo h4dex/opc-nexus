@@ -21,7 +21,8 @@ const require = createRequire(import.meta.url);
  *  v36：canonical task/message/plan 外键语义、输入消息 exactly-once 与外键强制；
  *  v37：组织化 project/agent/channel 与待审批 memory proposal 持久化。 */
 // v38: durable task schedule proposals reviewed through OPC-Nexus Scheduler.
-const SCHEMA_VERSION = 38;
+// v39: rename the legacy built-in `eng-hermes` runtime identity to Nexus.
+const SCHEMA_VERSION = 39;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -1894,6 +1895,12 @@ export class Database {
         // turning foreign_keys on for the connection. Derived orphan rows can be
         // discarded; user-authored task/message content is retained and invalid
         // nullable links are detached instead of deleting the owning row.
+        // A few early v35 snapshots (and the deliberately minimal compatibility
+        // fixtures) predate the originally required engine_id column. Repair
+        // those snapshots while their version history is still being replayed;
+        // a database stamped v38 or later must remain fail-closed in v39 rather
+        // than silently inventing a missing legacy reference.
+        addCol('agents', 'engine_id', "TEXT NOT NULL DEFAULT 'eng-hermes'");
         this.inner.exec(`
           UPDATE tasks SET project_id = NULL
           WHERE project_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM projects p WHERE p.id = tasks.project_id);
@@ -2196,6 +2203,213 @@ export class Database {
           CREATE INDEX IF NOT EXISTS idx_task_schedule_proposals_conversation
             ON task_schedule_proposals(conversation_id);
         `);
+      }
+      if (prev < 39) {
+        // The built-in LLM/tool-loop runtime was historically called Hermes,
+        // before the real Hermes Agent CLI was integrated as eng-hermes-cli.
+        // Move every live engine reference to an unambiguous Nexus identity.
+        // Some early schema snapshots were stamped with a later version while
+        // still missing additive columns. Bring the engine table to the
+        // canonical shape before copying the legacy row.
+        addCol('engines', 'config_json', 'TEXT');
+        addCol('agents', 'agent_kind', "TEXT NOT NULL DEFAULT 'general'");
+
+        // INSERT OR IGNORE makes this safe if eng-nexus was already created by
+        // an interrupted migration. When both rows exist, the canonical Nexus
+        // row wins and only missing metadata is filled from the legacy row.
+        this.inner.exec(`
+          INSERT OR IGNORE INTO engines(
+            id, type, name, version, path, status, auth_status, is_default,
+            data_boundary, config_json
+          )
+          SELECT
+            'eng-nexus', 'nexus', 'Nexus Agent', version, path, status,
+            auth_status, is_default, data_boundary, config_json
+          FROM engines WHERE id = 'eng-hermes';
+
+          UPDATE engines
+          SET type = 'nexus', name = 'Nexus Agent',
+              version = COALESCE(version, (
+                SELECT version FROM engines legacy WHERE legacy.id = 'eng-hermes'
+              )),
+              path = COALESCE(path, (
+                SELECT path FROM engines legacy WHERE legacy.id = 'eng-hermes'
+              )),
+              is_default = MAX(is_default, COALESCE((
+                SELECT is_default FROM engines legacy WHERE legacy.id = 'eng-hermes'
+              ), 0)),
+              data_boundary = CASE WHEN data_boundary = '' THEN COALESCE((
+                SELECT data_boundary FROM engines legacy WHERE legacy.id = 'eng-hermes'
+              ), '') ELSE data_boundary END,
+              config_json = COALESCE(config_json, (
+                SELECT config_json FROM engines legacy WHERE legacy.id = 'eng-hermes'
+              ))
+          WHERE id = 'eng-nexus';
+        `);
+
+        const hasColumn = (table: string, column: string): boolean => {
+          const info = this.inner.exec(`PRAGMA table_info(${table})`);
+          return info.length > 0 && info[0].values.some((row) => row[1] === column);
+        };
+        const hasTable = (table: string): boolean => {
+          const info = this.inner.exec(`PRAGMA table_info(${table})`);
+          return info.length > 0;
+        };
+        const requireColumn = (table: string, column: string): void => {
+          // A table introduced by an older optional migration may be absent
+          // from a deliberately minimal snapshot. There can be no references
+          // to migrate in a table that does not exist. Conversely, if the
+          // table is present, a missing reference column means the stamped
+          // schema is malformed and must fail closed.
+          if (!hasTable(table)) return;
+          if (!hasColumn(table, column)) {
+            this.migrationFailure(39, `cannot migrate legacy engine references because ${table}.${column} is missing`);
+          }
+        };
+        // These columns exist in every supported pre-v39 schema after the
+        // additive migrations above. Treat a stamped-but-malformed database
+        // as unrecoverable instead of deleting eng-hermes and leaving opaque
+        // engine references behind.
+        for (const [table, column] of [
+          ['agents', 'engine_id'],
+          ['agents', 'agent_kind'],
+          ['tasks', 'engine_override'],
+          ['tasks', 'status'],
+          ['agent_runs', 'requested_engine_id'],
+          ['agent_runs', 'resolved_engine_id'],
+          ['dispatch_plans', 'worker_agent_id'],
+          ['dispatch_plans', 'worker_engine_id'],
+          ['dispatch_plans', 'plan_json'],
+          ['dispatch_plans', 'status'],
+          ['task_events', 'payload'],
+          ['engine_logs', 'engine_id'],
+          ['settings', 'key'],
+          ['settings', 'value_json'],
+          ['settings', 'updated_at'],
+          ['providers', 'api_key_ref']
+        ] as const) requireColumn(table, column);
+        const migrateReference = (table: string, column: string): void => {
+          if (!hasTable(table)) return;
+          this.inner.exec(`UPDATE ${table} SET ${column} = 'eng-nexus' WHERE ${column} = 'eng-hermes'`);
+        };
+        const migrateJsonReference = (table: string, column: string): void => {
+          if (!hasTable(table)) return;
+          this.inner.exec(`
+            UPDATE ${table}
+            SET ${column} = REPLACE(${column}, '"eng-hermes"', '"eng-nexus"')
+            WHERE INSTR(${column}, '"eng-hermes"') > 0
+          `);
+        };
+
+        migrateReference('agents', 'engine_id');
+        this.inner.exec(`
+          UPDATE agents
+          SET engine_id = 'eng-hermes-cli'
+          WHERE agent_kind = 'android_operator' AND engine_id <> 'eng-hermes-cli'
+        `);
+        migrateReference('tasks', 'engine_override');
+        migrateReference('agent_runs', 'requested_engine_id');
+        migrateReference('agent_runs', 'resolved_engine_id');
+        migrateReference('dispatch_plans', 'worker_engine_id');
+        migrateJsonReference('dispatch_plans', 'plan_json');
+        migrateJsonReference('task_events', 'payload');
+        migrateReference('engine_logs', 'engine_id');
+
+        // Old builds could bind an Android employee or a task-level override
+        // to DSH/another runtime. Only active work is repaired; terminal task
+        // and run rows remain historical evidence of what actually executed.
+        this.inner.exec(`
+          UPDATE tasks
+          SET engine_override = NULL
+          WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED')
+            AND agent_id IN (
+              SELECT id FROM agents WHERE agent_kind = 'android_operator'
+            )
+        `);
+        {
+          const plans = this.migrationRows(`
+            SELECT id, plan_json FROM dispatch_plans
+            WHERE worker_agent_id IN (
+              SELECT id FROM agents WHERE agent_kind = 'android_operator'
+            ) AND (
+              status = 'planned'
+              OR (status = 'committed' AND (
+                task_id IS NULL OR task_id IN (
+                  SELECT id FROM tasks
+                  WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED')
+                )
+              ))
+            )
+          `);
+          for (const plan of plans) {
+            let parsed: Record<string, unknown>;
+            try {
+              const value = JSON.parse(String(plan.plan_json));
+              if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+              parsed = value as Record<string, unknown>;
+            } catch {
+              this.migrationFailure(39, `Android dispatch plan ${String(plan.id)} contains invalid JSON`);
+            }
+            parsed.workerEngineId = 'eng-hermes-cli';
+            this.raw.prepare(
+              "UPDATE dispatch_plans SET worker_engine_id = 'eng-hermes-cli', plan_json = ? WHERE id = ?"
+            ).run(JSON.stringify(parsed), String(plan.id));
+          }
+        }
+
+        {
+          this.inner.exec(`
+            INSERT OR IGNORE INTO settings(key, value_json, updated_at)
+            SELECT REPLACE(key, 'eng-hermes', 'eng-nexus'), value_json, updated_at
+            FROM settings
+            WHERE key IN ('engine:health:eng-hermes', 'secret:engine:eng-hermes:env');
+            DELETE FROM settings
+            WHERE key IN ('engine:health:eng-hermes', 'secret:engine:eng-hermes:env');
+            UPDATE settings
+            SET value_json = REPLACE(value_json, '"eng-hermes"', '"eng-nexus"')
+            WHERE INSTR(value_json, '"eng-hermes"') > 0;
+
+            INSERT OR IGNORE INTO settings(key, value_json, updated_at)
+            SELECT 'provider:nexus', value_json, updated_at
+            FROM settings WHERE key = 'provider:hermes';
+          `);
+
+          const legacySecret = this.migrationRows(
+            "SELECT value_json, updated_at FROM settings WHERE key = 'secret:provider:hermes:key'"
+          )[0];
+          const canonicalSecret = this.migrationRows(
+            "SELECT value_json, updated_at FROM settings WHERE key = 'secret:provider:nexus:key'"
+          )[0];
+          let migratedSecretRef = 'secret:provider:nexus:key';
+          if (legacySecret) {
+            if (canonicalSecret && canonicalSecret.value_json !== legacySecret.value_json) {
+              migratedSecretRef = 'secret:provider:nexus:migrated-v39-key';
+              const existingMigrated = this.migrationRows(
+                'SELECT value_json FROM settings WHERE key = ?', [migratedSecretRef]
+              )[0];
+              if (existingMigrated && existingMigrated.value_json !== legacySecret.value_json) {
+                this.migrationFailure(39, 'cannot preserve two distinct legacy Nexus Provider credentials');
+              }
+              this.raw.prepare(
+                'INSERT OR REPLACE INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)'
+              ).run(migratedSecretRef, legacySecret.value_json, legacySecret.updated_at);
+            } else if (!canonicalSecret) {
+              this.raw.prepare(
+                'INSERT INTO settings(key, value_json, updated_at) VALUES(?, ?, ?)'
+              ).run(migratedSecretRef, legacySecret.value_json, legacySecret.updated_at);
+            }
+          }
+
+          this.raw.prepare(
+            "UPDATE providers SET api_key_ref = ? WHERE api_key_ref = 'secret:provider:hermes:key'"
+          ).run(migratedSecretRef);
+          this.inner.exec(`
+            DELETE FROM settings
+            WHERE key IN ('provider:hermes', 'secret:provider:hermes:key')
+          `);
+        }
+
+        this.inner.exec("DELETE FROM engines WHERE id = 'eng-hermes'");
       }
       this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_input_message_exactly_once
         ON tasks(input_message_id) WHERE input_message_id IS NOT NULL`);

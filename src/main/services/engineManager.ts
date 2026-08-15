@@ -1,10 +1,9 @@
 /**
  * 引擎中心（PRD 9.x）
- * 引擎目录：Nexus 与 Hermes 控制 Runtime，加上受管 Harness 和本机 Worker CLI
- *（Codex / Claude Code / Pi / OpenCode）。
- * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / HEALTHY，不做假安装。
- * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）；
- * ZCode 为桌面应用无公开 npm 包，仅提供官方指引。
+ * 引擎目录：内置 Nexus Runtime、真实 Hermes Agent CLI、受管 Harness，
+ * 以及本机 Worker CLI（Codex / Claude Code / Pi / OpenCode）。
+ * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / AUTH_REQUIRED，不做假安装。
+ * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）。
  * Nexus Agent 状态按供应商配置派生：已配置 = HEALTHY，未配置 = SETUP_REQUIRED（演示模式）。
  * 凭据：自定义环境变量中的敏感键经 engineEnv.ts 拆分加密，config_json 仅存占位符。
  *
@@ -14,19 +13,26 @@ import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { safeStorage } from 'electron';
 import type { Database } from './database.js';
-import { providerReady } from './provider.js';
 import { loadConfig, sanitizeRegistry } from './config.js';
 import { runCli } from './cliLauncher.js';
 import { acpCommandFor, probeAcpEngine, probeAcpTask } from './executor/acpExecutor.js';
 import {
   childProcessEnv,
+  engineRequiresManagedProvider,
+  engineSupportsNativeAuth,
   engineEnvSecretRef,
   redactSensitiveText,
+  readEngineRuntimeConfig,
+  requiredProviderProtocol,
+  resolveClaudeEngineEnv,
   resolveConfiguredEngineEnv,
   resolveEngineEnv,
+  resolveEngineProvider,
+  resolveOpenCodeEngineEnv,
   splitSecretEnv,
   SECRET_PLACEHOLDER
 } from './engineEnv.js';
+import type { ProviderRuntimeChange } from './providerManager.js';
 import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 import { HermesRuntimeProfileService } from './hermesRuntimeProfile.js';
 import { PI_ENGINE_ID, PiRuntimeProfileService } from './piRuntimeProfile.js';
@@ -41,6 +47,9 @@ import {
   CLAUDE_ENGINE_ID,
   buildClaudeAuthCheckArgs,
   buildClaudeProbeArgs,
+  buildCodexManagedArgs,
+  buildOpenCodeManagedArgs,
+  managedCodexProcessEnv,
   parseClaudeAuthStatus,
   parseClaudeProbeOutput,
   redactClaudeText
@@ -57,13 +66,41 @@ import {
   harnessProviderVerificationIsCurrent,
   saveHarnessProviderFingerprint
 } from './harnessProviderVerification.js';
-import type { Engine, EngineHealthSignals, EngineInstallGuide, EngineInstallResult, EngineType } from '../../shared/types.js';
+import {
+  NEXUS_ENGINE_ID,
+  type Engine,
+  type EngineHealthSignals,
+  type EngineInstallGuide,
+  type EngineInstallResult,
+  type EngineRuntimeConfig,
+  type EngineType,
+  type ProviderProtocol
+} from '../../shared/types.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 
 /** 四级探活信号在 settings 中的存储键 */
 function healthSignalsKey(engineId: string): string {
   return `engine:health:${engineId}`;
+}
+
+function managedProviderState(db: Database, engineId: string): { configured: boolean; error: string | null } {
+  try {
+    return { configured: resolveEngineProvider(db, engineId) !== null, error: null };
+  } catch (error) {
+    return { configured: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function managedProviderReady(db: Database, engineId: string): boolean {
+  const state = managedProviderState(db, engineId);
+  return state.error === null && state.configured;
+}
+
+/** Installing a CLI only proves that its executable launches. A fresh install
+ * correctly remains AUTH_REQUIRED until the real model probe succeeds. */
+export function cliInstallWasDetected(status: Engine['status'] | undefined): boolean {
+  return status === 'AUTH_REQUIRED' || status === 'HEALTHY';
 }
 
 interface EngineRow {
@@ -97,7 +134,7 @@ export interface CatalogEntry {
  */
 export const ENGINE_CATALOG: CatalogEntry[] = [
   {
-    id: 'eng-hermes', type: 'hermes', name: 'Nexus Agent', bin: null, npmPackage: null,
+    id: NEXUS_ENGINE_ID, type: 'nexus', name: 'Nexus Agent', bin: null, npmPackage: null,
     dataBoundary: '本地运行；模型请求发送至所配置模型提供商',
     guide: { guide: '内置引擎无需安装，在设置页完成模型供应商配置即可启用', url: null }
   },
@@ -108,7 +145,7 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
   },
   {
     id: 'eng-hermes-cli', type: 'hermes-cli', name: 'Hermes Agent', bin: 'hermes', npmPackage: null,
-    dataBoundary: '本地 Hermes Agent Runtime；数据发送目标取决于 Hermes 自身配置',
+    dataBoundary: '本地 Hermes Agent Runtime；继承 OPC-Nexus 解析后的供应商、模型与 Base URL',
     guide: { guide: '请按 Hermes Agent 官方方式安装 hermes CLI；如可执行名或运行参数不同，可在配置文件 engines["eng-hermes-cli"] 中覆写 bin/runArgs', url: null }
   },
   {
@@ -121,12 +158,12 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
   },
   {
     id: 'eng-opencode', type: 'opencode', name: 'OpenCode', bin: 'opencode', npmPackage: 'opencode-ai',
-    dataBoundary: '数据发送目标取决于 OpenCode 内所配置的模型提供商',
+    dataBoundary: '本地 OpenCode Runtime；按所选原生登录或 OPC-Nexus 托管供应商发送模型请求',
     guide: { guide: 'npm install -g opencode-ai，安装后运行 opencode auth login 配置提供商', url: 'https://opencode.ai/docs' }
   },
   {
     id: 'eng-codex', type: 'codex', name: 'OpenAI Codex CLI', bin: 'codex', npmPackage: '@openai/codex',
-    dataBoundary: '数据将发送至 OpenAI API',
+    dataBoundary: '本地 Codex CLI；按所选原生登录或 OPC-Nexus 托管供应商发送模型请求',
     guide: { guide: 'npm install -g @openai/codex，安装后运行 codex 完成登录', url: 'https://github.com/openai/codex' }
   },
   {
@@ -185,6 +222,18 @@ function assertSafePersistedEngineConfig(value: unknown): void {
   const config = value as Record<string, unknown>;
   assertSafeEngineArguments(config.runArgs, 'runArgs');
   assertSafeEngineArguments(config.acpCommand, 'ACP arguments');
+  if (config.providerId !== undefined
+    && (typeof config.providerId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(config.providerId))) {
+    throw new Error('Invalid providerId');
+  }
+  if (config.modelOverride !== undefined
+    && (typeof config.modelOverride !== 'string' || config.modelOverride.length > 200 || /[\r\n\0]/.test(config.modelOverride))) {
+    throw new Error('Invalid modelOverride');
+  }
+  if (config.protocol !== undefined
+    && !['openai-chat', 'openai-responses', 'anthropic-messages'].includes(config.protocol as string)) {
+    throw new Error('Invalid Provider protocol');
+  }
 }
 
 /** 旧配置文件中的 ACP 条目仅用于升级导入，运行时状态与命令以 SQLite 为准。 */
@@ -224,26 +273,139 @@ export class EngineManager {
 
   constructor(private db: Database) {}
 
-  /** Provider mutations invalidate the real-task proof until a new probe succeeds. */
+  /** Provider mutations invalidate every affected engine's real-task proof.
+   * Native-login CLIs with no managed binding remain untouched. */
+  invalidateProviderVerification(change?: ProviderRuntimeChange): void {
+    const rows = this.db.raw.prepare('SELECT id, type, status FROM engines').all() as unknown as {
+      id: string;
+      type: string;
+      status: string;
+    }[];
+    let harnessAffected = false;
+    for (const row of rows) {
+      let configured = false;
+      let explicitError = false;
+      try {
+        configured = resolveEngineProvider(this.db, row.id) !== null;
+      } catch {
+        explicitError = true;
+      }
+      let runtimeConfig: EngineRuntimeConfig | null = null;
+      try {
+        runtimeConfig = readEngineRuntimeConfig(this.db, row.id);
+      } catch {
+        explicitError = true;
+      }
+      const customExternal = row.type === 'external' && row.id !== DEEPSEEK_HARNESS_ENGINE_ID;
+      const legacyManagedBinding = customExternal
+        ? Boolean(runtimeConfig?.providerId)
+        : Boolean(runtimeConfig?.providerId || runtimeConfig?.modelOverride || runtimeConfig?.protocol);
+      const agentBindings = this.db.raw.prepare(
+        `SELECT provider_id, model_override FROM agents
+         WHERE engine_id = ? AND archived = 0
+           AND (provider_id IS NOT NULL OR TRIM(COALESCE(model_override, '')) != '')`
+      ).all(row.id) as unknown as { provider_id?: string | null; model_override?: string | null }[];
+      const agentBindingAffected = agentBindings.some((binding) => {
+        const customBindingAuthorized = !customExternal
+          || Boolean(binding.provider_id)
+          || runtimeConfig?.providerMode === 'managed'
+          || Boolean(runtimeConfig?.providerId);
+        if (!customBindingAuthorized) return false;
+        if (!change) return true;
+        const effectiveProviderId = binding.provider_id || runtimeConfig?.providerId || null;
+        return effectiveProviderId
+          ? change.providerUpdated && effectiveProviderId === change.providerId
+          : change.defaultRouteChanged;
+      });
+      const usesManagedProvider = engineRequiresManagedProvider(row.id)
+        || runtimeConfig?.providerMode === 'managed'
+        || (runtimeConfig?.providerMode === undefined && legacyManagedBinding);
+      const affected = explicitError || agentBindingAffected || (usesManagedProvider && (
+        !change
+          ? true
+          : runtimeConfig?.providerId
+            ? change.providerUpdated && runtimeConfig.providerId === change.providerId
+            : change.defaultRouteChanged
+      ));
+      if (!affected) continue;
+
+      // Nexus is an in-process Worker whose readiness contract is complete
+      // Provider configuration; it has no separate CLI authentication step.
+      if (row.id === NEXUS_ENGINE_ID) {
+        const nextStatus = configured && !explicitError
+          ? 'HEALTHY'
+          : explicitError ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED';
+        this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+          .run(nextStatus, nextStatus === 'HEALTHY' ? 'authed' : 'required', row.id);
+        continue;
+      }
+
+      // A prepared Harness can advance from "missing Provider" to "awaiting
+      // real model probe" as soon as the first complete default is created.
+      if (row.id === DEEPSEEK_HARNESS_ENGINE_ID) {
+        harnessAffected = true;
+        const previous = this.getHealthSignals(row.id);
+        const nextStatus = configured && !explicitError && previous?.launchable
+          ? 'AUTH_REQUIRED'
+          : explicitError ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED';
+        this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+          .run(nextStatus, 'required', row.id);
+        this.saveHealthSignals(row.id, {
+          detected: previous?.detected ?? true,
+          launchable: previous?.launchable ?? false,
+          authenticated: false,
+          taskVerified: false,
+          detail: nextStatus === 'AUTH_REQUIRED'
+            ? '模型供应商配置已变化；请重新运行“验证可用性”完成真实模型任务探测'
+            : '请先配置可用的模型供应商和 API Key'
+        });
+        continue;
+      }
+
+      // Hermes and Pi are managed-only CLIs. If their executable was already
+      // detected while no Provider existed, a newly completed default route
+      // must expose the real-task verification action immediately.
+      if (engineRequiresManagedProvider(row.id)) {
+        if (row.status === 'NOT_INSTALLED' || row.status === 'INSTALLING') continue;
+        const previous = this.getHealthSignals(row.id);
+        const launchable = previous?.launchable ?? row.status === 'HEALTHY';
+        const nextStatus = explicitError
+          ? 'AUTH_REQUIRED'
+          : configured && launchable ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED';
+        this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+          .run(nextStatus, 'required', row.id);
+        this.saveHealthSignals(row.id, {
+          detected: previous?.detected ?? launchable,
+          launchable,
+          authenticated: false,
+          taskVerified: false,
+          detail: nextStatus === 'AUTH_REQUIRED'
+            ? '模型供应商配置已变化；请重新运行“验证可用性”完成真实模型任务探测'
+            : '请先配置可用的模型供应商和 API Key'
+        });
+        continue;
+      }
+
+      if (row.status !== 'HEALTHY') continue;
+      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+        .run('AUTH_REQUIRED', 'required', row.id);
+      const previous = this.getHealthSignals(row.id);
+      this.saveHealthSignals(row.id, {
+        detected: previous?.detected ?? true,
+        launchable: previous?.launchable ?? true,
+        authenticated: false,
+        taskVerified: false,
+        detail: configured || explicitError
+          ? '模型供应商配置已变化；请重新运行“验证登录”完成真实模型任务探测'
+          : '请先配置可用的模型供应商和 API Key'
+      });
+    }
+    if (harnessAffected || !change) saveHarnessProviderFingerprint(this.db, null);
+  }
+
+  /** Backward-compatible name retained for v1.8.0 callers/tests. */
   invalidateHarnessProviderVerification(): void {
-    const configured = providerReady(this.db);
-    const commandAvailable = deepseekHarnessCommand() !== null;
-    const previousSignals = this.getHealthSignals(DEEPSEEK_HARNESS_ENGINE_ID);
-    this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?').run(
-      commandAvailable ? (configured ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED') : 'NOT_INSTALLED',
-      'required',
-      DEEPSEEK_HARNESS_ENGINE_ID
-    );
-    this.saveHealthSignals(DEEPSEEK_HARNESS_ENGINE_ID, {
-      detected: commandAvailable,
-      launchable: commandAvailable && previousSignals?.launchable === true,
-      authenticated: false,
-      taskVerified: false,
-      detail: configured
-        ? '模型供应商配置已变化；请重新运行“验证登录”完成真实模型任务探测'
-        : '请先配置可用的模型供应商和 API Key'
-    });
-    saveHarnessProviderFingerprint(this.db, null);
+    this.invalidateProviderVerification();
   }
 
   /** 目录中的引擎逐个补齐；旧配置文件里的 ACP 条目只在数据库尚无该 ID 时导入。 */
@@ -254,8 +416,8 @@ export class EngineManager {
        ON CONFLICT(id) DO UPDATE SET name = excluded.name, data_boundary = excluded.data_boundary`
     );
     for (const e of ENGINE_CATALOG) {
-      const initial = e.id === 'eng-hermes' ? 'SETUP_REQUIRED' : 'NOT_INSTALLED';
-      stmt.run(e.id, e.type, e.name, initial, e.id === 'eng-hermes' ? 1 : 0, e.dataBoundary);
+      const initial = e.id === NEXUS_ENGINE_ID ? 'SETUP_REQUIRED' : 'NOT_INSTALLED';
+      stmt.run(e.id, e.type, e.name, initial, e.id === NEXUS_ENGINE_ID ? 1 : 0, e.dataBoundary);
     }
 
     const legacyStmt = this.db.raw.prepare(
@@ -327,12 +489,14 @@ export class EngineManager {
     return null;
   }
 
-  /** 至少一个可用执行器（PRD：系统正常运行的最低条件）：任一 CLI 健康 或 Hermes 供应商已配置 */
+  /** At least one executor that the registry can actually dispatch now. */
   hasUsableExecutor(): boolean {
     const healthy = (this.db.raw
-      .prepare("SELECT COUNT(*) c FROM engines WHERE status = 'HEALTHY' AND id != 'eng-hermes'")
-      .get() as { c: number }).c;
-    return healthy > 0 || providerReady(this.db);
+      .prepare('SELECT COUNT(*) c FROM engines WHERE status = \'HEALTHY\' AND id != ?')
+      .get(NEXUS_ENGINE_ID) as { c: number }).c;
+    const nexus = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?')
+      .get(NEXUS_ENGINE_ID) as { status?: string } | undefined;
+    return healthy > 0 || (nexus?.status === 'HEALTHY' && managedProviderReady(this.db, NEXUS_ENGINE_ID));
   }
 
   /**
@@ -358,12 +522,25 @@ export class EngineManager {
       });
       saveHarnessProviderFingerprint(this.db, null);
     } else {
+      const providerState = managedProviderState(this.db, DEEPSEEK_HARNESS_ENGINE_ID);
+      if (providerState.error) {
+        this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required', version = ?, path = ? WHERE id = ?").run(
+          DEEPSEEK_HARNESS_VERSION,
+          deepseekHarnessRuntimePaths().root,
+          DEEPSEEK_HARNESS_ENGINE_ID
+        );
+        this.db.setSetting(healthSignalsKey(DEEPSEEK_HARNESS_ENGINE_ID), {
+          detected: true, launchable: false, authenticated: false, taskVerified: false,
+          detail: `模型供应商配置不兼容：${providerState.error}`, checkedAt: Date.now()
+        });
+        saveHarnessProviderFingerprint(this.db, null);
+      } else {
       const probe = await probeAcpEngine(
         harnessCommand,
         deepseekHarnessProbeEnv(this.db),
         { managedHarness: true }
       );
-      const configured = providerReady(this.db);
+      const configured = providerState.configured;
       const previous = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?')
         .get(DEEPSEEK_HARNESS_ENGINE_ID) as { status: string } | undefined;
       const alreadyVerified = previous?.status === 'HEALTHY'
@@ -391,6 +568,7 @@ export class EngineManager {
           checkedAt: Date.now()
         });
         saveHarnessProviderFingerprint(this.db, null);
+      }
       }
     }
     for (const entry of ENGINE_CATALOG) {
@@ -463,16 +641,16 @@ export class EngineManager {
       }
     }
     // Nexus Agent：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED（演示模式，UI 必须标注）
-    const nexusReady = providerReady(this.db);
+    const nexusReady = managedProviderReady(this.db, NEXUS_ENGINE_ID);
     this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
-      .run(nexusReady ? 'HEALTHY' : 'SETUP_REQUIRED', nexusReady ? 'authed' : 'required', 'eng-hermes');
+      .run(nexusReady ? 'HEALTHY' : 'SETUP_REQUIRED', nexusReady ? 'authed' : 'required', NEXUS_ENGINE_ID);
     return this.list();
   }
 
   /**
    * 自动安装：npm install -g <官方包> --registry <配置文件下载地址>
    * 安装来源固定为目录内官方包名，配置文件不可覆写（9.3 供应链基线）。
-   * 完成后重新检测该引擎，如实回写 HEALTHY / NOT_INSTALLED。
+   * 完成后重新检测该引擎，如实回写 AUTH_REQUIRED / HEALTHY / NOT_INSTALLED。
    */
   async install(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
@@ -501,11 +679,17 @@ export class EngineManager {
 
     await this.detect();
     const status = (this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(id) as { status: string } | undefined)?.status;
-    const ok = status === 'HEALTHY';
-    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.install', target: npmPackage, result: ok ? 'ok' : 'installed-but-not-detected' });
-    return ok
-      ? { ok: true, message: `${entry.name} 安装成功，已可用于任务调度（首次使用请先完成登录授权）` }
-      : { ok: false, message: '安装命令已完成，但未检测到可执行文件；请检查 npm 全局 bin 目录是否在 PATH 中后点击"重新检测"' };
+    const detected = cliInstallWasDetected(status as Engine['status'] | undefined);
+    const ready = status === 'HEALTHY';
+    this.db.audit({
+      id: randomUUID(), actor: 'admin', action: 'engine.install', target: npmPackage,
+      result: ready ? 'ok' : detected ? 'installed-awaiting-auth' : 'installed-but-not-detected'
+    });
+    if (ready) return { ok: true, message: `${entry.name} 安装成功，已通过可用性验证` };
+    if (detected) {
+      return { ok: true, message: `${entry.name} 安装成功并已确认可启动；请运行“验证可用性”完成凭据与模型任务探测` };
+    }
+    return { ok: false, message: '安装命令已完成，但未检测到可执行文件；请检查 npm 全局 bin 目录是否在 PATH 中后点击"重新检测"' };
   }
 
   /**
@@ -552,14 +736,18 @@ export class EngineManager {
     if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
       const command = deepseekHarnessCommand();
       if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备，请先运行 harness:prepare 或重新安装应用' };
-      if (!providerReady(this.db)) {
+      const providerState = managedProviderState(this.db, id);
+      if (!providerState.configured) {
+        const detail = providerState.error
+          ? `模型供应商配置不兼容：${providerState.error}`
+          : '请先配置可用的模型供应商和 API Key';
         this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required' WHERE id = ?").run(id);
         this.saveHealthSignals(id, {
           detected: true, launchable: true, authenticated: false, taskVerified: false,
-          detail: '请先配置可用的模型供应商和 API Key'
+          detail
         });
         saveHarnessProviderFingerprint(this.db, null);
-        return { ok: false, message: '请先配置可用的模型供应商和 API Key' };
+        return { ok: false, message: detail };
       }
       const providerFingerprint = harnessProviderFingerprint(this.db);
       const probe = await probeAcpTask(
@@ -598,7 +786,7 @@ export class EngineManager {
 
     // 内置 Nexus：凭据即供应商配置
     if (entry.bin === null) {
-      const ready = providerReady(this.db);
+      const ready = managedProviderReady(this.db, id);
       this.db.raw.prepare("UPDATE engines SET status = ?, auth_status = ? WHERE id = ?")
         .run(ready ? 'HEALTHY' : 'SETUP_REQUIRED', ready ? 'authed' : 'required', id);
       this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id, result: ready ? 'authed' : 'setup-required' });
@@ -659,6 +847,32 @@ export class EngineManager {
     if (changed) this.addLog(id, 'warn', `Runtime authentication failed: ${boundedDetail.slice(0, 500)}`);
   }
 
+  /** A local profile/runtime preparation error leaves Provider authentication
+   * intact, but revokes the task verification proof until detection succeeds. */
+  reportRuntimeFailure(id: string, detail: string): void {
+    const boundedDetail = detail.trim().slice(0, 2_000) || 'Runtime preparation failed';
+    let changed = false;
+    this.db.transaction(() => {
+      changed = this.db.raw.prepare(
+        "UPDATE engines SET status = ?, auth_status = ? WHERE id = ? AND status = 'HEALTHY'"
+      ).run('DEGRADED', 'authed', id).changes === 1;
+      if (!changed) return;
+      const previous = this.getHealthSignals(id);
+      this.saveHealthSignals(id, {
+        detected: previous?.detected ?? true,
+        launchable: previous?.launchable ?? true,
+        authenticated: previous?.authenticated ?? true,
+        taskVerified: false,
+        detail: boundedDetail
+      });
+      this.db.audit({
+        id: randomUUID(), actor: 'system', action: 'engine.runtimeFailure',
+        target: id, result: 'DEGRADED'
+      });
+    });
+    if (changed) this.addLog(id, 'warn', `Runtime preparation failed: ${boundedDetail.slice(0, 500)}`);
+  }
+
   setDefault(id: string) {
     this.db.transaction(() => {
       this.db.raw.prepare('UPDATE engines SET is_default = 0').run();
@@ -692,19 +906,29 @@ export class EngineManager {
     return { ok: true, message: `${entry.name} 已卸载` };
   }
 
-  /** 重启引擎：重新检测指定引擎（Hermes 重新读取供应商配置，CLI 重新定位二进制 + 取版本）。
+  /** 重启引擎：重新检测指定引擎（受管引擎重读供应商配置，CLI 重新定位二进制 + 取版本）。
    *  用于修改配置后刷新引擎状态，无需重启整个应用。 */
   async restart(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
     if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
       const command = deepseekHarnessCommand();
       if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备' };
+      const providerState = managedProviderState(this.db, id);
+      if (providerState.error) {
+        this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required' WHERE id = ?").run(id);
+        this.saveHealthSignals(id, {
+          detected: true, launchable: false, authenticated: false, taskVerified: false,
+          detail: `模型供应商配置不兼容：${providerState.error}`
+        });
+        saveHarnessProviderFingerprint(this.db, null);
+        return { ok: false, message: `DeepSeek Harness 模型供应商配置不兼容：${providerState.error}` };
+      }
       const probe = await probeAcpEngine(
         command,
         deepseekHarnessProbeEnv(this.db),
         { managedHarness: true }
       );
-      const configured = providerReady(this.db);
+      const configured = providerState.configured;
       this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
         probe.ok ? (configured ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED') : 'ERROR',
         'required',
@@ -719,10 +943,11 @@ export class EngineManager {
       saveHarnessProviderFingerprint(this.db, null);
       return { ok: probe.ok, message: probe.ok ? 'DeepSeek Harness 已重新加载，请继续验证登录' : `DeepSeek Harness 连接失败：${probe.message}` };
     }
-    if (id === 'eng-hermes') {
+    if (id === NEXUS_ENGINE_ID) {
       // Nexus Agent：重新检测供应商配置是否就绪
-      this.db.raw.prepare("UPDATE engines SET status = ? WHERE id = 'eng-hermes'").run(providerReady(this.db) ? 'HEALTHY' : 'SETUP_REQUIRED');
-      const ready = providerReady(this.db);
+      const ready = managedProviderReady(this.db, NEXUS_ENGINE_ID);
+      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
+        .run(ready ? 'HEALTHY' : 'SETUP_REQUIRED', ready ? 'authed' : 'required', NEXUS_ENGINE_ID);
       return { ok: ready, message: ready ? 'Nexus Agent 引擎已重新加载，供应商配置生效' : 'Nexus Agent 引擎未就绪：请先在设置页完成模型供应商配置' };
     }
     if (!entry) {
@@ -744,9 +969,21 @@ export class EngineManager {
       return { ok: false, message: `${entry.name} 未检测到可执行文件，请确认已安装并在 PATH 中` };
     }
     const version = await binVersion(found);
-    this.db.raw.prepare("UPDATE engines SET status = 'HEALTHY', version = ?, path = ? WHERE id = ?").run(version ?? 'unknown', found, id);
-    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.restart', target: id, result: 'ok' });
-    return { ok: true, message: `${entry.name} 已重新检测（v${version ?? 'unknown'}），配置已生效` };
+    this.db.raw.prepare(
+      "UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required', version = ?, path = ? WHERE id = ?"
+    ).run(version ?? 'unknown', found, id);
+    this.saveHealthSignals(id, {
+      detected: true,
+      launchable: true,
+      authenticated: false,
+      taskVerified: false,
+      detail: 'CLI 已重新检测；请运行“验证登录”完成真实模型任务探测'
+    });
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.restart', target: id, result: 'AUTH_REQUIRED' });
+    return {
+      ok: true,
+      message: `${entry.name} 已重新检测（v${version ?? 'unknown'}），请继续验证登录`
+    };
   }
 
   /** 查询 npm registry 上的最新版本 */
@@ -862,50 +1099,166 @@ export class EngineManager {
    * config_json 中仅保留占位符，确保 Renderer 与日志都拿不到明文。
    * 与 providerManager 的密钥处理保持同一模式。
    */
-  saveConfig(id: string, config: { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number }) {
+  saveConfig(id: string, config: EngineRuntimeConfig) {
+    const engine = this.db.raw.prepare('SELECT id, type FROM engines WHERE id = ?').get(id) as
+      | { id?: string; type?: string }
+      | undefined;
+    if (!engine?.id) throw new Error(`Engine does not exist: ${id}`);
     assertSafeEngineArguments(config.runArgs, 'runArgs');
     assertSafeEngineArguments((config as Record<string, unknown>).acpCommand, 'ACP arguments');
-    const { safe, secrets } = splitSecretEnv(config.env ?? {});
+    if (config.providerId !== undefined
+      && (typeof config.providerId !== 'string'
+        || (config.providerId !== '' && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(config.providerId)))) {
+      throw new Error('Invalid providerId');
+    }
+    if (config.modelOverride !== undefined
+      && (typeof config.modelOverride !== 'string'
+        || config.modelOverride.length > 200 || /[\r\n\0]/.test(config.modelOverride))) {
+      throw new Error('Invalid modelOverride');
+    }
+    if (config.protocol !== undefined
+      && !['openai-chat', 'openai-responses', 'anthropic-messages'].includes(config.protocol)) {
+      throw new Error('Invalid Provider protocol');
+    }
+    if (config.providerMode !== undefined && config.providerMode !== 'native' && config.providerMode !== 'managed') {
+      throw new Error('Invalid Provider mode');
+    }
+    const existing = this.getConfig(id) ?? {};
+    const nextRunArgs = config.runArgs === undefined ? existing.runArgs : config.runArgs;
+    const nextEnv = config.env === undefined ? existing.env : config.env;
+    const supportsNative = engineSupportsNativeAuth(id)
+      || (engine.type === 'external' && id !== DEEPSEEK_HARNESS_ENGINE_ID);
+    const customExternal = engine.type === 'external' && id !== DEEPSEEK_HARNESS_ENGINE_ID;
+    const existingManagedFields = customExternal
+      ? Boolean(existing.providerId)
+      : Boolean(existing.providerId || existing.modelOverride || existing.protocol);
+    const existingProviderMode = existing.providerMode
+      ?? (supportsNative && !existingManagedFields ? 'native' : 'managed');
+    const requestedManagedFields = Boolean(
+      config.providerId?.trim() || config.modelOverride?.trim() || config.protocol
+    );
+    const requestedManagedAuthorization = customExternal
+      ? Boolean(config.providerId?.trim())
+      : requestedManagedFields;
+    const nextProviderMode = config.providerMode
+      ?? (requestedManagedAuthorization ? 'managed' : existingProviderMode);
+    if (nextProviderMode === 'native' && !supportsNative) {
+      throw new Error(`${id} does not support native Provider authentication`);
+    }
+    if (nextProviderMode === 'native' && requestedManagedFields) {
+      throw new Error('Native authentication cannot be combined with a managed Provider, model, or protocol');
+    }
+    const nextProviderId = nextProviderMode === 'native'
+      ? undefined
+      : config.providerId === undefined ? existing.providerId : config.providerId.trim() || undefined;
+    const nextModelOverride = nextProviderMode === 'native'
+      ? undefined
+      : config.modelOverride === undefined
+      ? existing.modelOverride
+      : config.modelOverride.trim() || undefined;
+    const requiredProtocol = requiredProviderProtocol(id);
+    const nextProtocol = nextProviderMode === 'native'
+      ? undefined
+      : config.protocol === undefined ? existing.protocol ?? requiredProtocol ?? 'openai-chat' : config.protocol;
+    if (requiredProtocol && nextProviderMode === 'managed' && nextProtocol !== requiredProtocol) {
+      throw new Error(`${id} requires ${requiredProtocol}; configured Provider protocol is ${nextProtocol}`);
+    }
+    if (nextProviderId) {
+      const provider = this.db.raw.prepare('SELECT id FROM providers WHERE id = ?').get(nextProviderId) as
+        | { id?: string }
+        | undefined;
+      if (!provider?.id) throw new Error(`Configured model Provider does not exist: ${nextProviderId}`);
+    }
+    const { safe, secrets: submittedSecrets } = splitSecretEnv(nextEnv ?? {});
+    const secrets = { ...submittedSecrets };
+    const retainedKeys = Object.entries(safe)
+      .filter(([, value]) => value === SECRET_PLACEHOLDER)
+      .map(([key]) => key)
+      .filter((key) => !(key in secrets));
+    if (retainedKeys.length > 0) {
+      const existingResolved = resolveConfiguredEngineEnv(this.db, id);
+      for (const key of retainedKeys) {
+        const value = existingResolved[key];
+        if (!value) throw new Error(`Configured engine credential is unavailable: ${key}`);
+        secrets[key] = value;
+      }
+    }
+    if (Object.keys(secrets).length > 0 && !safeStorage.isEncryptionAvailable()) {
+      throw new Error('系统加密不可用，无法保存引擎凭据');
+    }
+    const encryptedSecrets = Object.keys(secrets).length > 0
+      ? safeStorage.encryptString(JSON.stringify(secrets)).toString('base64')
+      : null;
+    const existingAcpCommand = (existing as EngineRuntimeConfig & { acpCommand?: string[] }).acpCommand;
     const persisted = {
-      runArgs: config.runArgs,
+      runArgs: nextRunArgs,
       env: safe,
-      maxConcurrency: config.maxConcurrency
+      maxConcurrency: config.maxConcurrency === undefined ? existing.maxConcurrency : config.maxConcurrency,
+      ...(existingAcpCommand ? { acpCommand: existingAcpCommand } : {}),
+      providerMode: nextProviderMode,
+      ...(nextProviderId ? { providerId: nextProviderId } : {}),
+      ...(nextModelOverride ? { modelOverride: nextModelOverride } : {}),
+      ...(nextProtocol ? { protocol: nextProtocol as ProviderProtocol } : {})
     };
-    this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(persisted), id);
-
     const ref = engineEnvSecretRef(id);
-    if (Object.keys(secrets).length > 0) {
-      if (safeStorage.isEncryptionAvailable()) {
-        this.db.setSetting(ref, safeStorage.encryptString(JSON.stringify(secrets)).toString('base64'));
+    const hadStoredSecrets = Boolean(this.db.getSetting<string>(ref, ''));
+    this.db.transaction(() => {
+      this.db.raw.prepare('UPDATE engines SET config_json = ? WHERE id = ?').run(JSON.stringify(persisted), id);
+      if (encryptedSecrets) {
+        this.db.setSetting(ref, encryptedSecrets);
         this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.saveSecretEnv', target: id, result: `${Object.keys(secrets).length} keys` });
       } else {
-        // 加密不可用时拒绝落盘，避免明文存储
-        this.addLog(id, 'warn', '系统加密不可用，敏感环境变量未保存（请检查 OS 凭据服务）');
-        this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.saveSecretEnv', target: id, result: 'rejected: no encryption' });
+        this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(ref);
+        if (hadStoredSecrets) {
+          this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.deleteSecretEnv', target: id, result: 'ok' });
+        }
       }
-    } else if (!Object.values(safe).includes(SECRET_PLACEHOLDER)) {
-      // 仅当本次配置完全不含敏感项时才清除；占位符表示「沿用已存密钥」
-      this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(ref);
-    }
+    });
     // 日志只记录非敏感部分，避免凭据进入 engine_logs
     this.addLog(
       id,
       'info',
-      `Configuration updated: runArgs=${config.runArgs?.length ?? 0}, env=${Object.keys(safe).length}`
+      `Configuration updated: runArgs=${nextRunArgs?.length ?? 0}, env=${Object.keys(safe).length}`
     );
+
+    // A saved routing/profile change invalidates a previous real-task proof.
+    // Otherwise the UI could remain HEALTHY while the next task uses a new
+    // provider, model, or command line.
+    const normalizedRuntime = (value: EngineRuntimeConfig, mode: 'native' | 'managed') => JSON.stringify({
+      runArgs: value.runArgs ?? [],
+      env: value.env ?? {},
+      providerMode: mode,
+      providerId: mode === 'managed' ? value.providerId ?? '' : '',
+      modelOverride: mode === 'managed' ? value.modelOverride ?? '' : '',
+      protocol: mode === 'managed' ? value.protocol ?? requiredProtocol ?? 'openai-chat' : ''
+    });
+    const runtimeChanged = Object.keys(submittedSecrets).length > 0
+      || normalizedRuntime(existing, existingProviderMode) !== normalizedRuntime(persisted, nextProviderMode);
+    const row = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(id) as { status?: string } | undefined;
+    if (runtimeChanged && row?.status === 'HEALTHY') {
+      this.db.raw.prepare("UPDATE engines SET status = 'AUTH_REQUIRED', auth_status = 'required' WHERE id = ?").run(id);
+      const prior = this.getHealthSignals(id);
+      this.saveHealthSignals(id, {
+        detected: prior?.detected ?? true,
+        launchable: prior?.launchable ?? true,
+        authenticated: false,
+        taskVerified: false,
+        detail: '引擎运行配置已变化；请重新验证可用性'
+      });
+    }
   }
 
   /**
    * 获取引擎配置（供 Renderer 展示）。
    * 敏感环境变量以占位符形式返回，绝不返回明文。
    */
-  getConfig(id: string): { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number } | null {
+  getConfig(id: string): EngineRuntimeConfig | null {
     const row = this.db.raw.prepare('SELECT config_json FROM engines WHERE id = ?').get(id) as { config_json?: string } | undefined;
     if (!row?.config_json) return null;
     let parsed: unknown;
     try { parsed = JSON.parse(row.config_json); } catch { return null; }
     assertSafePersistedEngineConfig(parsed);
-    return parsed as { runArgs?: string[]; env?: Record<string, string>; maxConcurrency?: number };
+    return parsed as EngineRuntimeConfig;
   }
 
   /**
@@ -1018,9 +1371,9 @@ function npmCommand(npmArgs: string[]): Promise<{ ok: boolean; message: string }
 
 /**
  * where（Windows）/ which（Linux）定位可执行文件。
- * Windows 上优先 .exe → .cmd → 其余（无扩展名 npm shim 排最后）：
- * .exe 可直接 spawn；.cmd 与无扩展名 shim 都需经 cmd.exe 拉起（见 cliLauncher），
- * 但 .cmd 语义明确，优先选它便于后续判定。
+ * Windows 上优先普通 .exe，再选带安全 PowerShell 伴生入口的 npm .cmd。
+ * Microsoft Store 的 WindowsApps execution alias 可能被 where 排在 npm shim
+ * 后面却无法由 Electron 子进程直接启动（EPERM），因此只作为最后回退。
  */
 function locateBin(bin: string): Promise<string | null> {
   const cmd = process.platform === 'win32' ? 'where' : 'which';
@@ -1030,9 +1383,13 @@ function locateBin(bin: string): Promise<string | null> {
         if (err) return resolve(null);
         const lines = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
         if (lines.length === 0) return resolve(null);
+        const outsideWindowsApps = (path: string) => !/[\\/]WindowsApps[\\/]/i.test(path);
         resolve(
-          lines.find((l) => /\.exe$/i.test(l))
-          ?? lines.find((l) => /\.cmd$/i.test(l))
+          lines.find((l) => outsideWindowsApps(l) && /\.exe$/i.test(l))
+          ?? lines.find((l) => outsideWindowsApps(l) && /\.cmd$/i.test(l))
+          ?? lines.find((l) => outsideWindowsApps(l) && /\.ps1$/i.test(l))
+          ?? lines.find(outsideWindowsApps)
+          ?? lines.find((l) => /\.exe$/i.test(l))
           ?? lines[0]
         );
       });
@@ -1100,6 +1457,19 @@ export async function probeCliAuth(
   };
   let hermesRuntime: ReturnType<HermesRuntimeProfileService['ensureProbe']> | null = null;
   let piRuntime: ReturnType<PiRuntimeProfileService['ensureProbe']> | null = null;
+  let managedProvider: import('./providerManager.js').ResolvedProvider | null = null;
+  try {
+    managedProvider = resolveEngineProvider(db, engineId);
+  } catch (error) {
+    signals.detail = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      status: 'SETUP_REQUIRED',
+      authStatus: 'required',
+      signals,
+      message: `模型供应商配置不兼容：${signals.detail}`
+    };
+  }
   if (engineId === 'eng-hermes-cli') {
     try {
       hermesRuntime = new HermesRuntimeProfileService(db).ensureProbe();
@@ -1131,11 +1501,23 @@ export async function probeCliAuth(
     }
   }
   const engineEnv = engineId === CLAUDE_ENGINE_ID
-    ? resolveConfiguredEngineEnv(db, engineId)
+    ? (managedProvider ? resolveClaudeEngineEnv(db, engineId) : resolveConfiguredEngineEnv(db, engineId))
     : (hermesRuntime || piRuntime)
       ? {}
-      : resolveEngineEnv(db, engineId);
-  const env = childProcessEnv({ ...engineEnv, ...hermesRuntime?.env, ...piRuntime?.env });
+      : engineId === 'eng-opencode'
+        ? resolveOpenCodeEngineEnv(db, engineId)
+        : resolveEngineEnv(db, engineId);
+  let env = childProcessEnv({ ...engineEnv, ...hermesRuntime?.env, ...piRuntime?.env });
+  const managedProviderApplied = managedProvider && (
+    engineId === CLAUDE_ENGINE_ID
+      ? env.ANTHROPIC_API_KEY === managedProvider.key
+        && env.ANTHROPIC_BASE_URL === managedProvider.baseUrl.replace(/\/+$/, '')
+      : env.OPENAI_API_KEY === managedProvider.key
+        && env.OPENAI_BASE_URL === managedProvider.baseUrl.replace(/\/+$/, '')
+  ) ? managedProvider : null;
+  if (engineId === 'eng-codex' && managedProviderApplied) {
+    env = managedCodexProcessEnv(env, 'probe');
+  }
 
   // 第 1 级：launchable —— 用 --version 验证进程真能起来（最轻量、不消耗额度）
   const ver = await runCli(binPath, ['--version'], { timeoutMs: cliLaunchProbeTimeoutMs(engineId, env), env });
@@ -1169,7 +1551,8 @@ export async function probeCliAuth(
     signals.authenticated = true;
   }
 
-  if (engineId === CLAUDE_ENGINE_ID) {
+  const claudeUsesManagedProvider = engineId === CLAUDE_ENGINE_ID && Boolean(managedProviderApplied);
+  if (engineId === CLAUDE_ENGINE_ID && !claudeUsesManagedProvider) {
     const auth = await runCli(binPath, buildClaudeAuthCheckArgs(), { timeoutMs: 15_000, env });
     const parsed = parseClaudeAuthStatus(auth.stdout);
     if (auth.code !== 0 || !parsed.loggedIn) {
@@ -1196,8 +1579,12 @@ export async function probeCliAuth(
     : piRuntime
       ? buildPiProbeArgs(piRuntime)
       : engineId === CLAUDE_ENGINE_ID
-        ? buildClaudeProbeArgs()
-        : AUTH_PROBE_ARGS[engineId];
+        ? buildClaudeProbeArgs(managedProviderApplied?.model, claudeUsesManagedProvider)
+        : engineId === 'eng-codex' && managedProviderApplied
+          ? buildCodexManagedArgs('ping', managedProviderApplied.model, managedProviderApplied)
+          : engineId === 'eng-opencode' && managedProviderApplied
+            ? buildOpenCodeManagedArgs(['run', 'ping'], 'ping', managedProviderApplied.model)
+            : AUTH_PROBE_ARGS[engineId];
   if (!args) {
     signals.detail = '该引擎未定义最小任务探测参数';
     return {

@@ -35,6 +35,10 @@ CREATE TABLE agents (
   id TEXT PRIMARY KEY,
   provider_id TEXT
 );
+CREATE TABLE engines (
+  id TEXT PRIMARY KEY,
+  config_json TEXT
+);
 CREATE TABLE settings (
   key TEXT PRIMARY KEY,
   value_json TEXT NOT NULL,
@@ -172,6 +176,19 @@ describe('Provider transactions with real sql.js', () => {
     expect(db.rows('SELECT id FROM providers WHERE is_default = 1')).toEqual([{ id: first.id }]);
   });
 
+  it('adding an unrelated non-default Provider does not invalidate active runtimes', () => {
+    providers.create({
+      name: 'Default', baseUrl: 'https://default.test/v1', model: 'default-model', apiKey: 'default-key'
+    });
+    runtimeConfigChanged.mockClear();
+
+    providers.create({
+      name: 'Unused', baseUrl: 'https://unused.test/v1', model: 'unused-model', apiKey: 'unused-key'
+    });
+
+    expect(runtimeConfigChanged).not.toHaveBeenCalled();
+  });
+
   it('invalidates runtime verification for key, endpoint, model, default, and removal changes', () => {
     const first = providers.create({
       name: 'First', baseUrl: 'https://first.test/v1', model: 'first-model', apiKey: 'first-key'
@@ -215,7 +232,7 @@ describe('Provider transactions with real sql.js', () => {
     expect(db.rows('SELECT id FROM providers WHERE is_default = 1')).toEqual([{ id: second.id }]);
   });
 
-  it('removes an owned secret, unbinds Agents, promotes a successor, and audits the operation', () => {
+  it('refuses to remove a Provider while an Agent is explicitly bound, preserving fail-closed routing', () => {
     const first = providers.create({
       name: 'First', baseUrl: 'https://first.test/v1', model: 'first', apiKey: 'first-key'
     });
@@ -226,10 +243,41 @@ describe('Provider transactions with real sql.js', () => {
     const secondRef = db.row('SELECT api_key_ref FROM providers WHERE id = ?', second.id)!.api_key_ref as string;
     db.raw.prepare('INSERT INTO agents(id, provider_id) VALUES(?, ?)').run('agent-1', first.id);
 
+    expect(() => providers.remove(first.id)).toThrow(/显式绑定|重新绑定/);
+
+    expect(db.row('SELECT id FROM providers WHERE id = ?', first.id)).toMatchObject({ id: first.id });
+    expect(db.row('SELECT provider_id FROM agents WHERE id = ?', 'agent-1')).toEqual({ provider_id: first.id });
+    expect(db.rows('SELECT id FROM providers WHERE is_default = 1')).toEqual([{ id: first.id }]);
+    expect(secretValue(db, firstRef)).toBe('first-key');
+    expect(secretValue(db, secondRef)).toBe('second-key');
+    expect(db.rows("SELECT action, target, result FROM audit_logs WHERE target = ? AND action IN ('provider.remove', 'provider.secret.delete') ORDER BY created_at, rowid", first.id))
+      .toEqual([]);
+  });
+
+  it('refuses to remove a Provider while an engine is explicitly bound', () => {
+    const provider = providers.create({
+      name: 'Bound', baseUrl: 'https://bound.test/v1', model: 'bound-model', apiKey: 'bound-key'
+    });
+    db.raw.prepare('INSERT INTO engines(id, config_json) VALUES(?, ?)')
+      .run('eng-codex', JSON.stringify({ providerMode: 'managed', providerId: provider.id }));
+
+    expect(() => providers.remove(provider.id)).toThrow(/执行引擎显式绑定|重新配置引擎/);
+    expect(db.row('SELECT id FROM providers WHERE id = ?', provider.id)).toEqual({ id: provider.id });
+  });
+
+  it('removes an unbound Provider, its owned secret, and promotes a successor', () => {
+    const first = providers.create({
+      name: 'First', baseUrl: 'https://first.test/v1', model: 'first', apiKey: 'first-key'
+    });
+    const second = providers.create({
+      name: 'Second', baseUrl: 'https://second.test/v1', model: 'second', apiKey: 'second-key'
+    });
+    const firstRef = db.row('SELECT api_key_ref FROM providers WHERE id = ?', first.id)!.api_key_ref as string;
+    const secondRef = db.row('SELECT api_key_ref FROM providers WHERE id = ?', second.id)!.api_key_ref as string;
+
     providers.remove(first.id);
 
     expect(db.row('SELECT id FROM providers WHERE id = ?', first.id)).toBeUndefined();
-    expect(db.row('SELECT provider_id FROM agents WHERE id = ?', 'agent-1')).toEqual({ provider_id: null });
     expect(db.rows('SELECT id FROM providers WHERE is_default = 1')).toEqual([{ id: second.id }]);
     expect(db.row('SELECT key FROM settings WHERE key = ?', firstRef)).toBeUndefined();
     expect(secretValue(db, secondRef)).toBe('second-key');
@@ -255,13 +303,12 @@ describe('Provider transactions with real sql.js', () => {
       .toEqual(expect.arrayContaining([{ action: 'provider.secret.delete' }, { action: 'provider.remove' }]));
   });
 
-  it('rolls back Provider deletion, Agent unbinding, secret deletion, and audit writes on a mid-operation failure', () => {
+  it('rolls back Provider deletion, secret deletion, and audit writes on a mid-operation failure', () => {
     const first = providers.create({
       name: 'First', baseUrl: 'https://first.test/v1', model: 'first', apiKey: 'first-key'
     });
     const second = providers.create({ name: 'Second', baseUrl: 'https://second.test/v1', model: 'second' });
     const ref = db.row('SELECT api_key_ref FROM providers WHERE id = ?', first.id)!.api_key_ref as string;
-    db.raw.prepare('INSERT INTO agents(id, provider_id) VALUES(?, ?)').run('agent-1', first.id);
     db.raw.prepare('DELETE FROM audit_logs').run();
     db.failAfterAuditAction = 'provider.remove';
 
@@ -269,7 +316,6 @@ describe('Provider transactions with real sql.js', () => {
 
     expect(db.row('SELECT id, is_default FROM providers WHERE id = ?', first.id)).toEqual({ id: first.id, is_default: 1 });
     expect(db.row('SELECT id, is_default FROM providers WHERE id = ?', second.id)).toEqual({ id: second.id, is_default: 0 });
-    expect(db.row('SELECT provider_id FROM agents WHERE id = ?', 'agent-1')).toEqual({ provider_id: first.id });
     expect(secretValue(db, ref)).toBe('first-key');
     expect(db.rows('SELECT * FROM audit_logs')).toEqual([]);
   });

@@ -142,10 +142,12 @@ flowchart TD
 
 canonical DispatchPlan 会固定 `(workerAgentId, workerEngineId)`。Orchestrator 提交前重新核验员工、候选引擎与组织边界，并将批准引擎写入 Task；ExecutorRegistry 对 canonical Task 禁止静默 fallback 或模拟执行，批准引擎不可用时如实失败。只有不来自 canonical 控制面的旧式内部任务才保留主/辅执行引擎回退。
 
+Android 手机操作员是更严格的专用 Worker：当前仅允许 `eng-hermes-cli`，由 `HermesAgentExecutor` 注入任务级 Mobile Gateway 地址和短期 Token，并加载受管 `android_*` 工具插件。DSH rc.6 的 ACP 入口拒绝非空 `mcpServers`，OPC 的 DSH sidecar 也不启用 Shell，因此 DSH Worker 当前不能操控手机。即使 Hermes 未就绪，手机任务也不会回退到 DSH 或其他执行器；旧数据库或任务级 override 若形成错误组合，会以明确配置错误失败。已绑定但离线的手机不会被误判为执行失败：任务保持 `QUEUED` 并显示“手机离线，等待连接”，收到 `device_connected` 后由 Orchestrator 自动唤醒。
+
 ### 4.4 记忆所有权与提案
 
 - OPC-Nexus 数据库是身份、会话、长期记忆、定时任务、审批和审计的唯一事实源。`MemoryService` 按 organization 以及 principal、channel、conversation、agent、project 作用域隔离数据，并提供版本化的 recall/remember/update/forget。
-- Hermes controller 按 `(organization, principal, conversation)` 使用独立 `HERMES_HOME`，Hermes Worker 使用员工级独立 profile。Provider/model 被显式固定为 OPC 管理的 `opcnexus` Provider，密钥只注入子进程环境，从而避免用户全局 Hermes/OpenRouter 配置引起的 401/403 串线。
+- Hermes controller 按 `(organization, principal, conversation)` 使用独立 `HERMES_HOME`，Hermes Worker 使用员工级独立 profile。普通与 Android Hermes Worker 都通过同一个员工 → 引擎 → 默认 Provider 解析得到原子化的 Provider/model/key/base URL 绑定；Provider/model 被显式固定为 OPC 管理的 `opcnexus` Provider，密钥只注入子进程环境，从而避免用户全局 Hermes/OpenRouter 配置引起的 401/403 串线。缺少完整绑定时任务 fail-closed，不继承用户全局 Hermes 配置。
 - Hermes 原生 session、profile memory 与 `kernel_sessions` 锚点只作为可丢弃的连续对话缓存。每次规划仍显式接收 `MemoryService` 召回的 canonical memory；删除或升级 Hermes profile 不会改变 OPC 的长期记忆事实。
 - DSH 上游具备 JSONL 历史、checkpoint、SQLite/FTS 会话索引等持久化基础组件，但这些不等于跨会话用户长期记忆。当前集成没有长期记忆或跨任务 resume：`AcpExecutor` 每次调用 `session/new`，为任务建立独立 session root，并在进程结束后清理；没有接入 session list/resume/fork/delete 或跨会话语义召回。
 - 控制核只能在 DispatchPlan 中返回 `memoryProposals`。计划成功提交后，`MemoryProposalService` 以 `(request_id, proposal_index)` 幂等捕获为 `pending`；用户可在审核队列接受或拒绝。接受操作在同一事务中通过 `MemoryService` 创建 canonical memory 并标记 `accepted`，拒绝只标记 `rejected`。启动恢复会补捕获已提交计划中遗漏的提案。
@@ -269,7 +271,7 @@ canonical DispatchPlan 会固定 `(workerAgentId, workerEngineId)`。Orchestrato
 | Runtime | 当前证据 | 仍需注意 |
 |------|------|------|
 | Hermes Agent v0.19.0 | **PASS**：真实首轮 `-z + --usage-file` 和第二轮 `chat -Q -q --resume` 使用同一原生 session 成功 | 证明原生续接可用，不代表 Hermes profile 是 canonical 长期记忆；生产仍依赖 OPC Provider 与密钥可用 |
-| DeepSeek Harness v0.1.0-rc.6 | **PASS**：内置 sidecar 完成 Provider 校验和真实 ACP 模型任务 | 它不是 PATH 中的 `dsh` CLI；当前 ACP 不支持 resume，进程结束会删除任务 session root |
+| DeepSeek Harness v0.1.0-rc.6 | **PASS**：内置 sidecar 完成 Provider 校验和真实 ACP 模型任务 | 它不是 PATH 中的 `dsh` CLI；当前 ACP 不支持 resume 或非空 `mcpServers`，进程结束会删除任务 session root，也不能作为 Android 手机操作员 |
 | Pi Agent v0.84.2 | **PASS**：认证检查、真实任务和两轮 session 续接成功 | 目标机器仍需安装 Pi CLI，并由 OPC 管理的 profile 注入匹配 Provider |
 | Claude Code v2.1.220 | **部分通过**：CLI 已安装，参数协议修复和单元测试通过 | 本轮没有重新执行在线真实模型 smoke，不能仅凭安装状态宣称端到端可用 |
 | Codex CLI | 执行适配与 thread resume 路径已接入 | 本轮未重新执行独立在线 smoke；应由目标机器的 EngineManager 探测确认鉴权和最小任务 |

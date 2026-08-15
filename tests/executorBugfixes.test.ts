@@ -76,7 +76,7 @@ beforeEach(() => {
 
 describe('[P1] engine_override 编码委派真实生效', () => {
   const engines = {
-    'eng-hermes': { type: 'hermes', status: 'HEALTHY' },
+    'eng-nexus': { type: 'nexus', status: 'HEALTHY' },
     'eng-opencode': { type: 'opencode', status: 'HEALTHY' }
   };
 
@@ -85,10 +85,10 @@ describe('[P1] engine_override 编码委派真实生效', () => {
     const c = cb();
     const kind = reg.dispatch(
       { id: 't1', agentId: 'a1', title: '改代码', status: 'QUEUED', engineOverride: 'eng-opencode' },
-      { id: 'a1', engineId: 'eng-hermes', permissionMode: 'standard' },
+      { id: 'a1', engineId: 'eng-nexus', permissionMode: 'standard' },
       c
     );
-    // OpenCode 走 CliExecutor(generic-cli);修复前会误用 Hermes 内置引擎的 llm-api
+    // OpenCode 走 CliExecutor(generic-cli);修复前会误用 Nexus 内置引擎的 llm-api
     expect(kind).toBe('generic-cli');
     expect(c.onError).not.toHaveBeenCalled();
     reg.abort('t1');
@@ -98,7 +98,7 @@ describe('[P1] engine_override 编码委派真实生效', () => {
     const reg = new ExecutorRegistry(makeDb(engines), mockBroker(), mockProviders());
     const kind = reg.dispatch(
       { id: 't2', agentId: 'a1', title: '通用任务', status: 'QUEUED', engineOverride: null },
-      { id: 'a1', engineId: 'eng-hermes', permissionMode: 'standard' },
+      { id: 'a1', engineId: 'eng-nexus', permissionMode: 'standard' },
       cb()
     );
     expect(kind).toBe('llm-api');
@@ -107,13 +107,13 @@ describe('[P1] engine_override 编码委派真实生效', () => {
 
   it('委派目标引擎不可用时如实报错,不静默退回主引擎', () => {
     const reg = new ExecutorRegistry(
-      makeDb({ 'eng-hermes': { type: 'hermes', status: 'HEALTHY' }, 'eng-opencode': { type: 'opencode', status: 'NOT_INSTALLED' } }),
+      makeDb({ 'eng-nexus': { type: 'nexus', status: 'HEALTHY' }, 'eng-opencode': { type: 'opencode', status: 'NOT_INSTALLED' } }),
       mockBroker(), mockProviders()
     );
     const c = cb();
     const kind = reg.dispatch(
       { id: 't3', agentId: 'a1', title: '改代码', status: 'QUEUED', engineOverride: 'eng-opencode' },
-      { id: 'a1', engineId: 'eng-hermes', permissionMode: 'standard' },
+      { id: 'a1', engineId: 'eng-nexus', permissionMode: 'standard' },
       c
     );
     expect(kind).toBe('unavailable');
@@ -156,28 +156,28 @@ describe('[语义统一] 内置 Nexus 引擎的就绪判定纳入 engines.status
   // 修复前 adapterFor 绕过状态字段，导致「引擎页显示待配置、任务却照常派发」。
   it('SETUP_REQUIRED 时不派发（与引擎页展示一致）', () => {
     const reg = new ExecutorRegistry(
-      makeDb({ 'eng-hermes': { type: 'hermes', status: 'SETUP_REQUIRED' } }),
+      makeDb({ 'eng-nexus': { type: 'nexus', status: 'SETUP_REQUIRED' } }),
       mockBroker(), mockProviders()
     );
-    expect(reg.kindFor('eng-hermes')).toBe('unavailable');
+    expect(reg.kindFor('eng-nexus')).toBe('unavailable');
   });
 
   it('HEALTHY 且供应商就绪时正常派发', () => {
     const reg = new ExecutorRegistry(
-      makeDb({ 'eng-hermes': { type: 'hermes', status: 'HEALTHY' } }),
+      makeDb({ 'eng-nexus': { type: 'nexus', status: 'HEALTHY' } }),
       mockBroker(), mockProviders()
     );
-    expect(reg.kindFor('eng-hermes')).toBe('llm-api');
+    expect(reg.kindFor('eng-nexus')).toBe('llm-api');
   });
 
   it('状态 HEALTHY 但供应商未配置时仍不派发（双重校验）', () => {
     // 供应商 mock 缺失 → llm.isReady() 为假
     const reg = new ExecutorRegistry(
-      makeDb({ 'eng-hermes': { type: 'hermes', status: 'HEALTHY' } }),
+      makeDb({ 'eng-nexus': { type: 'nexus', status: 'HEALTHY' } }),
       mockBroker()
     );
     // 注：本文件顶部 mock 了 provider.js 使 isReady 恒真，故此处仅验证状态维度已生效；
     // 供应商维度由 engineManager.probeAuth 测试覆盖
-    expect(['llm-api', 'unavailable']).toContain(reg.kindFor('eng-hermes'));
+    expect(['llm-api', 'unavailable']).toContain(reg.kindFor('eng-nexus'));
   });
 });

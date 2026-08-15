@@ -11,11 +11,30 @@ vi.mock('../src/main/services/cliLauncher.js', () => ({
 }));
 
 const managedEnv = vi.hoisted(() => ({ ANTHROPIC_API_KEY: 'claude-secret' }));
+const providerState = vi.hoisted(() => ({
+  current: null as null | { baseUrl: string; model: string; key: string }
+}));
 vi.mock('../src/main/services/engineEnv.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/main/services/engineEnv.js')>(),
   SECRET_PLACEHOLDER: '***',
   engineEnvSecretRef: (id: string) => `secret:engine:${id}:env`,
-  resolveEngineEnv: () => ({ ...managedEnv }),
+  resolveEngineProvider: () => providerState.current,
+  resolveEngineEnv: () => providerState.current
+    ? {
+        OPENAI_API_KEY: providerState.current.key,
+        OPENAI_BASE_URL: providerState.current.baseUrl,
+        OPENAI_MODEL: providerState.current.model
+      }
+    : { ...managedEnv },
+  resolveOpenCodeEngineEnv: () => providerState.current
+    ? {
+        OPENAI_API_KEY: providerState.current.key,
+        OPENAI_BASE_URL: providerState.current.baseUrl,
+        OPENAI_MODEL: providerState.current.model,
+        OPENCODE_CONFIG_CONTENT: '{}'
+      }
+    : {},
+  resolveClaudeEngineEnv: () => ({ ...managedEnv }),
   resolveConfiguredEngineEnv: () => ({ ...managedEnv }),
   splitSecretEnv: (env: Record<string, string>) => ({ safe: env, secrets: {} })
 }));
@@ -44,6 +63,51 @@ const authResult = {
 describe('Claude Code EngineManager probe', () => {
   beforeEach(() => {
     runCli.mockReset();
+    providerState.current = null;
+  });
+
+  it('uses a complete managed Codex Provider and an isolated auth home', async () => {
+    providerState.current = {
+      baseUrl: 'https://provider.test/v1',
+      model: 'worker-model',
+      key: 'managed-codex-key'
+    };
+    runCli
+      .mockResolvedValueOnce({ ok: true, code: 0, stdout: 'codex-cli 0.145.0', stderr: '' })
+      .mockResolvedValueOnce({ ok: true, code: 0, stdout: '{"type":"turn.completed"}', stderr: '' });
+
+    const result = await probeCliAuth('eng-codex', 'codex', {} as never);
+
+    expect(result.ok).toBe(true);
+    expect(runCli.mock.calls[1][1]).toEqual(expect.arrayContaining([
+      '--ignore-user-config',
+      'model_providers.opcnexus.name="OPC-Nexus"',
+      'model_providers.opcnexus.wire_api="responses"',
+      '--model',
+      'worker-model'
+    ]));
+    expect(runCli.mock.calls[1][2].env.OPENAI_API_KEY).toBe('managed-codex-key');
+    expect(runCli.mock.calls[1][2].env.CODEX_HOME).toContain('aibox-data');
+    expect(runCli.mock.calls[1][2].env.CODEX_HOME).toContain('codex');
+  });
+
+  it('runs managed OpenCode probes without external plugins', async () => {
+    providerState.current = {
+      baseUrl: 'https://provider.test/v1',
+      model: 'worker-model',
+      key: 'managed-opencode-key'
+    };
+    runCli
+      .mockResolvedValueOnce({ ok: true, code: 0, stdout: 'OpenCode 1.18.4', stderr: '' })
+      .mockResolvedValueOnce({ ok: true, code: 0, stdout: 'pong', stderr: '' });
+
+    const result = await probeCliAuth('eng-opencode', 'opencode', {} as never);
+
+    expect(result.ok).toBe(true);
+    expect(runCli.mock.calls[1][1]).toEqual([
+      'run', '--pure', '-m', 'opcnexus/worker-model', 'ping'
+    ]);
+    expect(runCli.mock.calls[1][2].env.OPENAI_API_KEY).toBe('managed-opencode-key');
   });
 
   it('requires launch, auth status and a real toolless model result before HEALTHY', async () => {

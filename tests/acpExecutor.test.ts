@@ -318,7 +318,7 @@ describe('ACP 子进程环境', () => {
     try {
       executor.start(task as never, agent as never, callbacks() as never);
 
-      expect(resolveEngineEnv).toHaveBeenCalledWith(db, 'eng-harness');
+      expect(resolveEngineEnv).toHaveBeenCalledWith(db, 'eng-harness', agent);
       expect(lastSpawn?.options.env).toMatchObject({ AIBOX_RUNTIME_TEST: 'from-engine' });
       expect(lastSpawn?.options.env.AIBOX_HOST_TEST).toBeUndefined();
       expect(lastSpawn?.options.env.PATH).toBe(process.env.PATH);
@@ -355,7 +355,7 @@ describe('ACP 子进程环境', () => {
     await expect(probe).resolves.toEqual({ ok: true, message: 'ok' });
   });
 
-  it('自定义 ACP 不能用 ELECTRON_RUN_AS_NODE 冒充受管 Harness', async () => {
+  it('自定义 ACP 不能用 ELECTRON_RUN_AS_NODE 冒充受管 Harness，且探测错误仍会脱敏', async () => {
     const env = { ELECTRON_RUN_AS_NODE: '1', OPENAI_API_KEY: 'external-secret' };
     const probe = probeAcpEngine(['dsh', 'acp'], env);
 
@@ -364,10 +364,9 @@ describe('ACP 子进程环境', () => {
       '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"external-secret denied"}}\n'
     ));
 
-    await expect(probe).resolves.toMatchObject({
-      ok: false,
-      message: 'external-secret denied'
-    });
+    const result = await probe;
+    expect(result).toMatchObject({ ok: false, message: '[REDACTED] denied' });
+    expect(result.message).not.toContain('external-secret');
     expect(child.killed).toBe(true);
   });
 
@@ -613,6 +612,96 @@ describe('受管 Harness 协议防护', () => {
     expect(redactManagedHarnessText(source, { DEEPSEEK_API_KEY: 'deepseek.secret+$' })).toContain('[REDACTED]');
   });
 
+  it('普通 external ACP 会按实际进程环境脱敏输出、结果、工具事件和审批文本', async () => {
+    resolvedEnv = { OPENAI_API_KEY: 'external-secret' };
+    const db = makeDb({ 'eng-harness': { acpCommand: ['dsh', 'acp'] } });
+    const inserts: unknown[][] = [];
+    const originalPrepare = db.raw.prepare;
+    db.raw.prepare = (sql: string) => {
+      const statement = originalPrepare(sql);
+      return {
+        ...statement,
+        run: (...args: unknown[]) => {
+          if (/INSERT INTO task_events/.test(sql)) inserts.push(args);
+          return { changes: 1 };
+        }
+      };
+    };
+    const broker = { request: vi.fn(() => Promise.resolve(false)), abandonTask: vi.fn() };
+    const executor = new AcpExecutor(db as never, broker as never);
+    const cb = callbacks();
+
+    executor.start(task as never, agent as never, cb as never);
+    child.stdout.emit('data', Buffer.from('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}\n'));
+    await vi.waitFor(() => expect(child.stdin.write).toHaveBeenCalledTimes(2));
+    child.stdout.emit('data', Buffer.from('{"jsonrpc":"2.0","id":2,"result":{"sessionId":"external"}}\n'));
+    await vi.waitFor(() => expect(child.stdin.write).toHaveBeenCalledTimes(3));
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { update: { sessionUpdate: 'tool_call', title: 'Bearer external-secret denied' } }
+    })}\n`));
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 99,
+      method: 'session/request_permission',
+      params: {
+        toolCall: { title: 'use external-secret to write' },
+        options: [
+          { optionId: 'allow', kind: 'allow_once' },
+          { optionId: 'reject', kind: 'reject_once' }
+        ]
+      }
+    })}\n`));
+    await vi.waitFor(() => expect(broker.request).toHaveBeenCalledOnce());
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'external-' } } }
+    })}\n`));
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'secret response' } } }
+    })}\n`));
+    child.stdout.emit('data', Buffer.from('{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'));
+
+    await vi.waitFor(() => expect(cb.onDone).toHaveBeenCalledOnce());
+    const streamed = cb.onOutput.mock.calls.map((call) => call[1]).join('');
+    expect(streamed).toContain('[REDACTED]');
+    expect(streamed).not.toContain('external-secret');
+    expect(cb.onDone.mock.calls[0][1]).not.toContain('external-secret');
+    expect(String(inserts[0][3])).toContain('[REDACTED]');
+    expect(String(inserts[0][3])).not.toContain('external-secret');
+    expect(broker.request.mock.calls[0][0].request).toContain('[REDACTED]');
+    expect(broker.request.mock.calls[0][0].request).not.toContain('external-secret');
+    child.emit('close', 0);
+  });
+
+  it('普通 external ACP 会脱敏 RPC 与 stderr 错误', async () => {
+    resolvedEnv = { ENGINE_TOKEN: 'external-error-secret' };
+    const db = makeDb({ 'eng-harness': { acpCommand: ['dsh', 'acp'] } });
+    const executor = new AcpExecutor(db as never, { request: vi.fn(), abandonTask: vi.fn() } as never);
+    const rpcCallbacks = callbacks();
+
+    executor.start(task as never, agent as never, rpcCallbacks as never);
+    child.stdout.emit('data', Buffer.from(
+      '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"external-error-secret rejected"}}\n'
+    ));
+    await vi.waitFor(() => expect(rpcCallbacks.onError).toHaveBeenCalledOnce());
+    expect(rpcCallbacks.onError.mock.calls[0][1]).toContain('[REDACTED]');
+    expect(rpcCallbacks.onError.mock.calls[0][1]).not.toContain('external-error-secret');
+    child.emit('close', 1);
+
+    const stderrCallbacks = callbacks();
+    executor.start({ ...task, id: 't-stderr' } as never, agent as never, stderrCallbacks as never);
+    child.stderr.emit('data', Buffer.from('provider rejected external-error-secret'));
+    child.emit('close', 1);
+    expect(stderrCallbacks.onError).toHaveBeenCalledOnce();
+    expect(stderrCallbacks.onError.mock.calls[0][1]).toContain('[REDACTED]');
+    expect(stderrCallbacks.onError.mock.calls[0][1]).not.toContain('external-error-secret');
+  });
+
   it('受管任务的 JSON-RPC 错误不会把 API Key 交给终止回调', async () => {
     const db = makeDb({});
     const executor = new AcpExecutor(db as never, { request: vi.fn(), abandonTask: vi.fn() } as never);
@@ -775,6 +864,41 @@ describe('受管 Harness 协议防护', () => {
     const taskResult = await taskProbe;
     expect(taskResult.message).toContain('[REDACTED]');
     expect(taskResult.message).not.toContain('probe-secret');
+  });
+
+  it('普通 external ACP 的最小任务探测也会脱敏模型输出', async () => {
+    const env = { EXTERNAL_API_TOKEN: 'external-probe-secret' };
+    const probe = probeAcpTask(['dsh', 'acp'], env, 'D:\\probe', 2_000);
+    child.stdout.emit('data', Buffer.from('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}\n'));
+    await vi.waitFor(() => expect(child.stdin.write).toHaveBeenCalledTimes(2));
+    child.stdout.emit('data', Buffer.from('{"jsonrpc":"2.0","id":2,"result":{"sessionId":"probe"}}\n'));
+    await vi.waitFor(() => expect(child.stdin.write).toHaveBeenCalledTimes(3));
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'external-probe-' }
+        }
+      }
+    })}\n`));
+    child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'secret echoed' }
+        }
+      }
+    })}\n`));
+    child.stdout.emit('data', Buffer.from('{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}\n'));
+
+    const result = await probe;
+    expect(result.ok).toBe(true);
+    expect(result.output).toContain('[REDACTED]');
+    expect(result.output).not.toContain('external-probe-secret');
   });
 
   it('受管最小任务探测不会把模型回显的 API Key 写入健康详情', async () => {

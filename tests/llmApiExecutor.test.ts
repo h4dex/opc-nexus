@@ -91,6 +91,20 @@ function makeDb(agentProvider: { providerId?: string | null; modelOverride?: str
   } as never;
 }
 
+/** Minimal database rows needed to exercise the production engine-level
+ * Provider resolver without coupling the core SSE tests to the full schema. */
+function makeManagedDb(config: Record<string, unknown>, agentProvider: { providerId?: string | null; modelOverride?: string | null } = {}) {
+  const base = makeDb(agentProvider) as never as { raw: { prepare: (sql: string) => any } };
+  const originalPrepare = base.raw.prepare;
+  base.raw.prepare = (sql: string) => {
+    if (/SELECT config_json FROM engines/.test(sql)) {
+      return { get: () => ({ config_json: JSON.stringify(config) }) };
+    }
+    return originalPrepare(sql);
+  };
+  return base as never;
+}
+
 const task = (over = {}) => ({
   id: 't1', agentId: 'a1', title: '测试任务', source: 'desktop',
   sessionId: null, workspaceOverride: null, status: 'RUNNING', ...over
@@ -157,7 +171,29 @@ describe('就绪判定', () => {
     new LlmApiExecutor(makeDb({ providerId: 'provider-missing' }), broker(), providers as never)
       .start(task(), agent(), c);
     expect(providers.resolveForAgent).toHaveBeenCalledWith('provider-missing', null);
-    expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('API Key 未配置'));
+    expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('模型供应商配置无效'));
+  });
+
+  it('Nexus 执行实际采用引擎级 Provider/模型，并让员工 Provider 优先', async () => {
+    mockFetchSequence(textFrames('managed-result'));
+    const c = cb();
+    const providers = {
+      resolveForAgent: vi.fn((providerId: string | null, modelOverride: string | null) => ({
+        baseUrl: 'https://managed.example/v1',
+        model: modelOverride || (providerId === 'employee-provider' ? 'employee-model' : 'engine-model'),
+        key: 'sk-managed'
+      }))
+    };
+    const db = makeManagedDb(
+      { providerId: 'engine-provider', modelOverride: 'engine-model', protocol: 'openai-chat' },
+      { providerId: 'employee-provider' }
+    );
+    new LlmApiExecutor(db, broker(), providers as never).start(task(), agent(), c);
+    await settle();
+    expect(providers.resolveForAgent).toHaveBeenCalledWith('employee-provider', 'engine-model');
+    expect(c.onDone).toHaveBeenCalledWith('t1', 'managed-result');
+    const request = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+    expect(JSON.parse(request.body).model).toBe('engine-model');
   });
 });
 

@@ -5,6 +5,7 @@ import { app } from 'electron';
 import type { Agent } from '../../shared/types.js';
 import type { Database } from './database.js';
 import { ProviderManager, type ResolvedProvider } from './providerManager.js';
+import { resolveEngineProvider } from './engineEnv.js';
 
 export const PI_ENGINE_ID = 'eng-pi';
 export const PI_MANAGED_PROVIDER = 'opcnexus';
@@ -109,16 +110,13 @@ export class PiRuntimeProfileService {
   }
 
   ensure(agent: Pick<Agent, 'id' | 'modelOverride'>): PreparedPiRuntime {
-    const row = this.db.raw.prepare('SELECT provider_id FROM agents WHERE id = ?').get(agent.id) as
-      | { provider_id?: string | null }
-      | undefined;
-    const resolved = this.providers.resolveForAgent(row?.provider_id ?? null, agent.modelOverride ?? null);
+    const resolved = resolveEngineProvider(this.db, PI_ENGINE_ID, agent, this.providers);
     if (!resolved) throw new Error('No usable model provider is configured for this employee');
     return this.prepare(`agent:${agent.id}`, resolved);
   }
 
   ensureProbe(): PreparedPiRuntime {
-    const resolved = this.providers.resolveForAgent(null, null);
+    const resolved = resolveEngineProvider(this.db, PI_ENGINE_ID, null, this.providers);
     if (!resolved) throw new Error('No usable default model provider is configured');
     return this.prepare('engine-probe', resolved);
   }

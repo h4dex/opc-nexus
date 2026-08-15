@@ -1,6 +1,6 @@
 /**
  * 连接中心（PRD 10.x）
- * 复用 Hermes Messaging Gateway 的渠道能力；Electron 仅提供图形化配置、状态监控、路由绑定和诊断。
+ * 统一管理 OPC-Nexus 自有渠道适配器的图形化配置、状态监控、路由绑定和诊断。
  */
 import { randomUUID } from 'node:crypto';
 import type { Database } from './database.js';

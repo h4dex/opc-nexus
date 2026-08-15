@@ -63,7 +63,10 @@ const {
   CliExecutor,
   buildClaudeAuthCheckArgs,
   buildClaudeProbeArgs,
+  buildCodexManagedArgs,
+  buildOpenCodeManagedArgs,
   claudeProcessEnv,
+  managedCodexProcessEnv,
   parseClaudeAuthStatus,
   parseClaudeProbeOutput,
   redactClaudeText
@@ -168,7 +171,10 @@ describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
     expect(lastSpawn.args.slice(0, 1)).toEqual(['exec']);
 
     new CliExecutor('codex-cli', makeDb(), 'eng-codex').start(task({ sessionId: 'thread-abc' }), agent(), cb());
-    expect(lastSpawn.args.slice(0, 3)).toEqual(['exec', 'resume', 'thread-abc']);
+    expect(lastSpawn.args.slice(0, 2)).toEqual(['exec', 'resume']);
+    expect(lastSpawn.args).toContain('thread-abc');
+    expect(lastSpawn.args).not.toContain('--sandbox');
+    expect(lastSpawn.args).toContain('sandbox_mode="workspace-write"');
   });
 
   it('工作目录传给 spawn 的 cwd，且 shell:false（杜绝命令注入）', () => {
@@ -430,5 +436,44 @@ describe('中止与清理', () => {
 
   it('对不存在的任务 abort 不抛异常', () => {
     expect(() => new CliExecutor('codex-cli', makeDb(), 'eng-codex').abort('nope')).not.toThrow();
+  });
+});
+
+describe('Managed CLI Provider boundaries', () => {
+  it('supplies the complete Codex Responses Provider schema', () => {
+    const args = buildCodexManagedArgs('ping', 'worker-model', { baseUrl: 'https://provider.test/v1/' });
+    expect(args.slice(0, 2)).toEqual(['exec', '--ignore-user-config']);
+    expect(args).toContain('model_provider="opcnexus"');
+    expect(args).toContain('model_providers.opcnexus.name="OPC-Nexus"');
+    expect(args).toContain('model_providers.opcnexus.base_url="https://provider.test/v1"');
+    expect(args).toContain('model_providers.opcnexus.env_key="OPENAI_API_KEY"');
+    expect(args).toContain('model_providers.opcnexus.wire_api="responses"');
+    expect(args.slice(-3)).toEqual(['--model', 'worker-model', 'ping']);
+  });
+
+  it('replaces ambient CODEX_HOME with a stable application-owned profile', () => {
+    const first = managedCodexProcessEnv({ PATH: 'C:\\tools', CODEX_HOME: 'C:\\Users\\test\\.codex' }, 'agent:a1');
+    const second = managedCodexProcessEnv({ CODEX_HOME: 'D:\\other' }, 'agent:a1');
+    const other = managedCodexProcessEnv({}, 'agent:a2');
+    expect(first.PATH).toBe('C:\\tools');
+    expect(first.CODEX_HOME).toBe(second.CODEX_HOME);
+    expect(first.CODEX_HOME).not.toBe('C:\\Users\\test\\.codex');
+    expect(first.CODEX_HOME).toContain('aibox-data');
+    expect(first.CODEX_HOME).toContain('codex');
+    expect(other.CODEX_HOME).not.toBe(first.CODEX_HOME);
+  });
+
+  it('forces OpenCode pure mode and the managed model without duplicating explicit flags', () => {
+    expect(buildOpenCodeManagedArgs(['run', 'ping'], 'ping', 'worker-model')).toEqual([
+      'run', '--pure', '-m', 'opcnexus/worker-model', 'ping'
+    ]);
+    expect(buildOpenCodeManagedArgs(
+      ['run', '--pure', '--model=opcnexus/custom', 'ping'],
+      'ping',
+      'worker-model'
+    )).toEqual(['run', '--pure', '--model=opcnexus/custom', 'ping']);
+    expect(buildOpenCodeManagedArgs(['--dir', 'workspace', 'run', 'ping'], 'ping', 'worker-model')).toEqual([
+      '--dir', 'workspace', 'run', '--pure', '-m', 'opcnexus/worker-model', 'ping'
+    ]);
   });
 });

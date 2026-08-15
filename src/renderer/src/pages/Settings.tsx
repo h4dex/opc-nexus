@@ -303,12 +303,16 @@ function ProviderCard() {
   const [testResult, setTestResult] = useState<Record<string, { ok: boolean; msg: string }>>({});
   const [saved, setSaved] = useState(false);
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [error, setError] = useState('');
   const [fetchingModels, setFetchingModels] = useState(false);
 
   const load = () => { void window.aibox.listProviders().then(setProviders); };
   useEffect(() => { load(); }, []);
 
-  const resetForm = () => { setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setIsDefault(false); setEditId(null); setShowForm(false); };
+  const resetForm = () => {
+    setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setIsDefault(false);
+    setEditId(null); setShowForm(false); setError('');
+  };
 
   const startEdit = (p: ProviderItem) => {
     setEditId(p.id); setName(p.name); setBaseUrl(p.baseUrl); setModel(p.model); setApiKey(''); setIsDefault(p.isDefault); setShowForm(true);
@@ -316,13 +320,18 @@ function ProviderCard() {
 
   const save = async () => {
     if (!name.trim() || !baseUrl.trim() || !model.trim()) return;
-    if (editId) {
-      await window.aibox.updateProvider(editId, { name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
-    } else {
-      await window.aibox.createProvider({ name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
+    setError('');
+    try {
+      if (editId) {
+        await window.aibox.updateProvider(editId, { name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
+      } else {
+        await window.aibox.createProvider({ name, baseUrl, model, apiKey: apiKey || undefined, isDefault });
+      }
+      setSaved(true); setTimeout(() => setSaved(false), 2000);
+      resetForm(); load();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     }
-    setSaved(true); setTimeout(() => setSaved(false), 2000);
-    resetForm(); load();
   };
 
   const testConn = async (p: ProviderItem) => {
@@ -333,8 +342,16 @@ function ProviderCard() {
     } finally { setTesting(null); }
   };
 
-  const removeP = async (id: string) => { await window.aibox.removeProvider(id); load(); };
-  const setDefault = async (id: string) => { await window.aibox.updateProvider(id, { isDefault: true }); load(); };
+  const removeP = async (id: string) => {
+    setError('');
+    try { await window.aibox.removeProvider(id); load(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  };
+  const setDefault = async (id: string) => {
+    setError('');
+    try { await window.aibox.updateProvider(id, { isDefault: true }); load(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  };
 
   const inputStyle: React.CSSProperties = { width: '100%', padding: '7px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5, outline: 'none' };
 
@@ -346,6 +363,7 @@ function ProviderCard() {
 
       {/* 供应商列表 */}
       {providers.length === 0 && <div style={{ fontSize: 12.5, color: 'var(--text-3)', padding: '12px 0' }}>未配置任何供应商。点击「添加供应商」接入 DeepSeek/OpenAI/Ollama 等模型服务。</div>}
+      {error && <div style={{ fontSize: 12, color: 'var(--danger)', marginBottom: 10, lineHeight: 1.6 }}>{error}</div>}
       <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
         {providers.map((p) => (
           <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)', border: `1px solid ${p.isDefault ? 'var(--accent)' : 'var(--border)'}` }}>

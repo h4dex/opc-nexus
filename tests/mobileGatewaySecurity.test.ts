@@ -273,6 +273,8 @@ describe('Mobile Gateway security contracts', () => {
       return originalPrepare(sql);
     };
     const gateway = new MobileGatewayService(db as never) as any;
+    // The lease path rejects offline devices before touching the database.
+    gateway.connections.set('device-1', { deviceId: 'device-1', ws: {}, ip: '127.0.0.1', lastSeenAt: Date.now(), pending: new Map() });
     expect(() => gateway.acquireSession('agent-1', 'device-1', 'task-1', ['android_ping'], 60_000))
       .toThrow(/active control lease/);
   });

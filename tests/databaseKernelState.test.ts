@@ -114,6 +114,8 @@ describe('DatabaseKernelState', () => {
     state.set('conversation-1', 'hermes', 'session-b');
     expect(state.get('conversation-1', 'hermes')).toBe('session-b');
     expect(state.get('conversation-1', 'nexus')).toBeNull();
+    state.clear('conversation-1', 'hermes');
+    expect(state.get('conversation-1', 'hermes')).toBeNull();
   });
 
   it('stores one immutable plan per request and commits it idempotently', () => {
