@@ -218,7 +218,7 @@ export class FeishuChannel {
         tenantKey: data.sender?.tenant_key ?? null
       },
       ack: (message) => void reply(message),
-      final: (message) => void reply(message)
+      final: (message, taskId) => void reply(message)
     });
   }
 }

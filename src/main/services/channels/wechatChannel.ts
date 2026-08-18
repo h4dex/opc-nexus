@@ -689,7 +689,7 @@ export class WeixinChannel {
     if (!contextToken) return null;
 
     const text = extractIlinkText(message);
-    const send = (content: string) => this.enqueueReply({
+    const send = (content: string, taskId?: string) => this.enqueueReply({
       generation: gen,
       accountId: credentials.accountId,
       to: from,

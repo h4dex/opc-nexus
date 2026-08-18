@@ -419,8 +419,8 @@ export async function dispatchChannelTask(opts: {
   taskPlanner: ChannelTaskPlanner;
   /** 即时回执（收到消息后立刻回复，也用于路由/校验失败提示） */
   ack: (message: string) => void;
-  /** 终态回复（任务完成/失败/超时提示） */
-  final: (message: string) => void;
+  /** 终态回复（任务完成/失败/超时提示，可选 taskId 用于附加产物） */
+  final: (message: string, taskId?: string) => void;
 }): Promise<boolean> {
   const { db, orchestrator, channelId, text, sourceKey, taskPlanner, ack, final } = opts;
   if (!text) {
@@ -494,7 +494,7 @@ export async function dispatchChannelTask(opts: {
     ack(`任务创建失败：${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
-  const finish = (message: string, messageKey: string, status: string) => {
+  const finish = (message: string, messageKey: string, status: string, tid?: string) => {
     try {
       ingressService.recordOutbound(ingress, {
         messageKey,
@@ -505,7 +505,7 @@ export async function dispatchChannelTask(opts: {
     } catch (error) {
       console.error(`[ChannelIngress] Failed to persist outbound message for task ${taskId}:`, error);
     }
-    final(message);
+    final(message, tid);
   };
   const current = deduplicated
     ? db.raw.prepare('SELECT status, result, error FROM tasks WHERE id = ?').get(taskId) as
@@ -517,11 +517,11 @@ export async function dispatchChannelTask(opts: {
     const message = summary
       ? `✅ 任务完成：\n${current.result ?? '（无文本产物）'}\n${summary}`
       : `✅ 任务完成：\n${current.result ?? '（无文本产物）'}`;
-    finish(message, `task:${taskId}:completed`, current.status);
+    finish(message, `task:${taskId}:completed`, current.status, taskId);
     return true;
   }
   if (current && ['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(current.status)) {
-    finish(`❌ 任务未完成（${current.status}）：${current.error ?? '无错误信息'}`, `task:${taskId}:terminal`, current.status);
+    finish(`❌ 任务未完成（${current.status}）：${current.error ?? '无错误信息'}`, `task:${taskId}:terminal`, current.status, taskId);
     return true;
   }
 
@@ -546,12 +546,12 @@ export async function dispatchChannelTask(opts: {
       const message = summary
         ? `✅ 任务完成：\n${row.result ?? '（无文本产物）'}\n${summary}`
         : `✅ 任务完成：\n${row.result ?? '（无文本产物）'}`;
-      finish(message, `task:${taskId}:completed`, row.status);
+      finish(message, `task:${taskId}:completed`, row.status, taskId);
       return;
     }
     if (['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(row.status)) {
       activeReplyPolls.delete(taskId);
-      finish(`❌ 任务未完成（${row.status}）：${row.error ?? '无错误信息'}`, `task:${taskId}:terminal`, row.status);
+      finish(`❌ 任务未完成（${row.status}）：${row.error ?? '无错误信息'}`, `task:${taskId}:terminal`, row.status, taskId);
       return;
     }
     if (Date.now() - started > REPLY_TIMEOUT_MS) {

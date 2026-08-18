@@ -333,9 +333,9 @@ export class WecomChannel {
       sourceKey: body.msgid?.trim() || reqId?.trim(),
       metadata: { chatType: body.chattype ?? null, messageType: body.msgtype ?? null },
       ack: (message) => this.respondStream(ws, reqId, message),
-      final: (message) => {
+      final: (message, taskId) => {
         if (gen !== this.generation || !pushChatId) return;
-        this.sendFinalResult(pushChatId, pushChatType, message);
+        this.sendFinalResult(pushChatId, pushChatType, message, taskId);
       }
     });
   }
@@ -497,27 +497,69 @@ export class WecomChannel {
     }
   }
 
-  /** 智能发送终态结果：检测产物中的文件路径，图片/文件异步上传发送，文本走 markdown */
-  private sendFinalResult(chatId: string, chatType: number, message: string) {
-    const imgExts = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
-    const filePathRegex = /(?:[A-Za-z]:[\\/]|\/{1,2}|~[\/])[\w\-.\\/ ]+\.\w{1,6}/g;
-    const paths = message.match(filePathRegex) ?? [];
-    const mediaPaths = paths.filter((p) => {
-      try { return readFileSync(p.trim()).length > 0; } catch { return false; }
-    });
+  /**
+   * B.6: 发送终态结果，附加 manifest 中的真实项目产物。
+   * 不再使用正则猜测路径，改为从验证过的 artifact_manifest 中提取文件。
+   */
+  private sendFinalResult(chatId: string, chatType: number, message: string, taskId?: string) {
+    const imgExts = /\.(png|jpe?g|gif|webp|bmp)$/i;
+
+    // 从 manifest 提取已验证的项目产物文件
+    let artifactFiles: Array<{ absolutePath: string; relativePath: string; mediaType: string }> = [];
+    if (taskId) {
+      const manifestEvent = this.db.raw.prepare(
+        "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_manifest' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+      ).get(taskId) as { payload: string } | undefined;
+
+      if (manifestEvent) {
+        try {
+          const parsed = JSON.parse(manifestEvent.payload) as {
+            manifest?: {
+              projectId?: string;
+              entries?: Array<{ relativePath: string; mediaType: string; previewable?: boolean }>
+            }
+          };
+          const projectId = parsed.manifest?.projectId;
+          const entries = Array.isArray(parsed.manifest?.entries) ? parsed.manifest.entries : [];
+
+          if (projectId) {
+            const project = this.db.raw.prepare('SELECT workspace FROM projects WHERE id = ? LIMIT 1').get(projectId) as { workspace: string } | undefined;
+            if (project?.workspace) {
+              const { join, resolve } = require('node:path') as typeof import('node:path');
+              const { existsSync } = require('node:fs') as typeof import('node:fs');
+
+              // 只附加可预览的文件（图片/PDF等），限制前 5 个避免刷屏
+              for (const entry of entries.slice(0, 5)) {
+                if (!entry.previewable) continue;
+                const absolutePath = resolve(join(project.workspace, entry.relativePath));
+                if (existsSync(absolutePath)) {
+                  artifactFiles.push({
+                    absolutePath,
+                    relativePath: entry.relativePath,
+                    mediaType: entry.mediaType
+                  });
+                }
+              }
+            }
+          }
+        } catch {
+          // manifest 解析失败，回退到纯文本
+        }
+      }
+    }
 
     let textPart = message;
     const mediaSends: Promise<boolean>[] = [];
-    for (const p of mediaPaths) {
-      const trimmed = p.trim();
-      if (imgExts.test(trimmed)) {
-        mediaSends.push(this.sendImage(chatId, chatType, trimmed));
+
+    for (const file of artifactFiles) {
+      if (imgExts.test(file.relativePath)) {
+        mediaSends.push(this.sendImage(chatId, chatType, file.absolutePath));
       } else {
-        mediaSends.push(this.sendFile(chatId, chatType, trimmed));
+        mediaSends.push(this.sendFile(chatId, chatType, file.absolutePath, file.relativePath));
       }
-      textPart = textPart.replace(p, '').trim();
     }
-    // 剩余文本走 markdown（不等待媒体上传完成，文本先发）
+
+    // 文本走 markdown（不等待媒体上传完成，文本先发）
     if (textPart) this.sendMarkdown(chatId, chatType, textPart);
     // 媒体异步发送，失败静默
     void Promise.allSettled(mediaSends);

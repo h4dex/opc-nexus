@@ -382,7 +382,10 @@ describe('dispatchChannelTask 幂等', () => {
     expect(db.tables.tasks.size).toBe(1);
     expect(executors.dispatch).not.toHaveBeenCalled();
     expect(ack).not.toHaveBeenCalled();
-    expect(final).toHaveBeenCalledWith(expect.stringContaining('已整理 12 条反馈'));
+    expect(final).toHaveBeenCalledWith(
+      expect.stringContaining('已整理 12 条反馈'),
+      expect.any(String)
+    );
   });
 
   it('精确会话路由优先于渠道默认路由', async () => {
