@@ -433,7 +433,7 @@ function TaskManifestPanel({ taskId, manifest }: { taskId: string; manifest: Pro
         <span>验证产物<span className="sub">{manifest.entries.length} 个文件 · {formatBytes(manifest.totalBytes)}{manifest.truncated ? ' (已截断)' : ''}</span></span>
         <button className="btn small" onClick={() => void openFolder()}>打开目录</button>
       </div>
-      <div style={{ maxHeight: 160, overflowY: 'auto', fontSize: 12, border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden auto' }}>
+      <div style={{ maxHeight: 160, overflowY: 'auto', fontSize: 12, border: '1px solid var(--border)', borderRadius: 8 }}>
         {manifest.entries.map((entry) => (
           <div key={entry.relativePath} style={{
             display: 'flex', gap: 8, alignItems: 'center', padding: '5px 10px',
