@@ -14,17 +14,23 @@ function ingress() {
 function plan() {
   return {
     schemaVersion: 1 as const, requestId: 'kernel:message-1', conversationId: 'conversation-1',
-    leaderKernel: 'hermes' as const, workerAgentId: 'agent-pi', workerEngineId: 'eng-pi',
-    title: '整理反馈', objective: '整理完整反馈并生成报告', rationale: '职责匹配', priority: 0,
+    leaderKernel: 'cordis' as const, workerAgentId: 'agent-cordis', workerEngineId: 'eng-deepseek-harness-managed',
+    title: '整理反馈', objective: '整理完整反馈并生成报告', rationale: 'Cordis 根会话', priority: 0,
     expectedOutputs: ['报告'], requiresHumanApproval: false, memoryProposals: [], taskScheduleProposals: [],
     advisorAdvice: [], advisorReviews: []
   };
 }
 
-function setup(workerRows: Record<string, unknown>[] = [{
-  id: 'agent-pi', name: '运营员工', role: '运营', engine_id: 'eng-pi',
-  capabilities_json: '{"files":true,"shell":false}', tags_json: '["reporting"]'
-}], persistedWorker: Record<string, unknown> | null = workerRows[0] ?? null) {
+function setup(workerRows: Record<string, unknown>[] = [
+  {
+    id: 'agent-cordis', name: 'Cordis', role: '主 AI', engine_id: 'eng-deepseek-harness-managed',
+    capabilities_json: '{}', tags_json: '[]'
+  },
+  {
+    id: 'agent-pi', name: '运营员工', role: '运营', engine_id: 'eng-pi',
+    capabilities_json: '{"files":true,"shell":false}', tags_json: '["reporting"]'
+  }
+], persistedWorker: Record<string, unknown> | null = workerRows[0] ?? null) {
   const workerAll = vi.fn(() => workerRows);
   const workerGet = vi.fn(() => persistedWorker ?? undefined);
   const db = { raw: { prepare: vi.fn(() => ({ all: workerAll, get: workerGet })) }, audit: vi.fn() };
@@ -57,12 +63,13 @@ describe('ChannelControlPlane', () => {
     const request = router.plan.mock.calls[0][0];
     expect(request).toMatchObject({
       requestId: 'kernel:message-1', inputMessageId: 'message-1', preferredAgentId: 'agent-pi',
+      routingMode: 'cordis',
       memories: [{ id: 'memory-1', content: '使用中文' }]
     });
-    expect(request.workers).toEqual([{
-      agentId: 'agent-pi', name: '运营员工', role: '运营', engineId: 'eng-pi',
-      capabilities: ['files', 'tag:reporting']
-    }]);
+    expect(request.workers).toEqual([
+      { agentId: 'agent-cordis', name: 'Cordis', role: '主 AI', engineId: 'eng-deepseek-harness-managed', capabilities: [] },
+      { agentId: 'agent-pi', name: '运营员工', role: '运营', engineId: 'eng-pi', capabilities: ['files', 'tag:reporting'] }
+    ]);
     expect(workerAll).toHaveBeenCalledWith('org-1');
     expect(String(db.raw.prepare.mock.calls[0][0])).toContain('a.organization_id = ?');
     expect(orchestrator.applyDispatchPlan).toHaveBeenCalledWith(request, plan(), expect.anything());
@@ -76,7 +83,7 @@ describe('ChannelControlPlane', () => {
     await context.service.dispatch({ ingress: ingress(), message: '请整理今天的客户反馈', preferredAgentId: 'agent-pi' });
     expect(context.router.plan).not.toHaveBeenCalled();
     expect(context.memory.recall).not.toHaveBeenCalled();
-    expect(context.workerGet).toHaveBeenCalledWith('org-1', 'agent-pi', 'eng-pi');
+    expect(context.workerGet).toHaveBeenCalledWith('org-1', 'agent-cordis', 'eng-deepseek-harness-managed');
     expect(String(context.db.raw.prepare.mock.calls[0][0])).toContain('a.organization_id = ?');
     expect(context.orchestrator.applyDispatchPlan).toHaveBeenCalledWith(expect.anything(), plan(), expect.anything());
   });
@@ -89,7 +96,7 @@ describe('ChannelControlPlane', () => {
       ingress: ingress(), message: 'replay', preferredAgentId: 'agent-pi'
     })).rejects.toThrow('Persisted dispatch worker is no longer eligible');
 
-    expect(context.workerGet).toHaveBeenCalledWith('org-1', 'agent-pi', 'eng-pi');
+    expect(context.workerGet).toHaveBeenCalledWith('org-1', 'agent-cordis', 'eng-deepseek-harness-managed');
     expect(context.router.plan).not.toHaveBeenCalled();
     expect(context.orchestrator.applyDispatchPlan).not.toHaveBeenCalled();
   });
@@ -126,5 +133,17 @@ describe('ChannelControlPlane', () => {
       .rejects.toThrow('没有已就绪且引擎健康的执行员工');
     expect(context.router.plan).not.toHaveBeenCalled();
     expect(context.memory.recall).not.toHaveBeenCalled();
+  });
+
+  it('marks an explicit desktop employee selection as direct-worker without changing channel ownership', async () => {
+    const context = setup();
+    await context.service.dispatchCanonical({
+      source: 'desktop', organizationId: 'org-1', principalId: 'principal-1', channelId: null,
+      conversationId: 'conversation-1', inputMessageId: 'message-1', message: '直接询问运营员工',
+      preferredAgentId: 'agent-pi'
+    });
+    expect(context.router.plan.mock.calls[0][0]).toMatchObject({
+      routingMode: 'direct-worker', preferredAgentId: 'agent-pi'
+    });
   });
 });

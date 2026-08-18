@@ -4,7 +4,8 @@ import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconFolder } from '../components/icons';
 import { MobileToolPolicy } from '../components/MobileToolPolicy';
-import type { AgentKind, CreateAgentInput, MobileDevice, MobileToolCatalog, PermissionMode } from '@shared/types';
+import { DSH_MANAGED_ENGINE_ID, type AgentKind, type CreateAgentInput, type MobileDevice, type MobileToolCatalog, type PermissionMode } from '@shared/types';
+import { isSelectableLocalEngine, selectDefaultLocalEngineId } from './runtimeMode';
 
 const TEMPLATES = [
   { key: 'blank', name: '空白创建', role: '', prompt: '' },
@@ -29,10 +30,12 @@ const STEPS = ['基本信息', '引擎与目录', '渠道绑定', '确认创建'
 
 export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
   const { snapshot } = useApp();
+  const defaultLocalEngineId = selectDefaultLocalEngineId(snapshot?.engines ?? []);
   const [step, setStep] = useState(0);
   const [error, setError] = useState('');
   const [aiDesc, setAiDesc] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
+  const [runtimeMode, setRuntimeModeState] = useState<'local' | 'dsh'>('local');
   const [mobileCatalog, setMobileCatalog] = useState<MobileToolCatalog | null>(null);
   const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
   const [form, setForm] = useState<CreateAgentInput>({
@@ -42,9 +45,9 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
     soulMd: '',
     agentsMd: '',
     userMd: '',
-    engineId: snapshot?.engines.find((e) => e.isDefault)?.id ?? '',
+    engineId: defaultLocalEngineId,
     workspace: '',
-    permissionMode: 'standard',
+    permissionMode: 'autonomous',
     concurrencyLimit: 1,
     channelIds: []
   });
@@ -57,19 +60,35 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
     }).catch(() => {});
   }, []);
 
-  // 与后端校验一致：HEALTHY / SETUP_REQUIRED / AUTH_REQUIRED 均可选（未就绪引擎以演示模式执行）
-  const selectableEngines = snapshot?.engines.filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)) ?? [];
+  // 待配置引擎可先绑定，但不会在就绪前执行任务。
+  const selectableEngines = snapshot?.engines.filter(isSelectableLocalEngine) ?? [];
+  const managedDshEngine = snapshot?.engines.find((engine) => engine.id === DSH_MANAGED_ENGINE_ID);
   const onlineChannels = snapshot?.channels.filter((c) => c.status === 'ONLINE') ?? [];
   const androidOperator = form.kind === 'android_operator';
 
   const setKind = (kind: AgentKind) => {
+    if (kind === 'android_operator') setRuntimeModeState('local');
     setForm((current) => ({
       ...current,
       kind,
-      engineId: kind === 'android_operator' ? 'eng-hermes-cli' : (snapshot?.engines.find((engine) => engine.isDefault)?.id ?? current.engineId),
+      engineId: kind === 'android_operator'
+        ? 'eng-hermes-cli'
+        : runtimeMode === 'dsh'
+          ? DSH_MANAGED_ENGINE_ID
+          : defaultLocalEngineId,
       concurrencyLimit: kind === 'android_operator' ? 1 : current.concurrencyLimit,
       deviceId: kind === 'android_operator' ? current.deviceId : null,
       mobileAuthorizationConfirmed: kind === 'android_operator' ? current.mobileAuthorizationConfirmed : false
+    }));
+  };
+
+  const setRuntimeMode = (mode: 'local' | 'dsh') => {
+    setRuntimeModeState(mode);
+    setForm((current) => ({
+      ...current,
+      engineId: mode === 'dsh'
+        ? DSH_MANAGED_ENGINE_ID
+        : defaultLocalEngineId
     }));
   };
 
@@ -110,6 +129,8 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
     }
     if (step === 1) {
       if (!form.engineId) return setError('请选择已安装且健康的默认引擎');
+      if (runtimeMode === 'dsh' && !managedDshEngine) return setError('DSH 工作台 Runtime 尚未安装');
+      if (runtimeMode === 'dsh' && managedDshEngine?.status === 'NOT_INSTALLED') return setError('请先准备 DSH 工作台 Runtime');
       if (!androidOperator && !form.workspace) return setError('必须选择工作目录（进入允许列表）');
       if (androidOperator && form.deviceId && !form.mobileAuthorizationConfirmed) return setError('首次绑定设备前必须确认完整手机工具授权');
       if (androidOperator && (form.mobileAllowedTools?.length ?? 0) < 1) return setError('Android 手机操作员至少需要启用一个工具');
@@ -188,17 +209,29 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
 
       {step === 1 && (
         <>
+          {!androidOperator && <div className="field">
+            <label>运行模式</label>
+            <div className="automation-segmented" role="group" aria-label="数字员工运行模式">
+              <button type="button" className={runtimeMode === 'local' ? 'active' : ''} aria-pressed={runtimeMode === 'local'} onClick={() => setRuntimeMode('local')}>本地 CLI</button>
+              <button type="button" className={runtimeMode === 'dsh' ? 'active' : ''} aria-pressed={runtimeMode === 'dsh'} onClick={() => setRuntimeMode('dsh')}>DSH</button>
+            </div>
+          </div>}
           <div className="field">
-            <label>{androidOperator ? '执行引擎（手机操作员固定）' : '默认执行引擎（未就绪引擎将以演示模式执行，配置完成后自动切换真实执行）*'}</label>
+            <label>{androidOperator ? '执行引擎（手机操作员固定）' : runtimeMode === 'dsh' ? 'DSH Runtime' : '默认执行引擎（需配置并检测为健康后才能执行）*'}</label>
             {androidOperator
               ? <>
                   <div className="chip-row"><button className="chip on" disabled>Hermes Agent CLI</button></div>
                   <div className="hint">手机工具仅通过 Hermes Agent 的受管插件接入；DeepSeek Harness 和其他 Runtime 当前不能操控 Android 设备。</div>
                 </>
-              : <div className="chip-row">
+              : runtimeMode === 'dsh'
+                ? <div className="chip-row">
+                    <button className="chip on" disabled>DSH / Cordis</button>
+                    {managedDshEngine?.status === 'NOT_INSTALLED' && <span style={{ color: 'var(--warning)', fontSize: 12 }}>Runtime 未准备</span>}
+                  </div>
+                : <div className="chip-row">
                 {selectableEngines.map((e) => (
                   <button key={e.id} className={`chip ${form.engineId === e.id ? 'on' : ''}`} onClick={() => setForm({ ...form, engineId: e.id })}>
-                    {e.name} {e.status !== 'HEALTHY' ? '（演示模式）' : e.version ? `v${e.version}` : ''}
+                    {e.name} {e.status !== 'HEALTHY' ? '（待就绪）' : e.version ? `v${e.version}` : ''}
                   </button>
                 ))}
                 {selectableEngines.length === 0 && <span style={{ color: 'var(--warning)', fontSize: 12 }}>暂无可用引擎，请先到引擎中心安装</span>}
@@ -216,13 +249,13 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
           <div className="field">
             <label>权限模式</label>
             <div className="chip-row">
-              {(['readonly', 'standard', 'trusted'] as PermissionMode[]).map((m) => (
+              {(['autonomous', 'readonly', 'standard'] as PermissionMode[]).map((m) => (
                 <button key={m} className={`chip ${form.permissionMode === m ? 'on' : ''}`} onClick={() => setForm({ ...form, permissionMode: m })}>
-                  {m === 'readonly' ? '只读' : m === 'standard' ? '标准审批（默认）' : '受信任'}
+                  {m === 'autonomous' ? '项目自主（默认）' : m === 'readonly' ? '只读' : '逐步审批'}
                 </button>
               ))}
             </div>
-            <div className="hint">标准审批：写入工作目录逐任务授权；目录外访问、删除、网络、安装必须审批。</div>
+            <div className="hint">项目自主：计划确认后在所选项目目录内持续执行；目录外访问直接拒绝，发布、付款等不可逆外部动作仍需确认。</div>
           </div>
           {!androidOperator && <div className="field">
             <label>并发上限（默认 1，受系统资源策略限制）</label>
@@ -274,10 +307,11 @@ export function CreateAgentWizard({ onClose }: { onClose: () => void }) {
             <tr><td style={{ color: 'var(--text-2)', width: 110 }}>名称</td><td>{form.name}</td></tr>
             <tr><td style={{ color: 'var(--text-2)' }}>职责</td><td>{form.role}</td></tr>
             <tr><td style={{ color: 'var(--text-2)' }}>身份</td><td>{androidOperator ? 'Android 手机操作员' : '通用数字员工'}</td></tr>
-            <tr><td style={{ color: 'var(--text-2)' }}>引擎</td><td>{androidOperator ? 'Hermes Agent CLI' : selectableEngines.find((e) => e.id === form.engineId)?.name}</td></tr>
+            <tr><td style={{ color: 'var(--text-2)' }}>运行模式</td><td>{androidOperator || runtimeMode === 'local' ? '本地 CLI' : 'DSH'}</td></tr>
+            <tr><td style={{ color: 'var(--text-2)' }}>引擎</td><td>{androidOperator ? 'Hermes Agent CLI' : runtimeMode === 'dsh' ? managedDshEngine?.name : selectableEngines.find((e) => e.id === form.engineId)?.name}</td></tr>
             <tr><td style={{ color: 'var(--text-2)' }}>{androidOperator ? '设备' : '工作目录'}</td><td style={{ fontFamily: 'monospace', fontSize: 12 }}>{androidOperator ? (mobileDevices.find((device) => device.id === form.deviceId)?.name ?? '暂未绑定') : form.workspace}</td></tr>
             {androidOperator && <tr><td style={{ color: 'var(--text-2)' }}>手机工具</td><td>{form.mobileAllowedTools?.length ?? 0} / {mobileCatalog?.tools.length ?? 42} 个</td></tr>}
-            <tr><td style={{ color: 'var(--text-2)' }}>权限模式</td><td>{form.permissionMode === 'readonly' ? '只读' : form.permissionMode === 'trusted' ? '受信任' : '标准审批'}</td></tr>
+            <tr><td style={{ color: 'var(--text-2)' }}>权限模式</td><td>{form.permissionMode === 'autonomous' ? '项目自主' : form.permissionMode === 'readonly' ? '只读' : form.permissionMode === 'trusted' ? '受信任（兼容）' : '逐步审批'}</td></tr>
             <tr><td style={{ color: 'var(--text-2)' }}>渠道</td><td>{form.channelIds.length ? `${form.channelIds.length} 个` : '未绑定'}</td></tr>
           </tbody>
         </table>

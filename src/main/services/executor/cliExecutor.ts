@@ -188,11 +188,12 @@ export function buildClaudeTaskArgs(
   const tools = permissionMode === 'readonly'
     ? 'Read,Glob,Grep'
     : 'Read,Glob,Grep,Edit,Write,Bash';
+  // Claude has no host-verifiable project sandbox when permission checks are
+  // bypassed. acceptEdits keeps its cwd boundary active while avoiding the
+  // normal per-edit prompts; never translate autonomy into host-wide access.
   const permissions = permissionMode === 'readonly'
     ? ['--permission-mode', 'dontAsk']
-    : (permissionMode === 'trusted' || permissionMode === 'autonomous')
-      ? ['--dangerously-skip-permissions']
-      : ['--permission-mode', 'acceptEdits'];
+    : ['--permission-mode', 'acceptEdits'];
   const resumeId = claudeSessionId(sessionAnchor);
   return [
     '-p', '--output-format', 'stream-json', '--verbose', '--safe-mode',
@@ -246,7 +247,7 @@ export class CliExecutor implements ExecutorAdapter {
     const mode = task.source === 'channel' && baseMode === 'trusted' ? 'standard' : baseMode;
     if (this.kind === 'codex-cli') {
       // codex exec --json：非交互执行，stdout 输出 JSONL 事件流；有 session 则 resume 续跑（P2b）
-      const sandbox = mode === 'readonly' ? 'read-only' : (mode === 'trusted' || mode === 'autonomous') ? 'danger-full-access' : 'workspace-write';
+      const sandbox = mode === 'readonly' ? 'read-only' : 'workspace-write';
       const providerArgs = managedProvider ? [
         '--ignore-user-config',
         '-c', 'model_provider="opcnexus"',

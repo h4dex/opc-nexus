@@ -16,6 +16,25 @@ const BROWSER_SKILL_CONTENT = `# 浏览器操作规范
 - 遇到登录、验证码、双因素认证或浏览器连接授权时暂停，等待用户完成后继续。
 - 完成后汇报实际操作结果；无法确认成功时明确说明当前页面状态。`;
 
+export const VISION_UNDERSTANDING_SKILL_ID = 'skill-vision-understanding';
+const VISION_UNDERSTANDING_SKILL_CONTENT = `# 图片理解
+
+## 使用方式
+- 需要理解截图、照片、界面或图表时，调用 DSH/Cordis 工具 \`vision.describe\`。
+- 需要精确抄录图片文字时，调用本地工具 \`vision.ocr\`；它与图片理解共用同一个 \`attachmentRef\`。
+- 工具只接受宿主生成的 \`attachmentRef\`，不要传入文件路径、网络 URL、Base64 或凭据。
+- 根据任务给出明确提示词，例如：识别界面状态、解释图表趋势、提取关键字段或检查视觉异常。
+
+## 能力边界
+- \`vision.describe\` 适合语义理解，\`vision.ocr\` 适合精确文字抄录；两者结果可组合但不要互相冒充。
+- 不根据图片猜测身份、密钥或不可见信息；低置信度内容必须明确标注。
+- 支持 PNG、JPEG、WebP 和 GIF，单图大小与像素数由宿主策略限制。
+
+## 输出
+- 先给结论，再列证据和不确定项。
+- 涉及图表时说明指标、趋势、异常点和时间/坐标范围。
+- 涉及界面时说明当前状态、可见控件和建议的下一步，不虚构已完成的操作。`;
+
 export interface Skill {
   id: string;
   name: string;
@@ -84,6 +103,23 @@ export class SkillManager {
     }
     this.bindAgent(agentId, BROWSER_SKILL_ID);
     return this.list().find((skill) => skill.id === BROWSER_SKILL_ID)!;
+  }
+
+  /** Ensure the DSH-owned image-understanding skill exists with a stable id. */
+  ensureVisionUnderstanding(): Skill {
+    const existing = this.db.raw.prepare('SELECT id FROM skills WHERE id = ?').get(VISION_UNDERSTANDING_SKILL_ID) as
+      | { id: string }
+      | undefined;
+    const name = '图片理解';
+    const description = '通过受控视觉模型理解图片，并用同一 attachmentRef 调用本地 OCR 精确识字';
+    if (!existing) {
+      this.db.raw.prepare('INSERT INTO skills(id, name, description, content, enabled, created_at) VALUES(?,?,?,?,1,?)')
+        .run(VISION_UNDERSTANDING_SKILL_ID, name, description, VISION_UNDERSTANDING_SKILL_CONTENT, Date.now());
+    } else {
+      this.db.raw.prepare('UPDATE skills SET name = ?, description = ?, content = ?, enabled = 1 WHERE id = ?')
+        .run(name, description, VISION_UNDERSTANDING_SKILL_CONTENT, VISION_UNDERSTANDING_SKILL_ID);
+    }
+    return this.list().find((skill) => skill.id === VISION_UNDERSTANDING_SKILL_ID)!;
   }
 
   /** 获取助手绑定的 skills */

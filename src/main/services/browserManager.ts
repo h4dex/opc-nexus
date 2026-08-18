@@ -6,7 +6,6 @@
  * - 空闲超时自动关闭（5 分钟无操作释放资源）
  */
 import { join } from 'node:path';
-import { app } from 'electron';
 import { mkdirSync } from 'node:fs';
 
 /** 延迟加载 playwright-core（避免未安装时阻塞启动） */
@@ -273,9 +272,10 @@ export class BrowserManager {
     return `已在 ${selector} 输入文本（${text.length} 字符）`;
   }
 
-  async screenshot(agentId: string, selector?: string): Promise<{ path: string; base64: string }> {
+  async screenshot(agentId: string, selector?: string, outputDir?: string): Promise<{ path: string; base64: string }> {
     const { page } = await this.getSession(agentId);
-    const screenshotDir = join(app.getPath('userData'), 'aibox-data', 'screenshots');
+    if (!outputDir) throw new Error('浏览器截图需要项目产物目录');
+    const screenshotDir = outputDir;
     mkdirSync(screenshotDir, { recursive: true });
     const filePath = join(screenshotDir, `agent_${agentId}_${Date.now()}.png`);
     const opts = selector

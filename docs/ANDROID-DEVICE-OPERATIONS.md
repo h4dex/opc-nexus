@@ -1,12 +1,12 @@
 # Android 设备操作功能文档
 
-> 本文档描述 OPC-Nexus `1.8.1` / Android Bridge `0.4.3` 当前已经实现的 Android 设备接入、控制、脚本、媒体采集和安全边界。文中的桌面截图来自「手机控制台」实际运行页面；空设备截图用于展示未连接状态，Android Launcher 图标已在 API 34 模拟器验证。
+> 本文档描述 DSH/Cordis 工作台 `2.0.0` 中由 `opc-nexus-governance` 提供的 Android Bridge `0.4.3` 能力：设备接入、控制、脚本、媒体采集和安全边界。文中的既有截图仍来自「手机控制台」；Android Launcher 图标已在 API 34 模拟器验证。
 
 ## 1. 功能范围
 
-OPC-Nexus 通过 Android Bridge App 把 Android 设备接入桌面端 Mobile Gateway，再由 Android 操作员 Agent 或「手机控制台」调用受策略约束的 Android 工具。
+`opc-nexus-governance` 通过 Android Bridge App 把 Android 设备接入 `aibox-native-host` 的 Mobile Gateway，再由 Cordis 指派的 Android 操作员 worker 或「手机控制台」调用受策略约束的 Android 工具。
 
-自动化手机任务固定由 Hermes Agent 经 OPC Orchestrator 调度，并通过 Mobile Gateway 调用 `android_*` 工具。DeepSeek Harness（DSH）当前仅作为受限 ACP Worker/Advisor，没有 Android MCP 或手机工具桥；把手机任务直接交给 DSH、Codex、Claude 或 Pi 不会获得设备控制能力。
+DSH/Cordis 是自动化任务的规划和派工权威。Android 工具目录以治理插件 capability 暴露，Cordis 只能把 `android_*` 调用交给已绑定设备、已批准权限和工具白名单的固定 worker；Local CLI、ACP/A2A worker 不会因被选中而自动获得设备权限。旧 OPC Orchestrator 只保留兼容 Task/审计投影，不再决定团队或计划。
 
 当前链路支持：
 
@@ -26,7 +26,7 @@ OPC-Nexus 通过 Android Bridge App 把 Android 设备接入桌面端 Mobile Gat
 
 | 组件 | 版本 |
 |---|---|
-| OPC-Nexus 桌面端 | `1.8.1` |
+| DSH/Cordis OPC 工作台 | `2.0.0` |
 | Android Bridge | `0.4.3`（`versionCode 5`） |
 | Android 包名 | `com.senke.opcnexus.bridge` |
 
@@ -179,7 +179,7 @@ Gateway 只绑定局域网 IPv4，不接受公网地址；设备通道为 `wss:/
 | 通信/系统 | `android_send_sms`、`android_call`、`android_media`、`android_send_intent`、`android_broadcast` |
 | 媒体/语音 | `android_screenshot`、`android_screen_record`、`android_mic_record`、`android_mic_stop`、`android_mic_fetch`、`android_speak`、`android_speak_stop` |
 
-其中 `android_setup` 由 OPC-Nexus 桌面端管理配对/绑定状态；`android_macro` 是 Agent 工具语义，桌面脚本编辑器使用受限的步骤列表，不允许脚本嵌套这两个工具。
+其中 `android_setup` 由 `aibox-native-host` 管理配对/绑定状态；`android_macro` 是 worker 工具语义，桌面脚本编辑器使用受限的步骤列表，不允许脚本嵌套这两个工具。
 
 ### 6.3 非幂等操作
 
@@ -228,9 +228,9 @@ Gateway 只绑定局域网 IPv4，不接受公网地址；设备通道为 `wss:/
 
 ## 9. Android 操作员 Agent
 
-创建或编辑数字员工时，将 Agent 类型设置为 `android_operator`，然后选择设备、工具策略并确认授权。桌面端会为该 Agent 创建独立 Hermes Profile，注入 `opcnexus-android` 插件和工具目录，并将设备绑定写入本地数据库。
+创建或编辑固定数字员工时，将类型设置为 `android_operator`，然后选择设备、工具策略并确认授权。治理插件会注册一个可由 Cordis 发现的固定 worker manifest；当前兼容实现可使用独立 Hermes Profile 执行工具，但 Hermes 只是 Local CLI adapter，不是规划内核。
 
-绑定完成后，可直接在「数字员工」列表、卡片或更多菜单点击「安排任务」。自然语言任务会通过该员工的 Hermes Profile 执行，并且只暴露 `android` 工具集；普通员工看不到手机工具。未绑定设备时任务会被拒绝，设备离线或正被占用时任务保持排队。
+绑定完成后，Cordis 可以在 Quest/项目计划中选择该固定 worker，用户也可以从员工目录发起显式直达任务。执行环境只暴露批准的 `android` 工具集；普通员工看不到手机工具。未绑定设备时任务会被拒绝，设备离线或正被占用时任务保持排队。
 
 Agent 能否使用 Android 工具由三层共同决定：
 
@@ -255,7 +255,7 @@ Agent 能否使用 Android 工具由三层共同决定：
 
 ### 10.1 第三方应用安装与登录
 
-无 Root Bridge 不会绕过 Android 安装确认、锁屏、生物识别或应用登录。需要安装第三方应用时，Agent 可打开官方网站或应用商店并导航到安装入口，但系统安装确认、未知来源授权、账号密码、短信验证码和扫码登录必须由用户在手机上亲自完成。OPC-Nexus 自带的 ADB「安装」按钮只接受经过摘要和签名校验的 Bridge APK，不用于静默安装任意第三方 APK。
+无 Root Bridge 不会绕过 Android 安装确认、锁屏、生物识别或应用登录。需要安装第三方应用时，worker 可打开官方网站或应用商店并导航到安装入口，但系统安装确认、未知来源授权、账号密码、短信验证码和扫码登录必须由用户在手机上亲自完成。工作台自带的 ADB「安装」按钮只接受经过摘要和签名校验的 Bridge APK，不用于静默安装任意第三方 APK。
 
 ## 11. 紧急停止和断开
 

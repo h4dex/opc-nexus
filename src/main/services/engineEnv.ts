@@ -14,7 +14,7 @@
  * @author liyingjie <y@senke.com>
  */
 import { safeStorage } from 'electron';
-import type { Agent, EngineProviderMode, EngineRuntimeConfig, ProviderProtocol } from '../../shared/types.js';
+import { DSH_MANAGED_ENGINE_ID, type Agent, type EngineProviderMode, type EngineRuntimeConfig, type ProviderProtocol } from '../../shared/types.js';
 import type { Database } from './database.js';
 import { getProviderSettings, readProviderKey } from './provider.js';
 import { ProviderManager, type ResolvedProvider } from './providerManager.js';
@@ -40,6 +40,7 @@ const REQUIRED_PROVIDER_PROTOCOL: Readonly<Record<string, ProviderProtocol>> = {
   'eng-hermes-cli': 'openai-chat',
   'eng-pi': 'openai-chat',
   'eng-deepseek-harness': 'openai-chat',
+  [DSH_MANAGED_ENGINE_ID]: 'openai-chat',
   'eng-opencode': 'openai-chat',
   'eng-codex': 'openai-responses',
   'eng-claude': 'anthropic-messages'
@@ -52,7 +53,8 @@ const MANAGED_PROVIDER_ENGINES = new Set([
   'eng-nexus',
   'eng-hermes-cli',
   'eng-pi',
-  'eng-deepseek-harness'
+  'eng-deepseek-harness',
+  DSH_MANAGED_ENGINE_ID
 ]);
 
 export function engineSupportsNativeAuth(engineId: string): boolean {

@@ -229,10 +229,16 @@ describe('引擎目录收敛(E-1)', () => {
 
   it('目录包含控制内核与已验证的 Worker runtime', () => {
     expect(ENGINE_CATALOG.map((e) => e.id).sort()).toEqual(
-      ['eng-claude', 'eng-codex', 'eng-deepseek-harness', 'eng-hermes-cli', 'eng-nexus', 'eng-opencode', 'eng-pi'].sort()
+      ['eng-claude', 'eng-codex', 'eng-deepseek-harness', 'eng-deepseek-harness-managed', 'eng-hermes-cli', 'eng-nexus', 'eng-opencode', 'eng-pi'].sort()
     );
     expect(ENGINE_CATALOG.find((e) => e.id === 'eng-deepseek-harness')).toMatchObject({
       type: 'external',
+      bin: null,
+      npmPackage: null
+    });
+    expect(ENGINE_CATALOG.find((e) => e.id === 'eng-deepseek-harness-managed')).toMatchObject({
+      type: 'dsh-managed',
+      name: 'DSH / Cordis',
       bin: null,
       npmPackage: null
     });
@@ -281,6 +287,99 @@ describe('鉴权探测状态迁移(H-4)', () => {
     expect(CLI_FAILURE_BODY_PATTERN.test('HTTP 401: Missing Authentication header')).toBe(true);
     expect(CLI_FAILURE_BODY_PATTERN.test('No usable credentials found for provider')).toBe(true);
     expect(CLI_FAILURE_BODY_PATTERN.test('pong')).toBe(false);
+  });
+
+  it('detect 让 runtime、Provider 与安全代理均就绪的 Cordis 成为 HEALTHY', async () => {
+    const provider = {
+      id: 'provider-default', base_url: 'https://provider.test/v1', model: 'cordis-model',
+      api_key_ref: 'secret:provider:cordis', is_default: 1
+    };
+    const db = makeDb({}, [provider]);
+    db._settings[provider.api_key_ref] = Buffer.from('enc:cordis-key').toString('base64');
+    for (const id of ['eng-hermes-cli', 'eng-opencode', 'eng-codex', 'eng-claude', 'eng-pi']) {
+      appCfg.engines[id] = { bin: `missing-${id}` };
+    }
+    const manager = new EngineManager(db as never, {
+      managedDshRuntimeAvailable: () => true,
+      managedDshProxyReady: () => true
+    });
+
+    await manager.detect();
+
+    expect(db._engines['eng-deepseek-harness-managed']).toMatchObject({
+      status: 'HEALTHY', auth_status: 'authed', version: '0.1.0-rc.6'
+    });
+    expect(db._settings['engine:health:eng-deepseek-harness-managed']).toMatchObject({
+      detected: true, launchable: true, authenticated: true, taskVerified: false
+    });
+  });
+
+  it('probeAuth 对缺少 Provider proxy 的 Cordis 保持 DEGRADED', async () => {
+    const provider = {
+      id: 'provider-default', base_url: 'https://provider.test/v1', model: 'cordis-model',
+      api_key_ref: 'secret:provider:cordis', is_default: 1
+    };
+    const db = makeDb({
+      'eng-deepseek-harness-managed': {
+        id: 'eng-deepseek-harness-managed', type: 'dsh-managed', status: 'AUTH_REQUIRED', auth_status: 'required'
+      }
+    }, [provider]);
+    db._settings[provider.api_key_ref] = Buffer.from('enc:cordis-key').toString('base64');
+
+    const result = await new EngineManager(db as never, {
+      managedDshRuntimeAvailable: () => true,
+      managedDshProxyReady: () => false
+    }).probeAuth('eng-deepseek-harness-managed');
+
+    expect(result.ok).toBe(false);
+    expect(db._engines['eng-deepseek-harness-managed']).toMatchObject({
+      status: 'DEGRADED', auth_status: 'authed'
+    });
+  });
+
+  it('restart 在 managed runtime 缺失时将 Cordis 收敛为 NOT_INSTALLED', async () => {
+    const db = makeDb({
+      'eng-deepseek-harness-managed': {
+        id: 'eng-deepseek-harness-managed', type: 'dsh-managed', status: 'HEALTHY', auth_status: 'authed'
+      }
+    });
+
+    const result = await new EngineManager(db as never, {
+      managedDshRuntimeAvailable: () => false,
+      managedDshProxyReady: () => true
+    }).restart('eng-deepseek-harness-managed');
+
+    expect(result.ok).toBe(false);
+    expect(db._engines['eng-deepseek-harness-managed']).toMatchObject({
+      status: 'NOT_INSTALLED', auth_status: 'unknown', version: null, path: null
+    });
+  });
+
+  it('Provider 默认路由变更后仍按真实 proxy readiness 保持 Cordis HEALTHY', () => {
+    const provider = {
+      id: 'provider-default', base_url: 'https://provider.test/v1', model: 'cordis-model',
+      api_key_ref: 'secret:provider:cordis', is_default: 1
+    };
+    const db = makeDb({
+      'eng-deepseek-harness-managed': {
+        id: 'eng-deepseek-harness-managed', type: 'dsh-managed', status: 'HEALTHY', auth_status: 'authed'
+      }
+    }, [provider]);
+    db._settings[provider.api_key_ref] = Buffer.from('enc:cordis-key').toString('base64');
+
+    new EngineManager(db as never, {
+      managedDshRuntimeAvailable: () => true,
+      managedDshProxyReady: () => true
+    }).invalidateProviderVerification({
+      providerId: provider.id, providerUpdated: false, defaultRouteChanged: true
+    });
+
+    expect(db._engines['eng-deepseek-harness-managed']).toMatchObject({
+      status: 'HEALTHY', auth_status: 'authed'
+    });
+    expect(db._settings['engine:health:eng-deepseek-harness-managed']).toMatchObject({
+      taskVerified: false, authenticated: true
+    });
   });
 
   it('运行时鉴权失败会撤销 HEALTHY 证明并要求重新验证', () => {

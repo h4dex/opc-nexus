@@ -1,11 +1,9 @@
 /**
- * 首次启动种子数据：与产品基准 UI 一致的演示环境
- * （3 个项目；12 数字员工 = 8 执行中 + 4 空闲/待命；今日完成 23 项；待办 8 项）
- * + 常用 MCP 服务器预置 + 常用技能预置
+ * 常用 MCP 服务器与技能初始目录。
+ * 生产启动不创建虚构项目、员工、任务或审批。
  */
 import { randomUUID } from 'node:crypto';
 import type { Database } from './database.js';
-import { NEXUS_ENGINE_ID } from '../../shared/types.js';
 
 // ==================== 常用 MCP 服务器预置 ====================
 
@@ -190,162 +188,7 @@ export function seedSkills(db: Database) {
   });
 }
 
-interface SeedAgent {
-  name: string; role: string; color: string;
-  task?: { title: string; progress: number; owner: string };
-}
-
-const AGENTS: SeedAgent[] = [
-  { name: 'ERP/CRM助手', role: '负责财务红冲发票提醒、应收应付对账与 CRM 客户资料同步，保障财务业务流转及时准确。', color: '#4d6bfe', task: { title: '财务红冲发票提醒', progress: 72, owner: '张财务' } },
-  { name: 'MES助手', role: '对接生产执行系统，维护生产流程看板，跟踪工单进度与产线异常，及时推送预警信息。', color: '#3aa7ff', task: { title: '生产流程看板', progress: 48, owner: '李生产' } },
-  { name: '测试验证助手', role: '执行自动化测试验证流程，整理测试报告，对回归缺陷进行归类并跟踪修复验证进度。', color: '#22c1a3' },
-  { name: '文档助手', role: '负责企业文档的整理与归档，识别重要文件变更，维护知识库索引与版本可追溯性。', color: '#f59e0b', task: { title: '文档整理与归档', progress: 85, owner: '赵品质' } },
-  { name: '人事招聘助手', role: '筛选简历、安排面试日程并同步候选人状态，维护招聘流程看板与人才库信息更新。', color: '#8a5cf6', task: { title: '企业内部线上学习平台', progress: 30, owner: '王人事' } },
-  { name: '品质管理助手', role: '替代 A4 纸质表单完成品质记录电子化，自动汇总检验数据并生成品质趋势分析报告。', color: '#ef6a6a', task: { title: '品质记录本替代A4表单', progress: 56, owner: '赵品质' } },
-  { name: '采购比价助手', role: '定期采集供应商报价并生成比价分析，跟踪采购订单交付进度与到货异常情况。', color: '#0ea5e9', task: { title: '供应商季度比价分析', progress: 40, owner: '钱采购' } },
-  { name: 'IT运维助手', role: '监控内部系统运行状态，处理常见运维工单，执行例行巡检并输出健康检查报告。', color: '#10b981', task: { title: '服务器例行巡检', progress: 64, owner: '孙运维' } },
-  { name: '销售外勤助手', role: '汇总外勤拜访记录，同步客户跟进状态，生成每日销售简报并提醒关键商机跟进。', color: '#f97316', task: { title: '客户拜访纪要归档', progress: 22, owner: '周销售' } },
-  { name: '合同审核助手', role: '对采购与销售合同进行条款初审，识别风险条款并给出修订建议，跟踪审批流转。', color: '#a855f7' },
-  { name: '数据分析助手', role: '定期汇总经营数据生成分析报表，支持多维度数据查询与可视化图表自动生成。', color: '#14b8a6' },
-  { name: '会议纪要助手', role: '整理线上会议录音与纪要，提取待办事项并分配到责任人，跟踪事项闭环情况。', color: '#64748b' }
-];
-
-const TODO_APPROVALS = [
-  { title: '财务红冲发票提醒：需要写入 ERP 工作目录授权', agent: 'ERP/CRM助手', risk: 'high' },
-  { title: '生产流程看板：访问 MES 数据库只读凭据确认', agent: 'MES助手', risk: 'medium' },
-  { title: '企业内部线上学习平台：新增课程发布审批', agent: '人事招聘助手', risk: 'medium' },
-  { title: '品质记录本替代A4表单：删除历史草稿表单', agent: '品质管理助手', risk: 'high' },
-  { title: '文档整理与归档：访问共享盘目录外路径审批', agent: '文档助手', risk: 'medium' },
-  { title: '供应商季度比价分析：外发邮件含报价附件确认', agent: '采购比价助手', risk: 'medium' },
-  { title: '服务器例行巡检：执行重启服务命令审批', agent: 'IT运维助手', risk: 'high' },
-  { title: '客户拜访纪要归档：网络访问 CRM 接口域名首授权', agent: '销售外勤助手', risk: 'low' }
-];
-
-const DEMO_PROJECTS = [
-  {
-    id: 'project-demo-operations', name: '经营自动化一期', objective: '打通财务、生产、采购与经营数据的例行自动化',
-    description: '优先覆盖高频、可量化、可复用的经营流程。', clientName: '内部运营', status: 'active', color: '#4d6bfe', dueDays: 14
-  },
-  {
-    id: 'project-demo-quality', name: '交付质量提升', objective: '建立测试、文档、品质与运维的交付检查闭环',
-    description: '统一质量记录、异常跟进和验收标准。', clientName: '交付中心', status: 'active', color: '#22c1a3', dueDays: 5
-  },
-  {
-    id: 'project-demo-customer', name: '客户协同标准化', objective: '沉淀招聘、销售、合同与会议协同标准流程',
-    description: '形成可复用的客户与组织协同模板。', clientName: '业务团队', status: 'completed', color: '#f59e0b', dueDays: -2
-  }
-] as const;
-
-function demoProjectForAgent(agentName: string): string {
-  if (['ERP/CRM助手', 'MES助手', '采购比价助手', '数据分析助手'].includes(agentName)) return 'project-demo-operations';
-  if (['测试验证助手', '文档助手', '品质管理助手', 'IT运维助手'].includes(agentName)) return 'project-demo-quality';
-  return 'project-demo-customer';
-}
-
-function demoTaskResult(agentName: string, sequence: number): string {
-  const focus: Record<string, string> = {
-    'ERP/CRM助手': '完成应收应付核对，未发现阻断项，已整理异常单据清单。',
-    'MES助手': '汇总产线工单数据，识别 2 项进度偏差并给出处置建议。',
-    '测试验证助手': '完成回归测试报告，核心流程通过，遗留问题已分级记录。',
-    '文档助手': '完成文档归档与索引更新，变更记录可追溯。',
-    '人事招聘助手': '更新候选人阶段与面试安排，待跟进事项已明确责任人。',
-    '品质管理助手': '完成品质数据统计，异常趋势和复核项已列入报告。',
-    '采购比价助手': '完成供应商报价数据对比，形成推荐顺序与风险说明。',
-    'IT运维助手': '完成系统巡检报告，服务可用性正常，容量风险已标注。',
-    '销售外勤助手': '整理客户拜访纪要，关键需求和下一步行动已结构化。',
-    '合同审核助手': '完成合同条款审查，风险条款与修订建议已归纳。',
-    '数据分析助手': '完成经营数据分析报告，核心指标和趋势结论已输出。',
-    '会议纪要助手': '完成会议纪要，决议、责任人和截止时间已提取。'
-  };
-  return `# ${agentName}例行成果 #${sequence}\n\n## 完成摘要\n\n${focus[agentName] ?? '例行工作已完成，结果与后续事项已整理。'}\n\n## 后续事项\n\n- 结果已归档，等待验收\n- 异常项进入下一轮跟进\n`;
-}
-
-/**
- * 首次启动种子数据。
- *
- * 【默认不写入】演示数据（12 员工 / 23 条已完成任务 / 8 待审批 / 3 项目）会与真实数据
- * 共用同一批表，若无标记则统计口径无法区分真伪。因此：
- *  - 默认跳过，新装用户看到干净的空状态；
- *  - 仅当 settings.seedDemoData 显式为 true 时写入，且所有行标记 is_demo = 1；
- *  - 首页统计与项目经营分析一律排除 is_demo 行（见 orchestrator.stats）。
- * 需要演示环境时在设置页开启，或调用 purgeDemoData 清空。
- */
-export function seedIfEmpty(db: Database) {
-  if (db.getSetting<boolean>('seedDemoData', false) !== true) return;
-  const count = (db.raw.prepare('SELECT COUNT(*) c FROM agents').get() as { c: number }).c;
-  if (count > 0) return;
-
-  const now = Date.now();
-  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-
-  db.transaction(() => {
-    const insertProject = db.raw.prepare(
-      'INSERT INTO projects(id, name, objective, description, client_name, status, color, due_at, created_at, updated_at, is_demo) VALUES(?,?,?,?,?,?,?,?,?,?,1)'
-    );
-    for (const project of DEMO_PROJECTS) {
-      insertProject.run(
-        project.id, project.name, project.objective, project.description, project.clientName, project.status, project.color,
-        now + project.dueDays * 86_400_000, now - 7 * 86_400_000, now
-      );
-    }
-    const insertAgent = db.raw.prepare(
-      `INSERT INTO agents(id, name, role, system_prompt, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, created_at, updated_at, is_demo)
-       VALUES(?, ?, ?, ?, 'READY', '${NEXUS_ENGINE_ID}', ?, 'standard', 1, 0, ?, ?, ?, 1)`
-    );
-    const insertTask = db.raw.prepare(
-      `INSERT INTO tasks(id, agent_id, project_id, title, source, parent_id, status, priority, progress, stage, error, created_at, started_at, ended_at, result, is_demo)
-       VALUES(?, ?, ?, ?, 'desktop', NULL, ?, 0, ?, ?, NULL, ?, ?, ?, ?, 1)`
-    );
-    const insertRun = db.raw.prepare(
-      `INSERT INTO agent_runs(id, agent_id, task_id, pid, session_id, status, started_at, ended_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
-    );
-    const insertApproval = db.raw.prepare(
-      `INSERT INTO approvals(id, task_id, agent_id, type, request, risk, status, created_at, decided_at) VALUES(?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`
-    );
-
-    const agentIds = new Map<string, string>();
-    const activeTaskIds = new Map<string, string>();
-
-    for (const a of AGENTS) {
-      const id = randomUUID();
-      agentIds.set(a.name, id);
-      insertAgent.run(
-        id, a.name, a.role,
-        `你是「${a.name}」。${a.role}严格遵守工作目录边界与审批策略，输出结构化结果。`,
-        `E:/AIBox/workspaces/${a.name}`, a.color, now - 7 * 86400_000, now
-      );
-      if (a.task) {
-        const tid = randomUUID();
-        activeTaskIds.set(a.name, tid);
-        insertTask.run(tid, id, demoProjectForAgent(a.name), a.task.title, 'RUNNING', a.task.progress, '执行中', now - 3600_000, now - 3600_000, null, null);
-        insertRun.run(randomUUID(), id, tid, process.pid, randomUUID(), 'RUNNING', now - 3600_000, null);
-      }
-    }
-
-    // 今日已完成 23 项（分布在各员工上）
-    const names = AGENTS.map((a) => a.name);
-    for (let i = 0; i < 23; i++) {
-      const agentId = agentIds.get(names[i % names.length])!;
-      const ended = todayStart.getTime() + 3600_000 + i * 900_000;
-      insertTask.run(
-        randomUUID(), agentId, demoProjectForAgent(names[i % names.length]), `例行任务 #${i + 1}`, 'COMPLETED', 100, '完成',
-        ended - 600_000, ended - 600_000, ended, demoTaskResult(names[i % names.length], i + 1)
-      );
-    }
-
-    // 8 项待审批（首页"待处理待办 8 项"）
-    for (const ap of TODO_APPROVALS) {
-      const agentId = agentIds.get(ap.agent)!;
-      const taskId = activeTaskIds.get(ap.agent);
-      if (!taskId) throw new Error(`演示审批缺少关联任务：${ap.agent}`);
-      insertApproval.run(randomUUID(), taskId, agentId, 'write_workspace', ap.title, ap.risk, now - 1800_000);
-    }
-  });
-
-  db.audit({ id: randomUUID(), actor: 'system', action: 'seed.demo', target: '12 agents / 8 approvals', result: 'ok' });
-}
-
-/** 演示数据统计：供设置页展示「当前库中有多少演示数据」 */
+/** 历史样例数据统计：只用于升级后清理旧版 `is_demo=1` 行。 */
 export function demoDataStats(db: Database): { agents: number; tasks: number; projects: number } {
   const count = (sql: string) => (db.raw.prepare(sql).get() as { c: number }).c;
   return {

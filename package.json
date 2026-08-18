@@ -1,6 +1,6 @@
 {
   "name": "aibox-control-center",
-  "version": "1.8.1",
+  "version": "2.0.0",
   "description": "数字员工 AI Box 控制中心 - 本地优先的桌面 Agent 管理器",
   "homepage": "https://github.com/h4dex/opc-nexus",
   "main": "out/main/index.js",
@@ -9,8 +9,10 @@
   "type": "module",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:quest": "node scripts/run-quest-surface.cjs",
     "build": "electron-vite build",
     "start": "electron-vite preview",
+    "start:quest": "node scripts/run-quest-surface.cjs preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -27,8 +29,15 @@
     "harness:verify": "node scripts/prepare-deepseek-harness.cjs --verify",
     "harness:verify:electron": "node scripts/verify-deepseek-harness-electron.cjs",
     "harness:verify:packaged": "node scripts/verify-packaged-deepseek-harness.cjs",
-    "pack:win": "npm run mobile:apk:release && npm run harness:prepare && npm run build && electron-builder --win --x64",
-    "pack:linux": "npm run mobile:apk:release && npm run harness:prepare && npm run build && electron-builder --linux --x64"
+    "harness:managed:prepare": "node scripts/prepare-deepseek-harness-managed.cjs",
+    "harness:managed:verify": "node scripts/prepare-deepseek-harness-managed.cjs --verify",
+    "harness:managed:verify:electron": "node scripts/verify-deepseek-harness-managed-electron.cjs",
+    "harness:managed:probe": "node runtime/deepseek-harness-managed/dist/probe-managed-capabilities.mjs",
+    "harness:managed:smoke:web": "node scripts/smoke-deepseek-harness-managed-web.cjs",
+    "harness:managed:smoke:quest": "node scripts/run-deepseek-harness-managed-quest-e2e.cjs",
+    "harness:managed:verify:packaged": "node scripts/verify-packaged-deepseek-harness-managed.cjs",
+    "pack:win": "npm run mobile:apk:release && npm run harness:prepare && npm run harness:managed:prepare && npm run build && electron-builder --win --x64",
+    "pack:linux": "npm run mobile:apk:release && npm run harness:prepare && npm run harness:managed:prepare && npm run build && electron-builder --linux --x64"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.71.1",
@@ -42,6 +51,7 @@
     "dompurify": "^3.4.12",
     "express": "^5.2.1",
     "marked": "^18.0.7",
+    "mermaid": "11.16.1",
     "onnxruntime-node": "^1.27.0",
     "playwright-core": "^1.61.1",
     "qrcode": "^1.5.4",

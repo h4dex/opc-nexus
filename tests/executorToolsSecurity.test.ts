@@ -1,12 +1,15 @@
 // @ts-nocheck
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
 const execFile = vi.fn((_file, _args, _options, callback) => callback(null, 'ok', ''));
 vi.mock('node:child_process', () => ({ execFile }));
 
-const { TOOLS } = await import('../src/main/services/executor/tools.js');
+const { TOOLS, resolveInWorkspace } = await import('../src/main/services/executor/tools.js');
 
 const originalSecret = process.env.OPC_NEXUS_TEST_SECRET;
 const originalProviderKey = process.env.OPENAI_API_KEY;
@@ -33,6 +36,21 @@ afterEach(() => {
 });
 
 describe('executor tool process boundary', () => {
+  it('rejects lexical and symbolic-link escapes from the project directory', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'opc-workspace-'));
+    const workspace = join(temp, 'project');
+    const outside = join(temp, 'outside');
+    mkdirSync(workspace);
+    mkdirSync(outside);
+    try {
+      expect(() => resolveInWorkspace(workspace, '../outside/file.txt')).toThrow(/路径越界/);
+      symlinkSync(outside, join(workspace, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+      expect(() => resolveInWorkspace(workspace, 'escape/file.txt')).toThrow(/符号链接/);
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
   it('runs shell commands with the minimal host allowlist instead of the main-process environment', async () => {
     process.env.OPC_NEXUS_TEST_SECRET = 'ambient-internal-secret';
     process.env.OPENAI_API_KEY = 'ambient-provider-secret';

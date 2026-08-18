@@ -193,7 +193,11 @@ export class AcpExecutor implements ExecutorAdapter {
       failBeforeStart('DeepSeek Harness 供应商未配置或 API Key 无效，请在设置中完成配置');
       return;
     }
-    const workspace = task.workspaceOverride || agent.workspace;
+    const workspace = task.projectId ? task.workspaceOverride?.trim() : task.workspaceOverride || agent.workspace;
+    if (!workspace) {
+      failBeforeStart('项目任务没有绑定工作目录，已拒绝启动 ACP');
+      return;
+    }
     try {
       mkdirSync(workspace, { recursive: true });
     } catch (err) {
@@ -443,7 +447,13 @@ export class AcpExecutor implements ExecutorAdapter {
         // source=team 是来源标签，不授予额外权限；嵌套任务继承员工策略。
         const effectiveMode = agent.permissionMode;
         if (effectiveMode === 'readonly') return pick(reject);
-        if (effectiveMode === 'autonomous' || (effectiveMode === 'trusted' && task.source !== 'channel')) return pick(allow);
+        if (effectiveMode === 'autonomous') {
+          // An arbitrary ACP process only receives cwd, not an OS sandbox. The
+          // reviewed managed Harness may self-govern; unknown ACP peers fail
+          // closed instead of turning autonomous mode into host-wide access.
+          return pick(managedEnv ? allow : reject);
+        }
+        if (effectiveMode === 'trusted' && task.source !== 'channel') return pick(allow);
         const approved = await this.broker.request({
           taskId: task.id,
           agentId: agent.id,

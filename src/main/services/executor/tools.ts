@@ -4,10 +4,10 @@
  * - risk 三级：safe（只读）/ write（写入）/ danger（删除等）；审批策略由执行器按 permissionMode 决定
  * - delegate_task（P3b A2A 内部委托）通过 ToolHost 回调编排器，避免循环依赖
  */
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { execFile } from 'node:child_process';
-import type { Task } from '../../../shared/types.js';
+import type { ApprovalType, Task } from '../../../shared/types.js';
 import { childProcessEnv } from '../engineEnv.js';
 
 export type ToolRisk = 'safe' | 'write' | 'danger';
@@ -67,6 +67,8 @@ export interface ToolDef {
   risk: ToolRisk;
   /** 需要员工开启对应能力开关才注册该工具（未设置 = 无额外要求） */
   requiresCapability?: ToolCapability;
+  /** Autonomous mode still confirms operations that cross the project boundary. */
+  autonomousApproval?: ApprovalType | ((args: Record<string, unknown>) => ApprovalType | null);
   inputSchema: Record<string, unknown>;
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<string>;
 }
@@ -146,13 +148,33 @@ async function searchDuckDuckGo(query: string): Promise<string | null> {
   }
 }
 
-/** 路径防护：拒绝逃逸 workspace 的任何路径（含 ..、绝对路径指向外部） */
-function resolveInWorkspace(workspace: string, relPath: unknown): string {
+function isInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+function nearestExistingAncestor(path: string): string {
+  let candidate = path;
+  while (!existsSync(candidate)) {
+    const parent = dirname(candidate);
+    if (parent === candidate) throw new Error('工作目录不存在');
+    candidate = parent;
+  }
+  return candidate;
+}
+
+/** 拒绝词法路径和符号链接两种 workspace 逃逸。 */
+export function resolveInWorkspace(workspace: string, relPath: unknown): string {
   const p = typeof relPath === 'string' ? relPath : '';
   const root = resolve(workspace);
   const full = resolve(root, p);
-  if (full !== root && !full.startsWith(root + sep)) {
+  if (!isInside(root, full)) {
     throw new Error(`路径越界：仅允许访问工作目录内文件（${p}）`);
+  }
+  const canonicalRoot = realpathSync.native(root);
+  const canonicalAncestor = realpathSync.native(nearestExistingAncestor(full));
+  if (!isInside(canonicalRoot, canonicalAncestor)) {
+    throw new Error(`路径越界：符号链接指向工作目录外（${p}）`);
   }
   return full;
 }
@@ -350,6 +372,7 @@ export const TOOLS: ToolDef[] = [
     name: 'http_request',
     description: '发起 HTTP/HTTPS 网络请求，返回响应体（最多 16000 字符）。支持 GET/POST/PUT/DELETE。',
     risk: 'write',
+    autonomousApproval: (args) => String(args.method ?? 'GET').toUpperCase() === 'GET' ? null : 'network',
     requiresCapability: 'network',
     inputSchema: {
       type: 'object',
@@ -388,6 +411,7 @@ export const TOOLS: ToolDef[] = [
     name: 'run_command',
     description: '在工作目录内执行系统命令（shell），返回 stdout+stderr（最多 16000 字符）。超时 5 分钟。',
     risk: 'danger',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'shell',
     inputSchema: {
       type: 'object',
@@ -426,6 +450,7 @@ export const TOOLS: ToolDef[] = [
     name: 'install_package',
     description: '安装软件包（支持 npm/pip/apt）。用于安装 MCP 工具、Skills 依赖、Python 库等。',
     risk: 'danger',
+    autonomousApproval: 'install',
     requiresCapability: 'install',
     inputSchema: {
       type: 'object',
@@ -479,6 +504,7 @@ export const TOOLS: ToolDef[] = [
     name: 'run_python_tool',
     description: '调用本地 Python 工具集（local-tools/）。可用工具: http_tool(网络请求/下载), sysinfo_tool(系统信息), office_convert(文件格式转换), file_tool(文件批处理), text_tool(文本处理), image_tool(图片处理), webserver_tool(本地Web服务)。返回 JSON 结构化结果。',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'shell',
     inputSchema: {
       type: 'object',
@@ -557,6 +583,7 @@ export const TOOLS: ToolDef[] = [
     name: 'browser_click',
     description: '点击页面上的元素（CSS 选择器）',
     risk: 'write',
+    autonomousApproval: 'network',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -574,6 +601,7 @@ export const TOOLS: ToolDef[] = [
     name: 'browser_type',
     description: '在页面输入框中填写文本（CSS 选择器定位）',
     risk: 'write',
+    autonomousApproval: 'network',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -601,7 +629,12 @@ export const TOOLS: ToolDef[] = [
     },
     async execute(args, ctx) {
       if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
-      const r = await ctx.browserMgr.screenshot(ctx.agentId, args.selector ? String(args.selector) : undefined);
+      const outputDir = resolveInWorkspace(ctx.workspace, '.opc-nexus/screenshots');
+      const r = await ctx.browserMgr.screenshot(
+        ctx.agentId,
+        args.selector ? String(args.selector) : undefined,
+        outputDir
+      );
       return `截图已保存：${r.path}`;
     }
   },
@@ -609,6 +642,7 @@ export const TOOLS: ToolDef[] = [
     name: 'browser_evaluate',
     description: '在页面中执行 JavaScript 代码，返回结果。',
     risk: 'write',
+    autonomousApproval: 'network',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -667,9 +701,8 @@ export const TOOLS: ToolDef[] = [
     inputSchema: { type: 'object', properties: {} },
     async execute(_args, ctx) {
       const { join: pJoin } = await import('node:path');
-      const { mkdirSync: mk, readFileSync: rf } = await import('node:fs');
-      const { app: electronApp } = await import('electron');
-      const dir = pJoin(electronApp.getPath('userData'), 'aibox-data', 'screenshots');
+      const { mkdirSync: mk } = await import('node:fs');
+      const dir = resolveInWorkspace(ctx.workspace, '.opc-nexus/screenshots');
       mk(dir, { recursive: true });
       const filePath = pJoin(dir, `desktop_${ctx.agentId}_${Date.now()}.png`);
       // Windows: PowerShell 截屏；Linux: scrot/gnome-screenshot
@@ -690,6 +723,7 @@ export const TOOLS: ToolDef[] = [
     name: 'computer_click',
     description: '在桌面指定坐标点击鼠标。',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',
@@ -730,6 +764,7 @@ public class MouseSim {
     name: 'computer_type',
     description: '模拟键盘输入文本（在当前焦点位置）',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',
@@ -760,6 +795,7 @@ public class MouseSim {
     name: 'computer_key',
     description: '模拟按键组合（如 Ctrl+C、Enter、Alt+Tab）',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',
@@ -794,6 +830,7 @@ public class MouseSim {
     name: 'computer_scroll',
     description: '在指定坐标滚动鼠标滚轮',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',

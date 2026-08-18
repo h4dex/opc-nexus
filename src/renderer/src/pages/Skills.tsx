@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { IconPlus, IconX } from '../components/icons';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
 
 interface Skill { id: string; name: string; description: string; content: string; enabled: boolean; createdAt: number }
 
@@ -86,7 +87,9 @@ function ComposeAgentModal({ skills, onClose }: { skills: Skill[]; onClose: () =
   const [error, setError] = useState('');
   const [done, setDone] = useState<string | null>(null);
 
-  const engines = (snapshot?.engines ?? []).filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status));
+  const engines = (snapshot?.engines ?? []).filter((e) =>
+    isUserVisibleEngine(e) && ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)
+  );
 
   const toggle = (id: string) => {
     setSelected((prev) => {

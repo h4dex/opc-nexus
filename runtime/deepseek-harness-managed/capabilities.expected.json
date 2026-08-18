@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "package": "@deepseek-ai/dsh",
+    "version": "0.1.0-rc.6",
+    "integrity": "sha512-brpZfED7ieRa2PQ5tUxMhHrM1pb2CmKFVM/f6yMULBDMicahk+Z2OsHgTwTDnoiZm23Ftu9rQz0NN4pflaoJcg==",
+    "cliEntry": "node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "webStartupEntry": "node_modules/@deepseek-ai/dsh-web-app/lib/startup.js",
+    "managedPolicyPatch": "opc-managed/managed-web.patch.yml",
+    "managedPresetRoot": "opc-managed/agent-presets"
+  },
+  "cli": {
+    "version": "0.1.0-rc.6",
+    "helpTokens": [
+      "--profile <name>",
+      "web",
+      "--dump-default-config"
+    ],
+    "webProfileTokens": [
+      "@deepseek-ai/dsh-web-app",
+      "@deepseek-ai/dsh-host-webserver",
+      "@deepseek-ai/dsh-web-frontend"
+    ],
+    "webStartupTokens": [
+      "--host <host>",
+      "--port <port>",
+      "--trusted-host <authority...>",
+      "options.host === \"0.0.0.0\"",
+      "use 127.0.0.1 instead"
+    ]
+  },
+  "managedPolicy": {
+    "requiredPatchTokens": [
+      "- id: settings\n  disabled: true",
+      "- id: credentials\n  disabled: true",
+      "- id: llm-pi-ai\n  disabled: true",
+      "- id: agent-default-model",
+      "process.env.AIBOX_DSH_MODEL || 'deepseek-chat'",
+      "- id: ui-settings-models\n  disabled: true",
+      "- id: ui-model-selection\n  disabled: true",
+      "- id: directory-picker\n  disabled: true",
+      "mode: workspace-write",
+      "policy: never",
+      "includeUserRoot: false",
+      "maxConcurrentJobsPerOwner: 4",
+      "defaultMaxGoalRounds: 24"
+    ],
+    "upstreamPresetSha256": {
+      "code": "749da0d93d3824bc4a227b6ead38c99b4247e63108e48bd5fc661b463da00077",
+      "cordis": "16ad73eabe064f33056924c7157b944a74425ce9b6b5e9b8d910d369d9e15ed8",
+      "minimal": "cacb47f09a88985c8eb0906a62e6883205727a3c8db901807cb03f936b863cca",
+      "standard": "cb98756a9ed76ca351a45a0ba138a97bf0ab7eead4fe2f1e9d1c9f9ec97937f0"
+    },
+    "shadowedPresetIds": [
+      "standard",
+      "code",
+      "cordis",
+      "minimal"
+    ],
+    "requiredPresetTokens": [
+      "name: '@deepseek-ai/dsh-tool-jobs'",
+      "name: '@deepseek-ai/dsh-tool-goal'",
+      "name: '@deepseek-ai/dsh-plan-mode'",
+      "name: '@deepseek-ai/dsh-tool-subagent-control'",
+      "name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'",
+      "name: '@deepseek-ai/dsh-tool-subagent'",
+      "name: '@deepseek-ai/dsh-tool-ask-user'",
+      "name: '@deepseek-ai/dsh-tool-todo'",
+      "name: '@deepseek-ai/dsh-tool-fs'",
+      "name: '@deepseek-ai/dsh-tool-fs-search'",
+      "backgroundMode: continuable",
+      "maxDepth: 2"
+    ],
+    "authorizedPresetPackages": [
+      "@deepseek-ai/dsh-persona",
+      "@deepseek-ai/dsh-tool-jobs",
+      "@deepseek-ai/dsh-tool-goal",
+      "@deepseek-ai/dsh-plan-mode",
+      "@deepseek-ai/dsh-compaction-basic",
+      "@deepseek-ai/dsh-command-compact",
+      "@deepseek-ai/dsh-compaction-tool-result-pruner",
+      "@deepseek-ai/dsh-tool-subagent-control",
+      "@deepseek-ai/dsh-tool-subagent",
+      "@deepseek-ai/dsh-tool-ask-user",
+      "@deepseek-ai/dsh-tool-todo",
+      "@deepseek-ai/dsh-tool-fs",
+      "@deepseek-ai/dsh-tool-fs-search"
+    ],
+    "forbiddenPresetPackages": [
+      "@deepseek-ai/dsh-tool-bash",
+      "@deepseek-ai/dsh-tool-pwsh",
+      "@deepseek-ai/dsh-tool-bash-persistent",
+      "@deepseek-ai/dsh-fs-local",
+      "@deepseek-ai/dsh-tool-str-replace-editor",
+      "@deepseek-ai/dsh-skill-filesystem",
+      "@deepseek-ai/dsh-tool-skill",
+      "@deepseek-ai/dsh-tool-workflow",
+      "@deepseek-ai/dsh-workflow-worker-thread",
+      "@deepseek-ai/dsh-tool-web",
+      "@deepseek-ai/dsh-tool-cordis",
+      "@deepseek-ai/dsh-agent-tool-presentation",
+      "@deepseek-ai/dsh-terminal",
+      "@deepseek-ai/dsh-terminal-bash",
+      "@deepseek-ai/dsh-tool-ralph"
+    ]
+  },
+  "runtimeCapabilities": {
+    "sessionEvents": true,
+    "history": true,
+    "goals": true,
+    "jobs": true,
+    "subagents": true,
+    "planMode": true,
+    "askUser": true,
+    "shell": false,
+    "filesystem": true,
+    "network": false,
+    "runtimeAuthoring": false
+  },
+  "capabilityPackages": {
+    "web": [
+      "@deepseek-ai/dsh-web-app",
+      "@deepseek-ai/dsh-web-frontend",
+      "@deepseek-ai/dsh-host-webserver",
+      "@deepseek-ai/dsh-client-connection"
+    ],
+    "durableWork": [
+      "@deepseek-ai/dsh-goal",
+      "@deepseek-ai/dsh-jobs-local",
+      "@deepseek-ai/dsh-tool-goal",
+      "@deepseek-ai/dsh-tool-jobs"
+    ],
+    "multiAgent": [
+      "@deepseek-ai/dsh-subagent",
+      "@deepseek-ai/dsh-tool-subagent",
+      "@deepseek-ai/dsh-tool-subagent-control",
+      "@deepseek-ai/dsh-client-ui-subagent"
+    ],
+    "interaction": [
+      "@deepseek-ai/dsh-tool-ask-user",
+      "@deepseek-ai/dsh-client-ui-user-questions",
+      "@deepseek-ai/dsh-client-ui-plan",
+      "@deepseek-ai/dsh-client-ui-deliverables"
+    ],
+    "managedCoordination": [
+      "@deepseek-ai/dsh-persona",
+      "@deepseek-ai/dsh-plan-mode",
+      "@deepseek-ai/dsh-compaction-basic",
+      "@deepseek-ai/dsh-command-compact",
+      "@deepseek-ai/dsh-compaction-tool-result-pruner",
+      "@deepseek-ai/dsh-tool-todo"
+    ]
+  }
+}

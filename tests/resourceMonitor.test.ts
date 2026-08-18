@@ -16,6 +16,7 @@ vi.mock('node:child_process', () => ({ execFile }));
 vi.mock('node:fs/promises', () => ({ statfs }));
 
 const { ResourceMonitor, collectGpuSample, hasActiveNetworkInterface, parseNvidiaSmiSample } = await import('../src/main/services/resourceMonitor.js');
+const { app } = await import('electron');
 
 afterEach(() => {
   vi.useRealTimers();
@@ -86,7 +87,7 @@ describe('ResourceMonitor memory boundaries', () => {
 
     monitor.start(10);
     await vi.advanceTimersByTimeAsync(1);
-    expect(statfs).toHaveBeenCalledWith(join('/tmp/test-userData', 'aibox-data'));
+    expect(statfs).toHaveBeenCalledWith(join(app.getPath('userData'), 'aibox-data'));
     monitor.stop();
   });
 });

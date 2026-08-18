@@ -3,6 +3,7 @@
 const { Arch } = require('builder-util');
 const { verifyDist } = require('./mobile-apk.cjs');
 const { verifyHarnessWithElectron } = require('./verify-deepseek-harness-electron.cjs');
+const { verifyManagedHarnessWithElectron } = require('./verify-deepseek-harness-managed-electron.cjs');
 
 function assertHarnessTarget(context) {
   const targetPlatform = context?.electronPlatformName;
@@ -16,15 +17,33 @@ function assertHarnessTarget(context) {
   }
 }
 
+function assertVerificationResult(result, label) {
+  if (!result || typeof result !== 'object') {
+    throw new Error(`${label} runtime verification returned no process result`);
+  }
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = result.signal
+      ? `signal ${result.signal}`
+      : `exit code ${result.status ?? 'unknown'}`;
+    throw new Error(`${label} runtime verification failed with ${detail}`);
+  }
+}
+
+async function verifyHarnessRuntimes(
+  verifyHarness = verifyHarnessWithElectron,
+  verifyManagedHarness = verifyManagedHarnessWithElectron
+) {
+  assertVerificationResult(await verifyHarness(), 'DeepSeek Harness');
+  assertVerificationResult(await verifyManagedHarness(), 'Managed DeepSeek Harness');
+}
+
 exports.default = async function verifyReleaseBeforePack(context) {
   verifyDist({ requireRelease: true });
   assertHarnessTarget(context);
-
-  const verified = verifyHarnessWithElectron();
-  if (verified.error) throw verified.error;
-  if (verified.status !== 0) {
-    throw new Error(`DeepSeek Harness runtime verification failed with exit code ${verified.status}`);
-  }
+  await verifyHarnessRuntimes();
 };
 
 exports.assertHarnessTarget = assertHarnessTarget;
+exports.assertVerificationResult = assertVerificationResult;
+exports.verifyHarnessRuntimes = verifyHarnessRuntimes;

@@ -16,6 +16,10 @@ vi.mock('electron', () => ({
 vi.mock('../src/main/services/notifier.js', () => ({ notify: vi.fn() }));
 
 import {
+  ILinkTimeoutError,
+} from '../src/main/services/channels/ilinkClient.js';
+import {
+  WEIXIN_LAST_ERROR_REF,
   WEIXIN_OUTBOX_REF,
   WEIXIN_PENDING_SESSION_REF,
   WEIXIN_POLL_STATE_REF,
@@ -354,16 +358,48 @@ describe('WeixinChannel iLink integration', () => {
       ilink_user_id: 'probe-error-owner',
       baseurl: 'https://ilinkai.weixin.qq.com'
     });
-    server.updates.push({ ret: 23, errcode: 0, errmsg: 'probe rejected', msgs: [] });
+    server.updates.push({ ret: 23, errcode: 0, errmsg: 'probe rejected: probe-error-token', msgs: [] });
     const { channel, db } = makeHarness(server);
 
     await channel.startLogin();
     await flushUntil(() => channel.getLoginState().phase === 'ERROR', 'activation protocol error');
 
     expect(channel.getLoginState().message).toContain('probe rejected');
+    expect(channel.getLoginState().message).not.toContain('probe-error-token');
     expect(db.channel.status).toBe('ERROR');
     expect(db.settings.has(WEIXIN_SESSION_REF)).toBe(false);
     expect(db.settings.has(WEIXIN_PENDING_SESSION_REF)).toBe(true);
+    expect(db.settings.get(WEIXIN_LAST_ERROR_REF)).toMatchObject({
+      message: expect.stringContaining('probe rejected'),
+      phase: 'ERROR'
+    });
+    expect(JSON.stringify(db.settings.get(WEIXIN_LAST_ERROR_REF))).not.toContain('probe-error-token');
+    expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'channel.weixin.ilink.login',
+      target: 'ch-weixin',
+      result: 'failed:activation'
+    }));
+  });
+
+  it('treats a normal empty long-poll timeout as a successful activation probe', async () => {
+    const server = new FakeIlinkServer();
+    server.qrStatuses.push({
+      status: 'confirmed',
+      bot_token: 'long-poll-token',
+      ilink_bot_id: 'long-poll-bot',
+      ilink_user_id: 'long-poll-owner',
+      baseurl: 'https://ilinkai.weixin.qq.com'
+    });
+    server.updates.push(new ILinkTimeoutError());
+    const { channel, db } = makeHarness(server);
+
+    await channel.startLogin();
+    await flushUntil(() => channel.getLoginState().phase === 'CONNECTED', 'activation after empty long poll');
+
+    expect(db.channel.status).toBe('ONLINE');
+    expect(db.settings.has(WEIXIN_SESSION_REF)).toBe(true);
+    expect(db.settings.has(WEIXIN_PENDING_SESSION_REF)).toBe(false);
+    await channel.disconnect();
   });
 
   it('stores a confirmed QR session encrypted and exposes a token-free login state', async () => {
@@ -443,6 +479,12 @@ describe('WeixinChannel iLink integration', () => {
     expect(db.flush).toHaveBeenCalled();
     expect(activated).not.toHaveBeenCalled();
     expect(db.audit).not.toHaveBeenCalledWith(expect.objectContaining({ action: 'channel.weixin.ilink.login' }));
+    expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'channel.weixin.ilink.pending.store',
+      target: 'cancelled-bot',
+      result: 'encrypted'
+    }));
+    expect(JSON.stringify(db.audits)).not.toContain('cancelled-token');
   });
 
   it('recovers encrypted confirmed credentials after cancellation through binded_redirect', async () => {
@@ -473,6 +515,48 @@ describe('WeixinChannel iLink integration', () => {
     expect(unseal<{ token: string }>(db.settings.get(WEIXIN_SESSION_REF))).toMatchObject({ token: 'recoverable-token' });
     expect(db.channel.status).toBe('ONLINE');
     await channel.disconnect();
+  });
+
+  it('recovers an encrypted confirmed session after the channel process restarts', async () => {
+    const server = new FakeIlinkServer();
+    server.qrStatuses.push({
+      status: 'confirmed',
+      bot_token: 'restart-recovery-token',
+      ilink_bot_id: 'restart-recovery-bot',
+      ilink_user_id: 'restart-recovery-owner',
+      baseurl: 'https://ilinkai.weixin.qq.com'
+    });
+    const first = makeHarness(server);
+
+    await first.channel.startLogin();
+    await flushUntil(() => first.channel.getLoginState().phase === 'VERIFYING', 'pre-restart verification');
+    await flushUntil(() => server.pendingSignals.length === 1, 'pre-restart activation poll');
+    await first.channel.dispose();
+    expect(first.db.settings.has(WEIXIN_PENDING_SESSION_REF)).toBe(true);
+    expect(first.db.settings.has(WEIXIN_SESSION_REF)).toBe(false);
+
+    server.qrStatuses.push({ status: 'binded_redirect' });
+    server.updates.push({ ret: 0, msgs: [], get_updates_buf: 'restart-recovered-cursor' });
+    const restarted = new WeixinChannel(first.db as never, first.orchestrator as never, {
+      fetchImpl: server.fetch,
+      qrToDataUrl: async (content: string) => `data:image/png;base64,${content}`,
+      sleep: async () => {},
+      taskPlanner: first.taskPlanner
+    });
+
+    expect(restarted.getLoginState()).toMatchObject({
+      phase: 'IDLE',
+      message: expect.stringContaining('上次已确认')
+    });
+    expect(JSON.stringify(restarted.getLoginState())).not.toContain('restart-recovery-token');
+    await restarted.startLogin();
+    await flushUntil(() => restarted.getLoginState().phase === 'CONNECTED', 'post-restart pending recovery');
+
+    expect(first.db.settings.has(WEIXIN_PENDING_SESSION_REF)).toBe(false);
+    expect(unseal<{ token: string }>(first.db.settings.get(WEIXIN_SESSION_REF))).toMatchObject({
+      token: 'restart-recovery-token'
+    });
+    await restarted.disconnect();
   });
 
   it('does not publish a refreshed QR that resolves after login cancellation', async () => {

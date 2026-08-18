@@ -142,9 +142,9 @@ describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
     expect(sandboxFor('standard')).toBe('workspace-write');
   });
 
-  it('trusted / autonomous → danger-full-access', () => {
-    expect(sandboxFor('trusted')).toBe('danger-full-access');
-    expect(sandboxFor('autonomous')).toBe('danger-full-access');
+  it('trusted / autonomous 仍限定为 workspace-write', () => {
+    expect(sandboxFor('trusted')).toBe('workspace-write');
+    expect(sandboxFor('autonomous')).toBe('workspace-write');
   });
 
   it('渠道来源任务：trusted 降级为 workspace-write（10.5）', () => {
@@ -152,8 +152,8 @@ describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
     expect(sandboxFor('trusted', 'channel')).toBe('workspace-write');
   });
 
-  it('渠道来源任务：autonomous 不降级', () => {
-    expect(sandboxFor('autonomous', 'channel')).toBe('danger-full-access');
+  it('渠道来源任务：autonomous 仍限定为 workspace-write', () => {
+    expect(sandboxFor('autonomous', 'channel')).toBe('workspace-write');
   });
 
   it('专家团任务保留员工权限：standard 仍为 workspace-write', () => {
@@ -231,11 +231,12 @@ describe('Claude Code Worker 边界', () => {
     expect(args).not.toContain('--allowedTools');
   });
 
-  it('trusted/autonomous 才允许权限绕过；渠道 trusted 仍降级为 standard；team 不升级', () => {
-    expect(argsFor('trusted')).toContain('--dangerously-skip-permissions');
-    expect(argsFor('autonomous', 'channel')).toContain('--dangerously-skip-permissions');
+  it('trusted/autonomous 也不绕过 Claude 的项目边界；team 与渠道同样不提升', () => {
+    expect(argsFor('trusted')).not.toContain('--dangerously-skip-permissions');
+    expect(argsFor('autonomous', 'channel')).not.toContain('--dangerously-skip-permissions');
     expect(argsFor('trusted', 'channel')).not.toContain('--dangerously-skip-permissions');
     expect(argsFor('standard', 'team')).not.toContain('--dangerously-skip-permissions');
+    expect(argsFor('autonomous')).toContain('acceptEdits');
   });
 
   it('只续接 Claude 命名空间或合法 UUID，不把其他执行器会话传给 --resume', () => {

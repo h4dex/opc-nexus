@@ -1,6 +1,34 @@
 # 系统架构设计
 
-## 1. 架构分层
+> **v2.0.0 迁移说明（2026-08-17）**：本文后续章节记录 v1.x 兼容实现，不再代表目标产品权威边界。v2 以 DSH/Cordis 为唯一主 AI、规划与执行内核；原 OPC-Nexus 能力收敛为 `opc-nexus-governance` Cordis 核心特色插件，Electron Main 仅保留无业务智能的 `aibox-native-host` 特权边界。Hermes Leader、Nexus fallback、DSH Advisor、Nexus Scheduler 及一次性 DSH Worker 等描述只用于迁移期兼容，禁止据此新增第二套规划、Session、Job 或子 Agent 状态源。目标架构与验收以 `docs/adr/ADR-DSH-003-DSH-AS-OWNER.md` 和 `docs/V2.0.0-DSH-CORDIS-PROJECT-QUEST-IMPLEMENTATION-PLAN.md` 为准。
+
+## 0. v2.0.0 权威运行模型
+
+```mermaid
+flowchart TD
+    OWNER["老板：桌面、手机、渠道"] --> WEB["官方 DSH Web UI"]
+    WEB --> CORDIS["DSH/Cordis：对话、Quest、规划、长任务、多 Agent"]
+    CORDIS --> CHILD["弹性 child Session / Goal"]
+    CORDIS --> WORKERS["固定数字员工与 CLI / ACP / A2A Worker"]
+    CHILD --> ARTIFACTS["项目制品与交付事实"]
+    WORKERS --> ARTIFACTS
+    GOVERNANCE["opc-nexus-governance 核心特色插件"] -. "项目、员工、策略、审批、审计、投影" .-> CORDIS
+    ARTIFACTS --> GOVERNANCE
+    HOST["aibox-native-host：凭据、文件、进程、网络、数据库、原生扩展"] -. "最小权限 Host Contract" .-> GOVERNANCE
+```
+
+当前所有权规则：
+
+1. DSH/Cordis 是唯一面向老板的主 AI，也是 QuestionSet、Plan、root/child Session、Goal 和多 Agent 编排的唯一业务 owner。
+2. `opc-nexus-governance` 是 DSH/Cordis 的核心特色插件，不是并列内核。它只维护组织/项目/员工目录、权限预算、审批审计、记忆归档、渠道和兼容看板投影。
+3. `aibox-native-host` 是 Electron Main 中的薄特权边界，不理解业务目标，不生成计划，不组队。
+4. Hermes、Codex、Pi、Claude、ACP/A2A、MCP 与 Skill 都是 Cordis 可选择的能力或 worker adapter。
+5. 官方 DSH Web UI 是桌面与 LAN/手机的统一会话界面；本项目不复制或 fork 另一套 DSH 对话页。旧 Chat 与 Secretary 仅作为隐藏迁移兼容入口。
+6. `@deepseek-ai/dsh-jobs-local` 的 Job 状态只在当前进程内有效。当前可持久恢复的是 Session、Goal 与 child-session 事实，不能把进程内 Job 宣称为跨重启无人值守任务。
+
+以下章节用于说明仍存在的 v1 兼容表、服务和状态机约束。任何新增功能都必须先服从本节所有权，再决定是否复用这些兼容实现。
+
+## 1. v1 兼容分层
 
 ```
 ┌─────────────────────────────────────────────────────────────┐

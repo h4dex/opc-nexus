@@ -246,6 +246,7 @@ export function Tasks() {
 const EVENT_LABEL: Record<string, string> = {
   queued: '进入队列', started: '开始执行', stage: '阶段切换', progress: '进度更新',
   tool_call: '工具调用', tool_result: '工具结果', approval_required: '等待审批',
+  artifact_manifest: '产物已验证', artifact_validation_failed: '产物校验失败',
   result: '产出结果', completed: '执行完成', failed: '执行失败', interrupted: '执行中断',
   cancelled: '执行取消'
 };
@@ -258,11 +259,25 @@ function eventDetail(e: TaskEvent): string {
     case 'tool_call': return `${String(p.name ?? '')} ${JSON.stringify(p.args ?? {}).slice(0, 80)}`;
     case 'tool_result': return `${String(p.name ?? '')}：${String(p.error ?? p.result ?? p.status ?? '').slice(0, 100)}`;
     case 'approval_required': return String(p.request ?? '').slice(0, 100);
+    case 'artifact_manifest': {
+      const manifest = p.manifest && typeof p.manifest === 'object' ? p.manifest as Record<string, unknown> : null;
+      const entries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+      const bytes = typeof manifest?.totalBytes === 'number' ? manifest.totalBytes : 0;
+      return `已验证 ${entries.length} 个项目文件，共 ${formatBytes(bytes)}`;
+    }
+    case 'artifact_validation_failed': return String(p.error ?? '未检测到真实项目产物');
     case 'failed':
     case 'interrupted': return String(p.error ?? '');
     case 'cancelled': return String(p.reason ?? '');
     default: return '';
   }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 /** 任务详情：事件时间线 + 实时输出 + 产物全文 + 父/子任务跳转 + 追问续跑（执行中每 2s 轮询，13.2 可追溯） */

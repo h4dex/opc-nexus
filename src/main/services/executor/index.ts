@@ -2,13 +2,13 @@
  * 执行器注册表：主辅引擎策略（P1）。
  * 解析顺序：主引擎（agent.engineId）就绪 → 用主引擎；
  * 否则辅助引擎（user/config.yaml engine.fallbackEngineId，默认 eng-opencode）就绪 → 回退辅助引擎；
- * 两者均不可用时按执行模式分流：production = 返回 null（任务如实 FAILED，绝不伪装完成）；
- * demo = SimulatedExecutor（UI 标注演示模式）。
- * Hermes 与 Pi 使用专属执行器；Codex、Claude Code、OpenCode 使用对应 CLI 适配器；DSH 与自定义引擎走 ACP。
+ * 两者均不可用时返回 null（任务如实 FAILED，绝不伪装完成）。
+ * Hermes 与 Pi 使用专属执行器；Codex、Claude Code、OpenCode 使用对应 CLI 适配器；
+ * managed DSH 使用持久控制面，兼容 DSH 与自定义引擎仍可走 ACP。
  *
  * @author liyingjie <y@senke.com>
  */
-import { NEXUS_ENGINE_ID, type Agent, type ExecutorKind, type Task } from '../../../shared/types.js';
+import { DSH_MANAGED_ENGINE_ID, NEXUS_ENGINE_ID, type Agent, type ExecutorKind, type Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { LlmApiExecutor } from './llmApiExecutor.js';
@@ -16,10 +16,15 @@ import { CliExecutor } from './cliExecutor.js';
 import { HermesAgentExecutor } from './hermesAgentExecutor.js';
 import { PiAgentExecutor } from './piAgentExecutor.js';
 import { AcpExecutor } from './acpExecutor.js';
-import { SimulatedExecutor } from './simulatedExecutor.js';
+import { DshManagedExecutor } from './dshManagedExecutor.js';
+import type { DshRuntimeAuthority } from './dshManagedExecutor.js';
+import type { DshSessionService } from '../dshSessionService.js';
+import type { DshDelegationSyncService } from '../dshDelegationSyncService.js';
+import type { DshTypedQuestBridge } from '../dshTypedQuestBridge.js';
+import { ProjectWorkbenchService } from '../projectWorkbench.js';
 import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
-import type { ExecutionBinding, ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import type { ExecutionBinding, ExecutorAbortResult, ExecutorAdapter, ExecutorCallbacks } from './types.js';
 import { PiRuntimeProfileService } from '../piRuntimeProfile.js';
 import {
   ANDROID_OPERATOR_ENGINE_ID,
@@ -41,10 +46,10 @@ interface RunningExecutor {
 export class ExecutorRegistry {
   private llm: LlmApiExecutor;
   private acp: AcpExecutor;
-  private sim: SimulatedExecutor;
   /** 真实 Hermes Agent CLI（专属执行器：-z headless + usage-file 会话锚点） */
   private hermes: HermesAgentExecutor;
   private pi: PiAgentExecutor;
+  private dsh: DshManagedExecutor | null = null;
   /** 引擎类型 → CLI 执行器 */
   private cliByType = new Map<string, CliExecutor>();
   /** taskId → 正在执行它的适配器（用于 abort） */
@@ -53,7 +58,6 @@ export class ExecutorRegistry {
   constructor(private db: Database, broker: ApprovalBroker, providerMgr?: import('../providerManager.js').ProviderManager) {
     this.llm = new LlmApiExecutor(db, broker, providerMgr);
     this.acp = new AcpExecutor(db, broker);
-    this.sim = new SimulatedExecutor();
     this.hermes = new HermesAgentExecutor(db);
     this.pi = new PiAgentExecutor(db, new PiRuntimeProfileService(db, providerMgr));
     this.cliByType.set('codex', new CliExecutor('codex-cli', db, 'eng-codex'));
@@ -90,6 +94,28 @@ export class ExecutorRegistry {
     return this.engineType(engineId) === 'nexus';
   }
 
+  /** Inject the persistent managed DSH control plane after its database service is ready. */
+  setDshRuntime(
+    sessions: DshSessionService,
+    authority: DshRuntimeAuthority,
+    delegationSync?: DshDelegationSyncService,
+    runtimeCapabilities?: Readonly<Record<string, boolean>>
+  ): void {
+    const workbench = new ProjectWorkbenchService(this.db);
+    this.dsh = new DshManagedExecutor(sessions, authority, {
+      delegationSync,
+      runtimeCapabilities,
+      resolveQuestContext: (task, agent) => task.projectId
+        ? workbench.resolveExecutionContext(task.projectId, agent.id, task.sessionId)
+        : null
+    });
+  }
+
+  /** Compose the typed DSH Quest projection after governance is initialized. */
+  setDshTypedQuestBridge(bridge: DshTypedQuestBridge | undefined): void {
+    this.dsh?.setTypedQuestBridge(bridge);
+  }
+
   private engineType(engineId: string): string {
     const row = this.db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as { type: string } | undefined;
     return row?.type ?? (engineId === NEXUS_ENGINE_ID ? 'nexus' : '');
@@ -107,6 +133,7 @@ export class ExecutorRegistry {
     // 的语义分裂 —— 引擎状态必须是唯一真相来源。
     if (type === 'nexus' && this.engineStatus(engineId) === 'HEALTHY' && this.llm.isReady()) return this.llm;
     if (type === 'external' && this.acp.engineReady(engineId)) return this.acp;
+    if (type === 'dsh-managed' && this.dsh?.isReady()) return this.dsh;
     return null;
   }
 
@@ -115,7 +142,7 @@ export class ExecutorRegistry {
     return row?.status ?? 'NOT_INSTALLED';
   }
 
-  /** 主辅解析：主引擎 → 辅助引擎 →（demo 模式）模拟器 / （production 模式）null */
+  /** 主辅解析：主引擎 → 辅助引擎 → null。 */
   private resolve(engineId: string, allowFallback = true): ResolvedExecutor | null {
     const primary = this.adapterFor(engineId);
     if (primary) return { adapter: primary, engineId, usedFallback: false };
@@ -126,17 +153,13 @@ export class ExecutorRegistry {
       const fallback = this.adapterFor(cfg.engine.fallbackEngineId);
       if (fallback) return { adapter: fallback, engineId: cfg.engine.fallbackEngineId, usedFallback: true };
     }
-    return cfg.engine.executionMode === 'production' ? null : { adapter: this.sim, engineId: null, usedFallback: true };
+    return null;
   }
 
-  /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 unavailable） */
+  /** 该引擎当前会使用的执行方式。 */
   kindFor(engineId: string): ExecutorKind {
     const adapter = this.resolve(engineId);
-    if (!adapter) {
-      const cfg = loadUserConfig();
-      return cfg.engine.executionMode === 'production' ? 'unavailable' : 'simulated';
-    }
-    return adapter.adapter.kind;
+    return adapter?.adapter.kind ?? 'unavailable';
   }
 
   /** 派发任务执行；production 模式无可用引擎 → 直接回报错误（任务 FAILED，不伪装成功） */
@@ -179,9 +202,11 @@ export class ExecutorRegistry {
       const message = mobileEngineError
         ?? (agent.kind === 'android_operator' && targetEngineId === ANDROID_OPERATOR_ENGINE_ID
           ? androidOperatorRuntimeUnavailableError()
+          : targetEngineId === DSH_MANAGED_ENGINE_ID
+            ? 'DSH 托管运行时尚未就绪；请启动 DSH 员工或改用本地 CLI 模式'
           : exactEngineBinding
             ? `任务固定的执行引擎不可用：${targetEngineId}（已禁止静默切换到其他引擎）`
-            : '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
+            : '无可用执行引擎：请检查主引擎与辅助引擎的安装/配置状态');
       cb.onError(task.id, message);
       return 'unavailable';
     }
@@ -202,11 +227,11 @@ export class ExecutorRegistry {
         if (release(id)) cb.onReleased?.(id);
       },
       onDone: (id, result) => {
-        if (adapter.kind !== 'acp') release(id);
+        if (adapter.kind !== 'acp' && adapter.kind !== 'dsh') release(id);
         cb.onDone(id, result);
       },
       onError: (id, message) => {
-        if (adapter.kind !== 'acp') release(id);
+        if (adapter.kind !== 'acp' && adapter.kind !== 'dsh') release(id);
         cb.onError(id, message);
       }
     });
@@ -216,8 +241,33 @@ export class ExecutorRegistry {
   abort(taskId: string): void {
     const current = this.running.get(taskId);
     current?.adapter.abort(taskId);
-    if (current?.adapter.kind !== 'acp' && this.running.get(taskId) === current) {
+    if (current?.adapter.kind !== 'acp' && current?.adapter.kind !== 'dsh' && this.running.get(taskId) === current) {
       this.running.delete(taskId);
+    }
+  }
+
+  /** Whether the selected adapter needs a durable upstream cancellation ack. */
+  requiresCancellationConfirmation(taskId: string): boolean {
+    return this.running.get(taskId)?.adapter.kind === 'dsh';
+  }
+
+  /** Request cancellation and normalize legacy synchronous adapters. */
+  abortWithResult(taskId: string): Promise<ExecutorAbortResult> {
+    const current = this.running.get(taskId);
+    if (!current) return Promise.resolve({ status: 'CONFIRMED', reason: 'not-running' });
+    try {
+      return Promise.resolve(current.adapter.abort(taskId)).then((result) => {
+        if (result && typeof result === 'object' && typeof result.status === 'string') return result;
+        return { status: 'CONFIRMED' as const, reason: 'adapter-acknowledged' };
+      }, (error: unknown) => ({
+        status: 'UNCONFIRMED' as const,
+        reason: error instanceof Error ? error.message : String(error)
+      }));
+    } catch (error) {
+      return Promise.resolve({
+        status: 'UNCONFIRMED' as const,
+        reason: error instanceof Error ? error.message : String(error)
+      });
     }
   }
 

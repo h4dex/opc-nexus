@@ -6,12 +6,14 @@ import { MobileToolPolicy } from './MobileToolPolicy';
 import type {
   Agent, AgentCapabilities, AgentKind, MobileAgentConfig, MobileDevice, MobileToolCatalog, MobileToolName, PermissionMode
 } from '@shared/types';
+import { LEGACY_DSH_ENGINE_ID } from '@shared/types';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
 
 const PERM_OPTIONS: { value: PermissionMode; label: string; desc: string; color: string }[] = [
   { value: 'readonly', label: '只读', desc: '仅允许读取操作，写入/删除一律禁止', color: 'var(--text-3)' },
   { value: 'standard', label: '标准审批', desc: '写入/删除操作需人工审批后执行', color: 'var(--warning)' },
-  { value: 'trusted', label: '受信任', desc: '自动执行所有操作（渠道来源仍需审批）', color: 'var(--accent)' },
-  { value: 'autonomous', label: '完全自主', desc: '无需任何审批，所有操作自动执行', color: 'var(--success)' }
+  { value: 'trusted', label: '受信任（兼容）', desc: '兼容旧配置，仍受项目工作目录边界约束', color: 'var(--accent)' },
+  { value: 'autonomous', label: '项目自主', desc: '项目目录内自动执行；目录外拒绝，不可逆外部动作单独确认', color: 'var(--success)' }
 ];
 
 /** 人设预设模板 */
@@ -378,10 +380,13 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
 /** 引擎选择下拉：从 snapshot.engines 中筛选可用引擎 */
 function EngineSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const { snapshot } = useApp();
-  const engines = (snapshot?.engines ?? []).filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status));
+  const engines = (snapshot?.engines ?? []).filter((e) =>
+    isUserVisibleEngine(e) && ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)
+  );
   return (
     <select value={value} onChange={(e) => onChange(e.target.value)} style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13 }}>
-      {engines.map((e) => <option key={e.id} value={e.id}>{e.name}{e.isDefault ? ' (默认)' : ''}{e.status === 'SETUP_REQUIRED' ? ' [演示模式]' : ''}</option>)}
+      {value === LEGACY_DSH_ENGINE_ID && <option value={LEGACY_DSH_ENGINE_ID} disabled>旧版 DSH 兼容执行器（仅历史）</option>}
+      {engines.map((e) => <option key={e.id} value={e.id}>{e.name}{e.isDefault ? ' (默认)' : ''}{e.status === 'SETUP_REQUIRED' ? ' [待配置]' : ''}</option>)}
       {engines.length === 0 && <option value="">无可用引擎</option>}
     </select>
   );

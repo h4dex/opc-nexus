@@ -1,273 +1,355 @@
-/** 对话聊天（Cherry Studio 风格）：左侧助手+会话列表，右侧消息流 + 输入框，流式输出 + Markdown 渲染 */
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
+/** Legacy Local CLI chat. Cordis conversations live in the official DSH Web UI. */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
-import type { Conversation, TaskEvent } from '@shared/types';
+import type {
+  Conversation,
+  ConversationMessageView,
+  TaskEvent,
+  TaskStatus
+} from '@shared/types';
 import { appendTaskOutput, compactTaskEvents } from '../utils/taskEvents';
+import { MarkdownView } from '../components/MarkdownView';
+import { IconChevronRight, IconLog, IconMessage, IconRefresh, IconSend, IconStop } from '../components/icons';
+import { toast } from '../components/Toast';
+import { DSH_MANAGED_ENGINE_ID } from '@shared/types';
 
-/** 表格规范化：在紧跟非表格文本的表格行前补空行，避免 GFM 解析失败（尤其含对齐标记 | :---: | 的表格） */
-function normalizeTables(md: string): string {
-  const lines = md.split('\n');
-  const out: string[] = [];
-  for (const line of lines) {
-    const prev = out[out.length - 1] ?? '';
-    if (/^\s*\|/.test(line) && prev.trim() !== '' && !/^\s*\|/.test(prev)) {
-      out.push('');
-    }
-    out.push(line);
-  }
-  return out.join('\n');
+const ACTIVE_TASK_STATUSES: TaskStatus[] = ['QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED'];
+const TERMINAL_TASK_STATUSES: TaskStatus[] = ['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED'];
+
+function taskIsActive(status: TaskStatus | undefined): boolean {
+  return status !== undefined && ACTIVE_TASK_STATUSES.includes(status);
 }
 
-/** 轻量 Markdown 渲染（同步解析 + DOMPurify 消毒 + 代码块复制按钮） */
-function Md({ text }: { text: string }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const raw = marked.parse(normalizeTables(text), { async: false, gfm: true, breaks: true }) as string;
-  const html = DOMPurify.sanitize(raw, { ADD_ATTR: ['target'] });
+function taskIsTerminal(status: TaskStatus | undefined): boolean {
+  return status !== undefined && TERMINAL_TASK_STATUSES.includes(status);
+}
 
-  // 为代码块注入复制按钮
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.querySelectorAll('pre').forEach((pre) => {
-      if (pre.querySelector('.code-copy-btn')) return;
-      pre.style.position = 'relative';
-      const btn = document.createElement('button');
-      btn.className = 'code-copy-btn';
-      btn.textContent = '复制';
-      btn.style.cssText = 'position:absolute;top:6px;right:6px;padding:2px 8px;font-size:11px;border:1px solid var(--border);background:var(--card);color:var(--text-2);border-radius:5px;cursor:pointer;opacity:.75';
-      btn.onclick = () => {
-        const code = pre.querySelector('code')?.textContent ?? pre.textContent ?? '';
-        void navigator.clipboard.writeText(code);
-        btn.textContent = '已复制';
-        setTimeout(() => { btn.textContent = '复制'; }, 1500);
-      };
-      pre.appendChild(btn);
-    });
-  }, [html]);
-
-  return <div ref={ref} className="md-body" dangerouslySetInnerHTML={{ __html: html }} />;
+function messageLabel(message: ConversationMessageView): string {
+  if (message.role === 'user' || message.direction === 'inbound') return '老板';
+  if (message.role === 'tool') return '工具';
+  return '员工';
 }
 
 export function Chat() {
-  const { snapshot } = useApp();
-  const [agentId, setAgentId] = useState<string>('');
+  const {
+    snapshot,
+    setRoute,
+    chatTarget,
+    clearAgentChatTarget
+  } = useApp();
+  const [agentId, setAgentId] = useState('');
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convId, setConvId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<TaskEvent[]>([]);
+  const [messages, setMessages] = useState<ConversationMessageView[]>([]);
+  const [nextCursor, setNextCursor] = useState<{ createdAt: number; id: string } | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [activity, setActivity] = useState<TaskEvent[]>([]);
   const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
+  const [dispatching, setDispatching] = useState(false);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState('');
   const [lastUserMsg, setLastUserMsg] = useState('');
+  const [activityOpen, setActivityOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const convIdRef = useRef<string | null>(null);
   const activeTaskRef = useRef<string | null>(null);
+  const timelineRequestRef = useRef(0);
 
-  // 保持 ref 同步
-  convIdRef.current = convId;
-  activeTaskRef.current = activeTaskId;
+  const agents = useMemo(
+    () => (snapshot?.agentCards ?? []).filter((card) =>
+      card.agent.lifecycle === 'READY' && card.agent.engineId !== DSH_MANAGED_ENGINE_ID
+    ),
+    [snapshot]
+  );
+  const selectedCard = snapshot?.agentCards.find((card) => card.agent.id === agentId) ?? null;
+  const selectedAgent = selectedCard?.agent ?? null;
+  const activeTask = snapshot?.tasks.find((task) => task.id === activeTaskId) ?? null;
+  const busy = dispatching || taskIsActive(activeTask?.status);
 
-  // 选中助手后加载会话列表
+  // Direct navigation from Agents opens one employee and (optionally) one conversation.
   useEffect(() => {
-    if (!agentId) return;
-    void window.aibox.listConversations(agentId).then(setConversations);
-  }, [agentId, snapshot?.tasks.length]);
+    if (!chatTarget) return;
+    setAgentId(chatTarget.agentId);
+    setConvId(chatTarget.conversationId);
+    setMessages([]);
+    setActivity([]);
+    setLastUserMsg('');
+    clearAgentChatTarget();
+  }, [chatTarget, clearAgentChatTarget]);
 
-  // 选中会话后加载消息（仅依赖 convId，不依赖 snapshot.tasks 避免重复订阅）
-  const loadMessages = useCallback(() => {
-    const cid = convIdRef.current;
-    if (!cid) { setMessages([]); return; }
-    // 通过 snapshot 查找对应任务（用 ref 避免闭包过期）
-    const tasks = useApp.getState().snapshot?.tasks ?? [];
-    const task = tasks.find((t) => t.sessionId === `conv-${cid}`);
-    if (task) {
-      activeTaskRef.current = task.id;
-      setActiveTaskId(task.id);
-      void window.aibox.getTaskEvents(task.id).then((items) => setMessages(compactTaskEvents(items)));
+  useEffect(() => {
+    if (!agentId) {
+      setConversations([]);
+      return;
+    }
+    let alive = true;
+    void window.aibox.listConversations(agentId).then((items) => {
+      if (alive) setConversations(items);
+    }).catch(() => {
+      if (alive) setConversations([]);
+    });
+    return () => { alive = false; };
+  }, [agentId, snapshot?.version]);
+
+  const loadTimeline = useCallback(async (employeeId: string, conversationId: string) => {
+    const requestId = ++timelineRequestRef.current;
+    const page = await window.aibox.getConversationTimeline({
+      agentId: employeeId,
+      conversationId,
+      limit: 100
+    });
+    if (requestId !== timelineRequestRef.current) return;
+    setMessages(page.messages);
+    setNextCursor(page.nextCursor);
+    setHasMore(page.hasMore);
+  }, []);
+
+  const loadMore = useCallback(async () => {
+    if (!agentId || !convId || !nextCursor || !hasMore) return;
+    const requestId = ++timelineRequestRef.current;
+    try {
+      const page = await window.aibox.getConversationTimeline({
+        agentId,
+        conversationId: convId,
+        cursor: nextCursor,
+        limit: 100
+      });
+      if (requestId !== timelineRequestRef.current) return;
+      setMessages((current) => [...page.messages, ...current]);
+      setNextCursor(page.nextCursor);
+      setHasMore(page.hasMore);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '加载历史消息失败');
+    }
+  }, [agentId, convId, hasMore, nextCursor]);
+
+  const refreshActivity = useCallback(async (taskId: string | null) => {
+    if (!taskId) {
+      setActivity([]);
+      return;
+    }
+    try {
+      setActivity(compactTaskEvents(await window.aibox.getTaskEvents(taskId)));
+    } catch {
+      setActivity([]);
     }
   }, []);
 
+  // Canonical history is the source of truth for every selected conversation.
   useEffect(() => {
-    if (!convId) { setMessages([]); setActiveTaskId(null); return; }
-    loadMessages();
-  }, [convId, loadMessages]);
+    if (!agentId || !convId) {
+      setMessages([]);
+      setNextCursor(null);
+      setHasMore(false);
+      setActiveTaskId(null);
+      activeTaskRef.current = null;
+      setActivity([]);
+      return;
+    }
+    let alive = true;
+    void loadTimeline(agentId, convId).catch((error) => {
+      if (alive) toast.err(error instanceof Error ? error.message : '加载会话失败');
+    });
+    const tasks = useApp.getState().snapshot?.tasks ?? [];
+    const candidate = tasks
+      .filter((task) => task.agentId === agentId && task.conversationId === convId)
+      .sort((left, right) => right.createdAt - left.createdAt)[0];
+    const taskId = candidate?.id ?? null;
+    setActiveTaskId(taskId);
+    activeTaskRef.current = taskId;
+    void refreshActivity(taskId);
+    return () => { alive = false; };
+  }, [agentId, convId, loadTimeline, refreshActivity]);
 
-  // 流式输出订阅：仅挂载一次，通过 ref 判断当前会话，避免重复订阅导致消息重复
+  // Keep the active task attached when a new snapshot arrives after dispatch.
+  useEffect(() => {
+    if (!agentId || !convId || !snapshot) return;
+    const candidate = snapshot.tasks
+      .filter((task) => task.agentId === agentId && task.conversationId === convId)
+      .sort((left, right) => right.createdAt - left.createdAt)[0];
+    if (!candidate) return;
+    if (candidate.id !== activeTaskRef.current) {
+      activeTaskRef.current = candidate.id;
+      setActiveTaskId(candidate.id);
+      void refreshActivity(candidate.id);
+    }
+    if (taskIsTerminal(candidate.status)) {
+      void loadTimeline(agentId, convId).catch(() => undefined);
+    }
+  }, [agentId, convId, snapshot, loadTimeline, refreshActivity]);
+
   useEffect(() => {
     const unsub = window.aibox.onTaskOutput(({ taskId, chunk }) => {
       if (taskId !== activeTaskRef.current) return;
-      setMessages((prev) => appendTaskOutput(prev, taskId, chunk));
+      setActivity((prev) => appendTaskOutput(prev, taskId, chunk));
+      setActivityOpen(true);
     });
     return unsub;
   }, []);
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'auto' }); }, [messages.length]);
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'auto' });
+  }, [messages.length, activity.length]);
 
-  // 所有 hooks 必须在早退之前调用（保活页面在 snapshot 加载前即挂载，早退后置 hooks 会触发 hooks 数量不一致）
   if (!snapshot) return null;
-  const { agentCards } = snapshot;
-  const agents = agentCards.filter((c) => c.agent.lifecycle === 'READY');
 
   const send = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim();
-    if (!text || !agentId || sending) return;
-    setSending(true);
+    if (!text || !agentId || busy) return;
+    setDispatching(true);
     setInput('');
-    setLastUserMsg(text);
     try {
-      const r = await window.aibox.chatWithAgent(agentId, text, convId ?? undefined);
-      setConvId(r.conversationId);
-      setActiveTaskId(r.task.id);
-      activeTaskRef.current = r.task.id;
-      // 刷新会话列表
-      void window.aibox.listConversations(agentId).then(setConversations);
+      const result = await window.aibox.chatWithAgent(agentId, text, convId ?? undefined);
+      setLastUserMsg(text);
+      setConvId(result.conversationId);
+      setActiveTaskId(result.task.id);
+      activeTaskRef.current = result.task.id;
+      await Promise.all([
+        window.aibox.listConversations(agentId).then(setConversations),
+        loadTimeline(agentId, result.conversationId).catch(() => undefined),
+        refreshActivity(result.task.id)
+      ]);
+    } catch (error) {
+      setInput((current) => current.trim() ? current : text);
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('QUEST_REQUIRED')) {
+        toast.err('复杂任务请从“项目与 Quest”交给 Cordis');
+        setRoute('projects');
+      } else {
+        toast.err(message);
+      }
     } finally {
-      setSending(false);
+      setDispatching(false);
     }
   };
 
-  /** 重新生成：重发最后一条用户消息 */
-  const regenerate = () => {
-    if (lastUserMsg && !sending) void send(lastUserMsg);
-  };
-
-  /** 停止生成：取消当前活跃任务 */
   const stopGeneration = async () => {
     if (!activeTaskId) return;
-    await window.aibox.cancelTask(activeTaskId);
-    setSending(false);
+    try {
+      await window.aibox.cancelTask(activeTaskId);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '停止任务失败');
+    }
   };
 
-  /** 会话重命名 */
   const doRename = async () => {
-    if (!renamingId || !renameText.trim()) { setRenamingId(null); return; }
+    if (!renamingId || !renameText.trim()) {
+      setRenamingId(null);
+      return;
+    }
     await window.aibox.renameConversation(renamingId, renameText.trim());
     setRenamingId(null);
     if (agentId) void window.aibox.listConversations(agentId).then(setConversations);
   };
 
-  /** 删除会话 */
   const doDelete = async (id: string) => {
     await window.aibox.deleteConversation(id);
-    if (convId === id) { setConvId(null); setMessages([]); }
+    if (convId === id) {
+      setConvId(null);
+      setMessages([]);
+      setActivity([]);
+    }
     if (agentId) void window.aibox.listConversations(agentId).then(setConversations);
   };
 
+  const streamingText = activity
+    .filter((event) => event.eventType === 'output')
+    .map((event) => String(event.payload.chunk ?? event.payload.text ?? ''))
+    .join('');
+
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', height: 'calc(100vh - 120px)', gap: 0 }}>
-      {/* 左侧：助手选择 + 会话列表 */}
-      <div style={{ borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border)' }}>
-          <select value={agentId} onChange={(e) => { setAgentId(e.target.value); setConvId(null); }}
-            style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13 }}>
-            <option value="">选择助手…</option>
-            {agents.map((c) => <option key={c.agent.id} value={c.agent.id}>{c.agent.name}</option>)}
+    <div className="nexus-chat">
+      <aside className="nexus-chat-rail">
+        <div className="nexus-chat-rail-head">
+          <div className="nexus-chat-title"><IconMessage size={16} />Local CLI 兼容对话</div>
+          <select value={agentId} onChange={(event) => { setAgentId(event.target.value); setConvId(null); setMessages([]); setActivity([]); }}>
+            <option value="">选择数字员工</option>
+            {agents.map((card) => <option key={card.agent.id} value={card.agent.id}>{card.agent.name}</option>)}
           </select>
         </div>
-        <div style={{ flex: 1, overflowY: 'auto', padding: 8 }}>
-          <button onClick={() => setConvId(null)}
-            style={{ display: 'block', width: '100%', padding: '10px 12px', marginBottom: 4, borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 12.5, textAlign: 'left', background: convId === null ? 'var(--accent-soft)' : 'transparent', color: 'var(--text-1)', fontWeight: 600 }}>
-            + 新对话
+        <div className="nexus-chat-conversations">
+          <button className={`conversation-item new ${convId === null ? 'selected' : ''}`} onClick={() => { setConvId(null); setMessages([]); setActivity([]); }}>
+            <span>新对话</span><span className="conversation-plus">+</span>
           </button>
-          {conversations.map((c) => (
-            <div key={c.id} style={{ position: 'relative', marginBottom: 4 }}>
-              {renamingId === c.id ? (
-                <input value={renameText} onChange={(e) => setRenameText(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') void doRename(); if (e.key === 'Escape') setRenamingId(null); }}
-                  onBlur={() => void doRename()}
-                  autoFocus
-                  style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--accent)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 12.5 }} />
+          {conversations.map((conversation) => (
+            <div key={conversation.id} className="conversation-row">
+              {renamingId === conversation.id ? (
+                <input value={renameText} onChange={(event) => setRenameText(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === 'Enter') void doRename(); if (event.key === 'Escape') setRenamingId(null); }}
+                  onBlur={() => void doRename()} autoFocus />
               ) : (
-                <button onClick={() => setConvId(c.id)}
-                  onContextMenu={(e) => { e.preventDefault(); setRenamingId(c.id); setRenameText(c.title); }}
-                  style={{ display: 'block', width: '100%', padding: '10px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 12.5, textAlign: 'left', background: convId === c.id ? 'var(--accent-soft)' : 'transparent', color: 'var(--text-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {c.title || '未命名对话'}
-                  <span style={{ display: 'block', fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>{c.messageCount} 条 · {new Date(c.lastMessageAt).toLocaleDateString()}</span>
+                <button className={`conversation-item ${convId === conversation.id ? 'selected' : ''}`} onClick={() => { setConvId(conversation.id); setLastUserMsg(''); }}
+                  onContextMenu={(event) => { event.preventDefault(); setRenamingId(conversation.id); setRenameText(conversation.title); }}>
+                  <span className="conversation-name">{conversation.title || '未命名对话'}</span>
+                  <span className="conversation-meta">{conversation.messageCount} 条 · {new Date(conversation.lastMessageAt).toLocaleDateString()}</span>
                 </button>
               )}
-              {/* 删除按钮（悬停显示） */}
-              {renamingId !== c.id && (
-                <button onClick={() => void doDelete(c.id)} title="删除会话"
-                  style={{ position: 'absolute', top: 8, right: 6, width: 20, height: 20, borderRadius: 4, border: 'none', background: 'transparent', color: 'var(--text-3)', cursor: 'pointer', fontSize: 13, lineHeight: '20px', opacity: 0.5 }}
-                  onMouseEnter={(e) => (e.currentTarget.style.opacity = '1')}
-                  onMouseLeave={(e) => (e.currentTarget.style.opacity = '0.5')}>
-                  ×
-                </button>
-              )}
+              {renamingId !== conversation.id && <button className="conversation-delete" onClick={() => void doDelete(conversation.id)} title="删除会话">×</button>}
             </div>
           ))}
         </div>
-        <div style={{ padding: '8px 12px', fontSize: 11, color: 'var(--text-3)', borderTop: '1px solid var(--border)' }}>
-          右键会话可重命名
-        </div>
-      </div>
+        <div className="nexus-chat-rail-foot">右键会话可重命名</div>
+      </aside>
 
-      {/* 右侧：消息流 + 输入 */}
-      <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <div style={{ flex: 1, overflowY: 'auto', padding: '18px 24px' }}>
-          {!agentId && <div style={{ color: 'var(--text-3)', textAlign: 'center', marginTop: 80 }}>选择一个助手开始对话</div>}
-          {agentId && messages.length === 0 && <div style={{ color: 'var(--text-3)', textAlign: 'center', marginTop: 80 }}>发送消息开始对话，助手将真实执行任务并回复结果</div>}
-          {messages.map((e) => {
-            if (e.eventType === 'output') {
-              const text = String(e.payload.chunk ?? e.payload.text ?? '');
-              return (
-                <div key={e.id} className="chat-msg" style={{ position: 'relative', marginBottom: 12, padding: '10px 14px', background: 'var(--input-bg)', borderRadius: 10, fontSize: 13, lineHeight: 1.8 }}>
-                  <Md text={text} />
-                  <button className="msg-copy-btn" title="复制回复" onClick={() => { void navigator.clipboard.writeText(text); }}
-                    style={{ position: 'absolute', top: 6, right: 6, padding: '2px 7px', fontSize: 10.5, border: '1px solid var(--border)', background: 'var(--card)', color: 'var(--text-3)', borderRadius: 5, cursor: 'pointer', opacity: 0.6 }}
-                    onMouseEnter={(ev) => (ev.currentTarget.style.opacity = '1')}
-                    onMouseLeave={(ev) => (ev.currentTarget.style.opacity = '0.6')}>复制</button>
-                </div>
-              );
-            }
-            if (e.eventType === 'tool_call') {
-              return <div key={e.id} style={{ marginBottom: 8, fontSize: 12, color: 'var(--warning)' }}>🔧 {String(e.payload.name ?? '')} {JSON.stringify(e.payload.args ?? {}).slice(0, 60)}</div>;
-            }
-            if (e.eventType === 'completed') {
-              return <div key={e.id} style={{ marginBottom: 8, fontSize: 12, color: 'var(--success)' }}>✅ 执行完成</div>;
-            }
-            if (e.eventType === 'failed') {
-              return <div key={e.id} style={{ marginBottom: 8, fontSize: 12, color: 'var(--danger)' }}>❌ {String(e.payload.error ?? '执行失败')}</div>;
-            }
-            return null;
-          })}
-          {/* 打字指示器 */}
-          {sending && (
-            <div style={{ marginBottom: 12, padding: '10px 14px', background: 'var(--input-bg)', borderRadius: 10, fontSize: 13, color: 'var(--text-3)', display: 'inline-flex', gap: 4, alignItems: 'center' }}>
-              <span className="typing-dot" />正在思考并执行<span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
-            </div>
+      <section className="nexus-chat-main">
+        <header className="nexus-chat-header">
+          <div>
+            <div className="nexus-chat-heading">{selectedAgent?.name ?? '选择数字员工'}</div>
+            <div className="nexus-chat-subheading">{selectedAgent?.role ?? '从员工列表进入兼容对话'}</div>
+          </div>
+        </header>
+
+        <div className="nexus-chat-stream">
+          {!agentId && <div className="chat-empty"><IconMessage size={26} /><span>选择一位数字员工开始对话</span></div>}
+          {agentId && convId && hasMore && <button className="load-older" onClick={() => void loadMore()}><IconRefresh size={13} />加载更早消息</button>}
+          {agentId && !convId && messages.length === 0 && <div className="chat-empty"><span>发送消息开始对话</span></div>}
+          {messages.map((message) => (
+            <article key={message.id} className={`canonical-message ${message.direction === 'inbound' ? 'from-owner' : 'from-agent'}`}>
+              <div className="message-label">{messageLabel(message)}<time>{new Date(message.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time></div>
+              <div className="message-body"><MarkdownView content={message.content} /></div>
+              {message.truncated && <div className="message-warning">此消息过长，已按显示上限截断</div>}
+            </article>
+          ))}
+          {busy && streamingText && (
+            <article className="canonical-message from-agent streaming-message">
+              <div className="message-label">员工 · 执行中</div>
+              <div className="message-body"><MarkdownView content={streamingText} /></div>
+            </article>
           )}
-          {/* 重新生成（有历史回复且未在生成时） */}
-          {!sending && lastUserMsg && messages.some((m) => m.eventType === 'output') && (
-            <div style={{ marginBottom: 12 }}>
-              <button className="btn small" onClick={regenerate} style={{ fontSize: 11.5 }}>↻ 重新生成</button>
-            </div>
+          {busy && !streamingText && <div className="thinking-indicator"><span className="typing-dot" />正在执行<span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" /></div>}
+          {!busy && lastUserMsg && messages.some((message) => message.direction === 'outbound') && (
+            <button className="btn small regenerate" onClick={() => void send(lastUserMsg)} title="重发上一条消息"><IconRefresh size={12} />重新生成</button>
           )}
           <div ref={bottomRef} />
         </div>
 
-        {/* 输入框 + 停止生成 */}
+        <details className="nexus-chat-activity" open={activityOpen} onToggle={(event) => setActivityOpen(event.currentTarget.open)}>
+          <summary><IconLog size={14} />执行活动 <span>{activity.length}</span><IconChevronRight size={13} /></summary>
+          <div className="activity-list">
+            {activity.length === 0 && <span className="muted">暂无活动</span>}
+            {activity.map((event) => (
+              <div key={event.id} className="activity-item">
+                <time>{new Date(event.createdAt).toLocaleTimeString('zh-CN', { hour12: false })}</time>
+                <span className={`activity-kind ${event.eventType}`}>{event.eventType}</span>
+                <span>{event.eventType === 'tool_call' ? String(event.payload.name ?? '') : event.eventType === 'failed' ? String(event.payload.error ?? '') : event.eventType === 'output' ? '输出增量' : ''}</span>
+              </div>
+            ))}
+          </div>
+        </details>
+
         {agentId && (
-          <div style={{ padding: '14px 24px', borderTop: '1px solid var(--border)', display: 'flex', gap: 10 }}>
-            <input value={input} onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send(); } }}
-              placeholder="输入消息…（Enter 发送）"
-              style={{ flex: 1, padding: '10px 16px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13.5 }} />
-            {sending ? (
-              <button className="btn danger" onClick={() => void stopGeneration()} title="停止生成">
-                ■ 停止
-              </button>
+          <div className="nexus-chat-composer">
+            <textarea value={input} onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send(); } }}
+              placeholder="输入消息…（Enter 发送，Shift+Enter 换行）" rows={2} disabled={busy} />
+            {busy ? (
+              <button className="btn danger composer-action" onClick={() => void stopGeneration()} title="停止当前任务"><IconStop size={14} />停止</button>
             ) : (
-              <button className="btn primary" disabled={!input.trim()} onClick={() => void send()}>
-                发送
-              </button>
+              <button className="btn primary composer-action" disabled={!input.trim()} onClick={() => void send()} title="发送消息"><IconSend size={14} />发送</button>
             )}
           </div>
         )}
-      </div>
+      </section>
     </div>
   );
 }

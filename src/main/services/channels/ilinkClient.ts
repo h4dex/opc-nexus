@@ -69,7 +69,7 @@ export interface ILinkUpdatesResponse {
 }
 
 interface GetUpdatesOptions {
-  /** Long-poll workers treat a client timeout as an empty poll; connection probes must not. */
+  /** Set false only when the caller requires a response rather than an empty timed-out poll. */
   timeoutAsEmpty?: boolean;
 }
 
@@ -84,6 +84,15 @@ export class ILinkProtocolError extends Error {
   constructor(public readonly code: number, message: string) {
     super(message);
     this.name = 'ILinkProtocolError';
+  }
+}
+
+export class ILinkTimeoutError extends Error {
+  constructor() {
+    super('微信 iLink 请求超时');
+    // Preserve the established AbortError contract while retaining a reliable
+    // class identity so unrelated transport aborts are never accepted as polls.
+    this.name = 'AbortError';
   }
 }
 
@@ -250,7 +259,7 @@ export class ILinkClient {
         authenticated: true
       });
     } catch (error) {
-      if (options.timeoutAsEmpty !== false && error instanceof Error && error.name === 'AbortError' && !signal?.aborted) {
+      if (options.timeoutAsEmpty !== false && error instanceof ILinkTimeoutError && !signal?.aborted) {
         return { ret: 0, msgs: [], get_updates_buf: cursor };
       }
       throw error;
@@ -349,9 +358,7 @@ export class ILinkClient {
       }
     } catch (error) {
       if (combined.timedOut()) {
-        const timeoutError = new Error('微信 iLink 请求超时');
-        timeoutError.name = 'AbortError';
-        throw timeoutError;
+        throw new ILinkTimeoutError();
       }
       throw error;
     } finally {

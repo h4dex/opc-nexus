@@ -8,6 +8,7 @@ import type { TaskScheduleProposalService } from './taskScheduleProposalService.
 import type { DatabaseKernelState } from './kernel/databaseKernelState.js';
 import type { KernelRouter } from './kernel/kernelRouter.js';
 import type { KernelRequest, WorkerCandidate } from './kernel/types.js';
+import { DSH_MANAGED_ENGINE_ID } from '../../shared/types.js';
 
 export interface ChannelControlPlaneInput {
   ingress: ChannelIngressResult;
@@ -26,6 +27,7 @@ export interface CanonicalControlPlaneInput {
   message: string;
   preferredAgentId: string;
   projectId?: string | null;
+  routingMode?: KernelRequest['routingMode'];
 }
 
 type Row = Record<string, unknown>;
@@ -90,7 +92,8 @@ export class ChannelControlPlane {
       inputMessageId: input.ingress.messageId,
       message: input.message,
       preferredAgentId: input.preferredAgentId,
-      projectId: input.projectId
+      projectId: input.projectId,
+      routingMode: 'cordis'
     });
   }
 
@@ -144,6 +147,7 @@ export class ChannelControlPlane {
       conversationId: input.conversationId,
       inputMessageId: input.inputMessageId,
       message: input.message,
+      routingMode: engineId === DSH_MANAGED_ENGINE_ID ? 'cordis' : 'direct-worker',
       preferredAgentId: agentId,
       projectId: input.projectId ?? null,
       workers: [worker],
@@ -172,6 +176,9 @@ export class ChannelControlPlane {
     const preferred = workers.some((worker) => worker.agentId === input.preferredAgentId)
       ? input.preferredAgentId
       : null;
+    const preferredWorker = preferred ? workers.find((worker) => worker.agentId === preferred) : undefined;
+    const routingMode = input.routingMode
+      ?? (preferredWorker && preferredWorker.engineId !== DSH_MANAGED_ENGINE_ID ? 'direct-worker' : 'cordis');
     const recallContext = {
       organizationId: input.organizationId,
       principalId: input.principalId,
@@ -198,6 +205,7 @@ export class ChannelControlPlane {
       conversationId: input.conversationId,
       inputMessageId: input.inputMessageId,
       message: input.message,
+      routingMode,
       preferredAgentId: preferred,
       projectId: input.projectId ?? null,
       workers,

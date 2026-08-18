@@ -17,15 +17,12 @@ wecom:
   botId: "abc-123"
   secret: 'sec-456'
   webhookUrl: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
-engine:
-  executionMode: production
 task:
   maxRunMinutes: 45
 `);
     expect((r.wecom as Record<string, unknown>).botId).toBe('abc-123');
     expect((r.wecom as Record<string, unknown>).secret).toBe('sec-456');
     expect((r.wecom as Record<string, unknown>).webhookUrl).toBe('https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx');
-    expect((r.engine as Record<string, unknown>).executionMode).toBe('production');
     expect((r.task as Record<string, unknown>).maxRunMinutes).toBe(45);
   });
 
@@ -62,14 +59,9 @@ describe('mergeUserConfig', () => {
     expect(cfg).toEqual(USER_CONFIG_DEFAULTS);
   });
 
-  it('非法 executionMode 回退 demo', () => {
-    const cfg = mergeUserConfig({ engine: { executionMode: 'hacker' } });
-    expect(cfg.engine.executionMode).toBe('demo');
-  });
-
-  it('production 模式被接受', () => {
-    const cfg = mergeUserConfig({ engine: { executionMode: 'production' } });
-    expect(cfg.engine.executionMode).toBe('production');
+  it('忽略旧版 executionMode，不恢复模拟执行', () => {
+    const cfg = mergeUserConfig({ engine: { executionMode: 'demo' } });
+    expect(cfg.engine).toEqual(USER_CONFIG_DEFAULTS.engine);
   });
 
   it('负数 maxRunMinutes 回退默认', () => {

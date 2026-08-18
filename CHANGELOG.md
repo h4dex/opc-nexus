@@ -2,6 +2,53 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [2.0.0] - 2026-08-18
+
+> DSH/Cordis 完整接入：OPC-Nexus 升级为本地优先 AI Agent 管理器的 v2 架构，引入 DSH 子智能体运行时、Quest 工作台、Secretary Planning 控制面、插件目录与治理层，以及全自主权限模型。
+
+### 架构
+
+- **DSH/Cordis 控制核**：`CordisControlKernel` 取代旧 Hermes/Nexus 双核设计，统一通过 Cordis 插件协议路由到 DSH 子智能体，`KernelRouter` 保留降级策略。
+- **四层运行时分离**：DSH（会话/Run/Job 权威）→ `opc-nexus-governance`（Cordis 插件，有界投影）→ `aibox-native-host`（特权边界）→ Renderer（无 Node.js API）。
+- **全自主权限模型**：数字员工与专家团默认获完全自主权限，`autonomousApproval` 白名单机制代替逐步审批；人类只做最终验收。每位数字员工严格限定在对应项目目录内。
+- **删除旧内核文件**：移除 `hermesControlKernel.ts`、`nexusControlKernel.ts`、`deepseekPlanningAdvisor.ts`、`planningPrompt.ts`、`simulatedExecutor.ts` 与对应测试。
+
+### 新增服务
+
+- **DSH 集成层**：`dshControlClient`、`dshDelegationService`、`dshDelegationSyncService`、`dshEmbeddedWorkbench`、`dshIntegrationService`、`dshLanGateway`、`dshLanGatewayComposition`、`dshLanGatewayController`、`dshPolicyBroker`、`dshProviderBinding`、`dshQuestGovernance`、`dshQuestSessionBinding`、`dshSessionService`、`dshSessionWriteCoordinator`、`dshSupervisor`、`dshTypedQuestBridge`、`dshWebGateway`、`dshWindowManager`。
+- **插件体系**：`pluginCatalog`、`pluginHost`、`opcNexusGovernancePlugin`、`dshCommunityPluginService`、`dshPluginCatalog`、`dshPluginPolicy`、`navigationPolicy`。
+- **Secretary Planning**：`secretaryPlanning`、`secretaryPlanningAdapters`、`secretaryPlanningClassifier`、`secretaryPlanningControlPlane`。
+- **项目产物管理**：`projectArtifactService`（FS 遍历 + TOCTOU 安全 `openVerified`）、`projectArtifactManifest`、`projectWorkbench`、`artifactRef`（SHA-256 + magic byte）、`artifactProtocol`（`aibox-project:` 特权协议，15 分钟 grant token）。
+- **运行时基础设施**：`deepseekHarnessManagedRuntime`、`dshManagedExecutor`、`environmentDiagnostics`、`nativeAdapterHost`、`providerCredentialProxy`、`cordisBootstrap`、`questLaunch`、`questWindowManager`、`visionService`、`chatService`、`mobileConsole`。
+
+### 界面
+
+- **Quest 工作台**：`Quest.tsx`、`QuestWorkbench.tsx`（含内嵌 Webview 产物预览）、`QuestRuntimeSetup.tsx`、`QuestMobileAccess.tsx`。
+- **项目产物面板**：`ProjectArtifactsPanel.tsx`，实时目录浏览 + SHA-256 指纹展示。
+- **Secretary Planning 页面**：`SecretaryPlanning.tsx`。
+- **插件页面**：`Plugins.tsx`。
+- **可见性过滤**：`engineVisibility.ts`；运行时模式向导 `runtimeMode.ts`。
+
+### 安全
+
+- **IPC 参数校验**：`assertKeys` 扩展 `required` 参数，`parseDshQuestIdentity` 强制 `principalId` 等必需字段；`aibox:hashProjectArtifact` 新 handler。
+- **产物协议 TOCTOU 修复**：`openVerified()` 在 stat 校验后立即 `open()`，通过 dev/ino 对比检测路径替换；`unowned` 标志防止双重关闭。
+- **错误文本脱敏**：`errorText()` 对 `api_key`、`token`、`password`、`secret` 等字段值自动 `[REDACTED]`。
+- **CSP 维持**：主进程与渲染侧 `script-src 'none'` 保持一致，`aibox-project:` 仅在 Renderer base-uri 中允许。
+
+### 测试
+
+- 新增 145 个测试文件（含 135 个新文件），**1554 tests passed / 2 skipped**（+14 相较于 1.8.1 基线），typecheck 全量通过。
+- 新增测试覆盖：DSH 全链路、插件目录/策略/治理、Secretary Planning 分类与控制面、LAN Gateway 组合、Quest 路由/启动/窗口管理、项目产物服务、Cordis 引导、`v2ScenarioAcceptance` 端到端场景。
+
+### 文档
+
+- `docs/V2.0.0-DSH-CORDIS-PROJECT-QUEST-IMPLEMENTATION-PLAN.md`：v2 完整实施规划。
+- `docs/V2-ACCEPTANCE-EXECUTION-PLAN.md`：验收执行计划（Phase A 已完成）。
+- `docs/FUNCTIONAL-UX-AUDIT-2026-08-18.md`：功能与 UX 审计报告。
+- `docs/adr/`：ADR-DSH-001/002/003 决策记录。
+- `CLAUDE.md` 更新：v2 架构、自主权限模型、产物浏览、IPC 校验陷阱、安全基线补充。
+
 ## [1.8.1] - 2026-08-16
 
 > 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`）。本次为嵌套编排安全与调度稳定性补丁，不启用完整的 DSH 子智能体工作流图。

@@ -274,10 +274,16 @@ function EventRow({ event }: { event: TaskEvent }) {
   }
 
   // 普通事件行
+  const manifest = event.eventType === 'artifact_manifest' && p.manifest && typeof p.manifest === 'object'
+    ? p.manifest as Record<string, unknown>
+    : null;
+  const artifactCount = Array.isArray(manifest?.entries) ? manifest.entries.length : 0;
   const label = event.eventType === 'stage' ? String(p.stage ?? '')
     : event.eventType === 'approval_required' ? `⚠️ ${String(p.request ?? '').slice(0, 80)}`
     : event.eventType === 'failed' ? String(p.error ?? '执行失败')
     : event.eventType === 'completed' ? '执行完成'
+    : event.eventType === 'artifact_manifest' ? `已验证 ${artifactCount} 个项目产物`
+    : event.eventType === 'artifact_validation_failed' ? String(p.error ?? '项目产物校验失败')
     : event.eventType === 'started' ? '开始执行'
     : event.eventType;
 
@@ -285,7 +291,7 @@ function EventRow({ event }: { event: TaskEvent }) {
     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6, fontSize: 12.5 }}>
       <span style={{ color: 'var(--text-3)', fontSize: 11, flexShrink: 0 }}>{time}</span>
       <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0, marginTop: 4 }} />
-      <span style={{ color: event.eventType === 'failed' ? 'var(--danger)' : 'var(--text-1)', lineHeight: 1.6 }}>{label}</span>
+      <span style={{ color: event.eventType === 'failed' || event.eventType === 'artifact_validation_failed' ? 'var(--danger)' : 'var(--text-1)', lineHeight: 1.6 }}>{label}</span>
     </div>
   );
 }

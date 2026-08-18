@@ -352,7 +352,7 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:openTaskWorkspace` | `taskId` | `{ ok, message }` | 打开产物目录 |
 | `aibox:openAgentWorkspace` | `agentId` | `{ ok, message }` | 打开工作目录 |
 
-`RendererSettingKey` 仅允许 `theme`、`thresholds`、`notifications`、`demoAutoTasks`。内部设置、健康状态和 `secret:*` 条目均不可通过 Renderer 或 Web 设置接口访问。
+`RendererSettingKey` 仅允许 `theme`、`thresholds`、`notifications`和记忆提案偏好。内部设置、健康状态和 `secret:*` 条目均不可通过 Renderer 或 Web 设置接口访问。
 
 ---
 

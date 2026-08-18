@@ -3,6 +3,7 @@ import {
   ILinkClient,
   ILinkHttpError,
   ILinkProtocolError,
+  ILinkTimeoutError,
   ILINK_NOTIFY_STOP_TIMEOUT_MS,
   ILINK_QUIT_CLEANUP_BUDGET_MS,
   extractIlinkText,
@@ -162,6 +163,16 @@ describe('ILinkClient requests', () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+
+  it('does not classify an unrelated transport AbortError as an empty long poll', async () => {
+    const transportAbort = new Error('transport aborted unexpectedly');
+    transportAbort.name = 'AbortError';
+    const fetchImpl = vi.fn(async () => { throw transportAbort; }) as unknown as typeof fetch;
+    const client = new ILinkClient('https://ilinkai.weixin.qq.com', 'bot-token', fetchImpl);
+
+    await expect(client.getUpdates('cursor', 1_000)).rejects.toBe(transportAbort);
+    expect(transportAbort).not.toBeInstanceOf(ILinkTimeoutError);
   });
 
   it('sends text with the target and inbound context token', async () => {

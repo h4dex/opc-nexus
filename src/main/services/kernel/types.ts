@@ -1,5 +1,6 @@
-export type ControlKernelId = 'hermes' | 'nexus';
+export type ControlKernelId = 'cordis' | 'local-cli' | 'hermes' | 'nexus';
 export type PlanningAdvisorId = 'deepseek-harness';
+export type KernelRoutingMode = 'cordis' | 'direct-worker';
 
 export interface WorkerCandidate {
   agentId: string;
@@ -27,6 +28,12 @@ export interface KernelRequest {
   conversationId: string;
   inputMessageId: string;
   message: string;
+  /**
+   * `cordis` is the default owner-facing route. `direct-worker` is only for
+   * an employee that the user selected explicitly; it never acts as a
+   * fallback planner when Cordis is unavailable.
+   */
+  routingMode?: KernelRoutingMode;
   preferredAgentId: string | null;
   projectId: string | null;
   workers: WorkerCandidate[];
@@ -56,7 +63,7 @@ export interface MemoryProposal {
 
 export type TaskScheduleCronKind = 'interval' | 'daily' | 'weekly' | 'monthly';
 
-/** A kernel suggestion only. OPC-Nexus Scheduler remains the sole schedule owner. */
+/** A legacy projection suggestion. Cordis remains the schedule/run owner. */
 export interface TaskScheduleProposal {
   operation: 'create_task_schedule';
   title: string;
@@ -120,8 +127,8 @@ export interface KernelAttemptRecorder {
   record(attempt: KernelAttemptRecord): void | Promise<void>;
 }
 
-/** Native kernel sessions are an optimization/cache. Canonical conversation
- * and memory state remains owned by OPC-Nexus. */
+/** Legacy native-controller sessions are an optimization/cache. Cordis owns
+ * the canonical AI session; governance keeps only the bounded host projection. */
 export interface KernelSessionStore {
   get(conversationId: string, kernelId: ControlKernelId): string | null;
   set(conversationId: string, kernelId: ControlKernelId, sessionId: string): void;

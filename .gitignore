@@ -1,12 +1,18 @@
 node_modules/
+/.pnpm-store/
 out/
 dist/
 /runtime/deepseek-harness/dist/
 /runtime/deepseek-harness/.dist-stage-*/
 /runtime/deepseek-harness/.dist-backup-*/
+/runtime/deepseek-harness-managed/dist/
+/runtime/deepseek-harness-managed/.dist-stage-*/
+/runtime/deepseek-harness-managed/.dist-backup-*/
 release/
+/release-preview/
 .qoder/
 .superpowers/
+/.claude-review/
 # 用户本地配置(含凭据,严禁入库)
 user/
 *.log
@@ -17,8 +23,15 @@ Thumbs.db
 /design-qa.md
 /.github/workflows/website.yml
 /release-repack/
+/runtime/deepseek-harness-managed/.npm-cache/
+/tmp/
+/.pytest_cache/
+/coverage/
+/test-results/
+/playwright-report/
 __pycache__/
 *.py[cod]
+*.tsbuildinfo
 *.png
 !build/icon.png
 !docs/screenshots/
@@ -32,3 +45,17 @@ d3.ps1
 d4.ps1
 pwcap.ps1
 uia.txt
+
+# Local environment and editor settings
+.env
+.env.*
+!.env.example
+!.env.*.example
+/.idea/
+/.vscode/
+*.iml
+*.swp
+*~
+
+# One-off local exports
+/embedded-ipc-export.html
