@@ -4,7 +4,7 @@ import { useApp } from '../store';
 import { TASK_STATUS_META, Modal, ProgressBar, ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconCheck, IconPause, IconPlay, IconRefresh, IconStop, IconTrash, IconX } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { Task, TaskEvent } from '@shared/types';
+import type { Task, TaskEvent, ProjectArtifactManifest } from '@shared/types';
 
 type TabKey = 'active' | 'approval' | 'done';
 
@@ -286,6 +286,7 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
 }) {
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [result, setResult] = useState<string | null>(null);
+  const [manifest, setManifest] = useState<ProjectArtifactManifest | null>(null);
   const [followUp, setFollowUp] = useState('');
   const meta = TASK_STATUS_META[task.status];
   const running = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'].includes(task.status);
@@ -301,13 +302,15 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
   useEffect(() => {
     let alive = true;
     const load = async () => {
-      const [ev, res] = await Promise.all([
+      const [ev, res, mf] = await Promise.all([
         window.aibox.getTaskEvents(task.id),
-        window.aibox.getTaskResult(task.id)
+        window.aibox.getTaskResult(task.id),
+        task.status === 'COMPLETED' ? window.aibox.getTaskManifest(task.id) : Promise.resolve(null)
       ]);
       if (alive) {
         setEvents(ev);
         setResult(res);
+        setManifest(mf);
       }
     };
     void load();
@@ -367,6 +370,10 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
         </div>
       )}
 
+      {manifest && manifest.entries.length > 0 && (
+        <TaskManifestPanel taskId={task.id} manifest={manifest} />
+      )}
+
       <div className="card-title" style={{ marginTop: 16 }}>执行时间线<span className="sub">{timeline.length} 个事件</span></div>
       <div style={{ maxHeight: 180, overflowY: 'auto', fontSize: 12.5, lineHeight: 2 }}>
         {timeline.length === 0 && <div className="empty">暂无事件</div>}
@@ -391,6 +398,62 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
         </>
       )}
     </Modal>
+  );
+}
+
+/** B.5 — 产物 Manifest 面板：展示验证文件列表 + 打开目录 / 文件 / 复制路径 */
+function TaskManifestPanel({ taskId, manifest }: { taskId: string; manifest: ProjectArtifactManifest }) {
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const openFolder = async () => {
+    const r = await window.aibox.openTaskDeliveryFolder(taskId);
+    if (!r.ok) toast.err(r.message || '无法打开产物目录');
+  };
+
+  const revealFile = async (projectId: string, relativePath: string) => {
+    await window.aibox.revealProjectArtifact(projectId, relativePath);
+  };
+
+  const copyPath = (relativePath: string) => {
+    void navigator.clipboard.writeText(relativePath).then(() => {
+      setCopied(relativePath);
+      setTimeout(() => setCopied(null), 1500);
+    });
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="card-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span>验证产物<span className="sub">{manifest.entries.length} 个文件 · {formatBytes(manifest.totalBytes)}{manifest.truncated ? ' (已截断)' : ''}</span></span>
+        <button className="btn small" onClick={() => void openFolder()}>打开目录</button>
+      </div>
+      <div style={{ maxHeight: 160, overflowY: 'auto', fontSize: 12, border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden auto' }}>
+        {manifest.entries.map((entry) => (
+          <div key={entry.relativePath} style={{
+            display: 'flex', gap: 8, alignItems: 'center', padding: '5px 10px',
+            borderBottom: '1px solid var(--border)', fontSize: 12
+          }}>
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11.5 }}
+              title={entry.relativePath}>{entry.relativePath}</span>
+            <span style={{ color: 'var(--text-3)', fontSize: 11, minWidth: 52, textAlign: 'right' }}>{formatBytes(entry.size)}</span>
+            <span style={{ color: 'var(--text-3)', fontSize: 11, fontFamily: 'monospace', minWidth: 64 }}
+              title={`SHA-256 ${entry.sha256}`}>{entry.sha256.slice(0, 8)}</span>
+            <button className="btn tiny" title="在文件管理器中显示"
+              onClick={() => void revealFile(manifest.projectId, entry.relativePath)}>显示</button>
+            <button className="btn tiny" title={copied === entry.relativePath ? '已复制' : '复制路径'}
+              onClick={() => copyPath(entry.relativePath)}>
+              {copied === entry.relativePath ? '✓' : '复制'}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

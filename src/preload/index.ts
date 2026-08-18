@@ -482,6 +482,8 @@ const api = {
   createFollowUpTask: (parentTaskId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createFollowUpTask', parentTaskId, encodeText(title)),
   getTaskEvents: (taskId: string): Promise<TaskEvent[]> => ipcRenderer.invoke('aibox:getTaskEvents', taskId),
   getTaskResult: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getTaskResult', taskId),
+  getTaskManifest: (taskId: string): Promise<import('@shared/types').ProjectArtifactManifest | null> => ipcRenderer.invoke('aibox:getTaskManifest', taskId),
+  openTaskDeliveryFolder: (taskId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openTaskDeliveryFolder', taskId),
   setTaskQuality: (taskId: string, quality: 'accepted' | 'rejected' | 'rework' | null): Promise<Task | null> => ipcRenderer.invoke('aibox:setTaskQuality', taskId, quality),
 
   // 定时任务（P3a）

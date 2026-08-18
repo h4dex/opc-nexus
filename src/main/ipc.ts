@@ -2287,6 +2287,34 @@ export function registerIpc(deps: IpcDeps) {
   // 任务详情：事件时间线 + 产物全文（13.2 审计可追溯）
   ipcMain.handle('aibox:getTaskEvents', (_e, taskId: string) => orchestrator.taskEvents(taskId));
   ipcMain.handle('aibox:getTaskResult', (_e, taskId: string) => orchestrator.taskResult(taskId));
+  // B.5 — 产物 Manifest 提取（从 task_events 取最后一条 artifact_manifest）
+  ipcMain.handle('aibox:getTaskManifest', (_e, taskId: string) => {
+    const id = assertId(taskId, 'taskId');
+    const row = db.raw.prepare(
+      "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_manifest' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    ).get(id) as { payload: string } | undefined;
+    if (!row) return null;
+    try { return (JSON.parse(row.payload) as { manifest?: unknown }).manifest ?? null; }
+    catch { return null; }
+  });
+  // B.5 — 打开项目产物目录（与任务绑定的项目 workspace）
+  ipcMain.handle('aibox:openTaskDeliveryFolder', async (_e, taskId: string) => {
+    const id = assertId(taskId, 'taskId');
+    const taskRow = db.raw.prepare('SELECT project_id FROM tasks WHERE id = ?').get(id) as { project_id: string | null } | undefined;
+    const projectId = taskRow?.project_id;
+    if (projectId && projectWorkbench) {
+      const ws = projectWorkbench.getExplicitWorkspacePath(projectId);
+      if (ws) {
+        const err = await shell.openPath(ws);
+        return err ? { ok: false, message: err } : { ok: true, message: '' };
+      }
+    }
+    // Fall back to task's own workspace (executor working directory)
+    const fallback = orchestrator.resolveTaskWorkspace(id);
+    if (!fallback) return { ok: false, message: '未找到任务产物目录' };
+    const err = await shell.openPath(fallback);
+    return err ? { ok: false, message: err } : { ok: true, message: '' };
+  });
   // 任务产出质量标记（成果管理：采纳/驳回/返工）
   ipcMain.handle('aibox:setTaskQuality', (_e, taskId: string, quality: 'accepted' | 'rejected' | 'rework' | null) => orchestrator.setTaskQuality(assertId(taskId, 'taskId'), quality));
 

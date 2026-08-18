@@ -159,6 +159,26 @@ function taskState(db: Database, taskId: string): { status: string } | null {
   return row && typeof row.status === 'string' ? { status: row.status } : null;
 }
 
+/** B.6 — 提取任务完成时的产物 Manifest 摘要（文件数与总字节数） */
+function taskManifestSummary(db: Database, taskId: string): string | null {
+  const event = db.raw.prepare(
+    "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_manifest' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+  ).get(taskId) as { payload: string } | undefined;
+  if (!event) return null;
+  try {
+    const parsed = JSON.parse(event.payload) as { manifest?: { entries?: unknown[]; totalBytes?: number } };
+    const entries = Array.isArray(parsed.manifest?.entries) ? parsed.manifest.entries : [];
+    const bytes = typeof parsed.manifest?.totalBytes === 'number' ? parsed.manifest.totalBytes : 0;
+    if (entries.length === 0) return null;
+    const formatBytes = (b: number) => {
+      if (b < 1024) return `${b} B`;
+      if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+      return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+    };
+    return `📁 ${entries.length} 个验证产物，共 ${formatBytes(bytes)}`;
+  } catch { return null; }
+}
+
 function applyChannelControlAction(db: Database, orchestrator: Orchestrator, action: ChannelControlAction): void {
   if (action.kind === 'informational') return;
   if (action.kind === 'cancel') {
@@ -493,7 +513,11 @@ export async function dispatchChannelTask(opts: {
       | undefined
     : undefined;
   if (current?.status === 'COMPLETED') {
-    finish(`✅ 任务完成：\n${current.result ?? '（无文本产物）'}`, `task:${taskId}:completed`, current.status);
+    const summary = taskManifestSummary(db, taskId);
+    const message = summary
+      ? `✅ 任务完成：\n${current.result ?? '（无文本产物）'}\n${summary}`
+      : `✅ 任务完成：\n${current.result ?? '（无文本产物）'}`;
+    finish(message, `task:${taskId}:completed`, current.status);
     return true;
   }
   if (current && ['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(current.status)) {
@@ -518,7 +542,11 @@ export async function dispatchChannelTask(opts: {
     }
     if (row.status === 'COMPLETED') {
       activeReplyPolls.delete(taskId);
-      finish(`✅ 任务完成：\n${row.result ?? '（无文本产物）'}`, `task:${taskId}:completed`, row.status);
+      const summary = taskManifestSummary(db, taskId);
+      const message = summary
+        ? `✅ 任务完成：\n${row.result ?? '（无文本产物）'}\n${summary}`
+        : `✅ 任务完成：\n${row.result ?? '（无文本产物）'}`;
+      finish(message, `task:${taskId}:completed`, row.status);
       return;
     }
     if (['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(row.status)) {
