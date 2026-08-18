@@ -22,7 +22,12 @@ const require = createRequire(import.meta.url);
  *  v37：组织化 project/agent/channel 与待审批 memory proposal 持久化。 */
 // v38: durable task schedule proposals reviewed through OPC-Nexus Scheduler.
 // v39: rename the legacy built-in `eng-hermes` runtime identity to Nexus.
-const SCHEMA_VERSION = 39;
+// v40: durable DSH runtime/session/run/event projection, control leases and command receipts.
+// v41: align DSH cursors with rc.6, whose first session event is seq=0.
+// v42: durable task prerequisite edges used by Secretary/DAG dispatch.
+// v43: project-scoped canonical conversations for DSH/Cordis Quest continuity.
+// v44: project-autonomous defaults without widening executor workspace boundaries.
+const SCHEMA_VERSION = 44;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -56,7 +61,7 @@ CREATE TABLE IF NOT EXISTS agents (
   lifecycle TEXT NOT NULL DEFAULT 'DISABLED',
   engine_id TEXT NOT NULL,
   workspace TEXT NOT NULL DEFAULT '',
-  permission_mode TEXT NOT NULL DEFAULT 'standard',
+  permission_mode TEXT NOT NULL DEFAULT 'autonomous',
   concurrency_limit INTEGER NOT NULL DEFAULT 1,
   archived INTEGER NOT NULL DEFAULT 0,
   avatar_color TEXT NOT NULL DEFAULT '#4d6bfe',
@@ -99,6 +104,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   started_at INTEGER,
   ended_at INTEGER,
   deleted_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  dependency_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(task_id, dependency_task_id),
+  CHECK(task_id <> dependency_task_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_runs (
@@ -233,6 +246,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id),
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
   organization_id TEXT REFERENCES organizations(id),
   principal_id TEXT REFERENCES principals(id),
   channel_id TEXT REFERENCES channels(id),
@@ -747,8 +761,109 @@ CREATE TABLE IF NOT EXISTS mobile_scripts (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dsh_profiles (
+  id TEXT PRIMARY KEY,
+  engine_id TEXT NOT NULL REFERENCES engines(id),
+  provider_profile TEXT NOT NULL DEFAULT '',
+  policy_json TEXT NOT NULL DEFAULT '{}',
+  version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dsh_runtime_instances (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES dsh_profiles(id),
+  process_state TEXT NOT NULL DEFAULT 'STOPPED',
+  endpoint TEXT,
+  protocol_version TEXT NOT NULL DEFAULT '',
+  capabilities_json TEXT NOT NULL DEFAULT '{}',
+  heartbeat_at INTEGER,
+  crash_count INTEGER NOT NULL DEFAULT 0 CHECK(crash_count >= 0),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(agent_id, profile_id)
+);
+
+CREATE TABLE IF NOT EXISTS dsh_sessions (
+  id TEXT PRIMARY KEY,
+  upstream_session_id TEXT NOT NULL,
+  runtime_instance_id TEXT NOT NULL REFERENCES dsh_runtime_instances(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+  parent_session_id TEXT REFERENCES dsh_sessions(id) ON DELETE SET NULL,
+  delegation_depth INTEGER NOT NULL DEFAULT 0 CHECK(delegation_depth >= 0),
+  workspace TEXT NOT NULL DEFAULT '',
+  control_mode TEXT NOT NULL DEFAULT 'STANDALONE'
+    CHECK(control_mode IN ('STANDALONE', 'DELEGATED', 'NEXUS_MANAGED', 'TAKEOVER')),
+  revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+  last_event_cursor INTEGER NOT NULL DEFAULT -1 CHECK(last_event_cursor >= -1),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(runtime_instance_id, upstream_session_id)
+);
+
+CREATE TABLE IF NOT EXISTS dsh_runs (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES dsh_sessions(id) ON DELETE CASCADE,
+  nexus_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+  dag_node_id TEXT,
+  command_id TEXT UNIQUE,
+  upstream_state TEXT NOT NULL DEFAULT 'QUEUED',
+  event_cursor INTEGER NOT NULL DEFAULT -1 CHECK(event_cursor >= -1),
+  checkpoint_ref TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dsh_events (
+  session_id TEXT NOT NULL REFERENCES dsh_sessions(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL CHECK(seq >= 0),
+  run_id TEXT REFERENCES dsh_runs(id) ON DELETE SET NULL,
+  type TEXT NOT NULL,
+  protocol_version TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(session_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS dsh_control_leases (
+  session_id TEXT PRIMARY KEY REFERENCES dsh_sessions(id) ON DELETE CASCADE,
+  controller TEXT NOT NULL CHECK(controller IN ('HUMAN', 'NEXUS', 'TEAM_LEAD')),
+  surface TEXT NOT NULL CHECK(surface IN ('DESKTOP', 'LAN', 'INTERNAL', 'A2A')),
+  principal TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  previous_control_mode TEXT NOT NULL
+    CHECK(previous_control_mode IN ('STANDALONE', 'DELEGATED', 'NEXUS_MANAGED', 'TAKEOVER')),
+  expires_at INTEGER NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  acquired_at INTEGER NOT NULL,
+  renewed_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dsh_command_receipts (
+  command_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES dsh_sessions(id) ON DELETE CASCADE,
+  run_id TEXT REFERENCES dsh_runs(id) ON DELETE SET NULL,
+  command_type TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  expected_revision INTEGER NOT NULL CHECK(expected_revision >= 0),
+  applied_revision INTEGER NOT NULL CHECK(applied_revision >= 1),
+  principal TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ACCEPTED'
+    CHECK(status IN ('ACCEPTED', 'COMPLETED', 'FAILED')),
+  result_json TEXT,
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_task ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_dependency ON task_dependencies(dependency_task_id);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(enabled, next_run_at);
@@ -769,6 +884,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_active_task_lease ON mobile_control
 CREATE INDEX IF NOT EXISTS idx_mobile_commands_device_time ON mobile_commands(device_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mobile_artifacts_device_time ON mobile_artifacts(device_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mobile_scripts_agent ON mobile_scripts(agent_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dsh_runtime_agent ON dsh_runtime_instances(agent_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dsh_sessions_agent ON dsh_sessions(agent_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dsh_sessions_conversation ON dsh_sessions(conversation_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dsh_runs_session ON dsh_runs(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dsh_runs_task ON dsh_runs(nexus_task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dsh_events_run ON dsh_events(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_dsh_receipts_session ON dsh_command_receipts(session_id, created_at DESC);
 `;
 
 type Row = Record<string, SqlValue>;
@@ -2410,6 +2532,198 @@ export class Database {
         }
 
         this.inner.exec("DELETE FROM engines WHERE id = 'eng-hermes'");
+      }
+      if (prev < 40) {
+        // The canonical DDL creates the additive DSH tables. Keep the migration
+        // branch explicit so interrupted upgrades can safely recreate indexes
+        // before the schema version is committed.
+        this.inner.exec(`
+          CREATE INDEX IF NOT EXISTS idx_dsh_runtime_agent
+            ON dsh_runtime_instances(agent_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_sessions_agent
+            ON dsh_sessions(agent_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_sessions_conversation
+            ON dsh_sessions(conversation_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_runs_session
+            ON dsh_runs(session_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_runs_task
+            ON dsh_runs(nexus_task_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_events_run
+            ON dsh_events(run_id, seq);
+          CREATE INDEX IF NOT EXISTS idx_dsh_receipts_session
+            ON dsh_command_receipts(session_id, created_at DESC);
+        `);
+      }
+      if (prev < 41) {
+        // DSH rc.6 numbers the first event in a session as seq=0. The v40
+        // tables used a positive-only check and a zero cursor sentinel, which
+        // made the first event impossible to project without an unsafe offset.
+        // Rebuild the three cursor-bearing tables in one transaction so old
+        // rows remain byte-for-byte equivalent apart from the empty sentinel.
+        // Foreign keys are disabled for the surrounding migration transaction;
+        // the final foreign_key_check below validates the reconstructed graph.
+        this.inner.exec(`
+          DROP INDEX IF EXISTS idx_dsh_sessions_agent;
+          DROP INDEX IF EXISTS idx_dsh_sessions_conversation;
+          DROP INDEX IF EXISTS idx_dsh_runs_session;
+          DROP INDEX IF EXISTS idx_dsh_runs_task;
+          DROP INDEX IF EXISTS idx_dsh_events_run;
+
+          CREATE TABLE dsh_sessions_v41 (
+            id TEXT PRIMARY KEY,
+            upstream_session_id TEXT NOT NULL,
+            runtime_instance_id TEXT NOT NULL REFERENCES dsh_runtime_instances(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+            parent_session_id TEXT REFERENCES dsh_sessions_v41(id) ON DELETE SET NULL,
+            delegation_depth INTEGER NOT NULL DEFAULT 0 CHECK(delegation_depth >= 0),
+            workspace TEXT NOT NULL DEFAULT '',
+            control_mode TEXT NOT NULL DEFAULT 'STANDALONE'
+              CHECK(control_mode IN ('STANDALONE', 'DELEGATED', 'NEXUS_MANAGED', 'TAKEOVER')),
+            revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+            last_event_cursor INTEGER NOT NULL DEFAULT -1 CHECK(last_event_cursor >= -1),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(runtime_instance_id, upstream_session_id)
+          );
+
+          CREATE TABLE dsh_runs_v41 (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES dsh_sessions_v41(id) ON DELETE CASCADE,
+            nexus_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+            team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+            dag_node_id TEXT,
+            command_id TEXT UNIQUE,
+            upstream_state TEXT NOT NULL DEFAULT 'QUEUED',
+            event_cursor INTEGER NOT NULL DEFAULT -1 CHECK(event_cursor >= -1),
+            checkpoint_ref TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+
+          CREATE TABLE dsh_events_v41 (
+            session_id TEXT NOT NULL REFERENCES dsh_sessions_v41(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL CHECK(seq >= 0),
+            run_id TEXT REFERENCES dsh_runs_v41(id) ON DELETE SET NULL,
+            type TEXT NOT NULL,
+            protocol_version TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(session_id, seq)
+          );
+
+          INSERT INTO dsh_events_v41(
+            session_id, seq, run_id, type, protocol_version, payload_json, created_at
+          ) SELECT
+            session_id, seq, run_id, type, protocol_version, payload_json, created_at
+          FROM dsh_events;
+
+          INSERT INTO dsh_sessions_v41(
+            id, upstream_session_id, runtime_instance_id, agent_id, conversation_id,
+            parent_session_id, delegation_depth, workspace, control_mode, revision,
+            last_event_cursor, created_at, updated_at
+          ) SELECT
+            s.id, s.upstream_session_id, s.runtime_instance_id, s.agent_id, s.conversation_id,
+            s.parent_session_id, s.delegation_depth, s.workspace, s.control_mode, s.revision,
+            CASE
+              WHEN EXISTS (
+                SELECT 1 FROM dsh_events e
+                WHERE e.session_id = s.id AND e.seq = 0
+              ) THEN 0
+              WHEN s.last_event_cursor = 0 THEN -1
+              ELSE s.last_event_cursor
+            END,
+            s.created_at, s.updated_at
+          FROM dsh_sessions s;
+
+          INSERT INTO dsh_runs_v41(
+            id, session_id, nexus_task_id, team_run_id, dag_node_id, command_id,
+            upstream_state, event_cursor, checkpoint_ref, created_at, updated_at
+          ) SELECT
+            r.id, r.session_id, r.nexus_task_id, r.team_run_id, r.dag_node_id, r.command_id,
+            r.upstream_state,
+            CASE
+              WHEN EXISTS (
+                SELECT 1 FROM dsh_events e
+                WHERE e.run_id = r.id AND e.seq = 0
+              ) THEN 0
+              WHEN r.event_cursor = 0 THEN -1
+              ELSE r.event_cursor
+            END,
+            r.checkpoint_ref, r.created_at, r.updated_at
+          FROM dsh_runs r;
+
+          DROP TABLE dsh_events;
+          DROP TABLE dsh_runs;
+          DROP TABLE dsh_sessions;
+          ALTER TABLE dsh_sessions_v41 RENAME TO dsh_sessions;
+          ALTER TABLE dsh_runs_v41 RENAME TO dsh_runs;
+          ALTER TABLE dsh_events_v41 RENAME TO dsh_events;
+
+          CREATE INDEX IF NOT EXISTS idx_dsh_sessions_agent
+            ON dsh_sessions(agent_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_sessions_conversation
+            ON dsh_sessions(conversation_id, updated_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_runs_session
+            ON dsh_runs(session_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_runs_task
+            ON dsh_runs(nexus_task_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_dsh_events_run
+            ON dsh_events(run_id, seq);
+        `);
+      }
+      if (prev < 42) {
+        // Task prerequisite edges are additive. Recreate the table/indexes
+        // explicitly for databases that were stamped before v42 or whose
+        // prior migration was interrupted after DDL had started.
+        this.inner.exec(`
+          CREATE TABLE IF NOT EXISTS task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            dependency_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(task_id, dependency_task_id),
+            CHECK(task_id <> dependency_task_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_task_dependencies_task
+            ON task_dependencies(task_id);
+          CREATE INDEX IF NOT EXISTS idx_task_dependencies_dependency
+            ON task_dependencies(dependency_task_id);
+        `);
+      }
+      if (prev < 43) {
+        // Conversations are project-scoped in v2. Existing conversations are
+        // backfilled only when all linked tasks agree on one project; mixed or
+        // unscoped history stays null instead of guessing across boundaries.
+        addCol('conversations', 'project_id', 'TEXT REFERENCES projects(id) ON DELETE SET NULL');
+        this.inner.exec(`
+          UPDATE conversations
+          SET project_id = (
+            SELECT MIN(t.project_id)
+            FROM tasks t
+            WHERE t.conversation_id = conversations.id AND t.project_id IS NOT NULL
+          )
+          WHERE project_id IS NULL
+            AND 1 = (
+              SELECT COUNT(DISTINCT t.project_id)
+              FROM tasks t
+              WHERE t.conversation_id = conversations.id AND t.project_id IS NOT NULL
+            );
+          CREATE INDEX IF NOT EXISTS idx_conversations_project
+            ON conversations(project_id, updated_at DESC);
+        `);
+      }
+      if (prev < 44) {
+        // v2 execution policy: existing default/standard employees become
+        // project-autonomous. Explicit readonly and other user choices remain
+        // untouched, and every executor still owns its workspace boundary.
+        // Some supported stamped snapshots predate the additive column even
+        // though their version is newer; normalize that shape first.
+        addCol('agents', 'permission_mode', "TEXT NOT NULL DEFAULT 'autonomous'");
+        this.inner.exec(`
+          UPDATE agents
+          SET permission_mode = 'autonomous'
+          WHERE permission_mode = 'standard';
+        `);
       }
       this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_input_message_exactly_once
         ON tasks(input_message_id) WHERE input_message_id IS NOT NULL`);

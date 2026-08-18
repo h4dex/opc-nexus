@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconAlert, IconChip, IconRefresh, IconPlus } from '../components/icons';
 import type { Engine, EngineProviderMode, EngineRuntimeConfig, ProviderProtocol } from '@shared/types';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
 
 interface ProviderOption {
   id: string;
@@ -96,6 +97,7 @@ export function Engines() {
   const [showRegister, setShowRegister] = useState(false);
   if (!snapshot) return null;
   const { engines, executorAvailable } = snapshot;
+  const visibleEngines = engines.filter(isUserVisibleEngine);
 
   const redetect = async () => {
     setDetecting(true);
@@ -145,14 +147,14 @@ export function Engines() {
         <div className="card" style={{ marginBottom: 16, display: 'flex', gap: 10, alignItems: 'center', color: 'var(--warning)', background: 'var(--warning-soft)' }}>
           <IconAlert size={18} />
           <div style={{ fontSize: 12.5, lineHeight: 1.8 }}>
-            <b>未检测到可用执行引擎，系统当前以演示模式运行。</b>
+            <b>未检测到可用执行引擎，任务暂时无法执行。</b>
             请安装下方任一 CLI 引擎，或在设置页完成模型供应商配置。
           </div>
         </div>
       )}
 
       <div className="agent-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))' }}>
-        {engines.map((e) => {
+        {visibleEngines.map((e) => {
           const meta = STATUS_META[e.status];
           const msg = installMsg[e.id];
           return (
@@ -242,7 +244,7 @@ export function Engines() {
       {showRegister && <RegisterEngineModal onClose={() => setShowRegister(false)} />}
 
       {/* 引擎路由规则 */}
-      <RoutingRules engines={engines} />
+      <RoutingRules engines={visibleEngines} />
     </>
   );
 }

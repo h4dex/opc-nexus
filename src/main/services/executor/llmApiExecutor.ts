@@ -333,11 +333,25 @@ export class LlmApiExecutor implements ExecutorAdapter {
       return msg;
     }
     const effectiveMode = task.source === 'channel' && effectivePermission === 'trusted' ? 'standard' : effectivePermission;
-    const needApproval = tool.risk !== 'safe' && effectiveMode !== 'autonomous' && (
-      effectiveMode === 'standard' || (effectiveMode === 'trusted' && tool.risk === 'danger')
-    );
+    const autonomousApproval = typeof tool.autonomousApproval === 'function'
+      ? tool.autonomousApproval(args)
+      : tool.autonomousApproval ?? null;
+    const needApproval = effectiveMode === 'autonomous'
+      ? autonomousApproval !== null
+      : tool.risk !== 'safe' && (
+        effectiveMode === 'standard' || (effectiveMode === 'trusted' && tool.risk === 'danger')
+      );
     if (needApproval) {
-      const approvalType = tool.risk === 'danger' ? 'delete' : call.name === 'delegate_task' ? 'admin' : 'write_workspace';
+      const approvalType = autonomousApproval
+        ?? (call.name === 'install_package'
+          ? 'install'
+          : call.name === 'http_request'
+            ? 'network'
+            : tool.risk === 'danger'
+              ? 'delete'
+              : call.name === 'delegate_task'
+                ? 'admin'
+                : 'write_workspace');
       const approved = await this.broker.request({
         taskId: task.id,
         agentId: agent.id,
@@ -354,7 +368,9 @@ export class LlmApiExecutor implements ExecutorAdapter {
     }
 
     try {
-      const ctx: ToolContext = { workspace: task.workspaceOverride || agent.workspace, agentId: agent.id, taskId: task.id, host: this.host, browserMgr: this.browserMgr, ocrService: this.ocrService };
+      const workspace = task.projectId ? task.workspaceOverride?.trim() : task.workspaceOverride || agent.workspace;
+      if (!workspace) throw new Error('项目任务没有绑定工作目录，已拒绝执行工具');
+      const ctx: ToolContext = { workspace, agentId: agent.id, taskId: task.id, host: this.host, browserMgr: this.browserMgr, ocrService: this.ocrService };
       const result = await tool.execute(args, ctx);
       record('tool_result', { name: call.name, result: result.slice(0, 2000) });
       cb.onOutput(task.id, `\n[工具 ${call.name}] ${result.slice(0, 400)}\n`);

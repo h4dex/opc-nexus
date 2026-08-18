@@ -2,7 +2,16 @@
  * IPC 白名单（PRD 12.2：不允许 Renderer 透传任意命令）
  * Renderer 仅能调用此处显式注册的方法；密钥操作只通过 safeStorage 句柄。
  */
-import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  shell,
+  type IpcMainInvokeEvent,
+  type OpenDialogOptions
+} from 'electron';
 import type { Database } from './services/database.js';
 import type { Orchestrator } from './services/orchestrator.js';
 import type { ExecutorRegistry } from './services/executor/index.js';
@@ -32,6 +41,50 @@ import type { MobileAdbService } from './services/mobileAdbService.js';
 import type { MemoryService } from './services/memoryService.js';
 import type { MemoryProposalService } from './services/memoryProposalService.js';
 import type { TaskScheduleProposalService } from './services/taskScheduleProposalService.js';
+import type { DshIntegrationService } from './services/dshIntegrationService.js';
+import type { DshPluginCatalogService } from './services/dshPluginCatalog.js';
+import type { PluginCatalogService } from './services/pluginCatalog.js';
+import type { EnvironmentDiagnosticsService } from './services/environmentDiagnostics.js';
+import type { ProjectWorkbenchService } from './services/projectWorkbench.js';
+import type { ProjectArtifactService } from './services/projectArtifactService.js';
+import type { DshQuestSessionBindingService } from './services/dshQuestSessionBinding.js';
+import type { QuestWindowManager } from './services/questWindowManager.js';
+import type { DshCommunityPluginService } from './services/dshCommunityPluginService.js';
+import type { DshDelegationService, DshSessionTreeView, DshChildResultAggregate } from './services/dshDelegationService.js';
+import type {
+  AnswerDshQuestQuestionsInput,
+  ApproveDshQuestPlanInput,
+  DshQuestGovernanceView,
+  DispatchDshQuestPlanInput,
+  RejectDshQuestPlanInput
+} from '../shared/types.js';
+import type { DshQuestGovernanceService } from './services/dshQuestGovernance.js';
+import type { VisionService } from './services/visionService.js';
+import {
+  DSH_VISION_PLUGIN_MANIFEST,
+  MAX_VISION_IMAGE_BYTES,
+  VISION_OCR_TOOL_CAPABILITY_ID,
+  VISION_PLUGIN_ID,
+  VISION_TOOL_CAPABILITY_ID,
+  VisionServiceError
+} from './services/visionService.js';
+import type { PluginHost } from './services/pluginHost.js';
+import {
+  DshLanGatewayComposition,
+  type DshLanGatewayCompositionStatus
+} from './services/dshLanGatewayComposition.js';
+import {
+  DshSessionService,
+  DshTakeoverConfirmationRequiredError
+} from './services/dshSessionService.js';
+import { SecretaryPlanningRepository, OrchestratorPlanningDispatchPort } from './services/secretaryPlanningAdapters.js';
+import { classifySecretaryPlanningRequest } from './services/secretaryPlanningClassifier.js';
+import {
+  LOCAL_PLANNING_ORGANIZATION_ID,
+  SecretaryPlanningControlPlane
+} from './services/secretaryPlanningControlPlane.js';
+import { PlanningError } from './services/secretaryPlanning.js';
+import { ChatService, LOCAL_CHAT_ORGANIZATION_ID, LOCAL_CHAT_PRINCIPAL_ID } from './services/chatService.js';
 import { getMobileToolCatalog, isMobileToolName, MOBILE_TOOL_NAMES } from './services/mobileCatalog.js';
 import { createProvisionedAgent } from './services/mobileAgentProvisioning.js';
 import { importFromHermes, exportToHermes } from './services/hermesSync.js';
@@ -46,19 +99,29 @@ import type {
   AutomationReportKind, CustomerDeliveryInput, CustomerDeliveryStatus, ProjectBudgetInput,
   MemoryForgetInput, MemoryListInput, MemoryProposalDecisionInput, MemoryProposalListInput,
   MemoryRecallInput, MemoryRememberInput, MemoryUpdateInput,
+  DshPluginLifecycleAction,
   TaskScheduleProposalDecisionInput, TaskScheduleProposalListInput,
-  MobileScriptDefinition, MobileToolName, EngineRuntimeConfig
+  MobileScriptDefinition, MobileToolName, EngineRuntimeConfig,
+  DshEmbeddedWorkbenchBounds, OpenDshEmbeddedWorkbenchInput,
+  DshReadEventsInput, DshReleaseControlRequest, DshTakeoverRequest,
+  DshDelegationTreeQueryInput, DshDelegationTreeView, DshChildResultsQueryInput, DshChildResultsAggregateView,
+  DshLanGatewayConfigInput, DshLanGatewayCompositionStatusView, DshLanPairingOfferView, DshLanRoleView,
+  AnswerPlanningQuestionsInput, ApprovePlanningPlanInput, CreatePlanningSessionInput,
+  DispatchPlanningPlanInput, ProposePlanningPlanInput, RejectPlanningPlanInput,
+  PlanningComplexitySignalsInput, PlanningQuestionAnswerInput, QuestSettings
 } from '../shared/types.js';
-import { NEXUS_ENGINE_ID } from '../shared/types.js';
+import { DSH_MANAGED_ENGINE_ID, NEXUS_ENGINE_ID } from '../shared/types.js';
 import { hostname, release } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, extname, join } from 'node:path';
 import { decodeOptionalUtf8Text, decodeUtf8Text } from './services/textEncoding.js';
 import { readRendererSetting, writeRendererSetting } from './services/rendererSettings.js';
 import { BRIDGE_KEY_SECRET_REF } from './services/apiBridge.js';
 import { WEB_TOKEN_SECRET_REF } from './services/webServer.js';
 import { summarizeAppMemory } from './services/appMemory.js';
+import { ensureCordisAgent } from './services/cordisBootstrap.js';
+import { QuestProviderPreflightService } from './services/questProviderPreflight.js';
 
 /** 轻量级运行时参数校验（防御异常/恶意输入穿透） */
 function assertString(v: unknown, field: string, min = 1, max = 500): string {
@@ -66,6 +129,15 @@ function assertString(v: unknown, field: string, min = 1, max = 500): string {
 }
 function assertId(v: unknown, field = 'id'): string {
   return assertString(v, field, 1, 100);
+}
+
+function assertProjectRelativePath(v: unknown, field: string, allowEmpty = false): string {
+  const value = assertString(v, field, allowEmpty ? 0 : 1, 4_096);
+  if ((!allowEmpty && !value) || /^[A-Za-z]:/.test(value) || /^[\\/]/.test(value)
+    || value.split(/[\\/]+/).some((part) => part === '.' || part === '..')) {
+    throw new Error(`${field} 必须是项目目录内的相对路径`);
+  }
+  return value;
 }
 
 function optionalId(v: unknown, field: string): string | null {
@@ -85,10 +157,348 @@ function positiveInteger(v: unknown, field: string): number {
   return v as number;
 }
 
+function nonNegativeInteger(v: unknown, field: string): number {
+  if (!Number.isSafeInteger(v) || (v as number) < 0) throw new Error(`${field} must be a non-negative integer`);
+  return v as number;
+}
+
+function dshCursor(v: unknown, field: string): number {
+  if (!Number.isSafeInteger(v) || (v as number) < -1) throw new Error(`${field} must be an integer >= -1`);
+  return v as number;
+}
+
 function optionalLimit(v: unknown): number | undefined {
   if (v === undefined) return undefined;
   if (!Number.isFinite(v) || (v as number) < 1) throw new Error('limit must be a positive number');
   return Math.trunc(v as number);
+}
+
+function assertRecord(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${field} 必须是对象`);
+  return value as Record<string, unknown>;
+}
+
+/** Rejects unknown keys, and when `required` is supplied also rejects payloads
+ * missing a declared field. Without `required` a validator that reads a field
+ * only conditionally cannot tell "absent" from "not applicable", which is how a
+ * validator once demanded fields its own input type never carried. */
+function assertKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  field: string,
+  required?: readonly string[]
+): void {
+  const keys = new Set(Object.keys(value));
+  for (const key of keys) if (!allowed.includes(key)) throw new Error(`${field} 包含未知字段 ${key}`);
+  if (!required) return;
+  for (const key of required) {
+    if (!allowed.includes(key)) throw new Error(`${field} 校验器错误：必需字段 ${key} 不在允许列表内`);
+    if (!keys.has(key) || value[key] === undefined) throw new Error(`${field} 缺少必需字段 ${key}`);
+  }
+}
+
+function dshEmbeddedBounds(value: unknown, host: BrowserWindow): DshEmbeddedWorkbenchBounds {
+  const input = assertRecord(value, 'DSH 嵌入区域');
+  assertKeys(input, ['x', 'y', 'width', 'height'], 'DSH 嵌入区域');
+  const bounds = {
+    x: nonNegativeInteger(input.x, 'bounds.x'),
+    y: nonNegativeInteger(input.y, 'bounds.y'),
+    width: nonNegativeInteger(input.width, 'bounds.width'),
+    height: nonNegativeInteger(input.height, 'bounds.height')
+  };
+  if (bounds.width < 320 || bounds.height < 240) throw new Error('DSH 嵌入区域不得小于 320x240');
+  const [contentWidth, contentHeight] = host.getContentSize();
+  if (bounds.x + bounds.width > contentWidth || bounds.y + bounds.height > contentHeight) {
+    throw new Error('DSH 嵌入区域超出应用窗口');
+  }
+  return bounds;
+}
+
+/** Keep DSH projection text bounded and safe even if a future adapter emits an
+ * unredacted value. The service already redacts event payloads; this second
+ * boundary prevents an accidental DTO change from widening the renderer API.
+ */
+function rendererProjectionText(value: unknown, max: number): string {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  return text
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
+    .replace(/((?:api[_-]?key|access[_-]?token|password|secret|credential|lease[_-]?token)\s*[:=]\s*["']?)[^\s"',;}]+/gi, '$1[REDACTED]')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .slice(0, max);
+}
+
+function rendererDshDelegationTree(tree: DshSessionTreeView): DshDelegationTreeView {
+  const sessions = tree.sessions.map((entry) => ({
+    sessionId: rendererProjectionText(entry.session.sessionId, 160),
+    agentId: rendererProjectionText(entry.session.agentId, 160),
+    conversationId: entry.session.conversationId === null ? null : rendererProjectionText(entry.session.conversationId, 160),
+    parentSessionId: entry.session.parentSessionId === null ? null : rendererProjectionText(entry.session.parentSessionId, 160),
+    delegationDepth: entry.session.delegationDepth,
+    controlMode: entry.session.controlMode,
+    revision: entry.session.revision,
+    lastEventCursor: entry.session.lastEventCursor,
+    createdAt: entry.session.createdAt,
+    updatedAt: entry.session.updatedAt,
+    childSessionIds: entry.childSessionIds.map((id) => rendererProjectionText(id, 160)),
+    latestRun: entry.latestRun ? {
+      runId: rendererProjectionText(entry.latestRun.id, 160),
+      state: rendererProjectionText(entry.latestRun.state, 80),
+      eventCursor: entry.latestRun.eventCursor,
+      createdAt: entry.latestRun.createdAt,
+      updatedAt: entry.latestRun.updatedAt
+    } : null,
+    active: entry.active,
+    eventCount: entry.eventCount,
+    latestEvent: entry.latestEvent ? {
+      seq: entry.latestEvent.seq,
+      type: rendererProjectionText(entry.latestEvent.type, 120),
+      createdAt: entry.latestEvent.createdAt
+    } : null
+  }));
+  const edges = tree.edges.map((edge) => ({
+    parentSessionId: rendererProjectionText(edge.parentSessionId, 160),
+    childSessionId: rendererProjectionText(edge.childSessionId, 160)
+  }));
+  const orphanSessionIds = tree.orphanSessionIds.slice(0, 200).map((id) => rendererProjectionText(id, 160));
+  const orphanDiagnosticsTruncated = tree.orphanSessionIds.length > orphanSessionIds.length;
+  return {
+    rootSessionId: rendererProjectionText(tree.rootSessionId, 160),
+    requestedSessionId: rendererProjectionText(tree.requestedSessionId, 160),
+    sessions,
+    nodes: sessions,
+    edges,
+    totalNodes: tree.totalNodes,
+    returnedNodes: tree.returnedNodes,
+    truncated: tree.truncated || orphanDiagnosticsTruncated,
+    orphanSessionIds
+  };
+}
+
+function rendererDshChildResults(aggregate: DshChildResultAggregate): DshChildResultsAggregateView {
+  return {
+    rootSessionId: rendererProjectionText(aggregate.rootSessionId, 160),
+    requestedParentSessionId: rendererProjectionText(aggregate.requestedParentSessionId, 160),
+    totalChildren: aggregate.totalChildren,
+    omittedChildren: aggregate.omittedChildren,
+    truncated: aggregate.truncated,
+    generatedAt: aggregate.generatedAt,
+    results: aggregate.results.map((result) => ({
+      sessionId: rendererProjectionText(result.sessionId, 160),
+      parentSessionId: rendererProjectionText(result.parentSessionId, 160),
+      depth: result.depth,
+      runId: result.runId === null ? null : rendererProjectionText(result.runId, 160),
+      status: rendererProjectionText(result.status, 80),
+      summary: rendererProjectionText(result.summary, 4_096),
+      artifactRefs: result.artifactRefs.slice(0, 20).map((ref) => rendererProjectionText(ref, 1_024)),
+      eventRefs: result.eventRefs.slice(-20).map((event) => ({ seq: event.seq, type: rendererProjectionText(event.type, 120) })),
+      truncated: result.truncated,
+      updatedAt: result.updatedAt
+    }))
+  };
+}
+
+function visionMimeForFilename(filename: string): string {
+  switch (extname(filename).toLowerCase()) {
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.webp': return 'image/webp';
+    case '.gif': return 'image/gif';
+    default: throw new VisionServiceError('INVALID_ATTACHMENT', '只支持 PNG、JPEG、WebP 和 GIF 图片');
+  }
+}
+
+function visionBytes(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new VisionServiceError('INVALID_ATTACHMENT', '图片数据格式无效');
+}
+
+function visionUploadInput(value: unknown): { data: Uint8Array; mimeType: string; filename?: string } {
+  const input = assertRecord(value, 'vision attachment');
+  assertKeys(input, ['data', 'mimeType', 'filename'], 'vision attachment');
+  const data = visionBytes(input.data);
+  if (data.byteLength < 1 || data.byteLength > MAX_VISION_IMAGE_BYTES) {
+    throw new VisionServiceError('ATTACHMENT_LIMIT', '图片超过大小限制');
+  }
+  const mimeType = assertString(input.mimeType, 'mimeType', 1, 64).toLowerCase();
+  const filename = input.filename === undefined ? undefined : assertString(input.filename, 'filename', 1, 160);
+  return { data, mimeType, filename };
+}
+
+function assertPlanningSignals(value: unknown): PlanningComplexitySignalsInput {
+  const input = assertRecord(value, 'signals');
+  const allowed = [
+    'departmentIds', 'hasCrossTeamDependencies', 'ambiguousObjective', 'ambiguousScope', 'ambiguousAcceptance',
+    'estimatedDurationMinutes', 'estimatedCost', 'estimatedTokenCount', 'requiresNewTeam', 'irreversibleOperations',
+    'compareAlternatives', 'phasedExecution', 'confirmBeforeExecution', 'estimatedTaskCount'
+  ] as const;
+  assertKeys(input, allowed, 'signals');
+  const boolFields = [
+    'hasCrossTeamDependencies', 'ambiguousObjective', 'ambiguousScope', 'ambiguousAcceptance',
+    'requiresNewTeam', 'compareAlternatives', 'phasedExecution', 'confirmBeforeExecution'
+  ] as const;
+  for (const field of boolFields) if (typeof input[field] !== 'boolean') throw new Error(`signals.${field} 必须是布尔值`);
+  for (const field of ['estimatedDurationMinutes', 'estimatedCost', 'estimatedTokenCount'] as const) {
+    if (typeof input[field] !== 'number' || !Number.isFinite(input[field]) || input[field] < 0) throw new Error(`signals.${field} 无效`);
+  }
+  if (input.estimatedTaskCount !== undefined && (typeof input.estimatedTaskCount !== 'number' || !Number.isSafeInteger(input.estimatedTaskCount) || input.estimatedTaskCount < 0)) {
+    throw new Error('signals.estimatedTaskCount 无效');
+  }
+  if (!Array.isArray(input.departmentIds) || input.departmentIds.length > 32) throw new Error('signals.departmentIds 无效');
+  const departmentIds = input.departmentIds.map((item, index) => assertString(item, `signals.departmentIds[${index}]`, 1, 128));
+  if (!Array.isArray(input.irreversibleOperations) || input.irreversibleOperations.length > 16) throw new Error('signals.irreversibleOperations 无效');
+  const operations = new Set(['write_files', 'install_software', 'send_external_message', 'production_change', 'payment', 'delete_data', 'publish']);
+  const irreversibleOperations = input.irreversibleOperations.map((item) => {
+    if (typeof item !== 'string' || !operations.has(item)) throw new Error('signals.irreversibleOperations 含未知操作');
+    return item as PlanningComplexitySignalsInput['irreversibleOperations'][number];
+  });
+  return {
+    departmentIds,
+    hasCrossTeamDependencies: input.hasCrossTeamDependencies as boolean,
+    ambiguousObjective: input.ambiguousObjective as boolean,
+    ambiguousScope: input.ambiguousScope as boolean,
+    ambiguousAcceptance: input.ambiguousAcceptance as boolean,
+    estimatedDurationMinutes: input.estimatedDurationMinutes as number,
+    estimatedCost: input.estimatedCost as number,
+    estimatedTokenCount: input.estimatedTokenCount as number,
+    requiresNewTeam: input.requiresNewTeam as boolean,
+    irreversibleOperations,
+    compareAlternatives: input.compareAlternatives as boolean,
+    phasedExecution: input.phasedExecution as boolean,
+    confirmBeforeExecution: input.confirmBeforeExecution as boolean,
+    estimatedTaskCount: input.estimatedTaskCount as number | undefined
+  };
+}
+
+function assertPlanningCreateInput(value: unknown): CreatePlanningSessionInput {
+  const input = assertRecord(value, '规划请求');
+  assertKeys(input, ['request', 'signals', 'projectId'], '规划请求', ['request', 'signals']);
+  return {
+    request: decodeUtf8Text(input.request, 'request', 1, 20_000),
+    signals: assertPlanningSignals(input.signals),
+    ...(input.projectId === undefined ? {} : { projectId: assertId(input.projectId, 'projectId') })
+  };
+}
+
+function assertPlanningAnswerInput(value: unknown): AnswerPlanningQuestionsInput {
+  const input = assertRecord(value, '规划回答');
+  assertKeys(input, ['sessionId', 'expectedRevision', 'questionSetVersion', 'answers'], '规划回答',
+    ['sessionId', 'expectedRevision', 'questionSetVersion', 'answers']);
+  const expectedRevision = positiveInteger(input.expectedRevision, 'expectedRevision');
+  const questionSetVersion = positiveInteger(input.questionSetVersion, 'questionSetVersion');
+  if (!Array.isArray(input.answers) || input.answers.length > 3) throw new Error('answers 必须包含不超过 3 项');
+  const answers: PlanningQuestionAnswerInput[] = input.answers.map((raw, index) => {
+    const answer = assertRecord(raw, `answers[${index}]`);
+    assertKeys(answer, ['questionId', 'selectedOptionIds', 'text'], `answers[${index}]`);
+    if (!Array.isArray(answer.selectedOptionIds) || answer.selectedOptionIds.length > 4) throw new Error(`answers[${index}].selectedOptionIds 无效`);
+    const selectedOptionIds = answer.selectedOptionIds.map((id, optionIndex) => assertString(id, `answers[${index}].selectedOptionIds[${optionIndex}]`, 1, 128));
+    const text = answer.text === null ? null : decodeUtf8Text(answer.text, `answers[${index}].text`, 0, 4_000);
+    return { questionId: assertString(answer.questionId, `answers[${index}].questionId`, 1, 128), selectedOptionIds, text };
+  });
+  return { sessionId: assertId(input.sessionId, 'sessionId'), expectedRevision, questionSetVersion, answers };
+}
+
+function assertPlanningProposalInput(value: unknown): ProposePlanningPlanInput {
+  const input = assertRecord(value, '规划提案');
+  assertKeys(input, ['sessionId', 'expectedRevision'], '规划提案', ['sessionId', 'expectedRevision']);
+  return {
+    sessionId: assertId(input.sessionId, '规划提案.sessionId'),
+    expectedRevision: positiveInteger(input.expectedRevision, '规划提案.expectedRevision')
+  };
+}
+
+function assertPlanningDecisionInput(value: unknown, field: string): ApprovePlanningPlanInput {
+  const input = assertRecord(value, field);
+  assertKeys(input, ['sessionId', 'expectedRevision', 'version', 'hash'], field,
+    ['sessionId', 'expectedRevision', 'version', 'hash']);
+  const hash = assertString(input.hash, `${field}.hash`, 64, 64);
+  if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error(`${field}.hash 必须是小写 SHA-256`);
+  const result = {
+    sessionId: assertId(input.sessionId, `${field}.sessionId`),
+    expectedRevision: positiveInteger(input.expectedRevision, `${field}.expectedRevision`),
+    version: positiveInteger(input.version, `${field}.version`),
+    hash
+  };
+  return result;
+}
+
+/**
+ * DSH Quest decisions are deliberately a separate wire shape. Do not infer a
+ * project or DSH root from the legacy Secretary session id: the governance
+ * binding is the authority boundary and is checked again below.
+ */
+function hasDshQuestMarker(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  return ['planningSessionId', 'projectId', 'dshSessionId', 'principalId', 'dshQuestionSetId', 'dshPlanId', 'dshVersion']
+    .some((key) => Object.prototype.hasOwnProperty.call(input, key));
+}
+
+function parseDshQuestIdentity(input: Record<string, unknown>, field: string): {
+  planningSessionId: string;
+  projectId: string;
+  dshSessionId: string;
+  principalId: string;
+  expectedRevision: number;
+} {
+  for (const key of ['planningSessionId', 'projectId', 'dshSessionId', 'principalId', 'expectedRevision']) {
+    if (!Object.prototype.hasOwnProperty.call(input, key)) throw new Error(`${field} missing ${key}`);
+  }
+  return {
+    planningSessionId: assertString(input.planningSessionId, `${field}.planningSessionId`, 1, 128),
+    projectId: assertString(input.projectId, `${field}.projectId`, 1, 128),
+    dshSessionId: assertString(input.dshSessionId, `${field}.dshSessionId`, 1, 128),
+    principalId: assertString(input.principalId, `${field}.principalId`, 1, 128),
+    expectedRevision: positiveInteger(input.expectedRevision, `${field}.expectedRevision`)
+  };
+}
+
+function assertDshQuestAnswerInput(value: unknown): AnswerDshQuestQuestionsInput {
+  const input = assertRecord(value, 'DSH Quest answer');
+  assertKeys(input, [
+    'planningSessionId', 'projectId', 'dshSessionId', 'principalId', 'expectedRevision',
+    'dshQuestionSetId', 'dshVersion', 'answers'
+  ], 'DSH Quest answer');
+  const identity = parseDshQuestIdentity(input, 'DSH Quest answer');
+  if (!Array.isArray(input.answers) || input.answers.length > 3) throw new Error('DSH Quest answers must contain at most 3 items');
+  const answers: PlanningQuestionAnswerInput[] = input.answers.map((raw, index) => {
+    const answer = assertRecord(raw, `DSH Quest answers[${index}]`);
+    assertKeys(answer, ['questionId', 'selectedOptionIds', 'text'], `DSH Quest answers[${index}]`);
+    if (!Array.isArray(answer.selectedOptionIds) || answer.selectedOptionIds.length > 4) {
+      throw new Error(`DSH Quest answers[${index}].selectedOptionIds is invalid`);
+    }
+    return {
+      questionId: assertString(answer.questionId, `DSH Quest answers[${index}].questionId`, 1, 128),
+      selectedOptionIds: answer.selectedOptionIds.map((id, optionIndex) =>
+        assertString(id, `DSH Quest answers[${index}].selectedOptionIds[${optionIndex}]`, 1, 128)),
+      text: answer.text === null ? null : decodeUtf8Text(answer.text, `DSH Quest answers[${index}].text`, 0, 4_000)
+    };
+  });
+  return {
+    ...identity,
+    dshQuestionSetId: assertString(input.dshQuestionSetId, 'DSH Quest answer.dshQuestionSetId', 1, 128),
+    dshVersion: positiveInteger(input.dshVersion, 'DSH Quest answer.dshVersion'),
+    answers
+  };
+}
+
+function assertDshQuestDecisionInput(value: unknown, field: string): ApproveDshQuestPlanInput {
+  const input = assertRecord(value, field);
+  assertKeys(input, [
+    'planningSessionId', 'projectId', 'dshSessionId', 'principalId', 'expectedRevision',
+    'dshPlanId', 'dshVersion', 'hash'
+  ], field);
+  const identity = parseDshQuestIdentity(input, field);
+  const hash = assertString(input.hash, `${field}.hash`, 64, 64);
+  if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error(`${field}.hash must be lowercase SHA-256`);
+  return {
+    ...identity,
+    dshPlanId: assertString(input.dshPlanId, `${field}.dshPlanId`, 1, 128),
+    dshVersion: positiveInteger(input.dshVersion, `${field}.dshVersion`),
+    hash
+  };
 }
 
 const LOCAL_MEMORY_ORGANIZATION_ID = 'org-local';
@@ -106,6 +516,57 @@ export function assertVoiceAudioChunk(value: unknown): ArrayBuffer {
 function assertPort(v: unknown): number {
   if (!Number.isInteger(v) || (v as number) < 1024 || (v as number) > 65535) throw new Error('端口必须为 1024-65535 的整数');
   return v as number;
+}
+
+function assertDshLanPort(v: unknown, field: string, allowWellKnown = false): number {
+  const minimum = allowWellKnown ? 1 : 1024;
+  if (!Number.isSafeInteger(v) || (v as number) < minimum || (v as number) > 65535) {
+    throw new Error(`${field} must be an integer between ${minimum} and 65535`);
+  }
+  return v as number;
+}
+
+function assertDshLanConfigInput(value: unknown): DshLanGatewayConfigInput {
+  const input = assertRecord(value, 'DSH LAN Gateway config');
+  assertKeys(input, ['bindHost', 'port', 'publicHost', 'publicPort'], 'DSH LAN Gateway config');
+  const result: DshLanGatewayConfigInput = {
+    bindHost: assertString(input.bindHost, 'bindHost', 1, 64)
+  };
+  if (input.port !== undefined) result.port = assertDshLanPort(input.port, 'port');
+  if (input.publicHost !== undefined) result.publicHost = assertString(input.publicHost, 'publicHost', 1, 255);
+  if (input.publicPort !== undefined) result.publicPort = assertDshLanPort(input.publicPort, 'publicPort', true);
+  return result;
+}
+
+function assertDshLanRole(value: unknown): DshLanRoleView {
+  if (value !== 'viewer' && value !== 'operator') throw new Error('DSH LAN role must be viewer or operator');
+  return value;
+}
+
+function dshLanStatusView(status: DshLanGatewayCompositionStatus): DshLanGatewayCompositionStatusView {
+  return {
+    desiredEnabled: status.desiredEnabled,
+    configured: status.configured ? { ...status.configured } : null,
+    gateway: {
+      state: status.gateway.state,
+      enabled: status.gateway.enabled,
+      running: status.gateway.running,
+      bindHost: status.gateway.bindHost,
+      port: status.gateway.port,
+      authority: status.gateway.authority,
+      origin: status.gateway.origin,
+      trustedAuthorities: [...status.gateway.trustedAuthorities],
+      runtimeId: status.gateway.runtimeId,
+      activeSessions: status.gateway.activeSessions,
+      activeRequests: status.gateway.activeRequests,
+      activeWebSockets: status.gateway.activeWebSockets,
+      certificateFingerprint: status.gateway.certificateFingerprint,
+      lastError: status.gateway.lastError
+    },
+    lastError: status.lastError,
+    boundRuntime: status.boundRuntime ? { ...status.boundRuntime } : null,
+    eligibleRuntimeCount: status.eligibleRuntimeCount
+  };
 }
 
 function assertMobileTool(v: unknown): MobileToolName {
@@ -179,6 +640,8 @@ export interface IpcDeps {
   wfPlatforms: WfPlatformManager;
   collab: CollabManager;
   ocr: import('./services/ocrService.js').OcrService;
+  vision: VisionService;
+  visionPluginHost?: PluginHost;
   voice: import('./services/voiceService.js').VoiceService;
   apiBridge: import('./services/apiBridge.js').ApiBridge;
   webServer: import('./services/webServer.js').WebServer;
@@ -187,11 +650,193 @@ export interface IpcDeps {
   memory: MemoryService;
   memoryProposals: MemoryProposalService;
   taskScheduleProposals: TaskScheduleProposalService;
+  dsh: DshIntegrationService;
+  dshSessions: DshSessionService;
+  /** Optional in focused fixtures; production supplies the bounded DSH projection service. */
+  dshDelegation?: DshDelegationService;
+  /** Optional in focused test fixtures; production always provides the read-only catalog. */
+  dshPluginCatalog?: DshPluginCatalogService;
+  /** Main-owned curated community plugin lifecycle for each DSH Web profile. */
+  dshCommunityPlugins?: DshCommunityPluginService;
+  /** Unified renderer-safe view over DSH, Host, MCP and Skill plugins. */
+  pluginCatalog?: PluginCatalogService;
+  /** Main-process environment/runtime diagnostics; native libraries are never loaded. */
+  environmentDiagnostics?: EnvironmentDiagnosticsService;
+  /** Project-centric DSH/Cordis and Quest projection. */
+  projectWorkbench?: ProjectWorkbenchService;
+  /** Project-scoped file listing and short-lived preview authorization. */
+  projectArtifacts?: ProjectArtifactService;
+  /** Main-only project root resolver; upstream ids never cross IPC. */
+  dshQuestSessions?: DshQuestSessionBindingService;
+  /** Main-owned DSH Quest governance boundary for owner decisions. */
+  dshQuestGovernance?: DshQuestGovernanceService;
+  /** Trusted renderer shell used for project-scoped Quest-only windows. */
+  questWindows?: QuestWindowManager;
+  /** Optional LAN composition is initialized by the DSH gateway slice. */
+  dshLan?: DshLanGatewayComposition;
+  /** Restores or creates the regular desktop control center from a Quest-only launch. */
+  openMainSurface: () => void;
   getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerIpc(deps: IpcDeps) {
-  const { db, orchestrator, desktopControlPlane, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, voice, webServer, mobile, mobileAdb, memory, memoryProposals, taskScheduleProposals, getMainWindow } = deps;
+  const { db, orchestrator, desktopControlPlane, executors, engines, channels, feishu, wecom, weixin, scheduler, broker, monitor, mcp, skills, providers, workflows, projects, deliverables, knowledge, automation, discovery, teams, wfPlatforms, collab, ocr, vision, visionPluginHost, voice, webServer, mobile, mobileAdb, memory, memoryProposals, taskScheduleProposals, dsh, dshSessions, dshDelegation, dshPluginCatalog, dshCommunityPlugins, pluginCatalog, environmentDiagnostics, projectWorkbench, projectArtifacts, dshQuestSessions, dshQuestGovernance, dshLan, questWindows, openMainSurface, getMainWindow } = deps;
+  const questWindowService = questWindows && typeof questWindows === 'object' ? questWindows : null;
+  const questProviderPreflight = new QuestProviderPreflightService(db, providers);
+  const windowForSender = (event: IpcMainInvokeEvent): BrowserWindow | null => {
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    return senderWindow && !senderWindow.isDestroyed() ? senderWindow : getMainWindow();
+  };
+  const usableProjectDirectory = (candidate: unknown): candidate is string => {
+    if (typeof candidate !== 'string' || !candidate.trim()) return false;
+    try {
+      const stat = lstatSync(candidate);
+      return stat.isDirectory() && !stat.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  const ensureProjectWorkspace = async (
+    event: IpcMainInvokeEvent,
+    projectId: string
+  ): Promise<{ workspace: string; changed: boolean } | null> => {
+    if (!projectWorkbench) return null;
+    const existing = projectWorkbench.getExplicitWorkspacePath(projectId);
+    if (usableProjectDirectory(existing)) return { workspace: existing, changed: false };
+    const owner = windowForSender(event);
+    if (!owner) throw new Error('应用窗口不可用，无法选择项目目录');
+    const result = await dialog.showOpenDialog(owner, {
+      title: '选择项目工作目录',
+      properties: ['openDirectory', 'createDirectory']
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    const selected = result.filePaths[0];
+    if (!usableProjectDirectory(selected)) throw new Error('选择的路径不是有效目录，或目录是符号链接');
+    projectWorkbench.setWorkspacePath(projectId, selected);
+    return { workspace: selected, changed: true };
+  };
+  const chatService = new ChatService(db);
+  const localChatAgent = (agentId: string) => {
+    const listedAgents = orchestrator.listAgents?.();
+    // A few isolated IPC tests provide a deliberately minimal orchestrator
+    // double. Production always returns an array; keep that test seam narrow
+    // without weakening the real database organization check below.
+    const agent = Array.isArray(listedAgents)
+      ? listedAgents.find((candidate) => candidate.id === agentId)
+      : { id: agentId, archived: false, engineId: NEXUS_ENGINE_ID } as ReturnType<Orchestrator['listAgents']>[number];
+    const row = db.raw.prepare('SELECT organization_id, archived FROM agents WHERE id = ? LIMIT 1').get(agentId) as { organization_id?: string; archived?: number } | undefined;
+    if (!agent || agent.archived || (row && (row.organization_id !== LOCAL_CHAT_ORGANIZATION_ID || Number(row.archived ?? 0) !== 0))) {
+      throw new Error('数字员工不存在或无权访问');
+    }
+    return agent;
+  };
+
+  const requireDshLan = (): DshLanGatewayComposition => {
+    if (!dshLan) throw new Error('DSH LAN Gateway is unavailable');
+    return dshLan;
+  };
+
+  // Planning tables and the control plane are initialized on first use. This
+  // keeps existing IPC registration/tests independent from the additive schema.
+  let planningControlPlane: SecretaryPlanningControlPlane | null = null;
+  const initializeLegacyPlanningProjectBindings = (): void => {
+    db.raw.prepare(
+      `CREATE TABLE IF NOT EXISTS legacy_planning_project_bindings (
+        planning_session_id TEXT PRIMARY KEY REFERENCES planning_sessions(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+        organization_id TEXT NOT NULL REFERENCES organizations(id),
+        created_at INTEGER NOT NULL
+      )`
+    ).run();
+  };
+  const resolveLegacyPlanningProjectId = (planningSessionId: string): string | null => {
+    const row = db.raw.prepare(
+      `SELECT b.project_id
+       FROM legacy_planning_project_bindings b
+       JOIN planning_sessions s ON s.id = b.planning_session_id
+       JOIN projects p ON p.id = b.project_id
+       WHERE b.planning_session_id = ?
+         AND b.organization_id = s.organization_id
+         AND p.organization_id = s.organization_id
+         AND p.status != 'archived'`
+    ).get(planningSessionId) as { project_id?: unknown } | undefined;
+    return typeof row?.project_id === 'string' && row.project_id.length > 0 ? row.project_id : null;
+  };
+  const getPlanningControlPlane = (): SecretaryPlanningControlPlane => {
+    if (!planningControlPlane) {
+      const repository = new SecretaryPlanningRepository(db);
+      initializeLegacyPlanningProjectBindings();
+      planningControlPlane = new SecretaryPlanningControlPlane({
+        db,
+        repository,
+        // A legacy Local CLI plan may remain readable without a project, but
+        // dispatch fails closed instead of creating project_id = NULL tasks.
+        dispatchPort: new OrchestratorPlanningDispatchPort(orchestrator, {
+          resolveProjectId: resolveLegacyPlanningProjectId
+        })
+      });
+    }
+    return planningControlPlane;
+  };
+  const bindLegacyPlanningProject = (planningSessionId: string, projectId: string): void => {
+    const project = db.raw.prepare(
+      `SELECT id, organization_id FROM projects
+       WHERE id = ? AND status != 'archived'`
+    ).get(projectId) as { id?: unknown; organization_id?: unknown } | undefined;
+    if (project?.id !== projectId || project.organization_id !== LOCAL_PLANNING_ORGANIZATION_ID) {
+      throw new PlanningError('PROJECT_BOUNDARY', 'legacy planning project does not exist, is archived, or belongs to another organization');
+    }
+    db.raw.prepare(
+      `INSERT INTO legacy_planning_project_bindings(
+        planning_session_id, project_id, organization_id, created_at
+      ) VALUES(?, ?, ?, ?) ON CONFLICT(planning_session_id) DO NOTHING`
+    ).run(planningSessionId, projectId, LOCAL_PLANNING_ORGANIZATION_ID, Date.now());
+    if (resolveLegacyPlanningProjectId(planningSessionId) !== projectId) {
+      throw new PlanningError('PROJECT_BOUNDARY', 'legacy planning session has a conflicting project binding');
+    }
+    db.audit({
+      id: randomUUID(), actor: 'principal-local-admin', action: 'planning.project.bind',
+      target: planningSessionId, result: `project=${projectId}`, source: 'desktop'
+    });
+  };
+
+  const dshGovernanceService = (): DshQuestGovernanceService | null => {
+    if (!dshQuestGovernance || typeof (dshQuestGovernance as { getBinding?: unknown }).getBinding !== 'function') return null;
+    return dshQuestGovernance;
+  };
+
+  const requireDshQuestGovernance = (): DshQuestGovernanceService => {
+    const service = dshGovernanceService();
+    if (!service) throw new PlanningError('DSH_QUEST_UNAVAILABLE', 'DSH Quest governance is unavailable');
+    return service;
+  };
+
+  /** Return a binding only when this is a real DSH Quest; preserve legacy sessions otherwise. */
+  const dshQuestBinding = (planningSessionId: string) => {
+    const service = dshGovernanceService();
+    if (!service) return null;
+    try {
+      return service.getBinding(planningSessionId);
+    } catch (error) {
+      if ((error as { code?: unknown })?.code === 'SESSION_NOT_FOUND') return null;
+      throw error;
+    }
+  };
+
+  const assertBoundDshQuestIdentity = <T extends {
+    planningSessionId: string;
+    projectId: string;
+    dshSessionId: string;
+    principalId: string;
+  }>(input: T) => {
+    const binding = requireDshQuestGovernance().getBinding(input.planningSessionId);
+    if (binding.projectId !== input.projectId) throw new PlanningError('PROJECT_BOUNDARY', 'DSH Quest project identity does not match its binding');
+    if (binding.dshSessionId !== input.dshSessionId) throw new PlanningError('SESSION_BOUNDARY', 'DSH Quest root session does not match its binding');
+    if (binding.principalId !== input.principalId) throw new PlanningError('PRINCIPAL_BOUNDARY', 'DSH Quest principal does not match its binding');
+    return binding;
+  };
+
+  const dshQuestView = (view: unknown): DshQuestGovernanceView => view as DshQuestGovernanceView;
 
   const broadcast = (channel: string, payload: unknown) => {
     for (const win of BrowserWindow.getAllWindows()) {
@@ -358,6 +1003,52 @@ export function registerIpc(deps: IpcDeps) {
     return project;
   });
   ipcMain.handle('aibox:getProjectOperations', () => projects.operations(deliverables.list()));
+  if (projectWorkbench) {
+    ipcMain.handle('aibox:getProjectWorkbench', (_e, projectId: string) =>
+      projectWorkbench.get(assertId(projectId, 'projectId')));
+    ipcMain.handle('aibox:saveQuestSettings', (_e, projectId: string, patch: Partial<QuestSettings>) => {
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Quest 设置无效');
+      return projectWorkbench.saveSettings(assertId(projectId, 'projectId'), patch);
+    });
+    ipcMain.handle('aibox:bindProjectRootSession', (_e, projectId: string, sessionId: string) => {
+      projectWorkbench.bindRootSession(assertId(projectId, 'projectId'), assertId(sessionId, 'sessionId'));
+      return { ok: true };
+    });
+    ipcMain.handle('aibox:openProjectWorkspace', async (event, projectId: string) => {
+      const id = assertId(projectId, 'projectId');
+      const resolved = await ensureProjectWorkspace(event, id);
+      if (!resolved) return { ok: false, message: '已取消选择项目目录', workspaceChanged: false };
+      const error = await shell.openPath(resolved.workspace);
+      return error
+        ? { ok: false, message: error, workspaceChanged: resolved.changed }
+        : { ok: true, message: '', workspaceChanged: resolved.changed };
+    });
+    if (projectArtifacts) {
+      ipcMain.handle('aibox:listProjectArtifacts', (_event, projectId: string, relativeDirectory?: string) =>
+        projectArtifacts.list(
+          assertId(projectId, 'projectId'),
+          relativeDirectory === undefined ? '' : assertProjectRelativePath(relativeDirectory, 'relativeDirectory', true)
+        ));
+      ipcMain.handle('aibox:previewProjectArtifact', (_event, projectId: string, relativePath: string) =>
+        projectArtifacts.preview(
+          assertId(projectId, 'projectId'),
+          assertProjectRelativePath(relativePath, 'relativePath')
+        ));
+      ipcMain.handle('aibox:hashProjectArtifact', (_event, projectId: string, relativePath: string) =>
+        projectArtifacts.hash(
+          assertId(projectId, 'projectId'),
+          assertProjectRelativePath(relativePath, 'relativePath')
+        ));
+      ipcMain.handle('aibox:revealProjectArtifact', (_event, projectId: string, relativePath: string) => {
+        const target = projectArtifacts.resolveForReveal(
+          assertId(projectId, 'projectId'),
+          assertProjectRelativePath(relativePath, 'relativePath')
+        );
+        shell.showItemInFolder(target);
+        return { ok: true };
+      });
+    }
+  }
 
   // ---------- 项目经营自动化 ----------
   ipcMain.handle('aibox:getAutomationOverview', (_e, projectId?: string) =>
@@ -486,12 +1177,614 @@ export function registerIpc(deps: IpcDeps) {
     pushSnapshot();
     return agent;
   });
-  ipcMain.handle('aibox:startAgent', (_e, id: string) => orchestrator.startAgent(assertId(id)));
-  ipcMain.handle('aibox:stopAgent', (_e, id: string) => orchestrator.stopAgent(assertId(id)));
+  const getActiveAgent = (value: unknown) => {
+    const safeId = assertId(value);
+    const agent = orchestrator.listAgents().find((candidate) => candidate.id === safeId);
+    if (!agent) throw new Error('数字员工不存在');
+    return agent;
+  };
+  const startAgentWithRuntime = async (value: unknown): Promise<void> => {
+    const agent = getActiveAgent(value);
+    // Managed DSH must be ready before the lifecycle becomes READY; otherwise
+    // the scheduler can dispatch into a process that is still starting.
+    if (agent.engineId === DSH_MANAGED_ENGINE_ID) await dsh.start(agent);
+    orchestrator.startAgent(agent.id);
+  };
+  const stopAgentWithRuntime = async (value: unknown): Promise<void> => {
+    const agent = getActiveAgent(value);
+    // Keep the employee schedulable when a managed runtime refuses to stop.
+    // This makes the failure visible instead of claiming a completed shutdown.
+    if (agent.engineId === DSH_MANAGED_ENGINE_ID) await dsh.stop(agent.id);
+    orchestrator.stopAgent(agent.id);
+  };
+  ipcMain.handle('aibox:startAgent', async (_e, id: string) => {
+    await startAgentWithRuntime(id);
+  });
+  ipcMain.handle('aibox:stopAgent', async (_e, id: string) => {
+    await stopAgentWithRuntime(id);
+  });
+  const managedDshAgent = (value: unknown) => {
+    const safeId = assertId(value, 'agentId');
+    const agent = orchestrator.listAgents().find((candidate) => candidate.id === safeId);
+    if (!agent || agent.archived) throw new Error('DSH 数字员工不存在');
+    if (agent.engineId !== DSH_MANAGED_ENGINE_ID) throw new Error('该数字员工未使用 DSH 模式');
+    return agent;
+  };
+  ipcMain.handle('aibox:getDshRuntimeStatus', (_e, agentId: string) => {
+    const agent = managedDshAgent(agentId);
+    return dsh.getStatus(agent.id);
+  });
+  ipcMain.handle('aibox:preflightQuestProvider', async (_event, value: unknown) => {
+    if (!projectWorkbench) throw new Error('项目工作台不可用');
+    const input = assertRecord(value, 'Quest Provider 预检请求');
+    assertKeys(input, ['projectId', 'agentId'], 'Quest Provider 预检请求');
+    const projectId = assertId(input.projectId, 'projectId');
+    const agent = managedDshAgent(input.agentId);
+    const projectView = projectWorkbench.get(projectId);
+    if (projectView.project.status === 'archived') throw new Error('已归档项目不能启动 Quest');
+    if (projectView.rootSession && projectView.rootSession.agentId !== agent.id) {
+      throw new Error('当前项目已绑定到其他 DSH 数字员工');
+    }
+    const result = await questProviderPreflight.probe(agent.id);
+    db.audit({
+      id: randomUUID(), actor: 'admin', action: 'quest.provider.preflight',
+      target: `${projectId}:${agent.id}`, result: result.code
+    });
+    return result;
+  });
+  ipcMain.handle('aibox:startDshRuntime', async (_e, agentId: string) => {
+    const agent = managedDshAgent(agentId);
+    const result = await dsh.start(agent);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.runtime.start', target: agent.id, result: 'ok' });
+    return result;
+  });
+  ipcMain.handle('aibox:stopDshRuntime', async (_e, agentId: string) => {
+    const agent = managedDshAgent(agentId);
+    const result = await dsh.stop(agent.id);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.runtime.stop', target: agent.id, result: 'ok' });
+    return result;
+  });
+  ipcMain.handle('aibox:openDshWorkbench', async (_e, agentId: string) => {
+    const agent = managedDshAgent(agentId);
+    const result = await dsh.openWorkbench(agent);
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.workbench.open', target: agent.id, result: 'ok' });
+    return result;
+  });
+  ipcMain.handle('aibox:openQuestWindow', async (_event, value: unknown) => {
+    if (!questWindowService) throw new Error('Quest 独立窗口不可用');
+    if (!projectWorkbench) throw new Error('项目工作台不可用');
+    const input = assertRecord(value, 'Quest 独立窗口请求');
+    assertKeys(input, ['projectId'], 'Quest 独立窗口请求');
+    const projectId = assertId(input.projectId, 'projectId');
+    const projectView = projectWorkbench.get(projectId);
+    if (projectView.project.status === 'archived') throw new Error('已归档项目不能打开 Quest');
+
+    // Opening the trusted Quest shell must not depend on Provider credentials
+    // or a healthy DSH process. The renderer opens the embedded workbench next;
+    // that guarded IPC owns runtime/session setup and projects failures into the
+    // in-window recovery UI.
+    const status = await questWindowService.open(projectId);
+    db.audit({
+      id: randomUUID(), actor: 'admin', action: 'quest.window.open',
+      target: projectId, result: 'ok'
+    });
+    return status;
+  });
+  ipcMain.handle('aibox:openMainSurface', async (event) => {
+    const main = getMainWindow();
+    const ownedByMain = Boolean(main && !main.isDestroyed() && event.sender === main.webContents);
+    const ownedByQuest = questWindowService?.ownsWebContents(event.sender) ?? false;
+    if ((!ownedByMain && !ownedByQuest) || event.senderFrame !== event.sender.mainFrame) {
+      throw new Error('主控制台只能由可信的应用窗口打开');
+    }
+    openMainSurface();
+    db.audit({
+      id: randomUUID(), actor: 'admin', action: 'desktop.main.open',
+      target: ownedByQuest ? 'quest-window' : 'main-window', result: 'ok'
+    });
+    return { ok: true as const };
+  });
+  let embeddedWorkbenchRequestRevision = 0;
+  let embeddedWorkbenchMutationTail: Promise<void> = Promise.resolve();
+  let embeddedWorkbenchOwner: Electron.WebContents | null = null;
+  const enqueueEmbeddedWorkbenchMutation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const run = embeddedWorkbenchMutationTail.then(operation, operation);
+    embeddedWorkbenchMutationTail = run.then(() => undefined, () => undefined);
+    return run;
+  };
+  const assertCurrentEmbeddedWorkbenchRequest = (revision: number): void => {
+    if (revision !== embeddedWorkbenchRequestRevision) {
+      throw new Error('DSH embedded Workbench request was superseded');
+    }
+  };
+  const embeddedWorkbenchHost = (event: Electron.IpcMainInvokeEvent): {
+    host: BrowserWindow;
+    surface: 'main' | 'quest';
+  } => {
+    const main = getMainWindow();
+    const quest = questWindowService?.ownsWebContents(event.sender) ? questWindowService.getWindow() : null;
+    const host = main && !main.isDestroyed() && event.sender === main.webContents
+      ? main
+      : quest && !quest.isDestroyed()
+        ? quest
+        : null;
+    if (!host || event.senderFrame !== host.webContents.mainFrame) {
+      throw new Error('DSH 嵌入工作台只能由可信的主应用或 Quest 窗口控制');
+    }
+    return { host, surface: host === main ? 'main' : 'quest' };
+  };
+  const liveEmbeddedWorkbenchOwner = (): Electron.WebContents | null => {
+    if (embeddedWorkbenchOwner
+      && typeof embeddedWorkbenchOwner.isDestroyed === 'function'
+      && embeddedWorkbenchOwner.isDestroyed()) {
+      embeddedWorkbenchOwner = null;
+    }
+    return embeddedWorkbenchOwner;
+  };
+  const assertEmbeddedWorkbenchOwner = (event: Electron.IpcMainInvokeEvent): BrowserWindow => {
+    const { host } = embeddedWorkbenchHost(event);
+    const owner = liveEmbeddedWorkbenchOwner();
+    if (owner && owner !== event.sender) throw new Error('DSH 工作区当前由另一个 Quest 窗口控制');
+    if (!owner) embeddedWorkbenchOwner = event.sender;
+    return host;
+  };
+  ipcMain.handle('aibox:openEmbeddedDshWorkbench', async (event, value: unknown) => {
+    if (!dshQuestSessions) throw new Error('DSH Quest root session service is unavailable');
+    if (!projectWorkbench) throw new Error('项目工作台不可用');
+    const input = assertRecord(value, 'DSH 嵌入工作台请求');
+    assertKeys(input, ['projectId', 'agentId', 'sessionId', 'bounds'], 'DSH 嵌入工作台请求');
+    const request: OpenDshEmbeddedWorkbenchInput = {
+      projectId: assertId(input.projectId, 'projectId'),
+      agentId: assertId(input.agentId, 'agentId'),
+      sessionId: optionalId(input.sessionId, 'sessionId'),
+      bounds: { x: 0, y: 0, width: 0, height: 0 }
+    };
+    const hostContext = embeddedWorkbenchHost(event);
+    const host = hostContext.host;
+    request.bounds = dshEmbeddedBounds(input.bounds, host);
+    if (hostContext.surface === 'quest' && questWindowService?.getProjectId() !== request.projectId) {
+      throw new Error('Quest 独立窗口项目上下文不匹配');
+    }
+    const projectView = projectWorkbench.get(request.projectId);
+    if (request.sessionId !== null && projectView.rootSession?.sessionId !== request.sessionId) {
+      throw new Error('DSH 会话不属于当前项目根会话');
+    }
+    const agent = managedDshAgent(request.agentId);
+    if (projectView.rootSession && projectView.rootSession.agentId !== agent.id) {
+      throw new Error('当前项目已绑定到其他 DSH 数字员工');
+    }
+    const projectWorkspace = await ensureProjectWorkspace(event, request.projectId);
+    if (!projectWorkspace) throw new Error('需要先选择项目工作目录才能启动 Quest');
+    const previousOwner = liveEmbeddedWorkbenchOwner();
+    if (previousOwner && previousOwner !== event.sender
+      && hostContext.surface === 'main' && questWindowService?.ownsWebContents(previousOwner)) {
+      throw new Error('独立 Quest 窗口正在使用 DSH 工作区');
+    }
+    embeddedWorkbenchOwner = event.sender;
+    const requestRevision = ++embeddedWorkbenchRequestRevision;
+    try {
+      const binding = await dshQuestSessions.resolveOrCreate({
+        projectId: request.projectId,
+        agent,
+        requestedSessionId: request.sessionId
+      });
+      await dshLan?.selectRuntime(agent.id, binding.profileId);
+      assertCurrentEmbeddedWorkbenchRequest(requestRevision);
+      const status = await enqueueEmbeddedWorkbenchMutation(async () => {
+        assertCurrentEmbeddedWorkbenchRequest(requestRevision);
+        const opened = await dsh.openEmbeddedWorkbench(
+          agent,
+          host,
+          request.bounds,
+          binding.upstreamSessionId,
+          { profileId: binding.profileId, workspace: binding.runtimeWorkspace }
+        );
+        if (requestRevision !== embeddedWorkbenchRequestRevision) {
+          await dsh.closeEmbeddedWorkbench();
+          throw new Error('DSH embedded Workbench request was superseded');
+        }
+        return opened;
+      });
+      db.audit({
+        id: randomUUID(), actor: 'admin', action: 'dsh.workbench.embed.open',
+        target: `${request.projectId}:${agent.id}`, result: 'ok'
+      });
+      return status;
+    } catch (error) {
+      if (requestRevision === embeddedWorkbenchRequestRevision
+        && embeddedWorkbenchOwner === event.sender) {
+        const previousDestroyed = previousOwner
+          && typeof previousOwner.isDestroyed === 'function'
+          && previousOwner.isDestroyed();
+        const recoveredOwner = previousOwner && !previousDestroyed ? previousOwner : null;
+        embeddedWorkbenchOwner = recoveredOwner;
+        if (recoveredOwner && recoveredOwner !== event.sender) {
+          setTimeout(() => {
+            if (recoveredOwner.isDestroyed()) return;
+            recoveredOwner.send('aibox:questWindowClosed', null);
+          }, 0);
+        }
+      }
+      throw error;
+    }
+  });
+  ipcMain.handle('aibox:setEmbeddedDshWorkbenchBounds', (event, value: unknown) => {
+    const host = assertEmbeddedWorkbenchOwner(event);
+    return dsh.setEmbeddedWorkbenchBounds(dshEmbeddedBounds(value, host));
+  });
+  ipcMain.handle('aibox:setEmbeddedDshWorkbenchVisible', (event, visible: unknown) => {
+    assertEmbeddedWorkbenchOwner(event);
+    if (typeof visible !== 'boolean') throw new Error('DSH 嵌入工作台可见性必须是布尔值');
+    return dsh.setEmbeddedWorkbenchVisible(visible);
+  });
+  ipcMain.handle('aibox:closeEmbeddedDshWorkbench', (event) => {
+    assertEmbeddedWorkbenchOwner(event);
+    embeddedWorkbenchRequestRevision += 1;
+    return enqueueEmbeddedWorkbenchMutation(async () => {
+      const status = await dsh.closeEmbeddedWorkbench();
+      if (embeddedWorkbenchOwner === event.sender) embeddedWorkbenchOwner = null;
+      return status;
+    });
+  });
+  ipcMain.handle('aibox:getEmbeddedDshWorkbenchStatus', (event) => {
+    assertEmbeddedWorkbenchOwner(event);
+    return dsh.getEmbeddedWorkbenchStatus();
+  });
+  if (dshPluginCatalog) {
+    ipcMain.handle('aibox:getDshPluginCatalog', () => dshPluginCatalog.getCatalog());
+  }
+  if (dshCommunityPlugins) {
+    ipcMain.handle('aibox:getDshCommunityPluginCatalog', async (_e, agentId: string) => {
+      const agent = managedDshAgent(agentId);
+      return dshCommunityPlugins.getCatalogAsync(agent.id);
+    });
+    ipcMain.handle('aibox:prepareDshCommunityPluginInstall', (_e, input: unknown) => {
+      const value = assertRecord(input, 'DSH community plugin confirmation');
+      assertKeys(value, ['agentId', 'pluginId'], 'DSH community plugin confirmation');
+      const agent = managedDshAgent(value.agentId);
+      const pluginId = assertId(value.pluginId, 'pluginId');
+      return dshCommunityPlugins.issueConfirmation({ agentId: agent.id, pluginId });
+    });
+    ipcMain.handle('aibox:installDshCommunityPlugin', async (_e, input: unknown) => {
+      const value = assertRecord(input, 'DSH community plugin install');
+      assertKeys(value, ['agentId', 'pluginId', 'confirmationToken'], 'DSH community plugin install');
+      const agent = managedDshAgent(value.agentId);
+      const pluginId = assertId(value.pluginId, 'pluginId');
+      const confirmationToken = assertString(value.confirmationToken, 'confirmationToken', 1, 160);
+      return dshCommunityPlugins.install({ agentId: agent.id, pluginId, confirmationToken });
+    });
+    ipcMain.handle('aibox:prepareDshCommunityPluginLifecycle', async (_e, input: unknown) => {
+      const value = assertRecord(input, 'DSH community plugin lifecycle confirmation');
+      assertKeys(value, ['agentId', 'pluginId', 'action'], 'DSH community plugin lifecycle confirmation');
+      const agent = managedDshAgent(value.agentId);
+      const pluginId = assertId(value.pluginId, 'pluginId');
+      const action = assertString(value.action, 'action', 1, 16) as DshPluginLifecycleAction;
+      if (action !== 'install' && action !== 'update' && action !== 'uninstall') throw new Error('action is invalid');
+      return dshCommunityPlugins.issueLifecycleConfirmation({ agentId: agent.id, pluginId, action });
+    });
+    ipcMain.handle('aibox:applyDshCommunityPluginLifecycle', async (_e, input: unknown) => {
+      const value = assertRecord(input, 'DSH community plugin lifecycle');
+      assertKeys(value, ['agentId', 'pluginId', 'action', 'confirmationToken'], 'DSH community plugin lifecycle');
+      const agent = managedDshAgent(value.agentId);
+      const pluginId = assertId(value.pluginId, 'pluginId');
+      const action = assertString(value.action, 'action', 1, 16) as DshPluginLifecycleAction;
+      if (action !== 'install' && action !== 'update' && action !== 'uninstall') throw new Error('action is invalid');
+      const confirmationToken = assertString(value.confirmationToken, 'confirmationToken', 1, 160);
+      return dshCommunityPlugins.applyLifecycle({ agentId: agent.id, pluginId, action, confirmationToken });
+    });
+  }
+  if (pluginCatalog) {
+    ipcMain.handle('aibox:getPluginCatalog', () => pluginCatalog.getCatalog());
+    ipcMain.handle('aibox:setPluginEnabled', (_e, id: string, enabled: boolean) => {
+      const pluginId = assertId(id, 'pluginId');
+      if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean');
+      pluginCatalog.setEnabled(pluginId, enabled);
+      db.audit({ id: randomUUID(), actor: 'admin', action: 'plugin.toggle', target: pluginId, result: enabled ? 'enabled' : 'disabled' });
+      pushSnapshot();
+      return pluginCatalog.getCatalog();
+    });
+  }
+  if (environmentDiagnostics) {
+    ipcMain.handle('aibox:getEnvironmentDiagnostics', () => environmentDiagnostics.diagnose());
+  }
+  const managedDshSession = (value: unknown) => {
+    const status = dshSessions.getControlStatus(assertId(value, 'sessionId'));
+    managedDshAgent(status.agentId);
+    return status;
+  };
+  ipcMain.handle('aibox:getDshControlStatus', (_e, sessionId: string) =>
+    managedDshSession(sessionId));
+  ipcMain.handle('aibox:readDshEvents', (_e, input: DshReadEventsInput) => {
+    if (!input || typeof input !== 'object') throw new Error('DSH event query is invalid');
+    const sessionId = assertId(input.sessionId, 'sessionId');
+    managedDshSession(sessionId);
+    return dshSessions.readEvents({
+      sessionId,
+      afterCursor: dshCursor(input.afterCursor ?? -1, 'afterCursor'),
+      limit: Math.min(optionalLimit(input.limit) ?? 100, 200)
+    });
+  });
+  if (dshDelegation) {
+    /**
+     * A project-scoped authorization gate for read-only delegation views.
+     * DSH sessions are owned by the runtime/agent, while project membership is
+     * established by the bound root or a Nexus task/team-run link. This keeps
+     * an otherwise valid session from being used to enumerate another project.
+     */
+    const requireProjectDelegationTree = (projectValue: unknown, sessionValue: unknown): DshSessionTreeView => {
+      const projectId = assertId(projectValue, 'projectId');
+      const sessionId = assertId(sessionValue, 'sessionId');
+      const project = db.raw.prepare('SELECT organization_id FROM projects WHERE id = ? LIMIT 1').get(projectId) as { organization_id?: string } | undefined;
+      if (!project) throw new Error('项目不存在或无权访问');
+      // Read the durable session record explicitly before using the redacted
+      // control status. This keeps the project/agent check anchored to Main's
+      // session table rather than trusting a renderer-supplied status shape.
+      const session = dshSessions.getSession(sessionId);
+      const status = dshSessions.getControlStatus(sessionId);
+      if (status.agentId !== session.agentId) throw new Error('DSH 会话状态归属不一致');
+      managedDshAgent(status.agentId);
+      const agent = db.raw.prepare('SELECT organization_id FROM agents WHERE id = ? LIMIT 1').get(status.agentId) as { organization_id?: string } | undefined;
+      if (!agent || agent.organization_id !== project.organization_id) throw new Error('DSH 会话不属于该项目组织');
+
+      // Resolve the complete bounded scope for authorization. The user-facing
+      // query is bounded again below, so no internal workspace/upstream fields
+      // are ever returned by this handler.
+      const tree = dshDelegation.getSessionTree(sessionId, { maxNodes: 1_000 });
+      const preference = db.getSetting<Record<string, unknown>>(`project:workbench:${projectId}`, {});
+      const boundRoot = preference && typeof preference.rootSessionId === 'string' ? preference.rootSessionId : null;
+      if (boundRoot) {
+        if (tree.rootSessionId !== boundRoot) throw new Error('DSH 会话不属于该项目根会话');
+        return tree;
+      }
+
+      // Before an explicit root bind, accept only a tree with a durable Nexus
+      // task/team-run association for this project. Child runs projected from
+      // DSH inherit the root's authorization through this tree.
+      const linked = tree.sessions.some((entry) => Boolean(db.raw.prepare(`
+        SELECT 1
+        FROM dsh_runs r
+        LEFT JOIN tasks t ON t.id = r.nexus_task_id
+        LEFT JOIN team_runs tr ON tr.id = r.team_run_id
+        WHERE r.session_id = ? AND (t.project_id = ? OR tr.project_id = ?)
+        LIMIT 1
+      `).get(entry.session.sessionId, projectId, projectId)));
+      if (!linked) throw new Error('DSH 会话尚未关联到该项目');
+      return tree;
+    };
+
+    ipcMain.handle('aibox:getDshDelegationTree', (_e, input: DshDelegationTreeQueryInput): DshDelegationTreeView => {
+      const value = assertRecord(input, 'DSH delegation tree query');
+      assertKeys(value, ['projectId', 'sessionId', 'maxNodes', 'maxDepth'], 'DSH delegation tree query');
+      const projectId = assertId(value.projectId, 'projectId');
+      const sessionId = assertId(value.sessionId, 'sessionId');
+      const maxNodes = value.maxNodes === undefined ? undefined : Math.min(positiveInteger(value.maxNodes, 'maxNodes'), 1_000);
+      const maxDepth = value.maxDepth === undefined ? undefined : Math.min(nonNegativeInteger(value.maxDepth, 'maxDepth'), 32);
+      requireProjectDelegationTree(projectId, sessionId);
+      return rendererDshDelegationTree(dshDelegation.getSessionTree(sessionId, { maxNodes, maxDepth }));
+    });
+
+    ipcMain.handle('aibox:getDshChildResults', (_e, input: DshChildResultsQueryInput): DshChildResultsAggregateView => {
+      const value = assertRecord(input, 'DSH child result query');
+      assertKeys(value, ['projectId', 'parentSessionId', 'maxResults', 'maxBytes'], 'DSH child result query');
+      const projectId = assertId(value.projectId, 'projectId');
+      const parentSessionId = assertId(value.parentSessionId, 'parentSessionId');
+      const maxResults = value.maxResults === undefined ? undefined : Math.min(positiveInteger(value.maxResults, 'maxResults'), 200);
+      const maxBytes = value.maxBytes === undefined ? undefined : Math.min(positiveInteger(value.maxBytes, 'maxBytes'), 256 * 1024);
+      requireProjectDelegationTree(projectId, parentSessionId);
+      return rendererDshChildResults(dshDelegation.aggregateChildResults(parentSessionId, { maxResults, maxBytes }));
+    });
+  }
+  ipcMain.handle('aibox:requestDshTakeover', async (_e, input: DshTakeoverRequest) => {
+    if (!input || typeof input !== 'object') throw new Error('DSH takeover request is invalid');
+    const sessionId = assertId(input.sessionId, 'sessionId');
+    const expectedRevision = nonNegativeInteger(input.expectedRevision, 'expectedRevision');
+    const reason = decodeOptionalUtf8Text(input.reason, 'reason', 1000);
+    managedDshSession(sessionId);
+    try {
+      const grant = await dshSessions.takeoverLease({
+        sessionId,
+        controller: 'HUMAN',
+        surface: 'DESKTOP',
+        principal: 'principal-local-admin',
+        expectedRevision,
+        reason
+      });
+      // Keep the bearer grant in Main and hand it to the isolated desktop
+      // write coordinator. The renderer receives only the redacted status.
+      dsh.adoptDesktopTakeover(sessionId, grant);
+      return { granted: true, status: grant.status, reason: null };
+    } catch (error) {
+      if (error instanceof DshTakeoverConfirmationRequiredError) {
+        return { granted: false, status: error.status, reason: error.message };
+      }
+      throw error;
+    }
+  });
+  ipcMain.handle('aibox:releaseDshControl', (_e, input: DshReleaseControlRequest) => {
+    if (!input || typeof input !== 'object') throw new Error('DSH control release is invalid');
+    const sessionId = assertId(input.sessionId, 'sessionId');
+    managedDshSession(sessionId);
+    return dshSessions.releaseLeaseForPrincipal({
+      sessionId,
+      controller: 'HUMAN',
+      surface: 'DESKTOP',
+      principal: 'principal-local-admin',
+      expectedRevision: nonNegativeInteger(input.expectedRevision, 'expectedRevision')
+    });
+  });
+
+  // ---------- DSH LAN Gateway ----------
+  // Every operation stays behind an explicit channel. The gateway itself
+  // owns TLS/session revocation; IPC only exposes validated configuration and
+  // renderer-safe projections.
+  ipcMain.handle('aibox:getDshLanGatewayStatus', () =>
+    dshLanStatusView(requireDshLan().getStatus()));
+  ipcMain.handle('aibox:startDshLanGateway', async (_e, input: unknown) => {
+    const status = await requireDshLan().start(assertDshLanConfigInput(input));
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.lan.start.request', target: status.gateway.runtimeId, result: status.gateway.running ? 'ok' : 'waiting-runtime' });
+    return dshLanStatusView(status);
+  });
+  ipcMain.handle('aibox:restoreDshLanGateway', async () => {
+    const status = await requireDshLan().restoreOnStartup();
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.lan.restore.request', target: status.gateway.runtimeId, result: status.gateway.running ? 'ok' : 'waiting-runtime' });
+    return dshLanStatusView(status);
+  });
+  ipcMain.handle('aibox:createDshLanPairing', (_e, role: unknown = 'operator'): DshLanPairingOfferView => {
+    const offer = requireDshLan().createPairingCode(assertDshLanRole(role));
+    // Do not add the one-time code to audit logs, snapshots, or settings.
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.lan.pairing.create', target: offer.runtimeId, result: 'ok' });
+    return {
+      code: offer.code,
+      expiresAt: offer.expiresAt,
+      origin: offer.origin,
+      pairingUrl: offer.pairingUrl,
+      runtimeId: offer.runtimeId,
+      role: offer.role,
+      certificateFingerprint: offer.certificateFingerprint
+    };
+  });
+  ipcMain.handle('aibox:shutdownDshLanGateway', async () => {
+    const status = await requireDshLan().shutdown();
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.lan.shutdown.request', target: status.gateway.runtimeId, result: 'ok' });
+    return dshLanStatusView(status);
+  });
+  ipcMain.handle('aibox:emergencyStopDshLanGateway', async () => {
+    const status = await requireDshLan().emergencyStop();
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.lan.emergency-stop.request', target: status.gateway.runtimeId, result: 'revoked' });
+    return dshLanStatusView(status);
+  });
+  ipcMain.handle('aibox:resetDshLanCertificate', async () => {
+    const status = await requireDshLan().resetCertificate();
+    db.audit({ id: randomUUID(), actor: 'admin', action: 'dsh.lan.tls.reset.request', target: status.gateway.runtimeId, result: 'repair-required' });
+    return dshLanStatusView(status);
+  });
+  ipcMain.handle('aibox:getDshLanTrustedAuthorities', () => [...requireDshLan().getTrustedAuthorities()]);
+
+  // ---------- Secretary planning control plane ----------
+  ipcMain.handle('aibox:listPlanningSessions', (_e, limit?: unknown) =>
+    getPlanningControlPlane().listSessions(optionalLimit(limit) ?? 50));
+  ipcMain.handle('aibox:getPlanningSession', (_e, sessionId: unknown) =>
+    getPlanningControlPlane().getSession(assertId(sessionId, 'sessionId')));
+  ipcMain.handle('aibox:createPlanningSession', (_e, input: unknown) => {
+    const value = assertPlanningCreateInput(input);
+    const view = getPlanningControlPlane().createSession(value);
+    if (value.projectId) bindLegacyPlanningProject(view.id, value.projectId);
+    return view;
+  });
+  ipcMain.handle('aibox:preflightChatMessage', (_e, message: unknown) => {
+    const request = decodeUtf8Text(message, 'message', 1, 20_000);
+    const signals = classifySecretaryPlanningRequest(request);
+    if (!signals) return { outcome: 'DIRECT_DISPATCH', planningSession: null } as const;
+    return {
+      outcome: 'PLANNING_REQUIRED',
+      planningSession: getPlanningControlPlane().createSession({
+        request,
+        signals: {
+          ...signals,
+          departmentIds: [...signals.departmentIds],
+          irreversibleOperations: [...signals.irreversibleOperations]
+        }
+      })
+    } as const;
+  });
+  const answerDshQuest = (input: unknown): DshQuestGovernanceView => {
+    const value = assertDshQuestAnswerInput(input);
+    assertBoundDshQuestIdentity(value);
+    return dshQuestView(requireDshQuestGovernance().answerQuestions({
+      planningSessionId: value.planningSessionId,
+      principalId: value.principalId,
+      expectedRevision: value.expectedRevision,
+      dshQuestionSetId: value.dshQuestionSetId,
+      dshVersion: value.dshVersion,
+      answers: value.answers
+    }));
+  };
+  const decideDshQuest = (input: unknown, operation: 'approve' | 'reject'): DshQuestGovernanceView => {
+    const value = assertDshQuestDecisionInput(input, `DSH Quest ${operation}`);
+    assertBoundDshQuestIdentity(value);
+    const payload = {
+      planningSessionId: value.planningSessionId,
+      principalId: value.principalId,
+      expectedRevision: value.expectedRevision,
+      dshPlanId: value.dshPlanId,
+      dshVersion: value.dshVersion,
+      hash: value.hash
+    };
+    return dshQuestView(operation === 'approve'
+      ? requireDshQuestGovernance().approvePlan(payload)
+      : requireDshQuestGovernance().rejectPlan(payload));
+  };
+  const dispatchDshQuest = async (input: unknown): Promise<DshQuestGovernanceView> => {
+    const value = assertDshQuestDecisionInput(input, 'DSH Quest dispatch');
+    assertBoundDshQuestIdentity(value);
+    return dshQuestView(await requireDshQuestGovernance().dispatchPlan({
+      planningSessionId: value.planningSessionId,
+      principalId: value.principalId,
+      expectedRevision: value.expectedRevision,
+      dshPlanId: value.dshPlanId,
+      dshVersion: value.dshVersion,
+      hash: value.hash
+    }));
+  };
+  // Existing names remain a narrow compatibility surface. DSH-bound sessions
+  // are never allowed to fall through to the legacy Secretary controller.
+  ipcMain.handle('aibox:answerPlanningQuestions', (_e, input: unknown) => {
+    const record = input !== null && typeof input === 'object' && !Array.isArray(input)
+      ? input as Record<string, unknown> : null;
+    const bound = typeof record?.planningSessionId === 'string'
+      ? dshQuestBinding(record.planningSessionId)
+      : typeof record?.sessionId === 'string' ? dshQuestBinding(record.sessionId) : null;
+    if (hasDshQuestMarker(input) || bound) return answerDshQuest(input);
+    return getPlanningControlPlane().answerQuestions(assertPlanningAnswerInput(input));
+  });
+  ipcMain.handle('aibox:proposePlanningPlan', (_e, input: unknown) => {
+    return getPlanningControlPlane().proposePlan(assertPlanningProposalInput(input));
+  });
+  ipcMain.handle('aibox:approvePlanningPlan', (_e, input: unknown) => {
+    const record = input !== null && typeof input === 'object' && !Array.isArray(input)
+      ? input as Record<string, unknown> : null;
+    const bound = typeof record?.planningSessionId === 'string'
+      ? dshQuestBinding(record.planningSessionId)
+      : typeof record?.sessionId === 'string' ? dshQuestBinding(record.sessionId) : null;
+    if (hasDshQuestMarker(input) || bound) return decideDshQuest(input, 'approve');
+    const value = assertPlanningDecisionInput(input, '规划批准');
+    return getPlanningControlPlane().approvePlan(value);
+  });
+  ipcMain.handle('aibox:rejectPlanningPlan', (_e, input: unknown) => {
+    const record = input !== null && typeof input === 'object' && !Array.isArray(input)
+      ? input as Record<string, unknown> : null;
+    const bound = typeof record?.planningSessionId === 'string'
+      ? dshQuestBinding(record.planningSessionId)
+      : typeof record?.sessionId === 'string' ? dshQuestBinding(record.sessionId) : null;
+    if (hasDshQuestMarker(input) || bound) return decideDshQuest(input, 'reject');
+    const value = assertPlanningDecisionInput(input, '规划拒绝');
+    return getPlanningControlPlane().rejectPlan(value as RejectPlanningPlanInput);
+  });
+  ipcMain.handle('aibox:dispatchPlanningPlan', async (_e, input: unknown) => {
+    const record = input !== null && typeof input === 'object' && !Array.isArray(input)
+      ? input as Record<string, unknown> : null;
+    const bound = typeof record?.planningSessionId === 'string'
+      ? dshQuestBinding(record.planningSessionId)
+      : typeof record?.sessionId === 'string' ? dshQuestBinding(record.sessionId) : null;
+    if (hasDshQuestMarker(input) || bound) return dispatchDshQuest(input);
+    const value = assertPlanningDecisionInput(input, '规划派工');
+    return getPlanningControlPlane().dispatchPlan(value as DispatchPlanningPlanInput);
+  });
+  // Explicit DSH names are used by the Quest renderer and future LAN owner UI.
+  ipcMain.handle('aibox:answerDshQuestQuestions', (_e, input: unknown) => answerDshQuest(input));
+  ipcMain.handle('aibox:approveDshQuestPlan', (_e, input: unknown) => decideDshQuest(input, 'approve'));
+  ipcMain.handle('aibox:rejectDshQuestPlan', (_e, input: unknown) => decideDshQuest(input, 'reject'));
+  ipcMain.handle('aibox:dispatchDshQuestPlan', (_e, input: unknown) => dispatchDshQuest(input));
+
   // 助手人设编辑（soul.md / agents.md / user.md / 权限模式）
   ipcMain.handle('aibox:updateAgentPersona', async (_e, id: string, patch: AgentPersonaPatch) => {
     patch = decodePersonaPatch(patch);
+    const safeAgentId = assertId(id);
+    const previous = orchestrator.listAgents().find((candidate) => candidate.id === safeAgentId);
     const a = orchestrator.updateAgentPersona(id, patch);
+    if (previous?.engineId === DSH_MANAGED_ENGINE_ID && a.engineId !== DSH_MANAGED_ENGINE_ID) {
+      await dsh.stop(a.id);
+    }
     if (a.kind === 'android_operator') {
       const existing = mobile.getAgentConfig(a.id);
       const tools = assertMobileTools(patch.mobileAllowedTools ?? existing?.allowedTools ?? [...MOBILE_TOOL_NAMES]);
@@ -565,7 +1858,7 @@ export function registerIpc(deps: IpcDeps) {
     const key = readProviderKey(db);
     if (!settings || !key) throw new Error('请先在设置页配置模型供应商');
     const prompt = `请根据以下描述生成一个 AI 助手的配置，用 JSON 格式输出：
-{"name":"助手名称","role":"职责描述(50-100字)","soulMd":"身份与性格(100-200字)","agentsMd":"行为指令(5条规则)","systemPrompt":"系统提示词(50-100字)","permissionMode":"readonly或standard"}
+{"name":"助手名称","role":"职责描述(50-100字)","soulMd":"身份与性格(100-200字)","agentsMd":"行为指令(5条规则)","systemPrompt":"系统提示词(50-100字)","permissionMode":"autonomous"}
 
 描述：${description}
 
@@ -584,25 +1877,110 @@ export function registerIpc(deps: IpcDeps) {
     return JSON.parse(jsonMatch[0]) as { name: string; role: string; soulMd: string; agentsMd: string; systemPrompt: string; permissionMode: string };
   });
   // 会话（持续多轮对话）
-  ipcMain.handle('aibox:listConversations', (_e, agentId: string) => orchestrator.listConversations(agentId));
-  ipcMain.handle('aibox:chatWithAgent', async (_e, agentId: string, message: string, conversationId?: string, messageKey?: string) => {
-    const r = await desktopControlPlane.dispatch({
-      preferredAgentId: assertId(agentId, 'agentId'),
-      message: assertString(message, 'message', 1, 20_000),
-      conversationId: conversationId ? assertId(conversationId, 'conversationId') : undefined,
-      messageKey: messageKey ? assertId(messageKey, 'messageKey') : undefined
+  ipcMain.handle('aibox:listConversations', (_e, agentId: string) => {
+    const safeAgentId = assertId(agentId, 'agentId');
+    localChatAgent(safeAgentId);
+    return orchestrator.listConversations(safeAgentId).filter((conversation) =>
+      conversation.organizationId === LOCAL_CHAT_ORGANIZATION_ID
+      && conversation.principalId === LOCAL_CHAT_PRINCIPAL_ID
+      && conversation.channelId === null
+    );
+  });
+  ipcMain.handle('aibox:getConversationTimeline', (_e, input: unknown) => {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('conversation timeline input is invalid');
+    const value = input as Record<string, unknown>;
+    return chatService.getTimeline({
+      agentId: assertId(value.agentId, 'agentId'),
+      conversationId: assertId(value.conversationId, 'conversationId'),
+      cursor: value.cursor as never,
+      limit: value.limit as number | undefined
     });
+  });
+  ipcMain.handle('aibox:getAgentChatContext', (_e, input: unknown) => {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('agent chat context input is invalid');
+    const value = input as Record<string, unknown>;
+    const agentId = assertId(value.agentId, 'agentId');
+    const agent = localChatAgent(agentId);
+    const requestedConversationId = value.conversationId === undefined || value.conversationId === null || value.conversationId === ''
+      ? null
+      : assertId(value.conversationId, 'conversationId');
+    if (requestedConversationId) {
+      // Reuse the canonical query to enforce the same agent/tenant/principal boundary.
+      chatService.getTimeline({ agentId, conversationId: requestedConversationId, limit: 1 });
+    }
+    const isDsh = agent.engineId === DSH_MANAGED_ENGINE_ID;
+    let dshSessionId: string | null = null;
+    let dshControl: ReturnType<DshSessionService['getControlStatus']> | null = null;
+    if (isDsh && requestedConversationId) {
+      const row = db.raw.prepare(
+        `SELECT id FROM dsh_sessions
+         WHERE agent_id = ? AND conversation_id = ?
+         ORDER BY updated_at DESC, id DESC LIMIT 1`
+      ).get(agentId, requestedConversationId) as { id?: string } | undefined;
+      if (row?.id) {
+        dshSessionId = String(row.id);
+        try { dshControl = dshSessions.getControlStatus(dshSessionId); } catch { dshControl = null; }
+      }
+    }
+    return {
+      agentId,
+      conversationId: requestedConversationId,
+      dsh: isDsh,
+      dshSessionId,
+      dshControl,
+      runtime: isDsh ? dsh.getStatus(agentId) : null
+    };
+  });
+  ipcMain.handle('aibox:chatWithAgent', async (_e, agentId: string, message: string, conversationId?: string, messageKey?: string, projectId?: string) => {
+    const request = assertString(message, 'message', 1, 20_000);
+    const preferredAgentId = assertId(agentId, 'agentId');
+    const preferredAgent = localChatAgent(preferredAgentId);
+    // Cordis is the only planner. Complex direct-worker requests must start in
+    // a project Quest instead of creating a second plan in the compatibility UI.
+    if (preferredAgent.engineId !== DSH_MANAGED_ENGINE_ID && classifySecretaryPlanningRequest(request)) {
+      db.audit({
+        id: randomUUID(), actor: 'principal-local-admin', action: 'quest.chat.blocked',
+        target: conversationId ? assertId(conversationId, 'conversationId') : 'new-conversation',
+        result: 'quest-required', source: 'desktop'
+      });
+      throw new Error('QUEST_REQUIRED: complex requests must start in a project Quest with Cordis');
+    }
+    const r = await desktopControlPlane.dispatch({
+      preferredAgentId,
+      message: request,
+      conversationId: conversationId ? assertId(conversationId, 'conversationId') : undefined,
+      messageKey: messageKey ? assertId(messageKey, 'messageKey') : undefined,
+      projectId: projectId ? assertId(projectId, 'projectId') : undefined
+    });
+    if (projectWorkbench && projectId && preferredAgent.engineId === DSH_MANAGED_ENGINE_ID) {
+      // The managed executor may create the DSH session asynchronously. Bind
+      // it when the canonical conversation projection is already available;
+      // a later workbench refresh can still discover it through dsh_runs.
+      const sessionRow = db.raw.prepare(
+        `SELECT id FROM dsh_sessions WHERE agent_id = ? AND conversation_id = ? AND parent_session_id IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1`
+      ).get(preferredAgentId, r.conversationId) as { id?: string } | undefined;
+      if (sessionRow?.id) {
+        try { projectWorkbench.bindRootSession(projectId, sessionRow.id); } catch { /* projection must not fail the dispatch */ }
+      }
+    }
     pushSnapshot();
     return r;
   });
   // 会话管理：重命名 / 删除
   ipcMain.handle('aibox:renameConversation', (_e, id: string, title: string) => {
-    db.raw.prepare("UPDATE conversations SET title = ? WHERE id = ? AND channel_id IS NULL AND organization_id = 'org-local'")
-      .run(assertString(title, 'title', 1, 100), assertId(id, 'conversationId'));
+    db.raw.prepare(
+      'UPDATE conversations SET title = ? WHERE id = ? AND channel_id IS NULL AND organization_id = ? AND principal_id = ?'
+    ).run(
+      assertString(title, 'title', 1, 100),
+      assertId(id, 'conversationId'),
+      LOCAL_CHAT_ORGANIZATION_ID,
+      LOCAL_CHAT_PRINCIPAL_ID
+    );
   });
   ipcMain.handle('aibox:deleteConversation', (_e, id: string) => {
-    db.raw.prepare("DELETE FROM conversations WHERE id = ? AND channel_id IS NULL AND organization_id = 'org-local'")
-      .run(assertId(id, 'conversationId'));
+    db.raw.prepare(
+      'DELETE FROM conversations WHERE id = ? AND channel_id IS NULL AND organization_id = ? AND principal_id = ?'
+    ).run(assertId(id, 'conversationId'), LOCAL_CHAT_ORGANIZATION_ID, LOCAL_CHAT_PRINCIPAL_ID);
   });
   // 用量统计
   ipcMain.handle('aibox:getUsageStats', () => orchestrator.usageStats());
@@ -683,7 +2061,7 @@ export function registerIpc(deps: IpcDeps) {
     const agent = orchestrator.createAgent({
       name: draft.name, role: draft.role, systemPrompt: draft.systemPrompt,
       soulMd: draft.soulMd, agentsMd: draft.agentsMd,
-      engineId, workspace: '', permissionMode: 'standard', concurrencyLimit: 1, channelIds: []
+      engineId, workspace: '', permissionMode: 'autonomous', concurrencyLimit: 1, channelIds: []
     });
     for (const skillId of draft.skillIds) skills.bindAgent(agent.id, skillId);
     db.audit({ id: randomUUID(), actor: 'admin', action: 'agent.createFromSkills', target: agent.id, result: draft.skillIds.join(',') });
@@ -764,7 +2142,7 @@ export function registerIpc(deps: IpcDeps) {
         name: data.name, role: data.role ?? '', systemPrompt: data.systemPrompt ?? '',
         soulMd: data.soulMd ?? '', agentsMd: data.agentsMd ?? '', userMd: data.userMd ?? '',
         engineId: data.engineId ?? NEXUS_ENGINE_ID, workspace: data.workspace ?? '',
-        permissionMode: (data.permissionMode as 'readonly' | 'standard' | 'trusted' | 'autonomous') ?? 'standard',
+        permissionMode: (data.permissionMode as 'readonly' | 'standard' | 'trusted' | 'autonomous') ?? 'autonomous',
         concurrencyLimit: data.concurrencyLimit ?? 1, channelIds: []
       });
       pushSnapshot();
@@ -773,13 +2151,20 @@ export function registerIpc(deps: IpcDeps) {
       return { ok: false, message: `JSON 解析失败: ${e instanceof Error ? e.message : String(e)}` };
     }
   });
-  ipcMain.handle('aibox:batchAgentAction', (_e, ids: string[], action: 'start' | 'stop' | 'delete') => {
+  ipcMain.handle('aibox:batchAgentAction', async (_e, ids: string[], action: 'start' | 'stop' | 'delete') => {
+    if (!Array.isArray(ids)) throw new Error('数字员工列表无效');
+    if (action !== 'start' && action !== 'stop' && action !== 'delete') throw new Error('批量操作无效');
     let count = 0;
-    for (const id of ids) {
+    for (const value of new Set(ids)) {
       try {
-        if (action === 'start') { orchestrator.startAgent(id); count++; }
-        else if (action === 'stop') { orchestrator.stopAgent(id); count++; }
-        else if (action === 'delete') { orchestrator.archiveAgent(id); count++; }
+        const id = assertId(value);
+        if (action === 'start') await startAgentWithRuntime(id);
+        else if (action === 'stop') await stopAgentWithRuntime(id);
+        else {
+          await stopAgentWithRuntime(id);
+          orchestrator.archiveAgent(id);
+        }
+        count++;
       } catch { /* 跳过失败的 */ }
     }
     pushSnapshot();
@@ -866,12 +2251,16 @@ export function registerIpc(deps: IpcDeps) {
 
   // ---------- 任务 ----------
   ipcMain.handle('aibox:createTask', async (
-    _e,
+    event,
     agentId: string,
     title: string,
     projectId: string | undefined,
     messageKey: string
   ) => {
+    if (projectId) {
+      const selected = await ensureProjectWorkspace(event, assertId(projectId, 'projectId'));
+      if (!selected) throw new Error('需要先选择项目工作目录才能派发任务');
+    }
     const result = await desktopControlPlane.dispatch({
       preferredAgentId: assertId(agentId, 'agentId'),
       message: assertString(title, 'title', 1, 500),
@@ -911,6 +2300,16 @@ export function registerIpc(deps: IpcDeps) {
   });
   ipcMain.handle('aibox:detectEngines', async () => {
     const list = await engines.detect();
+    const cordis = ensureCordisAgent(
+      orchestrator,
+      join(app.getPath('userData'), 'aibox-data', 'workspaces', 'Cordis')
+    );
+    if (cordis.created) {
+      db.audit({
+        id: randomUUID(), actor: 'admin', action: 'cordis.repair',
+        target: cordis.agent.id, result: 'created'
+      });
+    }
     pushSnapshot();
     return list;
   });
@@ -1101,10 +2500,68 @@ export function registerIpc(deps: IpcDeps) {
   });
 
   // ---------- OCR 文字识别服务 ----------
+  // ---------- DSH Vision / typed image attachments ----------
+  ipcMain.handle('aibox:getVisionBinding', () => vision.getBinding());
+  ipcMain.handle('aibox:configureVisionBinding', (_e, value: unknown) => {
+    const input = assertRecord(value, 'vision model binding');
+    assertKeys(input, ['providerId', 'model', 'enabled'], 'vision model binding');
+    if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('enabled must be boolean');
+    return vision.configureBinding({
+      providerId: assertId(input.providerId, 'providerId'),
+      model: assertString(input.model, 'model', 1, 256),
+      enabled: input.enabled as boolean | undefined
+    });
+  });
+  ipcMain.handle('aibox:clearVisionBinding', () => { vision.clearBinding(); return null; });
+  ipcMain.handle('aibox:putVisionAttachment', (_e, value: unknown) => vision.putAttachment(visionUploadInput(value)));
+  ipcMain.handle('aibox:pickVisionAttachment', async () => {
+    const options: OpenDialogOptions = {
+      properties: ['openFile'],
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }]
+    };
+    const owner = getMainWindow();
+    const result = owner
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled || result.filePaths.length !== 1) return null;
+    const selected = result.filePaths[0];
+    const stat = lstatSync(selected);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new VisionServiceError('INVALID_ATTACHMENT', '不接受符号链接图片');
+    if (stat.size < 1 || stat.size > MAX_VISION_IMAGE_BYTES) throw new VisionServiceError('ATTACHMENT_LIMIT', '图片超过大小限制');
+    const filename = basename(selected);
+    return vision.putAttachment({ data: readFileSync(selected), mimeType: visionMimeForFilename(filename), filename });
+  });
+  ipcMain.handle('aibox:describeVision', async (_e, value: unknown) => {
+    const input = assertRecord(value, 'vision request');
+    assertKeys(input, ['attachmentRef', 'prompt'], 'vision request');
+    const request = {
+      // VisionService performs the authoritative opaque-ref validation before
+      // reading bytes; this cast only carries the validated boundary to TS.
+      attachmentRef: input.attachmentRef as import('../shared/types.js').VisionAttachmentRef,
+      ...(input.prompt === undefined ? {} : { prompt: assertString(input.prompt, 'prompt', 1, 16_000) })
+    };
+    if (visionPluginHost) {
+      return visionPluginHost.invoke({ pluginId: VISION_PLUGIN_ID, capabilityId: VISION_TOOL_CAPABILITY_ID, input: request });
+    }
+    return vision.describe(request);
+  });
+
   ipcMain.handle('aibox:getOcrStatus', () => ocr.getStatus());
   ipcMain.handle('aibox:toggleOcr', (_e, enabled: boolean) => { ocr.setEnabled(enabled); return ocr.getStatus(); });
   ipcMain.handle('aibox:downloadOcrModels', () => ocr.downloadModels());
-  ipcMain.handle('aibox:ocrRecognize', (_e, imagePath: string) => ocr.recognize(imagePath));
+  ipcMain.handle('aibox:ocrRecognize', async (_e, value: unknown) => {
+    const request = { attachmentRef: value as import('../shared/types.js').VisionAttachmentRef };
+    if (visionPluginHost) {
+      return visionPluginHost.invoke({
+        pluginId: VISION_PLUGIN_ID,
+        capabilityId: VISION_OCR_TOOL_CAPABILITY_ID,
+        input: request
+      });
+    }
+    // VisionService remains the authoritative attachment parser and integrity
+    // checker when the optional plugin host is unavailable.
+    return ocr.recognizeBytes(vision.readAttachment(request.attachmentRef));
+  });
 
   // ---------- 语音任务下达（全双工实时识别） ----------
   // 音频经主进程转发而非 Renderer 直连云端：云端凭据必须留在主进程（安全基线 15.1）
@@ -1146,16 +2603,16 @@ export function registerIpc(deps: IpcDeps) {
   ipcMain.handle('aibox:integrityCheck', () => db.integrityCheck());
   ipcMain.handle('aibox:manualCleanup', () => { db.cleanupRetention(); return { ok: true, message: '数据清理完成' }; });
   // 窗口控制：全屏切换
-  ipcMain.handle('aibox:toggleFullscreen', () => {
-    const win = getMainWindow();
+  ipcMain.handle('aibox:toggleFullscreen', (event) => {
+    const win = windowForSender(event);
     if (win) win.setFullScreen(!win.isFullScreen());
     return win?.isFullScreen() ?? false;
   });
-  ipcMain.handle('aibox:isFullscreen', () => getMainWindow()?.isFullScreen() ?? false);
+  ipcMain.handle('aibox:isFullscreen', (event) => windowForSender(event)?.isFullScreen() ?? false);
 
   // ---------- 工作目录选择（7.2：必须由用户选择并进入允许列表） ----------
-  ipcMain.handle('aibox:pickDirectory', async () => {
-    const win = getMainWindow();
+  ipcMain.handle('aibox:pickDirectory', async (event) => {
+    const win = windowForSender(event);
     if (!win) return null;
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
     return r.canceled ? null : r.filePaths[0];

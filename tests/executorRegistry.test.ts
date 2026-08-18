@@ -1,7 +1,7 @@
 /**
  * 执行器注册表主辅引擎策略测试(P1)
  * 覆盖:主引擎就绪直用、主引擎不可用回退辅助引擎、
- * production 模式禁用模拟回退(任务 FAILED)、demo 模式保留演示回退
+ * 主辅引擎均不可用时任务如实失败
  */
 // @ts-nocheck
 /* eslint-disable */
@@ -71,13 +71,13 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.kindFor('eng-codex')).toBe('generic-cli');
   });
 
-  it('demo 模式主辅均不可用回退演示执行器', () => {
+  it('主辅均不可用时返回 unavailable', () => {
     const db = makeDb({
       'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' },
       'eng-opencode': { type: 'opencode', status: 'NOT_INSTALLED' }
     });
     const reg = new ExecutorRegistry(db as never, broker as never);
-    expect(reg.kindFor('eng-codex')).toBe('simulated');
+    expect(reg.kindFor('eng-codex')).toBe('unavailable');
   });
 
   it('production 模式主辅均不可用 → dispatch 直接 onError,任务不伪装完成', () => {
@@ -99,13 +99,13 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.isExecuting('t1')).toBe(false);
   });
 
-  it('辅助引擎与主引擎相同时不重复探测(仍走 demo 回退)', () => {
+  it('辅助引擎与主引擎相同时不重复探测', () => {
     userCfg.engine.fallbackEngineId = 'eng-codex';
     const db = makeDb({
       'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' }
     });
     const reg = new ExecutorRegistry(db as never, broker as never);
-    expect(reg.kindFor('eng-codex')).toBe('simulated');
+    expect(reg.kindFor('eng-codex')).toBe('unavailable');
   });
 
   it('Hermes Agent CLI(hermes-cli 类型)健康时按泛化 CLI 执行', () => {

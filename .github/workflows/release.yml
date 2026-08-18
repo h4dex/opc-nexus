@@ -55,8 +55,14 @@ jobs:
       - name: Prepare pinned DeepSeek Harness runtime
         run: npm run harness:prepare
 
+      - name: Prepare pinned managed DeepSeek Harness runtime
+        run: npm run harness:managed:prepare
+
       - name: Verify Harness with Electron Node
         run: npm run harness:verify:electron
+
+      - name: Verify managed Harness with Electron Node
+        run: npm run harness:managed:verify:electron
 
       - name: Type check
         run: npm run typecheck
@@ -182,8 +188,14 @@ jobs:
       - name: Prepare pinned DeepSeek Harness runtime
         run: npm run harness:prepare
 
+      - name: Prepare pinned managed DeepSeek Harness runtime
+        run: npm run harness:managed:prepare
+
       - name: Verify Harness with Electron Node
         run: npm run harness:verify:electron
+
+      - name: Verify managed Harness with Electron Node
+        run: npm run harness:managed:verify:electron
 
       - name: Download signed Android package
         uses: actions/download-artifact@v4
@@ -203,6 +215,9 @@ jobs:
 
       - name: Verify packaged Windows Harness runtime
         run: npm run harness:verify:packaged -- release/win-unpacked
+
+      - name: Verify packaged Windows managed Harness runtime
+        run: npm run harness:managed:verify:packaged -- release/win-unpacked
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
@@ -256,8 +271,14 @@ jobs:
       - name: Prepare pinned DeepSeek Harness runtime
         run: npm run harness:prepare
 
+      - name: Prepare pinned managed DeepSeek Harness runtime
+        run: npm run harness:managed:prepare
+
       - name: Verify Harness with Electron Node
         run: npm run harness:verify:electron
+
+      - name: Verify managed Harness with Electron Node
+        run: npm run harness:managed:verify:electron
 
       - name: Download signed Android package
         uses: actions/download-artifact@v4
@@ -273,6 +294,9 @@ jobs:
 
       - name: Verify packaged Linux Harness runtime
         run: npm run harness:verify:packaged -- release/linux-unpacked
+
+      - name: Verify packaged Linux managed Harness runtime
+        run: npm run harness:managed:verify:packaged -- release/linux-unpacked
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4

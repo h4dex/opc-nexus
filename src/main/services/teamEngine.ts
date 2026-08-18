@@ -108,8 +108,13 @@ export class TeamEngine {
   private retryingRuns = new Set<string>();
   /** 运行控制注册表：runId → 控制信号（流水线内存态，无需持久化） */
   private controls = new Map<string, RunControl>();
+  private projectWorkspaceResolver: ((projectId: string) => string | null) | null = null;
 
   constructor(private db: Database, private orchestrator: Orchestrator, private knowledge?: KnowledgeManager) {}
+
+  setProjectWorkspaceResolver(resolver: (projectId: string) => string | null): void {
+    this.projectWorkspaceResolver = resolver;
+  }
 
   /** 获取或创建 run 的控制信号（公开以供测试检验控制状态） */
   control(runId: string): RunControl {
@@ -301,7 +306,7 @@ export class TeamEngine {
     if (!coordinator) { this.updateRun(runId, { phase: 'failed', error: '协调者不存在，无法续跑', ended_at: Date.now() }); return; }
     const members = team.memberIds.map((id) => agents.find((a) => a.id === id)).filter((a): a is Agent => !!a);
 
-    const ws = this.ensureWorkspace(team);
+    const ws = this.ensureWorkspace(team, row.project_id);
 
     // 早期阶段（澄清/拆解）：状态不完整，从头重启整个流水线
     if (row.phase === 'clarify' || row.phase === 'decompose') {
@@ -462,7 +467,7 @@ export class TeamEngine {
   // ---------- 流水线核心 ----------
 
   private async runPipeline(runId: string, team: Team, coordinator: Agent, members: Agent[], task: string) {
-    const ws = this.ensureWorkspace(team);
+    const ws = this.ensureWorkspace(team, this.projectIdForRun(runId));
     this.prepareKnowledgeContext(runId, ws, task);
     this.appendProgress(ws, `流水线启动｜任务：${task}`);
     const events: TeamTimelineEvent[] = [];
@@ -951,8 +956,14 @@ ${report}${guidanceBlock}
 
   // ---------- MD 交接协议 ----------
 
-  private ensureWorkspace(team: Team): string {
-    const ws = team.workspace || join(app.getPath('userData'), 'workspaces', team.id);
+  private ensureWorkspace(team: Team, projectId: string | null = null): string {
+    const projectWorkspace = projectId && this.projectWorkspaceResolver
+      ? this.projectWorkspaceResolver(projectId)?.trim() ?? ''
+      : '';
+    if (projectId && this.projectWorkspaceResolver && !projectWorkspace) {
+      throw new Error('请先为项目选择工作目录，再启动专家团');
+    }
+    const ws = projectWorkspace || team.workspace || join(app.getPath('userData'), 'workspaces', team.id);
     mkdirSync(join(ws, '_aibox', 'handoffs'), { recursive: true });
     return ws;
   }
@@ -1136,7 +1147,7 @@ _生成时间：${new Date().toLocaleString()}_
   }
 
   private async doRetrySubtask(runId: string, row: RunRow, team: Team, coordinator: Agent, member: Agent, subtasks: TeamRunSubtask[], index: number) {
-    const ws = this.ensureWorkspace(team);
+    const ws = this.ensureWorkspace(team, row.project_id);
     const st = subtasks[index];
     this.appendProgress(ws, `手动重试｜${st.agent}：${st.subtask.slice(0, 60)}`);
 

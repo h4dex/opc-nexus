@@ -280,6 +280,7 @@ describe('引擎 Provider 协议边界', () => {
     ['eng-hermes-cli', 'openai-chat'],
     ['eng-pi', 'openai-chat'],
     ['eng-deepseek-harness', 'openai-chat'],
+    ['eng-deepseek-harness-managed', 'openai-chat'],
     ['eng-opencode', 'openai-chat'],
     ['eng-codex', 'openai-responses'],
     ['eng-claude', 'anthropic-messages']

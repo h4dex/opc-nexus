@@ -25,7 +25,8 @@ export class DesktopControlPlane {
       agentId: input.preferredAgentId,
       message: input.message,
       conversationId: input.conversationId,
-      messageKey: input.messageKey
+      messageKey: input.messageKey,
+      projectId: input.projectId
     });
     if (ingress.taskId) {
       const existing = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? LIMIT 1').get(ingress.taskId) as Record<string, unknown> | undefined;
@@ -41,23 +42,28 @@ export class DesktopControlPlane {
         inputMessageId: ingress.inputMessageId,
         message: input.message,
         preferredAgentId: input.preferredAgentId,
-        projectId: input.projectId
+        projectId: ingress.projectId
       });
       return { conversationId: ingress.conversationId, task };
     }
 
-    const task = await this.control.dispatchCanonical({
-      source: input.source ?? 'desktop',
-      organizationId: ingress.organizationId,
-      principalId: ingress.principalId,
-      channelId: null,
-      conversationId: ingress.conversationId,
-      inputMessageId: ingress.inputMessageId,
-      message: input.message,
-      preferredAgentId: input.preferredAgentId,
-      projectId: input.projectId
-    });
-    this.ingress.linkTask(ingress, task.id);
-    return { conversationId: ingress.conversationId, task };
+    try {
+      const task = await this.control.dispatchCanonical({
+        source: input.source ?? 'desktop',
+        organizationId: ingress.organizationId,
+        principalId: ingress.principalId,
+        channelId: null,
+        conversationId: ingress.conversationId,
+        inputMessageId: ingress.inputMessageId,
+        message: input.message,
+        preferredAgentId: input.preferredAgentId,
+        projectId: ingress.projectId
+      });
+      this.ingress.linkTask(ingress, task.id);
+      return { conversationId: ingress.conversationId, task };
+    } catch (error) {
+      this.ingress.discardUnlinked(ingress);
+      throw error;
+    }
   }
 }

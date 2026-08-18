@@ -1,5 +1,8 @@
 /**
- * 本地 Web 管理服务器：支持局域网远程访问，用于工控机无人值守场景。
+ * v1 兼容 Web 管理服务器。
+ *
+ * v2 的桌面、局域网和手机浏览器入口统一复用 DSH 官方 Web UI；本服务
+ * 仅供迁移工具和显式开启的旧部署使用，默认不启动，也不再展示在设置页。
  * - 复用 renderer 构建产物作为前端页面（与桌面端完全一致的 UI）
  * - REST API 镜像关键 IPC 通道（供应商/员工/渠道/引擎/设置）
  * - Token 认证（Bearer token，首次启动安全生成并经 safeStorage 加密）
@@ -31,6 +34,7 @@ import { getProviderConfig, saveProviderConfig } from './provider.js';
 import { loadConfig, saveConfig } from './config.js';
 import { notify } from './notifier.js';
 import { readRendererSetting, writeRendererSetting } from './rendererSettings.js';
+import { MOBILE_CONSOLE_HTML } from './mobileConsole.js';
 import type { WebAdminStatus } from '../../shared/types.js';
 
 export interface WebServerDeps {
@@ -61,11 +65,41 @@ export function webRendererDirectory(moduleUrl: string): string {
   return join(dirname(fileURLToPath(moduleUrl)), '../renderer');
 }
 
-interface SessionEntry { token: string; expiresAt: number; }
+interface SessionEntry { token: string; csrfToken: string; expiresAt: number; }
 interface RateBucket { count: number; resetAt: number; }
 
+interface MobileEventClient {
+  response: import('node:http').ServerResponse;
+  heartbeat: NodeJS.Timeout;
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const part of (header ?? '').split(';')) {
+    const index = part.indexOf('=');
+    if (index <= 0) continue;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(key)) continue;
+    try { result[key] = decodeURIComponent(value); } catch { /* ignore malformed cookie */ }
+  }
+  return result;
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  const value = (address ?? '').replace(/^::ffff:/i, '');
+  return value === '127.0.0.1' || value === '::1' || value === 'localhost';
+}
+
+function jsonError(res: import('express').Response, status: number, error: string): void {
+  res.status(status).json({ error });
+}
+
 /** 免认证白名单（精确匹配 + assets 前缀），判定前须先规范化路径 */
-const PUBLIC_PATHS = new Set(['/', '/index.html', '/api/health', '/api/login']);
+const PUBLIC_PATHS = new Set([
+  '/', '/index.html', '/api/health', '/api/login',
+  '/api/mobile/health', '/api/mobile/login'
+]);
 
 /**
  * 判定是否免认证路径。
@@ -111,8 +145,23 @@ export class WebServer {
   private sessions = new Map<string, SessionEntry>();
   /** 频率限制桶（key = ip 或 ip:auth） */
   private rateBuckets = new Map<string, RateBucket>();
+  /** Browser clients receive projections/events, never the Electron bridge. */
+  private mobileEventClients = new Set<MobileEventClient>();
+  private readonly unsubscribeOrchestratorChange: (() => void) | null;
+  private readonly unsubscribeOrchestratorOutput: (() => void) | null;
 
-  constructor(private deps: WebServerDeps) {}
+  constructor(private deps: WebServerDeps) {
+    // Credential/status tests may construct this service with only a DB
+    // double. Keep event wiring optional while production still receives live
+    // mobile projections from the orchestrator.
+    const orchestrator = this.deps.orchestrator;
+    const onChange = orchestrator?.onChange?.(() => this.broadcastMobileEvent('snapshot', this.mobileSnapshot()));
+    const onOutput = orchestrator?.onOutput?.((taskId, chunk) => {
+      this.broadcastMobileEvent('output', { taskId, chunk });
+    });
+    this.unsubscribeOrchestratorChange = typeof onChange === 'function' ? onChange : null;
+    this.unsubscribeOrchestratorOutput = typeof onOutput === 'function' ? onOutput : null;
+  }
 
   get port(): number {
     return this.deps.db.getSetting<number>('webPort', DEFAULT_PORT);
@@ -243,6 +292,103 @@ export class WebServer {
     this.cleanupTimer = null;
   }
 
+  private mobileSnapshot(): Record<string, unknown> {
+    return {
+      agents: this.deps.orchestrator.agentCards(),
+      tasks: this.deps.orchestrator.listTasks({ includeResult: false }).slice(0, 50),
+      approvals: this.deps.orchestrator.listApprovals()
+    };
+  }
+
+  private mobileAgentExists(agentId: string): boolean {
+    return this.deps.orchestrator.listAgents().some((agent) => agent.id === agentId && !agent.archived);
+  }
+
+  private mobileConversations(agentId?: string): unknown[] {
+    const normalized = agentId?.trim();
+    if (normalized && !this.mobileAgentExists(normalized)) throw new Error('数字员工不存在');
+    const query = normalized
+      ? `SELECT id, agent_id, project_id, title, last_message_at, message_count, created_at, updated_at
+         FROM conversations WHERE agent_id = ? AND channel_id IS NULL
+         AND organization_id = 'org-local' ORDER BY last_message_at DESC LIMIT 100`
+      : `SELECT id, agent_id, project_id, title, last_message_at, message_count, created_at, updated_at
+         FROM conversations WHERE channel_id IS NULL AND organization_id = 'org-local'
+         ORDER BY last_message_at DESC LIMIT 100`;
+    const rows = (normalized
+      ? this.deps.db.raw.prepare(query).all(normalized)
+      : this.deps.db.raw.prepare(query).all()) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id), agentId: String(row.agent_id), title: String(row.title ?? ''),
+      projectId: row.project_id === null || row.project_id === undefined ? null : String(row.project_id),
+      lastMessageAt: Number(row.last_message_at ?? 0), messageCount: Number(row.message_count ?? 0),
+      createdAt: row.created_at === null ? null : Number(row.created_at ?? 0),
+      updatedAt: row.updated_at === null ? null : Number(row.updated_at ?? 0)
+    }));
+  }
+
+  private mobileConversationAgent(conversationId: string): string {
+    const row = this.deps.db.raw.prepare(
+      `SELECT c.agent_id FROM conversations c
+       WHERE c.id = ? AND c.channel_id IS NULL AND c.organization_id = 'org-local' LIMIT 1`
+    ).get(conversationId) as { agent_id?: string } | undefined;
+    if (!row?.agent_id || !this.mobileAgentExists(row.agent_id)) throw new Error('会话不存在');
+    return row.agent_id;
+  }
+
+  private mobileMessages(conversationId: string): unknown[] {
+    this.mobileConversationAgent(conversationId);
+    const rows = this.deps.db.raw.prepare(
+      `SELECT id, direction, role, content, task_id, metadata_json, created_at
+       FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC LIMIT 500`
+    ).all(conversationId) as Record<string, unknown>[];
+    return rows.map((row) => {
+      let metadata: Record<string, unknown> = {};
+      try { metadata = JSON.parse(String(row.metadata_json ?? '{}')) as Record<string, unknown>; } catch { /* ignore malformed legacy metadata */ }
+      return {
+        id: String(row.id), direction: String(row.direction), role: String(row.role),
+        content: String(row.content ?? ''), taskId: row.task_id ? String(row.task_id) : null,
+        metadata, createdAt: Number(row.created_at ?? 0)
+      };
+    });
+  }
+
+  private broadcastMobileEvent(event: string, payload: unknown): void {
+    if (this.mobileEventClients.size === 0) return;
+    const encoded = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+    for (const client of [...this.mobileEventClients]) {
+      try { client.response.write(encoded); } catch { this.removeMobileEventClient(client); }
+    }
+  }
+
+  private removeMobileEventClient(client: MobileEventClient): void {
+    clearInterval(client.heartbeat);
+    this.mobileEventClients.delete(client);
+    try { client.response.end(); } catch { /* response may already be closed */ }
+  }
+
+  private setSessionCookie(res: import('express').Response, token: string, maxAgeSeconds: number): void {
+    res.setHeader('Set-Cookie', `nexus_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}`);
+  }
+
+  private clearSessionCookie(res: import('express').Response): void {
+    res.setHeader('Set-Cookie', 'nexus_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
+  }
+
+  private originAllowed(req: import('express').Request): boolean {
+    const origin = req.get('Origin');
+    if (!origin) return true;
+    if (origin === 'null') return false;
+    try {
+      const parsed = new URL(origin);
+      const host = req.get('Host');
+      return !!host && parsed.host === host && (parsed.protocol === 'http:' || parsed.protocol === 'https:');
+    } catch { return false; }
+  }
+
+  private legacyRouteIsLoopback(req: import('express').Request): boolean {
+    return isLoopbackAddress(req.socket.remoteAddress);
+  }
+
   start(): Promise<void> {
     if (this.server?.listening) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
@@ -261,6 +407,14 @@ export class WebServer {
     const { db, orchestrator, engines, channels, providers, mcp, skills, teams, desktopControlPlane } = this.deps;
     this.ensureToken();
     const app = express();
+    // Standalone browser surface: no Electron preload, no third-party code.
+    app.use((_req, res, next) => {
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      next();
+    });
 
     // CORS：不放行任意来源。管理面板由本服务自身托管（同源），
     // 无需跨源；开放 * 会让任意网页在用户浏览器里调用本 API（Token 若被读到即可控台）。
@@ -283,14 +437,34 @@ export class WebServer {
       const auth = req.headers.authorization;
       const bearerToken = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
       // 支持永久 Token（设置页配置的原始 token）或会话 Token
-      if (bearerToken && safeEqual(bearerToken, this.token)) return next();
-      const session = bearerToken ? this.sessions.get(bearerToken) : null;
-      if (session && Date.now() < session.expiresAt) return next();
-      return res.status(401).json({ error: '未授权：请提供有效的 Access Token 或先登录获取会话 Token' });
+      const cookieToken = parseCookies(req.headers.cookie).nexus_session;
+      const sessionToken = bearerToken ?? cookieToken;
+      const permanent = bearerToken && safeEqual(bearerToken, this.token);
+      const session = sessionToken ? this.sessions.get(sessionToken) : null;
+      if (!permanent && (!session || Date.now() >= session.expiresAt)) {
+        return res.status(401).json({ error: '未授权：请先登录' });
+      }
+      if (!this.originAllowed(req)) return res.status(403).json({ error: 'Origin 不受信任' });
+      if (!permanent && cookieToken && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        const csrf = req.get('X-CSRF-Token');
+        if (!session || !csrf || !safeEqual(csrf, session.csrfToken)) return res.status(403).json({ error: 'CSRF token 无效' });
+      }
+      res.locals.webSession = session ?? null;
+      return next();
     });
 
     // 静态文件：复用 renderer 构建产物
     const rendererDir = webRendererDirectory(import.meta.url);
+    app.get('/', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.type('html').send(MOBILE_CONSOLE_HTML);
+    });
+    // Keep the historical URL usable without exposing the privileged Electron
+    // renderer as the LAN control surface.
+    app.get('/index.html', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store');
+      res.type('html').send(MOBILE_CONSOLE_HTML);
+    });
     app.use(express.static(rendererDir));
     app.get('{*splat}', (req, res, next) => {
       if (req.path.startsWith('/api/')) return next();
@@ -316,8 +490,102 @@ export class WebServer {
         return res.status(401).json({ error: 'Token 无效' });
       }
       const sessionToken = randomBytes(32).toString('hex');
-      this.sessions.set(sessionToken, { token: sessionToken, expiresAt: Date.now() + SESSION_TTL_MS });
+      const csrfToken = randomBytes(24).toString('hex');
+      this.sessions.set(sessionToken, { token: sessionToken, csrfToken, expiresAt: Date.now() + SESSION_TTL_MS });
       res.json({ ok: true, sessionToken, expiresAt: Date.now() + SESSION_TTL_MS });
+    });
+
+    // Mobile browser control surface. It is intentionally narrower than the
+    // legacy desktop-admin REST mirror below.
+    app.get('/api/mobile/health', (_req, res) => {
+      res.json({ ok: true, surface: 'nexus-mobile', version: '1.0.0' });
+    });
+    app.post('/api/mobile/login', (req, res) => {
+      const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+      if (!this.checkRate(`${ip}:mobile-auth`, AUTH_RATE_LIMIT_PER_MIN)) {
+        return res.status(429).json({ error: '登录尝试过于频繁，请稍后再试' });
+      }
+      const token = req.body?.token;
+      if (typeof token !== 'string' || !safeEqual(token, this.token)) {
+        this.deps.db.audit({ id: randomUUID(), actor: 'web', action: 'webserver.mobile_login_failed', target: ip, result: 'invalid-token' });
+        return res.status(401).json({ error: 'Token 无效' });
+      }
+      const sessionToken = randomBytes(32).toString('hex');
+      const csrfToken = randomBytes(24).toString('hex');
+      const expiresAt = Date.now() + SESSION_TTL_MS;
+      this.sessions.set(sessionToken, { token: sessionToken, csrfToken, expiresAt });
+      this.setSessionCookie(res, sessionToken, Math.floor(SESSION_TTL_MS / 1000));
+      res.json({ ok: true, csrfToken, expiresAt });
+    });
+    app.post('/api/mobile/logout', (req, res) => {
+      const token = parseCookies(req.headers.cookie).nexus_session;
+      if (token) this.sessions.delete(token);
+      this.clearSessionCookie(res);
+      res.json({ ok: true });
+    });
+    app.get('/api/mobile/bootstrap', (_req, res) => res.json(this.mobileSnapshot()));
+    app.get('/api/mobile/agents', (_req, res) => res.json(this.deps.orchestrator.agentCards()));
+    app.get('/api/mobile/conversations', (req, res) => {
+      try { res.json(this.mobileConversations(typeof req.query.agentId === 'string' ? req.query.agentId : undefined)); }
+      catch (error) { jsonError(res, 404, error instanceof Error ? error.message : '会话查询失败'); }
+    });
+    app.get('/api/mobile/conversations/:id/messages', (req, res) => {
+      try { res.json(this.mobileMessages(req.params.id)); }
+      catch (error) { jsonError(res, 404, error instanceof Error ? error.message : '消息查询失败'); }
+    });
+    app.post('/api/mobile/messages', async (req, res) => {
+      try {
+        const agentId = String(req.body?.agentId ?? '').trim();
+        const message = String(req.body?.message ?? '').trim();
+        const conversationId = req.body?.conversationId ? String(req.body.conversationId) : undefined;
+        if (!agentId || !message || message.length > 20_000) return jsonError(res, 400, 'agentId 和 message 必填');
+        if (!this.mobileAgentExists(agentId)) return jsonError(res, 404, '数字员工不存在');
+        if (conversationId && this.mobileConversationAgent(conversationId) !== agentId) return jsonError(res, 403, '会话不属于该数字员工');
+        const suppliedKey = String(req.get('Idempotency-Key') ?? '').trim();
+        const result = await desktopControlPlane.dispatch({
+          preferredAgentId: agentId, message, conversationId,
+          messageKey: suppliedKey || randomUUID(), source: 'desktop'
+        });
+        this.broadcastMobileEvent('message', { conversationId: result.conversationId, task: result.task });
+        res.json(result);
+      } catch (error) { jsonError(res, 400, error instanceof Error ? error.message : '消息发送失败'); }
+    });
+    app.post('/api/mobile/tasks/:id/cancel', (req, res) => {
+      try { this.deps.orchestrator.cancelTask(req.params.id); this.broadcastMobileEvent('snapshot', this.mobileSnapshot()); res.json({ ok: true }); }
+      catch (error) { jsonError(res, 400, error instanceof Error ? error.message : '取消失败'); }
+    });
+    app.post('/api/mobile/approvals/:id/decide', (req, res) => {
+      try { this.deps.orchestrator.decideApproval(req.params.id, req.body?.approve === true); this.broadcastMobileEvent('snapshot', this.mobileSnapshot()); res.json({ ok: true }); }
+      catch (error) { jsonError(res, 400, error instanceof Error ? error.message : '审批失败'); }
+    });
+    app.get('/api/mobile/events', (req, res) => {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-store');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      const client: MobileEventClient = {
+        response: res,
+        heartbeat: setInterval(() => { try { res.write(': heartbeat\\n\\n'); } catch { this.removeMobileEventClient(client); } }, 20_000)
+      };
+      this.mobileEventClients.add(client);
+      res.write(`event: snapshot\\ndata: ${JSON.stringify(this.mobileSnapshot())}\\n\\n`);
+      req.on('close', () => this.removeMobileEventClient(client));
+    });
+
+    // The old desktop-admin mirror remains only for local automation and
+    // backwards compatibility. LAN/mobile clients must use /api/mobile/*.
+    app.use((req, res, next) => {
+      const legacyPrefixes = [
+        '/api/providers', '/api/provider', '/api/agents', '/api/tasks',
+        '/api/approvals', '/api/engines', '/api/channels', '/api/mcp',
+        '/api/skills', '/api/teams', '/api/config', '/api/settings'
+      ];
+      if (legacyPrefixes.some((prefix) => req.path === prefix || req.path.startsWith(`${prefix}/`))
+        && !this.legacyRouteIsLoopback(req)) {
+        return res.status(404).json({ error: '该管理路由仅限本机；请使用 DSH 移动控制面' });
+      }
+      next();
     });
 
     // 快照（完整状态）
@@ -575,5 +843,6 @@ export class WebServer {
     this.stopCleanup();
     this.sessions.clear();
     this.rateBuckets.clear();
+    for (const client of [...this.mobileEventClients]) this.removeMobileEventClient(client);
   }
 }

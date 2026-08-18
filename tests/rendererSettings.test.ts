@@ -31,7 +31,6 @@ describe('Renderer setting boundary', () => {
   it('validates primitive values and exact threshold shape before persistence', () => {
     const db = database();
     writeRendererSetting(db, 'theme', 'light');
-    writeRendererSetting(db, 'demoAutoTasks', false);
     writeRendererSetting(db, 'memory:autoAcceptConversationProposals', true);
     writeRendererSetting(db, 'thresholds', { cpu: 85, mem: 90, gpuTemp: 100 });
 
@@ -40,6 +39,7 @@ describe('Renderer setting boundary', () => {
     expect(db.values.get('thresholds')).toEqual({ cpu: 85, mem: 90, gpuTemp: 100 });
     expect(() => validateRendererSetting('theme', 'system')).toThrow(/Invalid theme/);
     expect(() => validateRendererSetting('notifications', 'true')).toThrow(/Invalid notifications/);
+    expect(() => validateRendererSetting('demoAutoTasks', false)).toThrow(/not allowed/);
     expect(() => validateRendererSetting('thresholds', { cpu: 85, mem: 85, gpuTemp: 85, secret: 'x' }))
       .toThrow(/Invalid thresholds/);
     expect(() => validateRendererSetting('thresholds', { cpu: 101, mem: 85, gpuTemp: 85 }))

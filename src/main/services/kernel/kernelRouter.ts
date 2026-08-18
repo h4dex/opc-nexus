@@ -1,13 +1,10 @@
 import type {
-  AdvisorAdvice,
-  AdvisorReview,
   ControlKernel,
   DispatchPlan,
   DispatchPlanDraft,
   KernelAttemptRecord,
   KernelAttemptRecorder,
   KernelRequest,
-  PlanningAdvisor,
   WorkerCandidate
 } from './types.js';
 
@@ -15,8 +12,6 @@ const MAX_MESSAGE_CHARS = 1_000_000;
 const MAX_OBJECTIVE_CHARS = 16_000;
 const MAX_MEMORY_PROPOSALS = 20;
 const MAX_TASK_SCHEDULE_PROPOSALS = 10;
-const COMPLEX_TASK_RE = /(?:规划|拆解|审查|评审|架构|调研|比较|多步骤|plan|review|architect|research|compare)/i;
-
 const NOOP_RECORDER: KernelAttemptRecorder = { record: () => {} };
 
 export class KernelRoutingError extends Error {
@@ -143,22 +138,23 @@ function validateDraft(draft: DispatchPlanDraft, request: KernelRequest): Dispat
 }
 
 /**
- * Selects exactly one control-plane leader for a request. Advisors can add
- * context or review a draft, but their output can never dispatch a worker.
- * Requests for the same logical conversation are serialized in-process.
+ * Selects exactly one ingress route. Cordis is the sole owner-facing AI;
+ * Local CLI is a deterministic adapter for an employee selected explicitly.
+ * A failed Cordis route is never retried through the Local CLI adapter.
  */
 export class KernelRouter {
   private readonly conversationTails = new Map<string, Promise<void>>();
 
   constructor(
     private readonly primary: ControlKernel,
-    private readonly fallback: ControlKernel,
-    private readonly advisors: PlanningAdvisor[] = [],
+    private readonly directWorker: ControlKernel,
     private readonly recorder: KernelAttemptRecorder = NOOP_RECORDER,
     private readonly now: () => number = Date.now
   ) {
-    if (primary.id !== 'hermes') throw new Error('Hermes must be the primary control kernel');
-    if (fallback.id !== 'nexus') throw new Error('Nexus must be the fallback control kernel');
+    if (primary.id !== 'cordis') throw new Error('Cordis must be the primary control kernel');
+    if (directWorker.id !== 'local-cli') {
+      throw new Error('The secondary route must be the explicit Local CLI dispatch adapter');
+    }
   }
 
   async plan(request: KernelRequest): Promise<DispatchPlan> {
@@ -180,100 +176,37 @@ export class KernelRouter {
   private async planUnlocked(request: KernelRequest): Promise<DispatchPlan> {
     const failures: string[] = [];
     let sequence = 0;
-    const advice: AdvisorAdvice[] = [];
-
-    for (const advisor of this.advisors) {
-      if (!advisor.isReady() || !advisor.shouldAdvise(request)) continue;
-      const startedAt = this.now();
-      try {
-        const result = await advisor.advise(request);
-        if (result.advisorId !== advisor.id) throw new Error('Advisor returned a mismatched id');
-        advice.push({ advisorId: advisor.id, summary: cleanText(result.summary, 'advisor.summary', 8_000) });
-        await this.record({ request, componentId: advisor.id, role: 'advisor', sequence: ++sequence, status: 'succeeded', startedAt, error: null });
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        failures.push(`${advisor.id} advisor: ${detail}`);
-        await this.record({ request, componentId: advisor.id, role: 'advisor', sequence: ++sequence, status: 'failed', startedAt, error: detail });
-      }
+    const route = request.routingMode === 'direct-worker' ? 'direct-worker' : 'cordis';
+    const kernel = route === 'direct-worker' ? this.directWorker : this.primary;
+    const startedAt = this.now();
+    if (!kernel.isReady()) {
+      const detail = `${kernel.id} is not ready`;
+      failures.push(detail);
+      await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'skipped', startedAt, error: detail });
+      throw new KernelRoutingError('The selected dispatch route is unavailable', failures);
     }
-
-    for (const kernel of [this.primary, this.fallback]) {
-      const startedAt = this.now();
-      if (!kernel.isReady()) {
-        const detail = `${kernel.id} is not ready`;
-        failures.push(detail);
-        await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'skipped', startedAt, error: detail });
-        continue;
-      }
-      try {
-        const draft = validateDraft(await kernel.plan(request, advice), request);
-        await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'succeeded', startedAt, error: null });
-        const advisedBy = new Set(advice.map((item) => item.advisorId));
-        const reviews = await this.review(request, draft, sequence, advisedBy);
-        sequence += reviews.attempts;
-        const worker = request.workers.find((candidate) => candidate.agentId === draft.workerAgentId)!;
-        const reviewRequiresApproval = reviews.results.some((review) => !review.accepted);
-        return Object.freeze({
-          ...draft,
-          requiresHumanApproval: draft.requiresHumanApproval || reviewRequiresApproval,
-          schemaVersion: 1 as const,
-          requestId: request.requestId,
-          conversationId: request.conversationId,
-          leaderKernel: kernel.id,
-          workerEngineId: worker.engineId,
-          advisorAdvice: advice,
-          advisorReviews: reviews.results
-        });
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        failures.push(`${kernel.id} leader: ${detail}`);
-        await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'failed', startedAt, error: detail });
-      }
+    try {
+      const draft = validateDraft(await kernel.plan(request, []), request);
+      await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'succeeded', startedAt, error: null });
+      const worker = request.workers.find((candidate) => candidate.agentId === draft.workerAgentId)!;
+      return Object.freeze({
+        ...draft,
+        schemaVersion: 1 as const,
+        requestId: request.requestId,
+        conversationId: request.conversationId,
+        leaderKernel: kernel.id,
+        workerEngineId: worker.engineId,
+        // Retained in schema v1 for old persisted projections. Quest
+        // clarification/review now lives inside the authoritative Cordis run.
+        advisorAdvice: [],
+        advisorReviews: []
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      failures.push(`${kernel.id} leader: ${detail}`);
+      await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'failed', startedAt, error: detail });
     }
     throw new KernelRoutingError('No control kernel produced a valid dispatch plan', failures);
-  }
-
-  private async review(
-    request: KernelRequest,
-    plan: DispatchPlanDraft,
-    initialSequence: number,
-    advisedBy: ReadonlySet<PlanningAdvisor['id']>
-  ): Promise<{ results: AdvisorReview[]; attempts: number }> {
-    const results: AdvisorReview[] = [];
-    let attempts = 0;
-    for (const advisor of this.advisors) {
-      if (!advisor.review || !advisor.shouldAdvise(request)) continue;
-      if (!advisor.isReady()) {
-        if (!advisedBy.has(advisor.id)) continue;
-        const detail = `${advisor.id} became unavailable after providing planning advice`;
-        results.push({
-          advisorId: advisor.id,
-          accepted: false,
-          summary: '复核器在提出建议后变为不可用，无法确认计划安全性。'
-        });
-        await this.record({
-          request, componentId: advisor.id, role: 'reviewer',
-          sequence: initialSequence + ++attempts, status: 'skipped', startedAt: this.now(), error: detail
-        });
-        continue;
-      }
-      const startedAt = this.now();
-      try {
-        const result = await advisor.review(request, plan);
-        if (result.advisorId !== advisor.id) throw new Error('Reviewer returned a mismatched id');
-        results.push({ advisorId: advisor.id, accepted: result.accepted === true, summary: cleanText(result.summary, 'review.summary', 8_000) });
-        await this.record({ request, componentId: advisor.id, role: 'reviewer', sequence: initialSequence + ++attempts, status: 'succeeded', startedAt, error: null });
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        results.push({
-          advisorId: advisor.id,
-          accepted: false,
-          summary: cleanText(`复核器不可用，无法确认计划安全性：${detail}`, 'review.summary', 8_000)
-        });
-        await this.record({ request, componentId: advisor.id, role: 'reviewer', sequence: initialSequence + ++attempts, status: 'failed', startedAt, error: detail });
-      }
-    }
-    return { results, attempts };
   }
 
   private async record(input: Omit<KernelAttemptRecord, 'requestId' | 'conversationId' | 'endedAt'> & { request: KernelRequest }): Promise<void> {
@@ -289,10 +222,4 @@ export class KernelRouter {
       error: input.error?.slice(0, 2_000) ?? null
     });
   }
-}
-
-export function defaultShouldUsePlanningAdvisor(request: KernelRequest): boolean {
-  return request.message.length >= 600
-    || request.message.split(/\r?\n/).length >= 6
-    || COMPLEX_TASK_RE.test(request.message);
 }

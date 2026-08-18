@@ -432,6 +432,26 @@ describe('ACP 子进程环境', () => {
 });
 
 describe('受管 Harness 协议防护', () => {
+  it('自主模式拒绝未知 ACP 的越界权限请求且不打扰用户审批', async () => {
+    const db = makeDb({ 'eng-harness': { acpCommand: ['dsh', 'acp'] } });
+    const broker = { request: vi.fn(), abandonTask: vi.fn() };
+    const executor = new AcpExecutor(db as never, broker as never);
+
+    executor.start(task as never, { ...agent, permissionMode: 'autonomous' } as never, callbacks() as never);
+    child.stdout.emit('data', Buffer.from(`${permissionRequestLine(77)}\n`));
+
+    await vi.waitFor(() => {
+      const messages = child.stdin.write.mock.calls.map(([line]) => JSON.parse(line));
+      expect(messages).toContainEqual(expect.objectContaining({
+        id: 77,
+        result: { outcome: { outcome: 'selected', optionId: 'reject' } }
+      }));
+    });
+    expect(broker.request).not.toHaveBeenCalled();
+    executor.abort(task.id);
+    child.emit('close', 0);
+  });
+
   it('同一任务只允许一个 permission 请求进入审批代理', async () => {
     const db = makeDb({ 'eng-harness': { acpCommand: ['dsh', 'acp'] } });
     let settleApproval!: (approved: boolean) => void;

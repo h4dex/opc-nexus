@@ -24,7 +24,7 @@ vi.mock('onnxruntime-node', () => ({
   Tensor: class {}
 }));
 
-const { OCR_SESSION_IDLE_MS, OcrService } = await import('../src/main/services/ocrService.js');
+const { MAX_OCR_IMAGE_BYTES, OCR_SESSION_IDLE_MS, OcrService } = await import('../src/main/services/ocrService.js');
 
 interface FakeSession {
   inputNames: string[];
@@ -76,6 +76,36 @@ afterEach(() => {
 });
 
 describe('OcrService session lifecycle', () => {
+  it('recognizes trusted attachment bytes without requiring a host path', async () => {
+    arrangeSessions();
+    const service = new OcrService(makeDb() as never);
+    const detect = vi.spyOn(service as any, 'detectText').mockResolvedValue([]);
+    const image = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+
+    await expect(service.recognizeBytes(image)).resolves.toMatchObject({
+      ok: true,
+      text: '（未检测到文字）',
+      boxes: []
+    });
+    expect(detect).toHaveBeenCalledWith(expect.anything(), expect.anything(), Buffer.from(image), 100, 40);
+    service.dispose();
+    await flushPromises();
+  });
+
+  it('rejects empty and oversized attachment bytes before loading OCR models', async () => {
+    const service = new OcrService(makeDb() as never);
+
+    await expect(service.recognizeBytes(new Uint8Array())).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining('大小限制')
+    });
+    await expect(service.recognizeBytes(new Uint8Array(MAX_OCR_IMAGE_BYTES + 1))).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining('大小限制')
+    });
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
   it('reads model sizes from metadata without loading model buffers', () => {
     const service = new OcrService(makeDb() as never);
 

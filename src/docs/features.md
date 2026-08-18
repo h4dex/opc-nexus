@@ -134,7 +134,6 @@ interface Agent {
 | `pi-cli` | Pi Agent CLI |
 | `generic-cli` | Hermes Agent / OpenCode CLI |
 | `acp` | ACP 协议外部引擎 |
-| `simulated` | 演示模拟 |
 | `unavailable` | 生产模式下无可用执行器 |
 
 ### 2.5 IPC 接口

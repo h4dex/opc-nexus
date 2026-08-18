@@ -25,7 +25,24 @@ import type {
   VoiceConfig, VoiceConfigInput, VoiceCommandDraft, VoiceTestResult,
   MobileAdbDevice, MobileAgentConfig, MobileApkInfo, MobileArtifact, MobileCommandLog, MobileDevice, MobileEvent,
   MobileGatewayStatus, MobilePairingOffer, MobileScriptDefinition, MobileToolCatalog, MobileToolName, Utf8TextPayload,
-  WeixinLoginState
+  WeixinLoginState, DshWorkbenchStatus, DshEmbeddedWorkbenchBounds, DshEmbeddedWorkbenchStatus,
+  OpenDshEmbeddedWorkbenchInput, OpenQuestWindowInput, QuestWindowStatus,
+  QuestProviderPreflightView,
+  DshControlStatusView, DshEventPage, DshPluginCatalogView,
+  DshCommunityPluginCatalogView, DshPluginInstallConfirmationView, DshPluginInstallRequest, DshPluginInstallResultView,
+  DshPluginLifecycleAction, DshPluginLifecycleConfirmationView, DshPluginLifecycleRequest, DshPluginLifecycleResultView,
+  PluginCatalogView, EnvironmentDiagnosticsView, ProjectWorkbenchView, QuestSettings,
+  ProjectArtifactDirectoryView, ProjectArtifactPreviewView,
+  DshReadEventsInput, DshReleaseControlRequest, DshTakeoverRequest, DshTakeoverResult,
+  DshDelegationTreeQueryInput, DshDelegationTreeView, DshChildResultsQueryInput, DshChildResultsAggregateView,
+  DshLanGatewayConfigInput, DshLanGatewayCompositionStatusView, DshLanPairingOfferView, DshLanRoleView,
+  AgentChatContextView, ConversationTimelineInput, ConversationTimelineView,
+  OcrRecognitionResultView, VisionAttachmentRef, VisionConfigureInput, VisionDescribeInput, VisionDescribeResult, VisionModelBindingView,
+  AnswerPlanningQuestionsInput, ApprovePlanningPlanInput, CreatePlanningSessionInput,
+  ChatPlanningPreflightResult, DispatchPlanningPlanInput, PlanningDispatchResult, PlanningSessionListItem, PlanningSessionView,
+  ProposePlanningPlanInput, RejectPlanningPlanInput,
+  AnswerDshQuestQuestionsInput, ApproveDshQuestPlanInput, DshQuestGovernanceView,
+  DispatchDshQuestPlanInput, RejectDshQuestPlanInput
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -134,6 +151,18 @@ const api = {
   updateProject: (id: string, patch: ProjectPatch): Promise<Project | null> => ipcRenderer.invoke('aibox:updateProject', id, patch),
   archiveProject: (id: string): Promise<Project | null> => ipcRenderer.invoke('aibox:archiveProject', id),
   getProjectOperations: (): Promise<ProjectOperationsOverview> => ipcRenderer.invoke('aibox:getProjectOperations'),
+  getProjectWorkbench: (projectId: string): Promise<ProjectWorkbenchView> => ipcRenderer.invoke('aibox:getProjectWorkbench', projectId),
+  saveQuestSettings: (projectId: string, patch: Partial<QuestSettings>): Promise<QuestSettings> => ipcRenderer.invoke('aibox:saveQuestSettings', projectId, patch),
+  bindProjectRootSession: (projectId: string, sessionId: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('aibox:bindProjectRootSession', projectId, sessionId),
+  openProjectWorkspace: (projectId: string): Promise<{ ok: boolean; message: string; workspaceChanged: boolean }> => ipcRenderer.invoke('aibox:openProjectWorkspace', projectId),
+  listProjectArtifacts: (projectId: string, relativeDirectory = ''): Promise<ProjectArtifactDirectoryView> =>
+    ipcRenderer.invoke('aibox:listProjectArtifacts', projectId, relativeDirectory),
+  previewProjectArtifact: (projectId: string, relativePath: string): Promise<ProjectArtifactPreviewView> =>
+    ipcRenderer.invoke('aibox:previewProjectArtifact', projectId, relativePath),
+  hashProjectArtifact: (projectId: string, relativePath: string): Promise<string> =>
+    ipcRenderer.invoke('aibox:hashProjectArtifact', projectId, relativePath),
+  revealProjectArtifact: (projectId: string, relativePath: string): Promise<{ ok: true }> =>
+    ipcRenderer.invoke('aibox:revealProjectArtifact', projectId, relativePath),
 
   getAutomationOverview: (projectId?: string): Promise<AutomationOverview> => ipcRenderer.invoke('aibox:getAutomationOverview', projectId),
   runAutomationReport: (kind: AutomationReportKind, projectId: string): Promise<AutomationReport> => ipcRenderer.invoke('aibox:runAutomationReport', kind, projectId),
@@ -161,6 +190,116 @@ const api = {
 
   // 数字员工
   createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', encodeAgentInput(input)),
+  getDshRuntimeStatus: (agentId: string): Promise<DshWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:getDshRuntimeStatus', agentId),
+  preflightQuestProvider: (projectId: string, agentId: string): Promise<QuestProviderPreflightView> =>
+    ipcRenderer.invoke('aibox:preflightQuestProvider', { projectId, agentId }),
+  getDshPluginCatalog: (): Promise<DshPluginCatalogView> =>
+    ipcRenderer.invoke('aibox:getDshPluginCatalog'),
+  getDshCommunityPluginCatalog: (agentId: string): Promise<DshCommunityPluginCatalogView> =>
+    ipcRenderer.invoke('aibox:getDshCommunityPluginCatalog', agentId),
+  prepareDshCommunityPluginInstall: (agentId: string, pluginId: string): Promise<DshPluginInstallConfirmationView> =>
+    ipcRenderer.invoke('aibox:prepareDshCommunityPluginInstall', { agentId, pluginId }),
+  installDshCommunityPlugin: (input: DshPluginInstallRequest): Promise<DshPluginInstallResultView> =>
+    ipcRenderer.invoke('aibox:installDshCommunityPlugin', input),
+  prepareDshCommunityPluginLifecycle: (agentId: string, pluginId: string, action: DshPluginLifecycleAction): Promise<DshPluginLifecycleConfirmationView> =>
+    ipcRenderer.invoke('aibox:prepareDshCommunityPluginLifecycle', { agentId, pluginId, action }),
+  applyDshCommunityPluginLifecycle: (input: DshPluginLifecycleRequest): Promise<DshPluginLifecycleResultView> =>
+    ipcRenderer.invoke('aibox:applyDshCommunityPluginLifecycle', input),
+  getPluginCatalog: (): Promise<PluginCatalogView> =>
+    ipcRenderer.invoke('aibox:getPluginCatalog'),
+  setPluginEnabled: (pluginId: string, enabled: boolean): Promise<PluginCatalogView> =>
+    ipcRenderer.invoke('aibox:setPluginEnabled', pluginId, enabled),
+  getEnvironmentDiagnostics: (): Promise<EnvironmentDiagnosticsView> =>
+    ipcRenderer.invoke('aibox:getEnvironmentDiagnostics'),
+  startDshRuntime: (agentId: string): Promise<DshWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:startDshRuntime', agentId),
+  stopDshRuntime: (agentId: string): Promise<DshWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:stopDshRuntime', agentId),
+  openDshWorkbench: (agentId: string): Promise<DshWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:openDshWorkbench', agentId),
+  openQuestWindow: (input: OpenQuestWindowInput): Promise<QuestWindowStatus> =>
+    ipcRenderer.invoke('aibox:openQuestWindow', input),
+  openMainSurface: (): Promise<{ ok: true }> =>
+    ipcRenderer.invoke('aibox:openMainSurface'),
+  openEmbeddedDshWorkbench: (input: OpenDshEmbeddedWorkbenchInput): Promise<DshEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:openEmbeddedDshWorkbench', input),
+  setEmbeddedDshWorkbenchBounds: (bounds: DshEmbeddedWorkbenchBounds): Promise<DshEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:setEmbeddedDshWorkbenchBounds', bounds),
+  setEmbeddedDshWorkbenchVisible: (visible: boolean): Promise<DshEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:setEmbeddedDshWorkbenchVisible', visible),
+  closeEmbeddedDshWorkbench: (): Promise<DshEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:closeEmbeddedDshWorkbench'),
+  getEmbeddedDshWorkbenchStatus: (): Promise<DshEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:getEmbeddedDshWorkbenchStatus'),
+  getDshControlStatus: (sessionId: string): Promise<DshControlStatusView> =>
+    ipcRenderer.invoke('aibox:getDshControlStatus', sessionId),
+  readDshEvents: (input: DshReadEventsInput): Promise<DshEventPage> =>
+    ipcRenderer.invoke('aibox:readDshEvents', input),
+  getDshDelegationTree: (input: DshDelegationTreeQueryInput): Promise<DshDelegationTreeView> =>
+    ipcRenderer.invoke('aibox:getDshDelegationTree', input),
+  getDshChildResults: (input: DshChildResultsQueryInput): Promise<DshChildResultsAggregateView> =>
+    ipcRenderer.invoke('aibox:getDshChildResults', input),
+  requestDshTakeover: (input: DshTakeoverRequest): Promise<DshTakeoverResult> =>
+    ipcRenderer.invoke('aibox:requestDshTakeover', input),
+  releaseDshControl: (input: DshReleaseControlRequest): Promise<DshControlStatusView> =>
+    ipcRenderer.invoke('aibox:releaseDshControl', input),
+  getDshLanGatewayStatus: (): Promise<DshLanGatewayCompositionStatusView> =>
+    ipcRenderer.invoke('aibox:getDshLanGatewayStatus'),
+  startDshLanGateway: (input: DshLanGatewayConfigInput): Promise<DshLanGatewayCompositionStatusView> =>
+    ipcRenderer.invoke('aibox:startDshLanGateway', input),
+  restoreDshLanGateway: (): Promise<DshLanGatewayCompositionStatusView> =>
+    ipcRenderer.invoke('aibox:restoreDshLanGateway'),
+  createDshLanPairing: (role: DshLanRoleView = 'operator'): Promise<DshLanPairingOfferView> =>
+    ipcRenderer.invoke('aibox:createDshLanPairing', role),
+  shutdownDshLanGateway: (): Promise<DshLanGatewayCompositionStatusView> =>
+    ipcRenderer.invoke('aibox:shutdownDshLanGateway'),
+  emergencyStopDshLanGateway: (): Promise<DshLanGatewayCompositionStatusView> =>
+    ipcRenderer.invoke('aibox:emergencyStopDshLanGateway'),
+  resetDshLanCertificate: (): Promise<DshLanGatewayCompositionStatusView> =>
+    ipcRenderer.invoke('aibox:resetDshLanCertificate'),
+  getDshLanTrustedAuthorities: (): Promise<string[]> =>
+    ipcRenderer.invoke('aibox:getDshLanTrustedAuthorities'),
+  // ---------- 秘书规划控制面 ----------
+  listPlanningSessions: (limit?: number): Promise<PlanningSessionListItem[]> =>
+    ipcRenderer.invoke('aibox:listPlanningSessions', limit),
+  getPlanningSession: (sessionId: string): Promise<PlanningSessionView> =>
+    ipcRenderer.invoke('aibox:getPlanningSession', sessionId),
+  createPlanningSession: (input: CreatePlanningSessionInput): Promise<PlanningSessionView> =>
+    ipcRenderer.invoke('aibox:createPlanningSession', { ...input, request: encodeText(input.request) }),
+  answerPlanningQuestions: (input: AnswerPlanningQuestionsInput): Promise<PlanningSessionView> =>
+    ipcRenderer.invoke('aibox:answerPlanningQuestions', {
+      ...input,
+      answers: input.answers.map((answer) => ({
+        ...answer,
+        text: answer.text === null ? null : encodeText(answer.text)
+      }))
+    }),
+  proposePlanningPlan: (input: ProposePlanningPlanInput): Promise<PlanningSessionView> =>
+    ipcRenderer.invoke('aibox:proposePlanningPlan', input),
+  approvePlanningPlan: (input: ApprovePlanningPlanInput): Promise<PlanningSessionView> =>
+    ipcRenderer.invoke('aibox:approvePlanningPlan', input),
+  rejectPlanningPlan: (input: RejectPlanningPlanInput): Promise<PlanningSessionView> =>
+    ipcRenderer.invoke('aibox:rejectPlanningPlan', input),
+  dispatchPlanningPlan: (input: DispatchPlanningPlanInput): Promise<PlanningDispatchResult> =>
+    ipcRenderer.invoke('aibox:dispatchPlanningPlan', input),
+  /** DSH/Cordis Quest owner actions. Identity is checked against the durable binding in Main. */
+  answerDshQuestQuestions: (input: AnswerDshQuestQuestionsInput): Promise<DshQuestGovernanceView> =>
+    ipcRenderer.invoke('aibox:answerDshQuestQuestions', {
+      ...input,
+      answers: input.answers.map((answer) => ({
+        ...answer,
+        text: answer.text === null ? null : encodeText(answer.text)
+      }))
+    }),
+  approveDshQuestPlan: (input: ApproveDshQuestPlanInput): Promise<DshQuestGovernanceView> =>
+    ipcRenderer.invoke('aibox:approveDshQuestPlan', input),
+  rejectDshQuestPlan: (input: RejectDshQuestPlanInput): Promise<DshQuestGovernanceView> =>
+    ipcRenderer.invoke('aibox:rejectDshQuestPlan', input),
+  dispatchDshQuestPlan: (input: DispatchDshQuestPlanInput): Promise<DshQuestGovernanceView> =>
+    ipcRenderer.invoke('aibox:dispatchDshQuestPlan', input),
+  preflightChatMessage: (message: string): Promise<ChatPlanningPreflightResult> =>
+    ipcRenderer.invoke('aibox:preflightChatMessage', encodeText(message)),
   startAgent: (id: string): Promise<void> => ipcRenderer.invoke('aibox:startAgent', id),
   stopAgent: (id: string): Promise<void> => ipcRenderer.invoke('aibox:stopAgent', id),
   /** 助手人设编辑（soul.md / agents.md / user.md / 权限模式） */
@@ -197,9 +336,15 @@ const api = {
   generatePersona: (description: string): Promise<{ name: string; role: string; soulMd: string; agentsMd: string; systemPrompt: string; permissionMode: string }> => ipcRenderer.invoke('aibox:generatePersona', description),
   /** 会话列表（按助手） */
   listConversations: (agentId: string): Promise<Conversation[]> => ipcRenderer.invoke('aibox:listConversations', agentId),
+  /** Canonical conversation history, scoped by employee and local principal. */
+  getConversationTimeline: (input: ConversationTimelineInput): Promise<ConversationTimelineView> =>
+    ipcRenderer.invoke('aibox:getConversationTimeline', input),
+  /** Runtime/control projection for the unified chat surface. */
+  getAgentChatContext: (agentId: string, conversationId?: string): Promise<AgentChatContextView> =>
+    ipcRenderer.invoke('aibox:getAgentChatContext', { agentId, conversationId }),
   /** 发送消息给助手（创建/继续会话） */
-  chatWithAgent: (agentId: string, message: string, conversationId?: string): Promise<{ conversationId: string; task: Task }> =>
-    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId, randomUUID()),
+  chatWithAgent: (agentId: string, message: string, conversationId?: string, projectId?: string): Promise<{ conversationId: string; task: Task }> =>
+    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId, randomUUID(), projectId),
   /** 会话重命名 */
   renameConversation: (id: string, title: string): Promise<void> => ipcRenderer.invoke('aibox:renameConversation', id, encodeText(title)),
   /** 删除会话 */
@@ -260,7 +405,7 @@ const api = {
 
   // 多供应商管理
   listProviders: (): Promise<{ id: string; name: string; baseUrl: string; model: string; isDefault: boolean; hasKey: boolean }[]> => ipcRenderer.invoke('aibox:listProviders'),
-  createProvider: (input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }): Promise<unknown> => ipcRenderer.invoke('aibox:createProvider', input),
+  createProvider: (input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }): Promise<{ id: string; name: string; baseUrl: string; model: string; isDefault: boolean; hasKey: boolean; createdAt: number }> => ipcRenderer.invoke('aibox:createProvider', input),
   updateProvider: (id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }): Promise<void> => ipcRenderer.invoke('aibox:updateProvider', id, patch),
   removeProvider: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeProvider', id),
   testProviderById: (id: string): Promise<{ ok: boolean; latencyMs: number; error: string | null }> => ipcRenderer.invoke('aibox:testProviderById', id),
@@ -411,11 +556,22 @@ const api = {
   regenerateWebToken: (): Promise<WebAdminStatus> => ipcRenderer.invoke('aibox:regenerateWebToken'),
   copyWebToken: (): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:copyWebToken'),
 
+  // Vision attachments are opaque references; host paths and provider keys
+  // never cross the preload boundary.
+  getVisionBinding: (): Promise<VisionModelBindingView | null> => ipcRenderer.invoke('aibox:getVisionBinding'),
+  configureVisionBinding: (input: VisionConfigureInput): Promise<VisionModelBindingView> => ipcRenderer.invoke('aibox:configureVisionBinding', input),
+  clearVisionBinding: (): Promise<null> => ipcRenderer.invoke('aibox:clearVisionBinding'),
+  putVisionAttachment: (input: { data: ArrayBuffer; mimeType: string; filename?: string }): Promise<VisionAttachmentRef> => ipcRenderer.invoke('aibox:putVisionAttachment', input),
+  pickVisionAttachment: (): Promise<VisionAttachmentRef | null> => ipcRenderer.invoke('aibox:pickVisionAttachment'),
+  describeVision: (input: VisionDescribeInput): Promise<VisionDescribeResult> => ipcRenderer.invoke('aibox:describeVision', input),
+
   // OCR 文字识别服务
   getOcrStatus: (): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:getOcrStatus'),
   toggleOcr: (enabled: boolean): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:toggleOcr', enabled),
   downloadOcrModels: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:downloadOcrModels'),
-  ocrRecognize: (imagePath: string): Promise<{ ok: boolean; text: string; boxes: { box: [number, number][]; text: string; confidence: number }[]; elapsed: number; error?: string }> => ipcRenderer.invoke('aibox:ocrRecognize', imagePath),
+  /** Local OCR accepts only the same opaque attachment contract as DSH Vision. */
+  ocrRecognize: (attachmentRef: VisionAttachmentRef): Promise<OcrRecognitionResultView> =>
+    ipcRenderer.invoke('aibox:ocrRecognize', attachmentRef),
   /** 数据库完整性检查 */
   integrityCheck: (): Promise<{ ok: boolean; message: string; repaired: number }> => ipcRenderer.invoke('aibox:integrityCheck'),
   /** 手动数据清理 */
@@ -452,6 +608,11 @@ const api = {
     const handler = (_: unknown, r: ResourceUpdatePayload) => fn(r);
     ipcRenderer.on('aibox:resources', handler);
     return () => ipcRenderer.removeListener('aibox:resources', handler);
+  },
+  onQuestWindowClosed: (fn: (projectId: string | null) => void): (() => void) => {
+    const handler = (_: unknown, projectId: string | null) => fn(projectId);
+    ipcRenderer.on('aibox:questWindowClosed', handler);
+    return () => ipcRenderer.removeListener('aibox:questWindowClosed', handler);
   },
   /** 任务输出流式推送（逐字显示） */
   onTaskOutput: (fn: (p: { taskId: string; chunk: string }) => void): (() => void) => {

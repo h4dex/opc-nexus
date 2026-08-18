@@ -50,6 +50,31 @@ describe('Scheduler 自动计划调度', () => {
     expect(scheduler.getHistory(schedule.id)).toEqual([expect.objectContaining({ id: 'report-1', title: '每日巡检报告', status: 'COMPLETED' })]);
   });
 
+  it('重建 Scheduler 后复用持久 next_run_at 且不会重复派发同一到期点', () => {
+    const db = createMockDb();
+    const agentId = seedAgent(db);
+    const createTask = vi.fn();
+    const first = new Scheduler(db as unknown as Database, { createTask } as unknown as Orchestrator);
+    const schedule = first.create({
+      automationKind: 'task', agentId, title: '恢复后的日报', content: '只派发一次',
+      cronKind: 'interval', cronValue: '1'
+    });
+    const dueAt = Date.now() - 1;
+    db.tables.schedules.get(schedule.id)!.next_run_at = dueAt;
+
+    const scanAt = Date.now();
+    first.runDue(scanAt);
+    const persisted = db.tables.schedules.get(schedule.id)!;
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(persisted.last_run_at).toBe(scanAt);
+    expect(Number(persisted.next_run_at)).toBeGreaterThan(scanAt);
+
+    const restarted = new Scheduler(db as unknown as Database, { createTask } as unknown as Orchestrator);
+    restarted.runDue(scanAt);
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(db.tables.schedules.get(schedule.id)?.next_run_at).toBe(persisted.next_run_at);
+  });
+
   it('拒绝缺少执行目标的计划', () => {
     const db = createMockDb();
     const scheduler = new Scheduler(db as unknown as Database, { createTask: vi.fn() } as unknown as Orchestrator);

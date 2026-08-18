@@ -3,9 +3,9 @@ import { useEffect, useState, useMemo } from 'react';
 import { useApp } from '../store';
 import { AgentEditor } from '../components/AgentEditor';
 import { ContextMenu, Modal, type CtxMenuItem } from '../components/common';
-import { IconPlay, IconStop, IconPlus, IconTask } from '../components/icons';
+import { IconMessage, IconPlay, IconStop, IconPlus, IconTask } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { Agent, AgentCardView, Project } from '@shared/types';
+import { DSH_MANAGED_ENGINE_ID, type Agent, type AgentCardView, type Project } from '@shared/types';
 
 const PERM_LABEL: Record<string, { text: string; color: string }> = {
   readonly: { text: '只读', color: 'var(--text-3)' },
@@ -22,10 +22,21 @@ const LIFECYCLE_LABEL: Record<string, { text: string; color: string }> = {
   ERROR: { text: '异常', color: 'var(--danger)' }
 };
 
+function lifecycleMeta(card: AgentCardView): { text: string; color: string } {
+  if (card.agent.lifecycle === 'READY' && card.engineStatus !== 'HEALTHY') {
+    if (card.engineStatus === 'AUTH_REQUIRED') return { text: '待登录', color: 'var(--warning)' };
+    if (card.engineStatus === 'SETUP_REQUIRED' || card.engineStatus === 'NOT_INSTALLED') {
+      return { text: '待配置', color: 'var(--warning)' };
+    }
+    return { text: '引擎异常', color: 'var(--danger)' };
+  }
+  return LIFECYCLE_LABEL[card.agent.lifecycle] ?? LIFECYCLE_LABEL.DISABLED;
+}
+
 type ViewMode = 'table' | 'card';
 
 export function Agents() {
-  const { snapshot, setWizardOpen, navigationTarget, clearNavigationTarget } = useApp();
+  const { snapshot, setWizardOpen, navigationTarget, clearNavigationTarget, openAgentChat } = useApp();
   const [editAgent, setEditAgent] = useState<Agent | null>(null);
   const [ctx, setCtx] = useState<{ x: number; y: number; card: AgentCardView } | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('table');
@@ -125,6 +136,24 @@ export function Agents() {
     setTaskProjectId('');
   };
 
+  const openDshWorkbench = async (agent: Agent) => {
+    try {
+      await window.aibox.openDshWorkbench(agent.id);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : 'DSH 工作台启动失败');
+    }
+  };
+
+  const openConversation = (agent: Agent) => {
+    if (agent.engineId === DSH_MANAGED_ENGINE_ID) {
+      void openDshWorkbench(agent);
+      return;
+    }
+    openAgentChat(agent.id);
+  };
+
+  const conversationLabel = (agent: Agent) => agent.engineId === DSH_MANAGED_ENGINE_ID ? '对话' : '兼容对话';
+
   const closeTaskModal = () => {
     if (taskBusy) return;
     setTaskAgent(null);
@@ -155,6 +184,7 @@ export function Agents() {
     const agent = card.agent;
     const ready = agent.lifecycle === 'READY';
     return [
+      { label: conversationLabel(agent), icon: <IconMessage size={13} />, onClick: () => openConversation(agent) },
       { label: '安排任务', icon: <IconTask size={13} />, onClick: () => openTaskModal(agent) },
       { label: '编辑 / 设置', onClick: () => setEditAgent(agent) },
       { label: '打开工作目录', onClick: () => void window.aibox.openAgentWorkspace(agent.id) },
@@ -251,7 +281,7 @@ export function Agents() {
             <tbody>
               {filtered.map((card) => {
                 const { agent } = card;
-                const lc = LIFECYCLE_LABEL[agent.lifecycle] ?? LIFECYCLE_LABEL.DISABLED;
+                const lc = lifecycleMeta(card);
                 const perm = PERM_LABEL[agent.permissionMode] ?? PERM_LABEL.standard;
                 return (
                   <tr key={agent.id} style={{ borderTop: '1px solid var(--border)' }}
@@ -295,7 +325,8 @@ export function Agents() {
                       {card.currentTask ? `${card.currentTask.progress}%` : '空闲'}
                     </td>
                     <td style={{ padding: '12px', textAlign: 'center' }}>
-                      <div style={{ display: 'flex', gap: 6, justifyContent: 'center' }}>
+                      <div style={{ display: 'flex', gap: 6, justifyContent: 'center', flexWrap: 'wrap' }}>
+                        <button className="btn small primary" onClick={() => openConversation(agent)} style={{ padding: '4px 9px', fontSize: 11.5 }} title={agent.engineId === DSH_MANAGED_ENGINE_ID ? '在 DSH 工作台中对话' : '打开 Local CLI 兼容对话'}><IconMessage size={12} />{conversationLabel(agent)}</button>
                         <button className="btn small primary" onClick={() => openTaskModal(agent)} style={{ padding: '4px 9px', fontSize: 11.5 }}><IconTask size={12} />安排任务</button>
                         <button className="btn small" onClick={() => setEditAgent(agent)} style={{ padding: '4px 10px', fontSize: 11.5 }}>编辑</button>
                         {agent.lifecycle === 'READY' ? (
@@ -323,7 +354,7 @@ export function Agents() {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 14 }}>
           {filtered.map((card) => {
             const { agent } = card;
-            const lc = LIFECYCLE_LABEL[agent.lifecycle] ?? LIFECYCLE_LABEL.DISABLED;
+            const lc = lifecycleMeta(card);
             const perm = PERM_LABEL[agent.permissionMode] ?? PERM_LABEL.standard;
             return (
               <div key={agent.id} className="card" style={{ padding: 16, cursor: 'pointer', border: selected.has(agent.id) ? '2px solid var(--accent)' : undefined }}
@@ -352,7 +383,8 @@ export function Agents() {
                     ))}
                   </div>
                 )}
-                <div style={{ display: 'flex', gap: 6 }}>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  <button className="btn small primary" onClick={(e) => { e.stopPropagation(); openConversation(agent); }} style={{ fontSize: 11 }} title={agent.engineId === DSH_MANAGED_ENGINE_ID ? '在 DSH 工作台中对话' : '打开 Local CLI 兼容对话'}><IconMessage size={12} />{conversationLabel(agent)}</button>
                   <button className="btn small primary" onClick={(e) => { e.stopPropagation(); openTaskModal(agent); }} style={{ fontSize: 11 }}><IconTask size={12} />安排任务</button>
                   <button className="btn small" onClick={(e) => { e.stopPropagation(); setEditAgent(agent); }} style={{ fontSize: 11 }}>编辑</button>
                   {agent.lifecycle === 'READY' ? (
@@ -372,7 +404,7 @@ export function Agents() {
       )}
 
       {editAgent && <AgentEditor agent={editAgent} onClose={() => setEditAgent(null)} />}
-      {detailAgent && <AgentDetailDrawer agent={detailAgent} onClose={() => setDetailAgent(null)} onEdit={() => { setEditAgent(detailAgent); setDetailAgent(null); }} />}
+      {detailAgent && <AgentDetailDrawer agent={detailAgent} onClose={() => setDetailAgent(null)} onEdit={() => { setEditAgent(detailAgent); setDetailAgent(null); }} onChat={() => openConversation(detailAgent)} />}
       {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.card)} onClose={() => setCtx(null)} />}
       {taskAgent && <AgentTaskModal
         agent={taskAgent}
@@ -437,7 +469,7 @@ function AgentTaskModal({
 }
 
 /** 员工详情抽屉：最近任务 + Token 统计 + 活动日志 */
-function AgentDetailDrawer({ agent, onClose, onEdit }: { agent: Agent; onClose: () => void; onEdit: () => void }) {
+function AgentDetailDrawer({ agent, onClose, onEdit, onChat }: { agent: Agent; onClose: () => void; onEdit: () => void; onChat: () => void }) {
   const [detail, setDetail] = useState<{
     tasks: { id: string; title: string; status: string; progress: number; createdAt: number }[];
     usage: { totalTokens: number; inputTokens: number; outputTokens: number; calls: number };
@@ -524,7 +556,10 @@ function AgentDetailDrawer({ agent, onClose, onEdit }: { agent: Agent; onClose: 
           </div>
         </div>
 
-        <button className="btn primary" style={{ width: '100%', justifyContent: 'center' }} onClick={onEdit}>编辑员工配置</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn primary" style={{ flex: 1, justifyContent: 'center' }} onClick={onChat}><IconMessage size={14} />{agent.engineId === DSH_MANAGED_ENGINE_ID ? '在 DSH 中对话' : '兼容对话'}</button>
+          <button className="btn" style={{ flex: 1, justifyContent: 'center' }} onClick={onEdit}>编辑员工配置</button>
+        </div>
       </div>
     </div>
   );

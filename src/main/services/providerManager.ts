@@ -26,6 +26,15 @@ export interface ResolvedProvider {
   key: string;
 }
 
+/**
+ * Main-process-only resolution result carrying the Provider identity that was
+ * selected.  Keep `ResolvedProvider` unchanged: several renderer-facing
+ * callers intentionally compare that shape exactly.
+ */
+export interface ResolvedProviderWithIdentity extends ResolvedProvider {
+  providerId: string;
+}
+
 export interface ProviderRuntimeChange {
   providerId: string;
   providerUpdated: boolean;
@@ -236,6 +245,20 @@ export class ProviderManager {
     return row ? this.resolveRow(row, modelOverride) : null;
   }
 
+  /** Resolve an Agent route while retaining the concrete Provider identity. */
+  resolveForAgentWithIdentity(
+    providerId: string | null,
+    modelOverride: string | null
+  ): ResolvedProviderWithIdentity | null {
+    const row = providerId
+      ? this.db.raw.prepare('SELECT * FROM providers WHERE id = ?').get(providerId) as ProviderRow | undefined
+      : (this.db.raw.prepare('SELECT * FROM providers WHERE is_default = 1 LIMIT 1').get() as ProviderRow | undefined)
+        ?? (this.db.raw.prepare('SELECT * FROM providers ORDER BY created_at LIMIT 1').get() as ProviderRow | undefined);
+    if (!row) return null;
+    const resolved = this.resolveRow(row, modelOverride);
+    return resolved ? { ...resolved, providerId: row.id } : null;
+  }
+
   private resolveRow(row: ProviderRow, modelOverride: string | null): ResolvedProvider | null {
     const baseUrl = tryNormalizeProviderBaseUrl(row.base_url);
     const model = (modelOverride || row.model).trim();
@@ -304,5 +327,17 @@ export class ProviderManager {
     const providers = this.db.raw.prepare('SELECT * FROM providers').all() as unknown as ProviderRow[];
     const match = providers.find((provider) => provider.model === model);
     return match ? this.resolveRow(match, null) : this.resolveForAgent(null, model);
+  }
+
+  /** Resolve by model while retaining the concrete Provider identity. */
+  resolveByModelWithIdentity(model: string): ResolvedProviderWithIdentity | null {
+    const providers = this.db.raw.prepare('SELECT * FROM providers').all() as unknown as ProviderRow[];
+    const match = providers.find((provider) => provider.model === model);
+    return match
+      ? (() => {
+          const resolved = this.resolveRow(match, null);
+          return resolved ? { ...resolved, providerId: match.id } : null;
+        })()
+      : this.resolveForAgentWithIdentity(null, model);
   }
 }

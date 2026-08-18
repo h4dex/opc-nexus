@@ -3,7 +3,19 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconMoon, IconSun } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { ApiBridgeStatus, SystemInfo, VoiceConfig, VoiceConfigInput, WebAdminStatus } from '@shared/types';
+import type {
+  ApiBridgeStatus,
+  DshLanGatewayConfigInput,
+  DshLanGatewayCompositionStatusView,
+  DshLanPairingOfferView,
+  DshLanRoleView,
+  DshPluginCatalogView,
+  DshPluginPackageView,
+  VisionModelBindingView,
+  SystemInfo,
+  VoiceConfig,
+  VoiceConfigInput
+} from '@shared/types';
 
 export function Settings() {
   const { theme, setTheme } = useApp();
@@ -12,7 +24,6 @@ export function Settings() {
   const [memAlert, setMemAlert] = useState(85);
   const [gpuTempAlert, setGpuTempAlert] = useState(85);
   const [notifications, setNotifications] = useState(true);
-  const [demoAutoTasks, setDemoAutoTasks] = useState(false);
 
   useEffect(() => {
     void window.aibox.getSystemInfo().then(setInfo);
@@ -26,7 +37,6 @@ export function Settings() {
     });
     void window.aibox.getSetting('notifications').then((v) => setNotifications(v !== false));
     // 默认关闭：生产环境绝不自动造任务（与主进程 orchestrator 默认值保持一致）
-    void window.aibox.getSetting('demoAutoTasks').then((v) => setDemoAutoTasks(v === true));
   }, []);
 
   const saveThresholds = () => {
@@ -42,10 +52,12 @@ export function Settings() {
 
       <div className="dash-grid">
         <ProviderCard />
+        <VisionCard />
         <VoiceCard />
         <RegistryCard />
         <BridgeCard />
-        <WebServerCard />
+        <DshLanGatewayCard />
+        <DshPluginCatalogCard />
 
         <div className="card">
           <div className="card-title">外观</div>
@@ -61,17 +73,12 @@ export function Settings() {
         </div>
 
         <div className="card">
-          <div className="card-title">通知与演示</div>
+          <div className="card-title">通知</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer' }}>
               <input type="checkbox" checked={notifications}
                 onChange={(e) => { setNotifications(e.target.checked); void window.aibox.setSetting('notifications', e.target.checked); }} />
               系统通知（审批到达 / 任务失败 / 引擎待登录 / 资源告警）
-            </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer' }}>
-              <input type="checkbox" checked={demoAutoTasks}
-                onChange={(e) => { setDemoAutoTasks(e.target.checked); void window.aibox.setSetting('demoAutoTasks', e.target.checked); }} />
-              演示自动派单（自动创建虚构任务维持水位；生产环境务必保持关闭）
             </label>
             <DemoDataPurge />
           </div>
@@ -119,7 +126,7 @@ export function Settings() {
           <table className="table">
             <tbody>
               <tr><td style={{ color: 'var(--text-2)', width: 120 }}>产品</td><td>数字员工 AI Box 控制中心</td></tr>
-              <tr><td style={{ color: 'var(--text-2)' }}>版本</td><td>v{info?.appVersion ?? '1.0.0'}</td></tr>
+              <tr><td style={{ color: 'var(--text-2)' }}>版本</td><td>v{info?.appVersion ?? '2.0.0'}</td></tr>
               <tr><td style={{ color: 'var(--text-2)' }}>平台</td><td>{info?.platform === 'win32' ? 'Windows' : info?.platform === 'linux' ? 'Ubuntu / Linux' : info?.platform} ({info?.osVersion})</td></tr>
               <tr><td style={{ color: 'var(--text-2)' }}>设备</td><td>{info?.hostname ?? '—'}</td></tr>
               <tr><td style={{ color: 'var(--text-2)' }}>数据目录</td><td style={{ fontSize: 12 }}>用户数据目录 / aibox-data（继承 OS 用户 ACL）</td></tr>
@@ -181,6 +188,232 @@ function DemoDataPurge() {
  * 语音任务下达配置：阿里云 NLS 凭据 + 双路策略。
  * 凭据经 IPC 交给主进程走 safeStorage 加密，此处只显示「是否已配置」，不回显明文。
  */
+/** DSH LAN Gateway: the renderer receives status only, never TLS key material. */
+function DshLanGatewayCard() {
+  const [status, setStatus] = useState<DshLanGatewayCompositionStatusView | null>(null);
+  const [bindHost, setBindHost] = useState('127.0.0.1');
+  const [port, setPort] = useState('18766');
+  const [publicHost, setPublicHost] = useState('');
+  const [publicPort, setPublicPort] = useState('18766');
+  const [role, setRole] = useState<DshLanRoleView>('operator');
+  const [pairing, setPairing] = useState<DshLanPairingOfferView | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async (hydrate = false) => {
+    try {
+      const next = await window.aibox.getDshLanGatewayStatus();
+      setStatus(next);
+      if (hydrate && next.configured) {
+        setBindHost(next.configured.bindHost);
+        setPort(String(next.configured.port));
+        setPublicHost(next.configured.publicHost);
+        setPublicPort(String(next.configured.publicPort));
+      }
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : 'Unable to read DSH LAN status');
+    }
+  };
+
+  useEffect(() => {
+    void load(true);
+    const timer = window.setInterval(() => { void load(); }, 3000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const run = async (operation: () => Promise<DshLanGatewayCompositionStatusView>, message: string) => {
+    setBusy(true);
+    try {
+      setStatus(await operation());
+      toast.ok(message);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : String(error));
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const start = () => {
+    const input: DshLanGatewayConfigInput = {
+      bindHost: bindHost.trim(),
+      port: Number(port),
+      publicHost: publicHost.trim() || undefined,
+      publicPort: Number(publicPort)
+    };
+    void run(() => window.aibox.startDshLanGateway(input), 'DSH LAN Gateway configuration saved');
+  };
+
+  const createPairing = async () => {
+    setBusy(true);
+    try {
+      setPairing(await window.aibox.createDshLanPairing(role));
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyPairingUrl = async () => {
+    if (!pairing) return;
+    try {
+      await navigator.clipboard.writeText(pairing.pairingUrl);
+      toast.ok('Pairing address copied');
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : 'Unable to copy pairing address');
+    }
+  };
+
+  const gateway = status?.gateway;
+  const fieldStyle: React.CSSProperties = {
+    width: '100%', padding: '7px 10px', borderRadius: 6,
+    border: '1px solid var(--border)', background: 'var(--input-bg)',
+    color: 'var(--text-1)', fontSize: 12.5, outline: 'none'
+  };
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">
+        DSH LAN Gateway
+        <span className="sub">TLS/Auth gateway for the managed DSH Web UI</span>
+      </div>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+        <span className={`tag ${gateway?.running ? 'green' : gateway?.state === 'error' ? 'red' : 'gray'}`}>
+          {gateway?.running ? 'Running' : gateway?.state === 'error' ? 'Error' : status?.desiredEnabled ? 'Waiting for runtime' : 'Stopped'}
+        </span>
+        <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>Eligible runtimes: {status?.eligibleRuntimeCount ?? 0}</span>
+        <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>Sessions: {gateway?.activeSessions ?? 0}</span>
+        {status?.lastError && <span style={{ fontSize: 11.5, color: 'var(--danger)' }}>{status.lastError}</span>}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px 1fr 120px', gap: 10, marginBottom: 12 }}>
+        <label className="field"><span>Bind host</span><input value={bindHost} onChange={(event) => setBindHost(event.target.value)} placeholder="127.0.0.1 or 192.168.1.10" /></label>
+        <label className="field"><span>Listen port</span><input type="number" min={1024} max={65535} value={port} onChange={(event) => setPort(event.target.value)} /></label>
+        <label className="field"><span>Public host / certificate name</span><input value={publicHost} onChange={(event) => setPublicHost(event.target.value)} placeholder="LAN hostname or IP" /></label>
+        <label className="field"><span>Public port</span><input style={fieldStyle} type="number" min={1} max={65535} value={publicPort} onChange={(event) => setPublicPort(event.target.value)} /></label>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+        <button className="btn primary" disabled={busy} onClick={start}>Save &amp; start</button>
+        <button className="btn" disabled={busy} onClick={() => void run(() => window.aibox.restoreDshLanGateway(), 'Restore requested')}>Restore</button>
+        <button className="btn" disabled={busy} onClick={() => void run(() => window.aibox.shutdownDshLanGateway(), 'Gateway stopped')}>Stop listener</button>
+        <button className="btn danger" disabled={busy} onClick={() => {
+          if (window.confirm('Emergency stop revokes all LAN sessions and disables automatic restore. Continue?')) {
+            void run(() => window.aibox.emergencyStopDshLanGateway(), 'LAN access disabled');
+          }
+        }}>Emergency stop</button>
+        <button className="btn" disabled={busy} onClick={() => {
+          if (window.confirm('Reset the DSH LAN certificate? Existing device trust must be re-established.')) {
+            void run(() => window.aibox.resetDshLanCertificate(), 'Certificate reset');
+          }
+        }}>Reset certificate</button>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
+        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', fontSize: 12, lineHeight: 1.8, wordBreak: 'break-word' }}>
+          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>Gateway</div>
+          <div>Origin: <code>{gateway?.origin ?? '-'}</code></div>
+          <div>Authority: <code>{gateway?.authority ?? '-'}</code></div>
+          <div>Certificate fingerprint: <code>{gateway?.certificateFingerprint ?? '-'}</code></div>
+        </div>
+        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', fontSize: 12, lineHeight: 1.8, wordBreak: 'break-word' }}>
+          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>Bound managed runtime</div>
+          {status?.boundRuntime ? <>
+            <div>Agent: <code>{status.boundRuntime.agentId}</code></div>
+            <div>Profile: <code>{status.boundRuntime.profileId}</code></div>
+            <div>Loopback upstream: <code>{status.boundRuntime.endpoint}</code></div>
+          </> : <span style={{ color: 'var(--text-3)' }}>No runtime bound</span>}
+        </div>
+      </div>
+
+      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 12.5, fontWeight: 600 }}>One-time pairing code</span>
+          <select value={role} onChange={(event) => setRole(event.target.value as DshLanRoleView)} style={{ ...fieldStyle, width: 120 }}>
+            <option value="operator">Operator</option>
+            <option value="viewer">Viewer</option>
+          </select>
+          <button className="btn small" disabled={busy || !gateway?.running} onClick={() => void createPairing()}>Generate code</button>
+          {pairing && <button className="btn small" onClick={() => setPairing(null)}>Hide</button>}
+        </div>
+        {pairing && <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: 'var(--accent-soft)' }}>
+          <code style={{ fontSize: 18, letterSpacing: 2 }}>{pairing.code}</code>
+          <span style={{ marginLeft: 12, fontSize: 11.5 }}>Expires {new Date(pairing.expiresAt).toLocaleTimeString()}</span>
+          <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 4, wordBreak: 'break-all' }}>{pairing.pairingUrl} · {pairing.role}</div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+            <button className="btn small" type="button" onClick={() => void copyPairingUrl()}>Copy address</button>
+            <button className="btn small" type="button" onClick={() => void window.aibox.openExternal(pairing.pairingUrl)}>Open pairing page</button>
+          </div>
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+/** Read-only managed DSH package inventory. Execution is never enabled here. */
+function DshPluginCatalogCard() {
+  const [catalog, setCatalog] = useState<DshPluginCatalogView | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      setCatalog(await window.aibox.getDshPluginCatalog());
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : 'Unable to read managed DSH catalog');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+  if (!catalog) return null;
+
+  const safetyColor = (safety: DshPluginPackageView['safety']) =>
+    safety === 'trusted' ? 'var(--success)' : safety === 'blocked' ? 'var(--danger)' : 'var(--warning)';
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">
+        Managed DSH plugin catalog
+        <span className="sub">Read-only supply-chain and policy projection</span>
+        <button className="btn small" style={{ marginLeft: 'auto' }} disabled={loading} onClick={() => void load()}>
+          {loading ? 'Scanning...' : 'Refresh'}
+        </button>
+      </div>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+        <span className={`tag ${catalog.available ? 'green' : 'red'}`}>{catalog.available ? 'Verified' : 'Fail-closed'}</span>
+        <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>
+          Runtime {catalog.runtime.installedVersion ?? '-'} / policy {catalog.policy.valid ? 'valid' : 'invalid'}
+        </span>
+        <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
+          Enabled {catalog.counts.enabled} · Review {catalog.counts.disabled} · Blocked {catalog.counts.blocked} · Missing {catalog.counts.missing}
+        </span>
+      </div>
+      <div style={{ overflowX: 'auto' }}>
+        <table className="table" style={{ minWidth: 620 }}>
+          <thead><tr><th>Package</th><th>Category</th><th>Safety</th><th>Exposure</th><th>Version</th></tr></thead>
+          <tbody>
+            {catalog.packages.slice(0, 20).map((item) => (
+              <tr key={item.name}>
+                <td><code>{item.name}</code></td>
+                <td>{item.categories.join(', ') || '-'}</td>
+                <td style={{ color: safetyColor(item.safety), fontWeight: 600 }}>{item.safety}</td>
+                <td>{item.enablement}</td>
+                <td>{item.version ?? '-'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {catalog.packages.length > 20 && <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 6 }}>Showing first 20 of {catalog.packages.length} packages.</div>}
+      {catalog.warnings.length > 0 && <div style={{ marginTop: 8, color: 'var(--warning)', fontSize: 11.5 }}>{catalog.warnings.join(' · ')}</div>}
+      <div style={{ marginTop: 8, color: 'var(--text-3)', fontSize: 11.5 }}>
+        Package presence does not grant execution. Unlisted or approval-gated capabilities stay disabled until an audited adapter and policy exist.
+      </div>
+    </div>
+  );
+}
+
 function VoiceCard() {
   const [cfg, setCfg] = useState<VoiceConfig | null>(null);
   const [appKey, setAppKey] = useState('');
@@ -546,60 +779,74 @@ function BridgeCard() {
   );
 }
 
-/** 局域网 Web 管理面板卡片：访问 Token 管理（安全加固） */
-function WebServerCard() {
-  const [status, setStatus] = useState<WebAdminStatus | null>(null);
-  const [copied, setCopied] = useState(false);
+/** OCR 文字识别服务卡片（PaddleOCR WASM） */
+/** Configure the DSH/Cordis visual model without exposing provider secrets. */
+function VisionCard() {
+  const [providers, setProviders] = useState<{ id: string; name: string; model: string; hasKey: boolean }[]>([]);
+  const [binding, setBinding] = useState<VisionModelBindingView | null>(null);
+  const [providerId, setProviderId] = useState('');
+  const [model, setModel] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState('');
 
-  useEffect(() => {
-    void window.aibox.getWebAdminStatus().then(setStatus);
-  }, []);
-
-  const regen = async () => {
-    try {
-      setStatus(await window.aibox.regenerateWebToken());
-      toast.ok('已重新生成访问 Token，旧会话已失效');
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : '重新生成访问 Token 失败');
+  const load = async () => {
+    const [nextProviders, nextBinding] = await Promise.all([window.aibox.listProviders(), window.aibox.getVisionBinding()]);
+    setProviders(nextProviders);
+    setBinding(nextBinding);
+    if (nextBinding) {
+      setProviderId(nextBinding.providerId);
+      setModel(nextBinding.model);
+    } else if (!providerId && nextProviders[0]) {
+      setProviderId(nextProviders[0].id);
+      setModel(nextProviders[0].model);
     }
   };
+  useEffect(() => { void load().catch(() => undefined); }, []);
 
-  const copy = async () => {
-    if (!status?.tokenConfigured) return;
+  const configure = async () => {
+    if (!providerId || !model.trim()) return;
+    setBusy(true);
     try {
-      await window.aibox.copyWebToken();
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      setBinding(await window.aibox.configureVisionBinding({ providerId, model: model.trim(), enabled: true }));
+      toast.ok('视觉模型已配置');
     } catch (error) {
-      toast.err(error instanceof Error ? error.message : '复制访问 Token 失败');
-    }
+      toast.err(error instanceof Error ? error.message : String(error));
+    } finally { setBusy(false); }
+  };
+
+  const sample = async () => {
+    setBusy(true);
+    try {
+      const ref = await window.aibox.pickVisionAttachment();
+      if (!ref) return;
+      const answer = await window.aibox.describeVision({ attachmentRef: ref, prompt: '请简要描述图片内容，并列出需要注意的文字或视觉信息。' });
+      setResult(answer.text);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : String(error));
+    } finally { setBusy(false); }
   };
 
   return (
     <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title">局域网 Web 管理面板<span className="sub">工控机无人值守远程管理 · 端口 {status?.port ?? 28889}</span></div>
-      {status?.weakToken && (
-        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--danger-soft, rgba(248,113,113,.1))', color: 'var(--danger)', fontSize: 12.5 }}>
-          ⚠️ 当前仍在使用默认弱口令「aibox-admin」，局域网内任何人可完全控制本系统！请立即重新生成。
-        </div>
-      )}
-      <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)', marginBottom: 12 }}>
-        <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>访问 Token（Bearer）</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{status?.tokenConfigured ? '已安全存储' : '（未生成）'}</code>
-          <button className="btn small" onClick={copy} disabled={!status?.tokenConfigured}>{copied ? '✓ 已复制' : '复制'}</button>
-          <button className="btn small primary" onClick={() => void regen()}>重新生成</button>
-        </div>
+      <div className="card-title">DSH / Cordis 视觉模型<span className="sub">图片理解由主进程代理，凭据不会进入界面</span></div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) minmax(180px, 1fr)', gap: 10 }}>
+        <div className="field"><label>Provider</label><select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
+          <option value="">选择已配置 Provider</option>
+          {providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}{provider.hasKey ? '' : '（缺少 Key）'}</option>)}
+        </select></div>
+        <div className="field"><label>视觉模型</label><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="例如 gpt-4o-mini 或 qwen-vl" /></div>
       </div>
-      <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
-        <b>访问地址：</b><code style={{ fontSize: 11.5 }}>http://&lt;本机局域网IP&gt;:{status?.port ?? 28889}</code>，请求头携带 <code style={{ fontSize: 11.5 }}>Authorization: Bearer &lt;Token&gt;</code>。<br />
-        首次启动已自动生成强随机 Token；重新生成会使所有已登录会话失效。
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+        <button className="btn primary" disabled={busy || !providerId || !model.trim()} onClick={() => void configure()}>保存视觉配置</button>
+        <button className="btn" disabled={busy || !binding} onClick={() => void sample()}>选择图片测试</button>
+        {binding && <span style={{ fontSize: 12, color: binding.enabled ? 'var(--success)' : 'var(--warning)' }}>{binding.enabled ? '已启用' : '已停用'} · {binding.model}</span>}
       </div>
+      {result && <div style={{ marginTop: 10, padding: '9px 12px', background: 'var(--input-bg)', borderRadius: 6, fontSize: 12.5, whiteSpace: 'pre-wrap' }}>{result}</div>}
+      <div style={{ marginTop: 8, fontSize: 11.5, color: 'var(--text-3)', lineHeight: 1.6 }}>支持 PNG、JPEG、WebP、GIF。精确文字抄录仍使用本地 OCR；图片外发前请确认 Provider 的数据策略。</div>
     </div>
   );
 }
 
-/** OCR 文字识别服务卡片（PaddleOCR WASM） */
 function OcrCard() {
   const [status, setStatus] = useState<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string } | null>(null);
   const [downloading, setDownloading] = useState(false);

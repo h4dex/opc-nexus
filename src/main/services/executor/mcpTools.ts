@@ -35,6 +35,7 @@ export async function mcpToolsForAgent(
     name: exposedName(tool),
     description: `[MCP: ${tool.serverName}] ${tool.description || tool.name}`,
     risk: toolRisk(tool),
+    autonomousApproval: toolRisk(tool) === 'danger' ? 'admin' : undefined,
     requiresCapability: tool.capability || undefined,
     inputSchema: tool.inputSchema,
     async execute(args: Record<string, unknown>, ctx: ToolContext) {

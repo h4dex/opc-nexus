@@ -1,13 +1,12 @@
 /** 项目中心：以经营目标组织任务、员工与成果。 */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../store';
-import { Modal, ProgressBar, TASK_STATUS_META } from '../components/common';
+import { Modal, ProgressBar } from '../components/common';
 import { IconAlert, IconCheck, IconClock, IconFolder, IconLayers, IconPlay, IconPlus, IconTask, IconUser } from '../components/icons';
 import { toast } from '../components/Toast';
 import { TrailingRefreshController } from '../utils/trailingRefresh';
 import type {
-  Project, ProjectHealth, ProjectInput, ProjectOperationsItem, ProjectOperationsOverview,
-  ProjectStatus, Task
+  Project, ProjectHealth, ProjectInput, ProjectOperationsOverview, ProjectStatus
 } from '@shared/types';
 
 type ProjectFilter = 'open' | 'completed' | 'archived' | 'all';
@@ -34,7 +33,6 @@ export function Projects() {
   const [filter, setFilter] = useState<ProjectFilter>('open');
   const [operations, setOperations] = useState<ProjectOperationsOverview | null>(null);
   const [editing, setEditing] = useState<Project | 'new' | null>(null);
-  const [viewing, setViewing] = useState<Project | null>(null);
   const [dispatching, setDispatching] = useState<Project | null>(null);
   const [archiving, setArchiving] = useState<Project | null>(null);
   const refreshRef = useRef<TrailingRefreshController<ProjectOperationsOverview> | null>(null);
@@ -44,6 +42,13 @@ export function Projects() {
 
   const projects = snapshot?.projects ?? [];
   const tasks = snapshot?.tasks ?? [];
+  const openProjectQuest = useCallback(async (project: Project) => {
+    try {
+      await window.aibox.openQuestWindow({ projectId: project.id });
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : 'Quest 独立窗口打开失败');
+    }
+  }, []);
   const loadOperations = useCallback((immediate = false) => refresh.request({
     run: () => window.aibox.getProjectOperations(),
     accept: setOperations,
@@ -63,10 +68,9 @@ export function Projects() {
     if (!snapshot || navigationTarget?.entityType !== 'project') return;
     const project = snapshot.projects.find((item) => item.id === navigationTarget.entityId);
     if (!project) return;
-    setView('operations');
-    setViewing(project);
     clearNavigationTarget();
-  }, [clearNavigationTarget, navigationTarget, snapshot]);
+    void openProjectQuest(project);
+  }, [clearNavigationTarget, navigationTarget, openProjectQuest, snapshot]);
   const operationByProject = useMemo(
     () => new Map(operations?.projects.map((item) => [item.project.id, item]) ?? []),
     [operations]
@@ -114,7 +118,7 @@ export function Projects() {
         </div>
       </div>
 
-      {view === 'operations' && <ProjectOperationsDashboard value={operations} onOpen={setViewing} onCreate={() => setEditing('new')} />}
+      {view === 'operations' && <ProjectOperationsDashboard value={operations} onOpen={(project) => void openProjectQuest(project)} onCreate={() => setEditing('new')} />}
 
       {view === 'list' && <><div className="project-filterbar" aria-label="项目状态筛选">
         {FILTERS.map((item) => (
@@ -167,7 +171,13 @@ export function Projects() {
                 </div>
 
                 <div className="project-actions">
-                  <button className="btn small" type="button" onClick={() => setViewing(project)}>详情</button>
+                  <button
+                    className="btn small"
+                    type="button"
+                    disabled={project.status === 'archived'}
+                    onClick={() => void openProjectQuest(project)}
+                    title={project.status === 'archived' ? '归档项目不可运行 Quest' : '打开 Quest'}
+                  >打开 Quest</button>
                   <button className="btn small primary" type="button" disabled={['completed', 'archived'].includes(project.status)} onClick={() => setDispatching(project)}><IconPlay size={12} />派发任务</button>
                   {project.status === 'archived' ? (
                     <button className="btn small" type="button" onClick={() => void window.aibox.updateProject(project.id, { status: 'active' }).then(() => toast.ok('项目已恢复'))}>恢复</button>
@@ -186,7 +196,6 @@ export function Projects() {
 
       {editing && <ProjectEditor project={editing === 'new' ? null : editing} onClose={() => setEditing(null)} />}
       {dispatching && <ProjectDispatch project={dispatching} onClose={() => setDispatching(null)} />}
-      {viewing && <ProjectDetail project={viewing} operation={operationByProject.get(viewing.id) ?? null} tasks={tasks.filter((task) => task.projectId === viewing.id)} onClose={() => setViewing(null)} onDispatch={() => { setViewing(null); setDispatching(viewing); }} />}
       {archiving && (
         <Modal title="归档项目" onClose={() => setArchiving(null)} footer={(
           <>
@@ -408,45 +417,6 @@ function ProjectDispatch({ project, onClose }: { project: Project; onClose: () =
     )}>
       <div className="field"><label>数字员工</label><select value={agentId} onChange={(e) => setAgentId(e.target.value)}><option value="">选择在岗员工</option>{agents.map((card) => <option key={card.agent.id} value={card.agent.id}>{card.agent.name} · {card.agent.role}</option>)}</select></div>
       <div className="field" style={{ marginTop: 14 }}><label>任务简报</label><textarea rows={5} value={title} maxLength={500} onChange={(e) => setTitle(e.target.value)} placeholder="说明预期成果、输入资料和验收标准" /></div>
-    </Modal>
-  );
-}
-
-function ProjectDetail({ project, operation, tasks, onClose, onDispatch }: { project: Project; operation: ProjectOperationsItem | null; tasks: Task[]; onClose: () => void; onDispatch: () => void }) {
-  const { snapshot } = useApp();
-  const agentNames = new Map(snapshot?.agentCards.map((card) => [card.agent.id, card.agent.name]) ?? []);
-  const sorted = [...tasks].sort((a, b) => b.createdAt - a.createdAt);
-  return (
-    <Modal title={project.name} onClose={onClose} width={760} footer={(
-      <>
-        <button className="btn" type="button" onClick={onClose}>关闭</button>
-        <button className="btn primary" type="button" disabled={['completed', 'archived'].includes(project.status)} onClick={onDispatch}><IconPlay size={13} />派发任务</button>
-      </>
-    )}>
-      <div className="project-detail-head" style={{ '--project-color': project.color } as React.CSSProperties}>
-        <span className="project-color" />
-        <div><strong>{project.objective || '未设置核心目标'}</strong>{project.description && <p>{project.description}</p>}</div>
-      </div>
-      <div className="project-detail-meta"><span>{STATUS_META[project.status].label}</span><span>{project.clientName || '内部项目'}</span><span>{project.dueAt ? `截止 ${new Date(project.dueAt).toLocaleDateString('zh-CN')}` : '无截止时间'}</span></div>
-      {operation && <>
-        <div className="project-detail-ops">
-          <span><small>健康状态</small><ProjectHealthBadge health={operation.health} /></span>
-          <span><small>平均进度</small><strong>{operation.progress}%</strong></span>
-          <span><small>任务</small><strong>{operation.tasks.completed}/{operation.tasks.total}</strong></span>
-          <span><small>活跃任务</small><strong>{operation.tasks.active}</strong></span>
-          <span><small>成果验收率</small><strong>{operation.acceptanceRate}%</strong></span>
-        </div>
-        {operation.risks.length > 0 && <div className="project-detail-risks">
-          <div className="card-title">风险与阻塞<span className="sub">{operation.risks.length} 项</span></div>
-          {operation.risks.map((risk) => <div key={risk.id} data-severity={risk.severity}><span className="project-risk-dot" /><strong>{risk.title}</strong><span>{risk.detail}</span></div>)}
-        </div>}
-        {operation.owners.length > 0 && <div className="project-detail-owners">
-          <div className="card-title">参与员工<span className="sub">{operation.owners.length} 名</span></div>
-          <div>{operation.owners.map((owner) => <span key={owner.agentId}><IconUser size={13} /><strong>{owner.name}</strong><small>{owner.activeTasks} 活跃 · {owner.completedTasks}/{owner.totalTasks} 完成</small></span>)}</div>
-        </div>}
-      </>}
-      <div className="card-title" style={{ marginTop: 18 }}>关联任务<span className="sub">{tasks.length} 项</span></div>
-      {sorted.length === 0 ? <div className="empty">暂无关联任务</div> : <div className="project-task-list">{sorted.slice(0, 20).map((task) => <div key={task.id}><span className={`tag ${TASK_STATUS_META[task.status].tag}`}>{TASK_STATUS_META[task.status].label}</span><strong>{task.title}</strong><span>{agentNames.get(task.agentId) ?? '未知员工'}</span><time>{new Date(task.createdAt).toLocaleDateString('zh-CN')}</time></div>)}</div>}
     </Modal>
   );
 }

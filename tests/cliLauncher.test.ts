@@ -12,6 +12,7 @@
 // @ts-nocheck
 /* eslint-disable */
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -140,7 +141,18 @@ describe('runCli：不抛异常的一次性执行', () => {
     expect(r.error).toContain('超时');
   });
 
-  it.runIf(isWin)('Windows 超时会终止整棵进程树，不遗留 CLI runtime', async () => {
+  it.runIf(isWin)('Windows 超时会终止整棵进程树，不遗留 CLI runtime', async ({ skip }) => {
+    const probe = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
+      stdio: 'ignore', windowsHide: true
+    });
+    const permission = spawnSync('taskkill.exe', ['/PID', String(probe.pid), '/T', '/F'], {
+      stdio: 'ignore', windowsHide: true
+    });
+    if (permission.status !== 0) {
+      try { probe.kill('SIGKILL'); } catch { /* probe already exited */ }
+      skip('当前执行环境不允许 taskkill 进程树');
+      return;
+    }
     const parentScript = [
       'const { spawn } = require("node:child_process")',
       'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: "ignore" })',
@@ -152,7 +164,14 @@ describe('runCli：不抛异常的一次性执行', () => {
 
     expect(r.error).toContain('超时');
     expect(descendantPid).toBeGreaterThan(0);
-    expect(() => process.kill(descendantPid, 0)).toThrow();
+    await expect.poll(() => {
+      try {
+        process.kill(descendantPid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }, { timeout: 2_000, interval: 50 }).toBe(false);
   }, 10_000);
 
   it.runIf(isWin)('中文 Windows 的 GBK 错误输出被正确解码（否则错误信息全乱码）', async () => {

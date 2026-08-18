@@ -4,7 +4,7 @@
  * 以及本机 Worker CLI（Codex / Claude Code / Pi / OpenCode）。
  * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / AUTH_REQUIRED，不做假安装。
  * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）。
- * Nexus Agent 状态按供应商配置派生：已配置 = HEALTHY，未配置 = SETUP_REQUIRED（演示模式）。
+ * Nexus 兼容引擎状态按供应商配置派生：已配置 = HEALTHY，未配置 = SETUP_REQUIRED。
  * 凭据：自定义环境变量中的敏感键经 engineEnv.ts 拆分加密，config_json 仅存占位符。
  *
  * @author liyingjie <y@senke.com>
@@ -62,6 +62,12 @@ import {
   deepseekHarnessRuntimePaths
 } from './deepseekHarnessRuntime.js';
 import {
+  DSH_MANAGED_ENGINE_ID,
+  DSH_MANAGED_VERSION,
+  deepseekHarnessManagedAvailable,
+  deepseekHarnessManagedRuntimePaths
+} from './deepseekHarnessManagedRuntime.js';
+import {
   harnessProviderFingerprint,
   harnessProviderVerificationIsCurrent,
   saveHarnessProviderFingerprint
@@ -95,6 +101,14 @@ function managedProviderState(db: Database, engineId: string): { configured: boo
 function managedProviderReady(db: Database, engineId: string): boolean {
   const state = managedProviderState(db, engineId);
   return state.error === null && state.configured;
+}
+
+export interface EngineManagerOptions {
+  /** Main-process Provider proxy readiness. Kept as a callback because the
+   * proxy is constructed after the engine catalog during application startup. */
+  managedDshProxyReady?: () => boolean;
+  /** Test seam for the prepared, pinned managed runtime contract. */
+  managedDshRuntimeAvailable?: () => boolean;
 }
 
 /** Installing a CLI only proves that its executable launches. A fresh install
@@ -142,6 +156,11 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
     id: DEEPSEEK_HARNESS_ENGINE_ID, type: 'external', name: 'DeepSeek Harness', bin: null, npmPackage: null,
     dataBoundary: 'Harness 与会话在本机 sidecar 运行；模型请求发送至所配置的 DeepSeek/OpenAI 兼容供应商',
     guide: { guide: 'DeepSeek Harness 随 OPC-Nexus 安装包分发；开发环境请运行 npm run harness:prepare', url: 'https://github.com/deepseek-ai/deepseek-harness' }
+  },
+  {
+    id: DSH_MANAGED_ENGINE_ID, type: 'dsh-managed', name: 'DSH / Cordis', bin: null, npmPackage: null,
+    dataBoundary: '完整 DSH Web Runtime 与持久会话在本机隔离目录运行；桌面仅经 loopback 安全网关访问',
+    guide: { guide: 'managed DSH 随 OPC-Nexus 安装包分发；开发环境请运行 npm run harness:managed:prepare', url: 'https://github.com/deepseek-ai/deepseek-harness' }
   },
   {
     id: 'eng-hermes-cli', type: 'hermes-cli', name: 'Hermes Agent', bin: 'hermes', npmPackage: null,
@@ -271,7 +290,73 @@ export class EngineManager {
   /** 正在安装的引擎（防重复触发） */
   private installing = new Set<string>();
 
-  constructor(private db: Database) {}
+  constructor(private db: Database, private readonly options: EngineManagerOptions = {}) {}
+
+  private managedDshReadiness(): {
+    status: Engine['status'];
+    authStatus: Engine['authStatus'];
+    available: boolean;
+    launchable: boolean;
+    authenticated: boolean;
+    detail: string;
+  } {
+    let available = false;
+    try {
+      available = (this.options.managedDshRuntimeAvailable ?? deepseekHarnessManagedAvailable)();
+    } catch {
+      available = false;
+    }
+    if (!available) {
+      return {
+        status: 'NOT_INSTALLED', authStatus: 'unknown', available: false,
+        launchable: false, authenticated: false,
+        detail: 'managed DSH Runtime is not prepared'
+      };
+    }
+    const provider = managedProviderState(this.db, DSH_MANAGED_ENGINE_ID);
+    if (!provider.configured || provider.error) {
+      return {
+        status: 'SETUP_REQUIRED', authStatus: 'required', available: true,
+        launchable: false, authenticated: false,
+        detail: provider.error ? 'managed DSH Provider configuration is incompatible' : 'managed DSH requires a configured Provider'
+      };
+    }
+    let proxyReady = false;
+    try { proxyReady = this.options.managedDshProxyReady?.() === true; } catch { proxyReady = false; }
+    if (!proxyReady) {
+      return {
+        status: 'DEGRADED', authStatus: 'authed', available: true,
+        launchable: false, authenticated: true,
+        detail: 'managed DSH Provider proxy is unavailable'
+      };
+    }
+    return {
+      status: 'HEALTHY', authStatus: 'authed', available: true,
+      launchable: true, authenticated: true,
+      detail: 'managed DSH Runtime and opaque Provider proxy are ready'
+    };
+  }
+
+  private applyManagedDshReadiness(): ReturnType<EngineManager['managedDshReadiness']> {
+    const readiness = this.managedDshReadiness();
+    const paths = deepseekHarnessManagedRuntimePaths();
+    this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
+      readiness.status,
+      readiness.authStatus,
+      readiness.available ? DSH_MANAGED_VERSION : null,
+      readiness.available ? paths.root : null,
+      DSH_MANAGED_ENGINE_ID
+    );
+    this.saveHealthSignals(DSH_MANAGED_ENGINE_ID, {
+      detected: readiness.available,
+      launchable: readiness.launchable,
+      authenticated: readiness.authenticated,
+      // The first real Cordis turn remains the model-task verification boundary.
+      taskVerified: false,
+      detail: readiness.detail
+    });
+    return readiness;
+  }
 
   /** Provider mutations invalidate every affected engine's real-task proof.
    * Native-login CLIs with no managed binding remain untouched. */
@@ -328,6 +413,14 @@ export class EngineManager {
             : change.defaultRouteChanged
       ));
       if (!affected) continue;
+
+      // The managed Cordis runtime has no separate user-login probe. Its
+      // dispatch readiness is the conjunction of the pinned runtime, a
+      // resolvable Provider, and the opaque Main-process Provider proxy.
+      if (row.id === DSH_MANAGED_ENGINE_ID) {
+        this.applyManagedDshReadiness();
+        continue;
+      }
 
       // Nexus is an in-process Worker whose readiness contract is complete
       // Provider configuration; it has no separate CLI authentication step.
@@ -512,6 +605,7 @@ export class EngineManager {
    */
   async detect(): Promise<Engine[]> {
     this.ensureBuiltinEngines(); // 兼容导入旧配置后，外部引擎统一从数据库发现
+    this.applyManagedDshReadiness();
     const harnessCommand = deepseekHarnessCommand();
     if (!harnessCommand) {
       this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?")
@@ -572,7 +666,7 @@ export class EngineManager {
       }
     }
     for (const entry of ENGINE_CATALOG) {
-      if (entry.id === DEEPSEEK_HARNESS_ENGINE_ID) continue;
+      if (entry.id === DEEPSEEK_HARNESS_ENGINE_ID || entry.id === DSH_MANAGED_ENGINE_ID) continue;
       if (!entry.bin) continue;
       if (this.installing.has(entry.id)) continue; // 安装中不覆盖 INSTALLING 状态
       const { bin } = effective(entry);
@@ -640,7 +734,7 @@ export class EngineManager {
         });
       }
     }
-    // Nexus Agent：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED（演示模式，UI 必须标注）
+    // Nexus 兼容引擎：供应商已配置 = HEALTHY；未配置 = SETUP_REQUIRED。
     const nexusReady = managedProviderReady(this.db, NEXUS_ENGINE_ID);
     this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
       .run(nexusReady ? 'HEALTHY' : 'SETUP_REQUIRED', nexusReady ? 'authed' : 'required', NEXUS_ENGINE_ID);
@@ -784,6 +878,17 @@ export class EngineManager {
       return { ok: verified, message: verified ? 'DeepSeek Harness 已完成真实模型任务验证' : `DeepSeek Harness 最小任务失败：${probeMessage}` };
     }
 
+    if (id === DSH_MANAGED_ENGINE_ID) {
+      const readiness = this.applyManagedDshReadiness();
+      this.db.audit({
+        id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id,
+        result: readiness.status
+      });
+      return readiness.status === 'HEALTHY'
+        ? { ok: true, message: 'Cordis Runtime、模型供应商与安全代理均已就绪' }
+        : { ok: false, message: readiness.detail };
+    }
+
     // 内置 Nexus：凭据即供应商配置
     if (entry.bin === null) {
       const ready = managedProviderReady(this.db, id);
@@ -910,6 +1015,12 @@ export class EngineManager {
    *  用于修改配置后刷新引擎状态，无需重启整个应用。 */
   async restart(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
+    if (id === DSH_MANAGED_ENGINE_ID) {
+      const readiness = this.applyManagedDshReadiness();
+      return readiness.status === 'HEALTHY'
+        ? { ok: true, message: 'Cordis Runtime 已重新检测并可接收任务' }
+        : { ok: false, message: readiness.detail };
+    }
     if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
       const command = deepseekHarnessCommand();
       if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备' };
@@ -1016,13 +1127,9 @@ export class EngineManager {
         results.push({ name: rt.name, installed: false, version: null, path: null });
         continue;
       }
-      const version = await new Promise<string | null>((resolve) => {
-        execFile(path, rt.args, { shell: false, timeout: 8000 }, (_err, stdout, stderr) => {
-          const out = (stdout || stderr || '').trim().split(/\r?\n/)[0]?.replace(/^v/, '') ?? null;
-          resolve(out);
-        });
-      });
-      results.push({ name: rt.name, installed: true, version, path });
+      const probe = await runCli(path, rt.args, { timeoutMs: 8_000 });
+      const version = (probe.stdout || probe.stderr).trim().split(/\r?\n/)[0]?.replace(/^v/, '') || null;
+      results.push({ name: rt.name, installed: probe.ok || version !== null, version, path });
     }
     return results;
   }

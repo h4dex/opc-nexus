@@ -49,8 +49,14 @@ jobs:
       - name: Prepare DeepSeek Harness runtime
         run: npm run harness:prepare
 
+      - name: Prepare managed DeepSeek Harness runtime
+        run: npm run harness:managed:prepare
+
       - name: Verify DeepSeek Harness with Electron Node
         run: npm run harness:verify:electron
+
+      - name: Verify managed DeepSeek Harness with Electron Node
+        run: npm run harness:managed:verify:electron
 
       - name: Type check
         run: npm run typecheck

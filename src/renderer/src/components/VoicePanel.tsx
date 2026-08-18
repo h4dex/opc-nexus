@@ -45,7 +45,14 @@ registerProcessor('pcm-extractor', PcmExtractor);
 
 type Phase = 'idle' | 'listening' | 'confirming';
 
-export function VoicePanel({ onClose }: { onClose: () => void }) {
+interface VoicePanelProps {
+  onClose: () => void;
+  /** When present, recognition fills another composer instead of dispatching a task. */
+  onTranscript?: (text: string) => void;
+  title?: string;
+}
+
+export function VoicePanel({ onClose, onTranscript, title = '语音下达任务' }: VoicePanelProps) {
   const { snapshot } = useApp();
   const [phase, setPhase] = useState<Phase>('idle');
   const [partial, setPartial] = useState('');
@@ -111,10 +118,16 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
 
   /** 一句话结束 → 解析为任务草稿，进入确认态 */
   const toConfirm = useCallback(async (text: string) => {
-    if (!text.trim()) return;
+    const normalized = text.trim();
+    if (!normalized) return;
     stopSession();
+    if (onTranscript) {
+      onTranscript(normalized);
+      onClose();
+      return;
+    }
     const generation = startGenerationRef.current;
-    const d = await window.aibox.parseVoiceCommand(text);
+    const d = await window.aibox.parseVoiceCommand(normalized);
     if (!mountedRef.current || startGenerationRef.current !== generation) return;
     dispatchAttemptRef.current = new VoiceDispatchAttempt();
     setSubmitting(false);
@@ -122,7 +135,7 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
     setEditTitle(d.title);
     setEditAgentId(d.agentId ?? readyAgents[0]?.id ?? '');
     setPhase('confirming');
-  }, [stopSession, readyAgents]);
+  }, [onClose, onTranscript, stopSession, readyAgents]);
 
   // 识别结果订阅：partial 持续覆盖，final 落定后进入确认
   useEffect(() => {
@@ -283,7 +296,7 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
       onClick={() => { if (!submitting) { stopSession(); onClose(); } }}>
       <div className="card" style={{ width: 520, padding: 22 }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ margin: 0, fontSize: 15 }}>语音下达任务</h3>
+          <h3 style={{ margin: 0, fontSize: 15 }}>{title}</h3>
           <button className="btn small" disabled={submitting} onClick={() => { stopSession(); onClose(); }}>关闭</button>
         </div>
 
@@ -299,7 +312,7 @@ export function VoicePanel({ onClose }: { onClose: () => void }) {
               minHeight: 90, background: 'var(--input-bg)', borderRadius: 10, padding: '14px 16px', marginBottom: 16,
               fontSize: 14, lineHeight: 1.8, color: live ? 'var(--text-1)' : 'var(--text-3)'
             }}>
-              {live || (phase === 'listening' ? '正在聆听，请说出要安排的任务…' : '点击下方按钮开始说话')}
+              {live || (phase === 'listening' ? '正在聆听…' : '点击下方按钮开始说话')}
               {phase === 'listening' && partial && <span style={{ color: 'var(--text-3)' }}> ▍</span>}
             </div>
             <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>

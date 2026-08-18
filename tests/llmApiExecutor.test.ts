@@ -385,6 +385,26 @@ describe('审批门禁（四级权限语义）', () => {
     expect(b.request).not.toHaveBeenCalled();
   });
 
+  it('autonomous:项目内删除自动执行,不会产生步骤审批', async () => {
+    mockFetchSequence(toolFrames('delete_path', '{"path":"a.txt"}'), textFrames('已处理'));
+    const b = broker(true);
+    new LlmApiExecutor(makeDb(), b).start(task(), agent({ permissionMode: 'autonomous' }), cb());
+    await settle();
+    expect(b.request).not.toHaveBeenCalled();
+  });
+
+  it('autonomous:未受沙箱保护的 Shell 仍作为项目边界例外确认', async () => {
+    mockFetchSequence(toolFrames('run_command', '{"command":"echo ok"}'), textFrames('已跳过'));
+    const b = broker(false);
+    new LlmApiExecutor(makeDb(), b).start(
+      task(),
+      agent({ permissionMode: 'autonomous', capabilities: { network: false, shell: true, install: false, browser: false, computer: false } }),
+      cb()
+    );
+    await settle();
+    expect(b.request).toHaveBeenCalledWith(expect.objectContaining({ type: 'outside_workspace', risk: 'high' }));
+  });
+
   it('readonly:写类工具根本不注册给模型(第一道防线)', async () => {
     const f = mockFetchSequence(toolFrames('write_file', '{"path":"a.txt","content":"x"}'), textFrames('换方案'));
     const b = broker(true);

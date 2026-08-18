@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 vi.mock('electron', () => ({ app: { getPath: () => tmpdir() } }));
 
 import { Database } from '../src/main/services/database.js';
-import { seedIfEmpty } from '../src/main/services/seed.js';
 
 const require = createRequire(import.meta.url);
 let SQL: Awaited<ReturnType<typeof initSqlJs>>;
@@ -29,6 +28,24 @@ function count(inner: InstanceType<Awaited<ReturnType<typeof initSqlJs>>['Databa
 
 function value(inner: InstanceType<Awaited<ReturnType<typeof initSqlJs>>['Database']>, sql: string): unknown {
   return inner.exec(sql)[0]?.values[0]?.[0];
+}
+
+function expectTaskDependenciesSchema(
+  inner: InstanceType<Awaited<ReturnType<typeof initSqlJs>>['Database']>
+): void {
+  expect(count(inner, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_dependencies'")).toBe(1);
+  const columns = inner.exec('PRAGMA table_info(task_dependencies)')[0]?.values
+    .map((row) => String(row[1])) ?? [];
+  expect(columns).toEqual(['task_id', 'dependency_task_id', 'created_at']);
+
+  const foreignKeys = inner.exec('PRAGMA foreign_key_list(task_dependencies)')[0]?.values ?? [];
+  expect(foreignKeys.map((row) => `${String(row[2])}:${String(row[3])}:${String(row[4])}:${String(row[6])}`).sort())
+    .toEqual(['tasks:dependency_task_id:id:CASCADE', 'tasks:task_id:id:CASCADE'].sort());
+
+  expect(count(inner, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_task_dependencies_task'")).toBe(1);
+  expect(count(inner, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_task_dependencies_dependency'")).toBe(1);
+  expect(String(value(inner, "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_dependencies'")))
+    .toMatch(/CHECK\s*\(task_id\s*<>\s*dependency_task_id\)/i);
 }
 
 function v35Database(): { db: Database; inner: InstanceType<Awaited<ReturnType<typeof initSqlJs>>['Database']> } {
@@ -126,7 +143,7 @@ function v35Database(): { db: Database; inner: InstanceType<Awaited<ReturnType<t
   return { db: database(inner), inner };
 }
 
-describe('database v39 reliability gates', () => {
+describe('database v44 reliability gates', () => {
   it.each(['', '0', '-1', '35.5', 'not-a-version'])('rejects illegal schema version %j before running DDL', (version) => {
     const inner = new SQL.Database();
     inner.exec('CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -139,7 +156,7 @@ describe('database v39 reliability gates', () => {
 
   it('rejects a future schema before running DDL', () => {
     const inner = new SQL.Database();
-    inner.exec("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '40')");
+    inner.exec("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '45')");
     const db = database(inner);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).toThrow('高于当前应用支持');
@@ -155,14 +172,36 @@ describe('database v39 reliability gates', () => {
     expect(count(inner, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_meta'")).toBe(0);
   });
 
-  it('migrates a truly empty database to v39 with foreign keys enabled', () => {
+  it('migrates a truly empty database to v44 with project-autonomous defaults and foreign keys enabled', () => {
     const inner = new SQL.Database();
     const db = database(inner);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('39');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
     expect(value(inner, 'PRAGMA foreign_keys')).toBe(1);
     expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
+    expectTaskDependenciesSchema(inner);
+    expect(value(inner, "SELECT dflt_value FROM pragma_table_info('agents') WHERE name='permission_mode'"))
+      .toBe("'autonomous'");
+
+    inner.exec(`
+      INSERT INTO engines(id, type, name) VALUES('engine-dependencies', 'test', 'Dependency Test');
+      INSERT INTO agents(id, organization_id, name, role, engine_id, lifecycle, created_at, updated_at)
+        VALUES('agent-dependencies', 'org-local', 'Dependency Test Agent', 'test', 'engine-dependencies', 'READY', 1, 1);
+      INSERT INTO tasks(id, agent_id, title, content, created_at)
+        VALUES('task-dependency-child', 'agent-dependencies', 'child', 'child', 1),
+              ('task-dependency-parent', 'agent-dependencies', 'parent', 'parent', 1);
+      INSERT INTO task_dependencies(task_id, dependency_task_id, created_at)
+        VALUES('task-dependency-child', 'task-dependency-parent', 1);
+    `);
+    expect(() => inner.exec(
+      "INSERT INTO task_dependencies(task_id, dependency_task_id, created_at) VALUES('task-dependency-child', 'task-dependency-child', 2)"
+    )).toThrow(/CHECK/);
+    expect(() => inner.exec(
+      "INSERT INTO task_dependencies(task_id, dependency_task_id, created_at) VALUES('task-dependency-child', 'missing-task', 2)"
+    )).toThrow(/FOREIGN KEY/);
+    inner.exec("DELETE FROM tasks WHERE id = 'task-dependency-parent'");
+    expect(count(inner, "SELECT COUNT(*) FROM task_dependencies WHERE task_id='task-dependency-child'")).toBe(0);
 
     inner.exec(`
       INSERT INTO workflows(id, name, created_at) VALUES('workflow-1','Workflow',1);
@@ -170,6 +209,27 @@ describe('database v39 reliability gates', () => {
       DELETE FROM workflows WHERE id = 'workflow-1';
     `);
     expect(count(inner, "SELECT COUNT(*) FROM workflow_runs WHERE id='workflow-run-1'")).toBe(0);
+  });
+
+  it('upgrades only legacy standard employees to project autonomy', () => {
+    const inner = new SQL.Database();
+    const db = database(inner);
+    (db as unknown as { migrate: () => void }).migrate();
+    inner.exec(`
+      INSERT INTO engines(id, type, name) VALUES('engine-policy', 'test', 'Policy Test');
+      INSERT INTO agents(
+        id, organization_id, name, role, engine_id, lifecycle, permission_mode, created_at, updated_at
+      ) VALUES
+        ('agent-standard', 'org-local', 'Legacy Standard', 'test', 'engine-policy', 'READY', 'standard', 1, 1),
+        ('agent-readonly', 'org-local', 'Explicit Readonly', 'test', 'engine-policy', 'READY', 'readonly', 1, 1);
+      UPDATE schema_meta SET value = '43' WHERE key = 'schema_version';
+    `);
+
+    (db as unknown as { migrate: () => void }).migrate();
+
+    expect(value(inner, "SELECT permission_mode FROM agents WHERE id='agent-standard'")).toBe('autonomous');
+    expect(value(inner, "SELECT permission_mode FROM agents WHERE id='agent-readonly'")).toBe('readonly');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
   });
 
   it('renames the legacy built-in Hermes engine and every live engine reference to Nexus', () => {
@@ -268,7 +328,7 @@ describe('database v39 reliability gates', () => {
     `);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('39');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
     expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-hermes'")).toBe(0);
     expect(value(inner, "SELECT type FROM engines WHERE id='eng-nexus'")).toBe('nexus');
     expect(value(inner, "SELECT config_json FROM engines WHERE id='eng-nexus'")).toContain('legacy-model');
@@ -349,27 +409,13 @@ describe('database v39 reliability gates', () => {
     expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-nexus'")).toBe(0);
   });
 
-  it('keeps optional demo approvals attached to real demo tasks under foreign keys', () => {
-    const inner = new SQL.Database();
-    const db = database(inner);
-    (db as unknown as { migrate: () => void }).migrate();
-    inner.exec("INSERT INTO engines(id, type, name) VALUES('eng-nexus','nexus','Nexus Agent')");
-    db.setSetting('seedDemoData', true);
-
-    expect(() => seedIfEmpty(db)).not.toThrow();
-    expect(count(inner, 'SELECT COUNT(*) FROM approvals')).toBe(8);
-    expect(count(inner, "SELECT COUNT(*) FROM agents WHERE engine_id <> 'eng-nexus'")).toBe(0);
-    expect(count(inner, `SELECT COUNT(*) FROM approvals ap
-      LEFT JOIN tasks t ON t.id = ap.task_id WHERE t.id IS NULL`)).toBe(0);
-    expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
-  });
-
   it('migrates v35 duplicate message links conservatively and enables foreign keys', () => {
     const { db, inner } = v35Database();
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
 
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('39');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
     expect(value(inner, 'PRAGMA foreign_keys')).toBe(1);
+    expectTaskDependenciesSchema(inner);
     expect(value(inner, "SELECT input_message_id FROM tasks WHERE id='task-winner'")).toBe('message-1');
     expect(value(inner, "SELECT input_message_id FROM tasks WHERE id='task-duplicate'")).toBeNull();
     expect(value(inner, "SELECT task_id FROM messages WHERE id='message-1'")).toBe('task-winner');
@@ -615,6 +661,30 @@ describe('database v39 reliability gates', () => {
     expect(() => inner.exec(`INSERT INTO tasks(
       id, agent_id, conversation_id, input_message_id, title, content, source, status, created_at
     ) VALUES('task-retry','agent-1','conversation-1','message-1','retry','retry','channel','QUEUED',3)`)).toThrow(/UNIQUE/);
+    expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
+  });
+
+  it('cascades prerequisite edges when retention physically deletes expired tasks', () => {
+    const { db, inner } = v35Database();
+    (db as unknown as { migrate: () => void }).migrate();
+    inner.exec(`
+      INSERT INTO tasks(
+        id, agent_id, project_id, conversation_id, title, content,
+        source, status, created_at, ended_at
+      ) VALUES
+        ('task-expired-upstream', 'agent-1', 'project-1', 'conversation-1', 'upstream', 'upstream',
+         'desktop', 'COMPLETED', 1, 1),
+        ('task-expired-downstream', 'agent-1', 'project-1', 'conversation-1', 'downstream', 'downstream',
+         'desktop', 'COMPLETED', 1, 1);
+      INSERT INTO task_dependencies(task_id, dependency_task_id, created_at)
+        VALUES
+          ('task-expired-downstream', 'task-expired-upstream', 1),
+          ('task-expired-upstream', 'task-expired-downstream', 1);
+    `);
+
+    expect(() => db.cleanupRetention()).not.toThrow();
+    expect(count(inner, "SELECT COUNT(*) FROM tasks WHERE id IN ('task-expired-upstream', 'task-expired-downstream')")).toBe(0);
+    expect(count(inner, "SELECT COUNT(*) FROM task_dependencies WHERE task_id LIKE 'task-expired-%' OR dependency_task_id LIKE 'task-expired-%'")).toBe(0);
     expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
   });
 });

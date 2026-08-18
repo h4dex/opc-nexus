@@ -2,10 +2,12 @@
  * Electron 模块 mock（vitest 环境无 Electron 运行时）
  */
 import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { vi } from 'vitest';
 
 function testPath(name: string): string {
-  const path = `/tmp/test-${name}`;
+  const path = join(tmpdir(), `aibox-test-${name}`);
   // Electron guarantees that userData exists before services use it.
   if (name === 'userData') mkdirSync(path, { recursive: true });
   return path;
@@ -27,6 +29,7 @@ export class Notification {
 
 export class BrowserWindow {
   static getAllWindows() { return []; }
+  static fromWebContents = vi.fn(() => null);
   webContents = { send: vi.fn() };
   isDestroyed() { return false; }
 }
@@ -54,5 +57,7 @@ export const safeStorage = {
 };
 
 export const shell = {
-  openExternal: vi.fn()
+  openExternal: vi.fn(),
+  openPath: vi.fn().mockResolvedValue(''),
+  showItemInFolder: vi.fn()
 };
