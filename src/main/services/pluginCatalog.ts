@@ -1,13 +1,12 @@
 /**
  * Unified, read-only view of the plugin boundary.
  *
- * MCP servers and database-backed Skills predate the DSH plugin host. They
- * remain managed by their existing owners, but this projection lets the UI
+ * MCP servers and database-backed Skills are managed by their existing Nexus
+ * owners, but this projection lets the UI
  * present them as one catalog without exposing commands, environment values,
  * skill bodies, or package internals to Renderer.
  */
 import type {
-  DshPluginCatalogView,
   PluginCatalogItemView,
   PluginCatalogKind,
   PluginLifecycleStatus,
@@ -17,7 +16,7 @@ import type {
   PluginCatalogView,
   Engine
 } from '../../shared/types.js';
-import type { DshPluginCatalogService } from './dshPluginCatalog.js';
+import { isRetiredExecutionEngine } from '../../shared/engineVisibility.js';
 import type { McpManager, McpServerConfig } from './mcpManager.js';
 import type { CapabilityRegistry, RegisteredPlugin, PluginCapability, PluginHost } from './pluginHost.js';
 import type { Skill, SkillManager } from './skillManager.js';
@@ -26,16 +25,19 @@ const MAX_ITEMS = 512;
 const MAX_WARNINGS = 64;
 const MAX_REASON_CODES = 24;
 
+function publicOwner(owner: string): 'nexus-governance' | 'legacy' {
+  return owner === 'nexus-governance' ? 'nexus-governance' : 'legacy';
+}
+
 export interface PluginCatalogOptions {
   registry?: CapabilityRegistry;
   host?: Pick<PluginHost, 'isAttached'>;
-  dsh?: DshPluginCatalogService;
   /** `toggle`/`update` are optional so read-only diagnostics fixtures remain lightweight. */
   mcp?: Pick<McpManager, 'list'> & Partial<Pick<McpManager, 'toggle'>>;
   skills?: Pick<SkillManager, 'list'> & Partial<Pick<SkillManager, 'update'>>;
   /** Existing engine manager remains authoritative; this is a redacted worker-adapter projection. */
   engines?: { list(): Engine[] };
-  /** A healthy local engine is only a Cordis Worker after its invocation
+  /** A healthy local engine is only a governed Worker after its invocation
    * bridge is registered. Omitted means declaration-only and fails closed. */
   workerBridgeAvailable?: (engineId: string) => boolean;
   now?: () => number;
@@ -79,7 +81,7 @@ function hostItem(plugin: RegisteredPlugin, host?: Pick<PluginHost, 'isAttached'
     version: plugin.manifest.version,
     source: 'host',
     kind: kindForCapabilities(capabilities),
-    owner: plugin.manifest.owner,
+    owner: publicOwner(plugin.manifest.owner),
     status: disabled ? 'disabled' : partiallyAttached ? 'degraded' : 'ready',
     lifecycle: disabled ? 'disabled' : fullyAttached ? 'live' : partiallyAttached ? 'review' : 'installed',
     safety: safetyForPermissions(permissions),
@@ -90,48 +92,6 @@ function hostItem(plugin: RegisteredPlugin, host?: Pick<PluginHost, 'isAttached'
     permissions,
     reasonCodes: disabled ? ['DISABLED_BY_HOST'] : partiallyAttached ? ['PARTIAL_CAPABILITY_BINDING'] : [],
     updatedAt: plugin.registeredAt
-  };
-}
-
-function dshKind(categories: readonly string[]): PluginCatalogKind {
-  if (categories.includes('runtime')) return 'runtime';
-  if (categories.includes('engine')) return 'engine';
-  if (categories.includes('skill')) return 'skill';
-  if (categories.includes('tool') || categories.includes('browser') || categories.includes('web')) return 'tool';
-  if (categories.includes('artifact')) return 'artifact';
-  if (categories.includes('channel')) return 'channel';
-  return 'integration';
-}
-
-function dshItem(item: DshPluginCatalogView['packages'][number]): PluginCatalogItemView {
-  const status: PluginCatalogStatus = item.enablement === 'enabled'
-    ? 'ready'
-    : item.enablement === 'disabled'
-      ? 'disabled'
-      : item.enablement;
-  return {
-    id: `dsh:${item.name}`,
-    name: item.name,
-    version: item.version,
-    source: 'dsh',
-    kind: dshKind(item.categories),
-    owner: 'dsh-cordis',
-    status,
-    lifecycle: !item.installed
-      ? 'missing'
-      : item.enablement === 'disabled'
-        ? 'disabled'
-        : item.enablement === 'blocked' || !item.reviewed
-          ? item.reasonCodes.some((reason) => /(?:BROKEN|INTEGRITY|INVALID|MISMATCH)/i.test(reason)) ? 'broken' : 'review'
-          : 'live',
-    safety: item.safety,
-    enabled: item.enablement === 'enabled',
-    installed: item.installed,
-    configured: item.reviewed,
-    capabilities: uniqueBounded(item.categories, 32),
-    permissions: [],
-    reasonCodes: uniqueBounded(item.reasonCodes),
-    updatedAt: null
   };
 }
 
@@ -179,7 +139,7 @@ function skillItem(skill: Skill): PluginCatalogItemView {
     version: '1.0.0',
     source: 'skill',
     kind: 'skill',
-    owner: builtIn ? 'dsh-cordis' : 'legacy',
+    owner: builtIn ? 'nexus-governance' : 'legacy',
     status: skill.enabled ? 'ready' : 'disabled',
     lifecycle: skill.enabled ? 'live' : 'disabled',
     safety: builtIn ? 'trusted' : 'review',
@@ -196,6 +156,9 @@ function skillItem(skill: Skill): PluginCatalogItemView {
 const CLI_ENGINE_TYPES = new Set<Engine['type']>(['hermes-cli', 'codex', 'claude', 'pi', 'opencode']);
 
 function engineAdapterItem(engine: Engine, workerBridgeAvailable?: (engineId: string) => boolean): PluginCatalogItemView | null {
+  // These runtimes remain available to historical/governed workers, but are
+  // not user-installable plugins and must not reappear in the shared catalog.
+  if (isRetiredExecutionEngine(engine)) return null;
   const source: PluginCatalogSource | null = CLI_ENGINE_TYPES.has(engine.type)
     ? 'cli'
     : engine.type === 'external'
@@ -228,7 +191,7 @@ function engineAdapterItem(engine: Engine, workerBridgeAvailable?: (engineId: st
     version: engine.version,
     source,
     kind: source === 'cli' ? 'cli-adapter' : 'acp-adapter',
-    owner: 'dsh-cordis',
+    owner: 'nexus-governance',
     status,
     lifecycle,
     safety: 'review',
@@ -239,7 +202,7 @@ function engineAdapterItem(engine: Engine, workerBridgeAvailable?: (engineId: st
     permissions: ['process.exec'],
     reasonCodes: uniqueBounded([
       ...(engineReady ? [] : [engine.status]),
-      ...(bridgeReady ? [] : ['CORDIS_BRIDGE_UNAVAILABLE'])
+      ...(bridgeReady ? [] : ['WORKER_BRIDGE_UNAVAILABLE'])
     ]),
     updatedAt: engine.healthSignals?.checkedAt ?? null
   };
@@ -248,7 +211,7 @@ function engineAdapterItem(engine: Engine, workerBridgeAvailable?: (engineId: st
 /**
  * ACP/A2A capabilities remain declarations until a handler is attached. This
  * extra row makes the transport visible without promoting its host plugin to
- * the DSH/Cordis orchestration role.
+ * the Quest/Hermes orchestration role.
  */
 function registryAdapterItems(
   plugin: RegisteredPlugin,
@@ -265,7 +228,7 @@ function registryAdapterItems(
       version: capability.version,
       source,
       kind: source === 'acp' ? 'acp-adapter' : 'a2a-adapter',
-      owner: plugin.manifest.owner,
+      owner: publicOwner(plugin.manifest.owner),
       status: disabled ? 'disabled' : attached ? 'ready' : 'degraded',
       lifecycle: disabled ? 'disabled' : attached ? 'live' : 'review',
       safety: 'review',
@@ -280,10 +243,6 @@ function registryAdapterItems(
   });
 }
 
-function emptyDshCatalog(): DshPluginCatalogView | null {
-  return null;
-}
-
 /** Build a bounded, deterministic catalog snapshot. */
 export class PluginCatalogService {
   private readonly now: () => number;
@@ -292,7 +251,7 @@ export class PluginCatalogService {
     this.now = options.now ?? Date.now;
   }
 
-  /** Attach legacy managers after the main-process dependency graph is built. */
+  /** Attach managers after the main-process dependency graph is built. */
   setSources(sources: Pick<PluginCatalogOptions, 'mcp' | 'skills' | 'engines'>): void {
     if (sources.mcp) this.options.mcp = sources.mcp;
     if (sources.skills) this.options.skills = sources.skills;
@@ -300,12 +259,12 @@ export class PluginCatalogService {
   }
 
   /**
-   * Toggle only legacy database-backed sources and in-memory Host plugins.
-   * DSH package enablement is derived from a reviewed, integrity-checked
-   * runtime profile and therefore cannot be changed by this generic action.
+   * Toggle only database-backed sources and in-memory Host plugins.
+   * Worker runtime enablement is derived from its engine health and cannot be
+   * changed by this generic plugin action.
    */
   setEnabled(id: string, enabled: boolean): void {
-    if (typeof id !== 'string' || !/^(?:host|dsh|mcp|skill|cli|acp|a2a):[A-Za-z0-9._-]{1,200}$/.test(id)) {
+    if (typeof id !== 'string' || !/^(?:host|mcp|skill|cli|acp|a2a):[A-Za-z0-9._-]{1,200}$/.test(id)) {
       throw new Error('Invalid plugin id');
     }
     if (typeof enabled !== 'boolean') throw new Error('Plugin enabled flag is invalid');
@@ -329,7 +288,7 @@ export class PluginCatalogService {
       this.options.skills.update(sourceId, { enabled });
       return;
     }
-    throw new Error('DSH package enablement is controlled by the managed profile');
+    throw new Error('Worker adapter enablement is controlled by the engine health check');
   }
 
   getCatalog(): PluginCatalogView {
@@ -352,21 +311,6 @@ export class PluginCatalogService {
         }
       } catch (error) {
         warn(`HOST_CATALOG_ERROR:${error instanceof Error ? error.message : String(error)}`.slice(0, 240));
-      }
-    }
-
-    let dsh: DshPluginCatalogView | null = emptyDshCatalog();
-    if (this.options.dsh) {
-      try {
-        dsh = this.options.dsh.getCatalog();
-        for (const packageItem of dsh.packages) {
-          if (items.length >= MAX_ITEMS) break;
-          items.push(dshItem(packageItem));
-        }
-        for (const warning of dsh.warnings) warn(`DSH:${warning}`.slice(0, 240));
-      } catch (error) {
-        warn(`DSH_CATALOG_ERROR:${error instanceof Error ? error.message : String(error)}`.slice(0, 240));
-        dsh = null;
       }
     }
 
@@ -409,14 +353,14 @@ export class PluginCatalogService {
       ready: 0, disabled: 0, blocked: 0, missing: 0, degraded: 0
     };
     const sourceCounts: Record<PluginCatalogSource, number> = {
-      host: 0, dsh: 0, mcp: 0, skill: 0, cli: 0, acp: 0, a2a: 0
+      host: 0, mcp: 0, skill: 0, cli: 0, acp: 0, a2a: 0
     };
     for (const item of items) {
       counts[item.status] += 1;
       sourceCounts[item.source] += 1;
     }
     if (items.length >= MAX_ITEMS) warn('PLUGIN_CATALOG_TRUNCATED');
-    return { scannedAt, items, counts, sourceCounts, warnings, dsh };
+    return { scannedAt, items, counts, sourceCounts, warnings };
   }
 }
 

@@ -203,6 +203,89 @@ describe('tryChannelApproval', () => {
 });
 
 describe('dispatchChannelTask 幂等', () => {
+  it('lets Hermes handle plan approval text when no task approval is pending', async () => {
+    const { db, orch } = setup();
+    const converse = vi.fn(async () => ({ content: '计划已批准：DSH v1' }));
+    const ack = vi.fn();
+    const final = vi.fn();
+
+    await dispatchChannelTask({
+      db,
+      orchestrator: orch,
+      taskPlanner: { converse },
+      channelId: 'ch-test',
+      text: '批准',
+      externalIdentity: 'control-user',
+      conversationKey: 'control-conversation',
+      sourceKey: 'approve-hermes-plan-1',
+      ack,
+      final
+    });
+
+    expect(converse).toHaveBeenCalledOnce();
+    expect(final).toHaveBeenCalledWith('计划已批准：DSH v1');
+    expect(ack).toHaveBeenCalledWith('已接收消息，Hermes 正在处理…');
+  });
+
+  it('tracks DSH task ids returned by a Hermes dispatch and sends terminal evidence', async () => {
+    const { db, orch, agentId } = setup();
+    const task = orch.createTask(agentId, 'Hermes plan node', 'team');
+    Object.assign(db.tables.tasks.get(task.id), { status: 'COMPLETED', result: '真实交付已生成' });
+    const final = vi.fn();
+
+    await dispatchChannelTask({
+      db,
+      orchestrator: orch,
+      taskPlanner: { converse: vi.fn(async () => ({ content: '计划已派工', taskIds: [task.id] })) },
+      channelId: 'ch-test',
+      text: '派工',
+      externalIdentity: 'control-user',
+      conversationKey: 'control-conversation',
+      sourceKey: 'dispatch-hermes-plan-1',
+      ack: vi.fn(),
+      final
+    });
+
+    expect(final).toHaveBeenNthCalledWith(1, '计划已派工');
+    expect(final).toHaveBeenNthCalledWith(2, expect.stringContaining('真实交付已生成'), task.id);
+    expect([...db.tables.messages.values()].some((row) => row.external_message_key === `task:${task.id}:completed`)).toBe(true);
+  });
+
+  it('does not send a completed Hermes plan artifact before independent PASS', async () => {
+    const { db, orch, agentId } = setup();
+    const task = orch.createTask(agentId, 'Hermes plan node', 'team');
+    Object.assign(db.tables.tasks.get(task.id), { status: 'COMPLETED', result: '真实交付已生成' });
+    const final = vi.fn();
+    const deliveryGate = vi.fn(() => ({
+      taskId: task.id,
+      projectId: 'project-1',
+      required: true,
+      allowed: false,
+      reason: '独立验收任务仍在 RUNNING',
+      validationTaskId: 'task-review',
+      validationVerdict: null
+    }));
+
+    await dispatchChannelTask({
+      db,
+      orchestrator: orch,
+      taskPlanner: { converse: vi.fn(async () => ({ content: '计划已派工', taskIds: [task.id] })), deliveryGate },
+      channelId: 'ch-test',
+      text: '派工',
+      externalIdentity: 'control-user',
+      conversationKey: 'control-conversation',
+      sourceKey: 'dispatch-hermes-plan-gated-1',
+      ack: vi.fn(),
+      final
+    });
+
+    expect(deliveryGate).toHaveBeenCalledWith(task.id);
+    expect(final).toHaveBeenNthCalledWith(1, '计划已派工');
+    expect(final).toHaveBeenNthCalledWith(2, expect.stringContaining('交付暂缓'));
+    expect(final).not.toHaveBeenCalledWith(expect.anything(), task.id);
+    expect([...db.tables.messages.values()].some((row) => row.external_message_key === `task:${task.id}:awaiting-validation`)).toBe(true);
+  });
+
   it('控制消息先持久化身份，并以 durable receipt 防止重复执行', async () => {
     const { db, orch, agentId, controlScope } = setup();
     const task = orch.createTask(agentId, '仅取消一次', 'channel', { conversationId: controlScope.conversationId });

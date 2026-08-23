@@ -3,9 +3,8 @@ import { useEffect, useState, useMemo } from 'react';
 import { useApp } from '../store';
 import { AgentEditor } from '../components/AgentEditor';
 import { ContextMenu, Modal, type CtxMenuItem } from '../components/common';
-import { IconMessage, IconPlay, IconStop, IconPlus, IconTask } from '../components/icons';
-import { toast } from '../components/Toast';
-import { DSH_MANAGED_ENGINE_ID, type Agent, type AgentCardView, type Project } from '@shared/types';
+import { IconFolder, IconPlay, IconStop, IconPlus } from '../components/icons';
+import type { Agent, AgentCardView } from '@shared/types';
 
 const PERM_LABEL: Record<string, { text: string; color: string }> = {
   readonly: { text: '只读', color: 'var(--text-3)' },
@@ -36,7 +35,7 @@ function lifecycleMeta(card: AgentCardView): { text: string; color: string } {
 type ViewMode = 'table' | 'card';
 
 export function Agents() {
-  const { snapshot, setWizardOpen, navigationTarget, clearNavigationTarget, openAgentChat } = useApp();
+  const { snapshot, setWizardOpen, navigationTarget, clearNavigationTarget, openQuest, setRoute, questProjectId } = useApp();
   const [editAgent, setEditAgent] = useState<Agent | null>(null);
   const [ctx, setCtx] = useState<{ x: number; y: number; card: AgentCardView } | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('table');
@@ -48,10 +47,17 @@ export function Agents() {
   const [batchMsg, setBatchMsg] = useState('');
   const [importMsg, setImportMsg] = useState('');
   const [detailAgent, setDetailAgent] = useState<Agent | null>(null);
-  const [taskAgent, setTaskAgent] = useState<Agent | null>(null);
-  const [taskTitle, setTaskTitle] = useState('');
-  const [taskProjectId, setTaskProjectId] = useState('');
-  const [taskBusy, setTaskBusy] = useState(false);
+  const [questAgent, setQuestAgent] = useState<Agent | null>(null);
+  const [questProjects, setQuestProjects] = useState<Array<{
+    id: string;
+    name: string;
+    allowed: boolean;
+    policy: 'dynamic' | 'fixed' | 'unavailable';
+    reason: string;
+  }>>([]);
+  const [questProjectChoice, setQuestProjectChoice] = useState('');
+  const [questProjectsLoading, setQuestProjectsLoading] = useState(false);
+  const [questProjectsError, setQuestProjectsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!snapshot || navigationTarget?.entityType !== 'agent') return;
@@ -130,53 +136,58 @@ export function Agents() {
     URL.revokeObjectURL(url);
   };
 
-  const openTaskModal = (agent: Agent) => {
-    setTaskAgent(agent);
-    setTaskTitle('');
-    setTaskProjectId('');
-  };
-
-  const openDshWorkbench = async (agent: Agent) => {
-    try {
-      await window.aibox.openDshWorkbench(agent.id);
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : 'DSH 工作台启动失败');
-    }
-  };
-
-  const openConversation = (agent: Agent) => {
-    if (agent.engineId === DSH_MANAGED_ENGINE_ID) {
-      void openDshWorkbench(agent);
+  const prepareQuest = async (agent: Agent) => {
+    setQuestAgent(agent);
+    setQuestProjects([]);
+    setQuestProjectChoice('');
+    setQuestProjectsError(null);
+    setQuestProjectsLoading(true);
+    const projects = (snapshot?.projects ?? [])
+      .filter((project) => project.status !== 'archived')
+      .sort((left, right) => Number(right.id === questProjectId) - Number(left.id === questProjectId)
+        || right.updatedAt - left.updatedAt);
+    if (projects.length === 0) {
+      setQuestProjectsLoading(false);
       return;
     }
-    openAgentChat(agent.id);
-  };
-
-  const conversationLabel = (agent: Agent) => agent.engineId === DSH_MANAGED_ENGINE_ID ? '对话' : '兼容对话';
-
-  const closeTaskModal = () => {
-    if (taskBusy) return;
-    setTaskAgent(null);
-    setTaskTitle('');
-    setTaskProjectId('');
-  };
-
-  const scheduleTask = async () => {
-    if (!taskAgent || !taskTitle.trim() || taskBusy) return;
-    setTaskBusy(true);
-    try {
-      await window.aibox.createTask(taskAgent.id, taskTitle.trim(), taskProjectId || undefined);
-      toast.ok(`任务已安排给「${taskAgent.name}」`);
-      // closeTaskModal intentionally refuses to close while a request is active;
-      // this path is already successful and should reset the form immediately.
-      setTaskAgent(null);
-      setTaskTitle('');
-      setTaskProjectId('');
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : '任务安排失败');
-    } finally {
-      setTaskBusy(false);
+    const results = await Promise.all(projects.map(async (project) => {
+      try {
+        const workbench = await window.aibox.getProjectWorkbench(project.id);
+        const fixed = workbench.settings.workerAgentIds;
+        const allowed = fixed.length === 0 || fixed.includes(agent.id);
+        return {
+          id: project.id,
+          name: project.name,
+          allowed,
+          policy: fixed.length === 0 ? 'dynamic' as const : allowed ? 'fixed' as const : 'unavailable' as const,
+          reason: fixed.length === 0
+            ? '动态组队，可使用该员工'
+            : allowed ? '该员工已在固定员工池中' : '固定员工池未包含该员工'
+        };
+      } catch {
+        return {
+          id: project.id,
+          name: project.name,
+          allowed: false,
+          policy: 'unavailable' as const,
+          reason: '项目配置暂时无法读取'
+        };
+      }
+    }));
+    setQuestProjects(results);
+    setQuestProjectChoice(results.find((project) => project.allowed)?.id ?? '');
+    if (!results.some((project) => project.allowed)) {
+      setQuestProjectsError('没有允许该员工加入的项目，请先在项目 Quest 设置中更新固定员工池。');
     }
+    setQuestProjectsLoading(false);
+  };
+
+  const launchQuest = () => {
+    if (!questAgent || !questProjectChoice) return;
+    const employeeId = questAgent.id;
+    const projectId = questProjectChoice;
+    setQuestAgent(null);
+    openQuest(projectId, employeeId);
   };
 
   /** 右键菜单项 */
@@ -184,8 +195,7 @@ export function Agents() {
     const agent = card.agent;
     const ready = agent.lifecycle === 'READY';
     return [
-      { label: conversationLabel(agent), icon: <IconMessage size={13} />, onClick: () => openConversation(agent) },
-      { label: '安排任务', icon: <IconTask size={13} />, onClick: () => openTaskModal(agent) },
+      { label: '在 Quest 中使用', icon: <IconFolder size={13} />, onClick: () => void prepareQuest(agent) },
       { label: '编辑 / 设置', onClick: () => setEditAgent(agent) },
       { label: '打开工作目录', onClick: () => void window.aibox.openAgentWorkspace(agent.id) },
       { label: '导出配置', onClick: () => void exportAgent(agent.id) },
@@ -326,8 +336,7 @@ export function Agents() {
                     </td>
                     <td style={{ padding: '12px', textAlign: 'center' }}>
                       <div style={{ display: 'flex', gap: 6, justifyContent: 'center', flexWrap: 'wrap' }}>
-                        <button className="btn small primary" onClick={() => openConversation(agent)} style={{ padding: '4px 9px', fontSize: 11.5 }} title={agent.engineId === DSH_MANAGED_ENGINE_ID ? '在 DSH 工作台中对话' : '打开 Local CLI 兼容对话'}><IconMessage size={12} />{conversationLabel(agent)}</button>
-                        <button className="btn small primary" onClick={() => openTaskModal(agent)} style={{ padding: '4px 9px', fontSize: 11.5 }}><IconTask size={12} />安排任务</button>
+                        <button className="btn small primary" onClick={() => void prepareQuest(agent)} style={{ padding: '4px 9px', fontSize: 11.5 }}><IconFolder size={12} />在 Quest 中使用</button>
                         <button className="btn small" onClick={() => setEditAgent(agent)} style={{ padding: '4px 10px', fontSize: 11.5 }}>编辑</button>
                         {agent.lifecycle === 'READY' ? (
                           <button className="btn small" onClick={() => void window.aibox.stopAgent(agent.id)} style={{ padding: '4px 8px' }} title="停用"><IconStop size={12} /></button>
@@ -384,8 +393,7 @@ export function Agents() {
                   </div>
                 )}
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                  <button className="btn small primary" onClick={(e) => { e.stopPropagation(); openConversation(agent); }} style={{ fontSize: 11 }} title={agent.engineId === DSH_MANAGED_ENGINE_ID ? '在 DSH 工作台中对话' : '打开 Local CLI 兼容对话'}><IconMessage size={12} />{conversationLabel(agent)}</button>
-                  <button className="btn small primary" onClick={(e) => { e.stopPropagation(); openTaskModal(agent); }} style={{ fontSize: 11 }}><IconTask size={12} />安排任务</button>
+                  <button className="btn small primary" onClick={(e) => { e.stopPropagation(); void prepareQuest(agent); }} style={{ fontSize: 11 }}><IconFolder size={12} />在 Quest 中使用</button>
                   <button className="btn small" onClick={(e) => { e.stopPropagation(); setEditAgent(agent); }} style={{ fontSize: 11 }}>编辑</button>
                   {agent.lifecycle === 'READY' ? (
                     <button className="btn small" onClick={(e) => { e.stopPropagation(); void window.aibox.stopAgent(agent.id); }} style={{ fontSize: 11 }}>停用</button>
@@ -404,72 +412,65 @@ export function Agents() {
       )}
 
       {editAgent && <AgentEditor agent={editAgent} onClose={() => setEditAgent(null)} />}
-      {detailAgent && <AgentDetailDrawer agent={detailAgent} onClose={() => setDetailAgent(null)} onEdit={() => { setEditAgent(detailAgent); setDetailAgent(null); }} onChat={() => openConversation(detailAgent)} />}
+      {detailAgent && <AgentDetailDrawer agent={detailAgent} onClose={() => setDetailAgent(null)} onEdit={() => { setEditAgent(detailAgent); setDetailAgent(null); }} onUse={() => { const agent = detailAgent; setDetailAgent(null); void prepareQuest(agent); }} />}
       {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems(ctx.card)} onClose={() => setCtx(null)} />}
-      {taskAgent && <AgentTaskModal
-        agent={taskAgent}
-        projects={snapshot.projects}
-        title={taskTitle}
-        projectId={taskProjectId}
-        busy={taskBusy}
-        onTitleChange={setTaskTitle}
-        onProjectChange={setTaskProjectId}
-        onClose={closeTaskModal}
-        onSubmit={() => void scheduleTask()}
-      />}
+      {questAgent && (
+        <Modal
+          title={`选择 ${questAgent.name} 使用的项目`}
+          onClose={() => setQuestAgent(null)}
+          width={520}
+          footer={(
+            <>
+              <button className="btn" type="button" onClick={() => setQuestAgent(null)}>取消</button>
+              {questProjects.length === 0 && !questProjectsLoading
+                ? <button className="btn primary" type="button" onClick={() => { setQuestAgent(null); setRoute('projects'); }}>前往项目中心</button>
+                : <button className="btn primary" type="button" disabled={!questProjectChoice || questProjectsLoading} onClick={launchQuest}>打开 Quest</button>}
+            </>
+          )}
+        >
+          {questProjectsLoading && <div className="page-loading">正在读取项目员工范围...</div>}
+          {!questProjectsLoading && questProjects.length === 0 && (
+            <div className="empty-state"><strong>还没有可用项目</strong><p>先创建项目并确认交付目录，再使用数字员工。</p></div>
+          )}
+          {!questProjectsLoading && questProjects.length > 0 && (
+            <div style={{ display: 'grid', gap: 8 }} role="radiogroup" aria-label="Quest 项目选择">
+              {questProjects.map((project) => (
+                <label
+                  key={project.id}
+                  style={{
+                    display: 'grid', gridTemplateColumns: '20px minmax(0, 1fr)', gap: 10,
+                    padding: '11px 12px', border: `1px solid ${questProjectChoice === project.id ? 'var(--accent)' : 'var(--border)'}`,
+                    borderRadius: 6, opacity: project.allowed ? 1 : 0.58,
+                    background: questProjectChoice === project.id ? 'var(--accent-soft)' : 'var(--input-bg)',
+                    cursor: project.allowed ? 'pointer' : 'not-allowed'
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="quest-project"
+                    value={project.id}
+                    checked={questProjectChoice === project.id}
+                    disabled={!project.allowed}
+                    onChange={() => setQuestProjectChoice(project.id)}
+                    style={{ marginTop: 2, accentColor: 'var(--accent)' }}
+                  />
+                  <span style={{ minWidth: 0 }}>
+                    <strong style={{ display: 'block', fontSize: 13 }}>{project.name}</strong>
+                    <small style={{ display: 'block', marginTop: 3, color: project.allowed ? 'var(--text-2)' : 'var(--warning)' }}>{project.reason}</small>
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+          {questProjectsError && <div role="alert" style={{ marginTop: 12, color: 'var(--warning)', fontSize: 12 }}>{questProjectsError}</div>}
+        </Modal>
+      )}
     </>
   );
 }
 
-function AgentTaskModal({
-  agent, projects, title, projectId, busy, onTitleChange, onProjectChange, onClose, onSubmit
-}: {
-  agent: Agent;
-  projects: Project[];
-  title: string;
-  projectId: string;
-  busy: boolean;
-  onTitleChange: (value: string) => void;
-  onProjectChange: (value: string) => void;
-  onClose: () => void;
-  onSubmit: () => void;
-}) {
-  const availableProjects = projects.filter((project) => !['completed', 'archived'].includes(project.status));
-  return (
-    <Modal title={`安排任务 · ${agent.name}`} onClose={onClose} width={560} footer={<>
-      <button className="btn" type="button" onClick={onClose} disabled={busy}>取消</button>
-      <button className="btn primary" type="button" onClick={onSubmit} disabled={busy || !title.trim()}>
-        <IconTask size={14} />{busy ? '安排中…' : '安排任务'}
-      </button>
-    </>}>
-      <div className="field">
-        <label>任务描述</label>
-        <textarea
-          autoFocus
-          rows={5}
-          maxLength={500}
-          value={title}
-          onChange={(event) => onTitleChange(event.target.value)}
-          onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') onSubmit(); }}
-          placeholder="说明目标、输入资料和预期结果"
-        />
-      </div>
-      <div className="field" style={{ marginTop: 14 }}>
-        <label>归属项目</label>
-        <select value={projectId} onChange={(event) => onProjectChange(event.target.value)}>
-          <option value="">未归项目</option>
-          {availableProjects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-        </select>
-      </div>
-      <div style={{ marginTop: 12, fontSize: 11.5, color: 'var(--text-3)' }}>
-        任务会进入任务中心，并按员工当前状态和并发限制执行。
-      </div>
-    </Modal>
-  );
-}
-
 /** 员工详情抽屉：最近任务 + Token 统计 + 活动日志 */
-function AgentDetailDrawer({ agent, onClose, onEdit, onChat }: { agent: Agent; onClose: () => void; onEdit: () => void; onChat: () => void }) {
+function AgentDetailDrawer({ agent, onClose, onEdit, onUse }: { agent: Agent; onClose: () => void; onEdit: () => void; onUse: () => void }) {
   const [detail, setDetail] = useState<{
     tasks: { id: string; title: string; status: string; progress: number; createdAt: number }[];
     usage: { totalTokens: number; inputTokens: number; outputTokens: number; calls: number };
@@ -557,7 +558,7 @@ function AgentDetailDrawer({ agent, onClose, onEdit, onChat }: { agent: Agent; o
         </div>
 
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn primary" style={{ flex: 1, justifyContent: 'center' }} onClick={onChat}><IconMessage size={14} />{agent.engineId === DSH_MANAGED_ENGINE_ID ? '在 DSH 中对话' : '兼容对话'}</button>
+          <button className="btn primary" style={{ flex: 1, justifyContent: 'center' }} onClick={onUse}><IconFolder size={14} />在项目中使用</button>
           <button className="btn" style={{ flex: 1, justifyContent: 'center' }} onClick={onEdit}>编辑员工配置</button>
         </div>
       </div>

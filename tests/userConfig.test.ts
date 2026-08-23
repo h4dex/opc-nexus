@@ -73,6 +73,11 @@ describe('mergeUserConfig', () => {
     const cfg = mergeUserConfig({ task: { maxRunMinutes: 0 } });
     expect(cfg.task.maxRunMinutes).toBe(0);
   });
+
+  it('升级后不保留已退役 DSH fallback', () => {
+    const cfg = mergeUserConfig({ engine: { fallbackEngineId: 'eng-deepseek-harness-managed' } });
+    expect(cfg.engine.fallbackEngineId).toBe(USER_CONFIG_DEFAULTS.engine.fallbackEngineId);
+  });
 });
 
 describe('sanitizeWebhookUrl', () => {

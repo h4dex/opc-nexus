@@ -7,7 +7,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { EnvironmentComponentView, NativeAdapterMode } from '../../shared/types.js';
-import type { DshScopedPolicyBroker } from './dshPolicyBroker.js';
+import type { HostScopedPolicyBroker } from './hostPolicyBroker.js';
 
 const IDENTIFIER = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
 const MAX_OPERATIONS = 64;
@@ -81,7 +81,7 @@ function expectedBoundary(mode: NativeAdapterMode): NativeAdapterTransport['boun
 export class NativeAdapterHost {
   private readonly adapters = new Map<string, RegisteredNativeAdapter>();
 
-  constructor(private readonly policy?: DshScopedPolicyBroker) {}
+  constructor(private readonly policy?: HostScopedPolicyBroker) {}
 
   register(input: NativeAdapterRegistration): void {
     const id = assertIdentifier(input.id, 'adapter id');

@@ -11,18 +11,15 @@ export const PLUGIN_MANIFEST_SCHEMA_VERSION = 1 as const;
 export const PLUGIN_HOST_API_VERSION = '1.0.0' as const;
 
 /**
- * Ownership is deliberately explicit at the plugin boundary. DSH/Cordis is
- * the product orchestrator and therefore the default owner; Nexus remains the
- * host governance boundary and is never silently promoted to the secretary or
- * planning owner by this registry.
+ * Ownership is deliberately explicit at the plugin boundary. Quest/Hermes
+ * is the orchestrator; Nexus remains the host governance boundary.
  */
-export const PLUGIN_OWNERS = ['dsh-cordis', 'nexus-governance'] as const;
-export const DEFAULT_PLUGIN_OWNER = 'dsh-cordis' as const;
+export const PLUGIN_OWNERS = ['nexus-governance'] as const;
+export const DEFAULT_PLUGIN_OWNER = 'nexus-governance' as const;
 export type PluginOwner = typeof PLUGIN_OWNERS[number];
 
-/** Execution adapters are workers selected by DSH/Cordis, not orchestrators. */
+/** Execution adapters are workers selected by Quest/Hermes, not orchestrators. */
 export const PLUGIN_EXECUTION_ADAPTERS = [
-  'dsh-managed',
   'local-cli',
   'hermes-cli',
   'codex-cli',
@@ -67,7 +64,7 @@ export interface PluginCapabilityBase {
   version: string;
   /** Inherited from the manifest and immutable for the life of a plugin. */
   owner: PluginOwner;
-  /** Optional worker transport selected by the DSH/Cordis orchestrator. */
+  /** Optional worker transport selected by the Quest/Hermes orchestrator. */
   executionAdapter?: PluginExecutionAdapter;
   description?: string;
   permissions?: readonly string[];
@@ -125,7 +122,7 @@ export interface PluginManifest {
   id: string;
   name: string;
   version: string;
-  /** Defaults to DSH/Cordis. Use nexus-governance only for host policy adapters. */
+  /** Defaults to the Nexus host policy boundary. */
   owner: PluginOwner;
   /** Default worker adapter for capabilities that do not override it. */
   executionAdapter?: PluginExecutionAdapter;
@@ -211,7 +208,7 @@ function identifier(value: unknown, label: string): string {
 function normalizeOwner(value: unknown, label: string, fallback: PluginOwner = DEFAULT_PLUGIN_OWNER): PluginOwner {
   const candidate = value === undefined ? fallback : boundedString(value, label, 64);
   if (!KNOWN_OWNERS.has(candidate)) {
-    throw new PluginHostError('INVALID_MANIFEST', `${label} must be dsh-cordis or nexus-governance`);
+    throw new PluginHostError('INVALID_MANIFEST', `${label} must be nexus-governance`);
   }
   return candidate as PluginOwner;
 }
@@ -633,7 +630,7 @@ export interface PluginInvokeRequest {
   capabilityId: string;
   input?: unknown;
   signal?: AbortSignal;
-  /** Trusted Main-side identity used by the DSH policy broker. */
+  /** Trusted Main-side identity used by the Nexus policy broker. */
   policyContext?: PluginInvocationPolicyContext;
 }
 

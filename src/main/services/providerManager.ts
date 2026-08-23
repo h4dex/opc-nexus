@@ -7,6 +7,7 @@ import {
   normalizeProviderBaseUrl,
   providerOriginsMatch,
   providerResourceUrl,
+  providerRuntimeBaseUrl,
   tryNormalizeProviderBaseUrl
 } from './providerEndpoint.js';
 
@@ -263,7 +264,7 @@ export class ProviderManager {
     const baseUrl = tryNormalizeProviderBaseUrl(row.base_url);
     const model = (modelOverride || row.model).trim();
     const key = row.api_key_ref ? this.decryptKey(row.api_key_ref).trim() : '';
-    return baseUrl && model && key ? { baseUrl, model, key } : null;
+    return baseUrl && model && key ? { baseUrl: providerRuntimeBaseUrl(baseUrl), model, key } : null;
   }
 
   private decryptKey(ref: string): string {

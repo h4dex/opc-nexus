@@ -4,11 +4,11 @@
  * 否则辅助引擎（user/config.yaml engine.fallbackEngineId，默认 eng-opencode）就绪 → 回退辅助引擎；
  * 两者均不可用时返回 null（任务如实 FAILED，绝不伪装完成）。
  * Hermes 与 Pi 使用专属执行器；Codex、Claude Code、OpenCode 使用对应 CLI 适配器；
- * managed DSH 使用持久控制面，兼容 DSH 与自定义引擎仍可走 ACP。
+ * 自定义外部引擎走 ACP。
  *
  * @author liyingjie <y@senke.com>
  */
-import { DSH_MANAGED_ENGINE_ID, NEXUS_ENGINE_ID, type Agent, type ExecutorKind, type Task } from '../../../shared/types.js';
+import { NEXUS_ENGINE_ID, type Agent, type ExecutorKind, type Task } from '../../../shared/types.js';
 import type { Database } from '../database.js';
 import type { ApprovalBroker } from '../approvalBroker.js';
 import { LlmApiExecutor } from './llmApiExecutor.js';
@@ -16,16 +16,11 @@ import { CliExecutor } from './cliExecutor.js';
 import { HermesAgentExecutor } from './hermesAgentExecutor.js';
 import { PiAgentExecutor } from './piAgentExecutor.js';
 import { AcpExecutor } from './acpExecutor.js';
-import { DshManagedExecutor } from './dshManagedExecutor.js';
-import type { DshRuntimeAuthority } from './dshManagedExecutor.js';
-import type { DshSessionService } from '../dshSessionService.js';
-import type { DshDelegationSyncService } from '../dshDelegationSyncService.js';
-import type { DshTypedQuestBridge } from '../dshTypedQuestBridge.js';
-import { ProjectWorkbenchService } from '../projectWorkbench.js';
 import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
-import type { ExecutionBinding, ExecutorAbortResult, ExecutorAdapter, ExecutorCallbacks } from './types.js';
+import type { ExecutionBinding, ExecutorAdapter, ExecutorCallbacks } from './types.js';
 import { PiRuntimeProfileService } from '../piRuntimeProfile.js';
+import { MemoryService } from '../memoryService.js';
 import {
   ANDROID_OPERATOR_ENGINE_ID,
   androidOperatorEngineError,
@@ -49,19 +44,25 @@ export class ExecutorRegistry {
   /** 真实 Hermes Agent CLI（专属执行器：-z headless + usage-file 会话锚点） */
   private hermes: HermesAgentExecutor;
   private pi: PiAgentExecutor;
-  private dsh: DshManagedExecutor | null = null;
   /** 引擎类型 → CLI 执行器 */
   private cliByType = new Map<string, CliExecutor>();
   /** taskId → 正在执行它的适配器（用于 abort） */
   private running = new Map<string, RunningExecutor>();
+  private readonly memory: MemoryService;
 
-  constructor(private db: Database, broker: ApprovalBroker, providerMgr?: import('../providerManager.js').ProviderManager) {
+  constructor(
+    private db: Database,
+    broker: ApprovalBroker,
+    providerMgr?: import('../providerManager.js').ProviderManager,
+    claudeGateway?: () => { baseUrl: string; key: string } | null
+  ) {
+    this.memory = new MemoryService(db);
     this.llm = new LlmApiExecutor(db, broker, providerMgr);
     this.acp = new AcpExecutor(db, broker);
     this.hermes = new HermesAgentExecutor(db);
     this.pi = new PiAgentExecutor(db, new PiRuntimeProfileService(db, providerMgr));
     this.cliByType.set('codex', new CliExecutor('codex-cli', db, 'eng-codex'));
-    this.cliByType.set('claude', new CliExecutor('claude-cli', db, 'eng-claude'));
+    this.cliByType.set('claude', new CliExecutor('claude-cli', db, 'eng-claude', ['-p', '{prompt}'], claudeGateway));
     this.cliByType.set('opencode', new CliExecutor('generic-cli', db, 'eng-opencode', ['run', '{prompt}']));
   }
 
@@ -94,28 +95,6 @@ export class ExecutorRegistry {
     return this.engineType(engineId) === 'nexus';
   }
 
-  /** Inject the persistent managed DSH control plane after its database service is ready. */
-  setDshRuntime(
-    sessions: DshSessionService,
-    authority: DshRuntimeAuthority,
-    delegationSync?: DshDelegationSyncService,
-    runtimeCapabilities?: Readonly<Record<string, boolean>>
-  ): void {
-    const workbench = new ProjectWorkbenchService(this.db);
-    this.dsh = new DshManagedExecutor(sessions, authority, {
-      delegationSync,
-      runtimeCapabilities,
-      resolveQuestContext: (task, agent) => task.projectId
-        ? workbench.resolveExecutionContext(task.projectId, agent.id, task.sessionId)
-        : null
-    });
-  }
-
-  /** Compose the typed DSH Quest projection after governance is initialized. */
-  setDshTypedQuestBridge(bridge: DshTypedQuestBridge | undefined): void {
-    this.dsh?.setTypedQuestBridge(bridge);
-  }
-
   private engineType(engineId: string): string {
     const row = this.db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as { type: string } | undefined;
     return row?.type ?? (engineId === NEXUS_ENGINE_ID ? 'nexus' : '');
@@ -133,7 +112,6 @@ export class ExecutorRegistry {
     // 的语义分裂 —— 引擎状态必须是唯一真相来源。
     if (type === 'nexus' && this.engineStatus(engineId) === 'HEALTHY' && this.llm.isReady()) return this.llm;
     if (type === 'external' && this.acp.engineReady(engineId)) return this.acp;
-    if (type === 'dsh-managed' && this.dsh?.isReady()) return this.dsh;
     return null;
   }
 
@@ -169,6 +147,11 @@ export class ExecutorRegistry {
     cb: ExecutorCallbacks,
     onResolved?: (binding: ExecutionBinding) => void
   ): ExecutorKind {
+    const memoryMode = agent.memoryMode ?? 'short_term';
+    const executionTask: Task = memoryMode === 'none' && task.sessionId !== null
+      ? { ...task, sessionId: null }
+      : task;
+    const executionAgent = this.withDurableMemory(agent, executionTask);
     // P1 修复：编码委派优先 —— task.engineOverride 覆盖 agent.engineId
     const targetEngineId = task.engineOverride || agent.engineId;
     const mobileEngineError = androidOperatorEngineError(agent.kind, targetEngineId);
@@ -202,8 +185,6 @@ export class ExecutorRegistry {
       const message = mobileEngineError
         ?? (agent.kind === 'android_operator' && targetEngineId === ANDROID_OPERATOR_ENGINE_ID
           ? androidOperatorRuntimeUnavailableError()
-          : targetEngineId === DSH_MANAGED_ENGINE_ID
-            ? 'DSH 托管运行时尚未就绪；请启动 DSH 员工或改用本地 CLI 模式'
           : exactEngineBinding
             ? `任务固定的执行引擎不可用：${targetEngineId}（已禁止静默切换到其他引擎）`
             : '无可用执行引擎：请检查主引擎与辅助引擎的安装/配置状态');
@@ -218,56 +199,70 @@ export class ExecutorRegistry {
       this.running.delete(id);
       return true;
     };
-    adapter.start(task, { ...agent, engineId: engineId ?? targetEngineId }, {
+    adapter.start(executionTask, { ...executionAgent, engineId: engineId ?? targetEngineId }, {
       onStage: (id, stage) => cb.onStage(id, stage),
       onProgress: (id, pct) => cb.onProgress(id, pct),
       onOutput: (id, chunk) => cb.onOutput(id, chunk),
-      onSession: (id, sessionId) => cb.onSession?.(id, sessionId),
+      onSession: (id, sessionId) => {
+        if (memoryMode !== 'none') cb.onSession?.(id, sessionId);
+      },
       onReleased: (id) => {
         if (release(id)) cb.onReleased?.(id);
       },
       onDone: (id, result) => {
-        if (adapter.kind !== 'acp' && adapter.kind !== 'dsh') release(id);
+        // A paused/retried task can already have a replacement execution with
+        // the same durable task id. Never let the old process settle the new
+        // generation when its terminal callback arrives late.
+        if (this.running.get(id) !== running) return;
+        if (adapter.kind !== 'acp') release(id);
         cb.onDone(id, result);
       },
       onError: (id, message) => {
-        if (adapter.kind !== 'acp' && adapter.kind !== 'dsh') release(id);
+        if (this.running.get(id) !== running) return;
+        if (adapter.kind !== 'acp') release(id);
         cb.onError(id, message);
       }
     });
     return adapter.kind;
   }
 
-  abort(taskId: string): void {
-    const current = this.running.get(taskId);
-    current?.adapter.abort(taskId);
-    if (current?.adapter.kind !== 'acp' && current?.adapter.kind !== 'dsh' && this.running.get(taskId) === current) {
-      this.running.delete(taskId);
+  private withDurableMemory(agent: Agent, task: Task): Agent {
+    if ((agent.memoryMode ?? 'short_term') !== 'long_term') return agent;
+    try {
+      const row = this.db.raw.prepare('SELECT organization_id FROM agents WHERE id = ?').get(agent.id) as
+        | { organization_id?: string }
+        | undefined;
+      if (!row?.organization_id) return agent;
+      const recalled = this.memory.recall({
+        organizationId: row.organization_id,
+        agentId: agent.id,
+        projectId: task.projectId,
+        query: task.content || task.title,
+        limit: 8
+      });
+      if (recalled.length === 0) return agent;
+      const memoryContext = recalled.map((item, index) => `${index + 1}. ${item.content}`).join('\n');
+      return {
+        ...agent,
+        systemPrompt: [
+          agent.systemPrompt,
+          '# 已接受的长期记忆',
+          '以下内容仅作为历史上下文；若与当前任务或项目事实冲突，以当前事实为准。',
+          memoryContext
+        ].filter(Boolean).join('\n\n')
+      };
+    } catch {
+      // A memory index problem must not silently widen scope. Execute without
+      // durable recall; the task itself still follows its configured engine.
+      return agent;
     }
   }
 
-  /** Whether the selected adapter needs a durable upstream cancellation ack. */
-  requiresCancellationConfirmation(taskId: string): boolean {
-    return this.running.get(taskId)?.adapter.kind === 'dsh';
-  }
-
-  /** Request cancellation and normalize legacy synchronous adapters. */
-  abortWithResult(taskId: string): Promise<ExecutorAbortResult> {
+  abort(taskId: string): void {
     const current = this.running.get(taskId);
-    if (!current) return Promise.resolve({ status: 'CONFIRMED', reason: 'not-running' });
-    try {
-      return Promise.resolve(current.adapter.abort(taskId)).then((result) => {
-        if (result && typeof result === 'object' && typeof result.status === 'string') return result;
-        return { status: 'CONFIRMED' as const, reason: 'adapter-acknowledged' };
-      }, (error: unknown) => ({
-        status: 'UNCONFIRMED' as const,
-        reason: error instanceof Error ? error.message : String(error)
-      }));
-    } catch (error) {
-      return Promise.resolve({
-        status: 'UNCONFIRMED' as const,
-        reason: error instanceof Error ? error.message : String(error)
-      });
+    current?.adapter.abort(taskId);
+    if (current?.adapter.kind !== 'acp' && this.running.get(taskId) === current) {
+      this.running.delete(taskId);
     }
   }
 

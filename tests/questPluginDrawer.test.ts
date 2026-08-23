@@ -6,27 +6,27 @@ describe('Quest default plugin drawer source contract', () => {
   const source = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'pages', 'QuestWorkbench.tsx'), 'utf8');
   const styles = readFileSync(join(process.cwd(), 'src', 'renderer', 'src', 'pages', 'questWorkbench.css'), 'utf8');
 
-  it('separates Main-owned built-ins from the ten community candidates', () => {
-    expect(source).toContain('pluginCatalog?.questDefaultPack');
-    expect(source).toContain('pluginCatalog?.builtInCapabilities');
-    expect(source).toContain('pluginPack?.liveCount');
-    expect(source).toContain("padStart(2, '0')");
-    expect(source).toContain("reasonCodes.includes('OFFICIAL_DSH_WEB_UI_ACTIVE')");
-    expect(source).toContain('社区候选 · 安装');
-    expect(source).toContain('内置能力');
-    expect(source).toContain('官方基础 UI 已集成；社区增强包仍需独立核验');
-    expect(source).toContain("plugin.activation.live ? '运行已验证'");
-    expect(source).not.toContain('核心能力已加载');
-    expect(source).toContain('PLUGIN_REASON_LABELS');
+  it('reads project capabilities only from the unified plugin catalog', () => {
+    expect(source).toContain('window.aibox.getPluginCatalog()');
+    expect(source).toContain('setUnifiedPluginCatalog(unifiedResult)');
+    expect(source).toContain('unifiedPluginCatalog?.items ?? []');
+    expect(source).toContain('REQUIRED_PROJECT_PLUGIN_IDS.has(plugin.id)');
+    expect(source).toContain('WORKER_PLUGIN_SOURCES.has(plugin.source)');
+    expect(source).toContain('HERMES_PROJECT_CAPABILITY_SOURCES.has(plugin.source)');
+    expect(source).toContain('选择已真实接入 Hermes 的 MCP 与技能');
+    expect(source).toContain('统一插件目录中暂无可选项目能力');
+    expect(source).toContain("plugin.lifecycle === 'missing' ? '未安装' : '未就绪'");
   });
 
-  it('keeps execution fail-closed and uses the confirmation IPC', () => {
-    expect(source).toContain('{plugin.installable && (');
-    expect(source).toContain('prepareDshCommunityPluginInstall(agentId, plugin.id)');
-    expect(source).toContain('installDshCommunityPlugin({');
-    expect(source).toContain('if (!agentId || pluginBusyId || !plugin.installable) return;');
-    expect(source).toContain('prepareDshCommunityPluginLifecycle(agentId, plugin.id, action)');
-    expect(source).toContain("applyCommunityPluginLifecycle(plugin, 'uninstall')");
+  it('only persists project capability ids and exposes no plugin lifecycle controls', () => {
+    expect(source).toContain('settingsDraft?.pluginIds.includes(plugin.id)');
+    expect(source).toContain('? [...new Set([...settingsDraft.pluginIds, plugin.id])]');
+    expect(source).toContain(': settingsDraft.pluginIds.filter((id) => id !== plugin.id)');
+    expect(source).toContain('window.aibox.saveQuestSettings(projectId, { ...settingsDraft, mode: \'quest\' })');
+    expect(source).not.toContain('prepareDshCommunityPluginInstall');
+    expect(source).not.toContain('installDshCommunityPlugin');
+    expect(source).not.toContain('prepareDshCommunityPluginLifecycle');
+    expect(source).not.toContain('applyDshCommunityPluginLifecycle');
   });
 
   it('keeps plugin, governance, and connection drawers mutually exclusive without mobile overlap', () => {

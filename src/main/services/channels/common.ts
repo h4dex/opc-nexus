@@ -6,11 +6,13 @@
  */
 import type { Database } from '../database.js';
 import type { CreateTaskResult, Orchestrator } from '../orchestrator.js';
+import { formatManifestBytes, readTaskArtifactManifest } from '../projectArtifactManifest.js';
 import {
   ChannelIngressService,
   DEFAULT_ORGANIZATION_KEY,
   type ChannelIngressResult
 } from '../channelIngressService.js';
+import type { HermesDeliveryGateResult } from '../hermesDeliveryGate.js';
 
 const REPLY_POLL_MS = 2000;
 const REPLY_TIMEOUT_MS = 15 * 60_000;
@@ -34,7 +36,8 @@ const HELP_TEXT = [
   '/暂停 — 暂停当前执行中任务',
   '/继续 — 恢复暂停的任务',
   '/帮助 — 显示本说明',
-  '回复「批准 / 拒绝」处理待审批操作'
+  '回复「批准 / 拒绝」处理待审批操作',
+  'Hermes 项目还支持「批准计划」「派工」「批准并派工」'
 ].join('\n');
 
 /**
@@ -89,13 +92,19 @@ function activeChannelTasks(db: Database, scope: ChannelControlScope): ChannelTa
   ).all(scope.agentId, scope.conversationId) as unknown as ChannelTaskRow[];
 }
 
-function planChannelCommand(db: Database, scope: ChannelControlScope, text: string): PlannedChannelControl | null {
+function planChannelCommand(
+  db: Database,
+  scope: ChannelControlScope,
+  text: string,
+  fallThroughWhenNoTask = false
+): PlannedChannelControl | null {
   const m = text.trim().match(COMMAND_RE);
   if (!m) return null;
   const [, cmd, arg] = m;
 
   if (/^(状态|status)$/i.test(cmd)) {
     const rows = activeChannelTasks(db, scope);
+    if (rows.length === 0 && fallThroughWhenNoTask) return null;
     if (rows.length === 0) return { action: { kind: 'informational' }, reply: '当前没有执行中的任务。' };
     const statusLabel: Record<string, string> = { RUNNING: '执行中', QUEUED: '排队', WAITING_APPROVAL: '待审批', PAUSED: '已暂停' };
     return {
@@ -106,6 +115,7 @@ function planChannelCommand(db: Database, scope: ChannelControlScope, text: stri
 
   if (/^(取消|停止|终止|cancel|stop)$/i.test(cmd)) {
     const rows = activeChannelTasks(db, scope);
+    if (rows.length === 0 && fallThroughWhenNoTask) return null;
     if (rows.length === 0) return { action: { kind: 'informational' }, reply: '当前没有可取消的任务。' };
     const all = /^(全部|所有|all)$/i.test(arg.trim());
     const targets = all ? rows : [rows[0]];
@@ -117,6 +127,7 @@ function planChannelCommand(db: Database, scope: ChannelControlScope, text: stri
 
   if (/^(暂停|pause)$/i.test(cmd)) {
     const running = activeChannelTasks(db, scope).find((row) => row.status === 'RUNNING');
+    if (!running && fallThroughWhenNoTask) return null;
     return running
       ? { action: { kind: 'pause', taskId: running.id }, reply: `⏸️ 已暂停任务：${running.title}（回复 /继续 恢复）` }
       : { action: { kind: 'informational' }, reply: '当前没有执行中的任务可暂停。' };
@@ -124,16 +135,23 @@ function planChannelCommand(db: Database, scope: ChannelControlScope, text: stri
 
   if (/^(继续|恢复|resume)$/i.test(cmd)) {
     const paused = activeChannelTasks(db, scope).find((row) => row.status === 'PAUSED');
+    if (!paused && fallThroughWhenNoTask) return null;
     return paused
       ? { action: { kind: 'resume', taskId: paused.id }, reply: `▶️ 已恢复任务：${paused.title}` }
       : { action: { kind: 'informational' }, reply: '当前没有暂停中的任务。' };
   }
 
   if (/^(帮助|help|\?|？)$/i.test(cmd)) return { action: { kind: 'informational' }, reply: HELP_TEXT };
+  if (fallThroughWhenNoTask) return null;
   return { action: { kind: 'informational' }, reply: `未识别的指令「/${cmd}」。\n${HELP_TEXT}` };
 }
 
-function planChannelApproval(db: Database, scope: ChannelControlScope, text: string): PlannedChannelControl | null {
+function planChannelApproval(
+  db: Database,
+  scope: ChannelControlScope,
+  text: string,
+  fallThroughWhenMissing = false
+): PlannedChannelControl | null {
   const isApprove = APPROVE_RE.test(text.trim());
   const isReject = REJECT_RE.test(text.trim());
   if (!isApprove && !isReject) return null;
@@ -145,6 +163,7 @@ function planChannelApproval(db: Database, scope: ChannelControlScope, text: str
        AND t.conversation_id = ? AND t.source = 'channel'
      ORDER BY a.created_at DESC LIMIT 1`
   ).get(scope.agentId, scope.conversationId) as { id: string; request: string } | undefined;
+  if (!pending && fallThroughWhenMissing) return null;
   if (!pending) return { action: { kind: 'informational' }, reply: '当前没有待审批的操作。' };
   return {
     action: { kind: 'approval', approvalId: pending.id, approve: isApprove },
@@ -161,22 +180,100 @@ function taskState(db: Database, taskId: string): { status: string } | null {
 
 /** B.6 — 提取任务完成时的产物 Manifest 摘要（文件数与总字节数） */
 function taskManifestSummary(db: Database, taskId: string): string | null {
-  const event = db.raw.prepare(
-    "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_manifest' ORDER BY created_at DESC, rowid DESC LIMIT 1"
-  ).get(taskId) as { payload: string } | undefined;
-  if (!event) return null;
+  const manifest = readTaskArtifactManifest(db, taskId);
+  if (!manifest || manifest.entries.length === 0) return null;
+  return `📁 ${manifest.entries.length} 个验证产物，共 ${formatManifestBytes(manifest.totalBytes)}`;
+}
+
+function hermesTaskIds(metadata: unknown): string[] {
+  if (typeof metadata !== 'string') return [];
   try {
-    const parsed = JSON.parse(event.payload) as { manifest?: { entries?: unknown[]; totalBytes?: number } };
-    const entries = Array.isArray(parsed.manifest?.entries) ? parsed.manifest.entries : [];
-    const bytes = typeof parsed.manifest?.totalBytes === 'number' ? parsed.manifest.totalBytes : 0;
-    if (entries.length === 0) return null;
-    const formatBytes = (b: number) => {
-      if (b < 1024) return `${b} B`;
-      if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-      return `${(b / (1024 * 1024)).toFixed(1)} MB`;
-    };
-    return `📁 ${entries.length} 个验证产物，共 ${formatBytes(bytes)}`;
-  } catch { return null; }
+    const parsed = JSON.parse(metadata) as { taskIds?: unknown };
+    if (!Array.isArray(parsed.taskIds) || parsed.taskIds.length > 512) return [];
+    return parsed.taskIds.filter((id): id is string => typeof id === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(id));
+  } catch {
+    return [];
+  }
+}
+
+/** Track Hermes plan tasks created after a Hermes channel turn. The canonical
+ * outbound rows make terminal delivery replayable, while activeReplyPolls
+ * prevents duplicate pollers in one process. */
+function trackHermesChannelTask(opts: {
+  db: Database;
+  taskId: string;
+  ingress: ChannelIngressResult;
+  ingressService: Pick<ChannelIngressService, 'recordOutbound'>;
+  deliveryGate?: (taskId: string) => HermesDeliveryGateResult;
+  final: (message: string, taskId?: string) => void;
+}): void {
+  const { db, taskId, ingress, ingressService, deliveryGate, final } = opts;
+  if (activeReplyPolls.has(taskId)) return;
+  activeReplyPolls.add(taskId);
+  const started = Date.now();
+  const deliver = (message: string, key: string, status: string, attachArtifact = true) => {
+    try {
+      ingressService.recordOutbound(ingress, {
+        messageKey: key,
+        content: message,
+        taskId,
+        metadata: { status, hermesPlanTask: true }
+      });
+      db.flush();
+    } catch (error) {
+      console.error(`[HermesChannel] Failed to persist terminal task reply ${taskId}:`, error);
+    }
+    if (attachArtifact) final(message, taskId);
+    else final(message);
+  };
+  const poll = () => {
+    const row = db.raw.prepare('SELECT status, result, error FROM tasks WHERE id = ?').get(taskId) as
+      | { status: string; result: string | null; error: string | null }
+      | undefined;
+    if (!row) {
+      activeReplyPolls.delete(taskId);
+      deliver('任务记录已不存在，无法继续跟踪交付。', `task:${taskId}:missing`, 'MISSING');
+      return;
+    }
+    if (row.status === 'COMPLETED') {
+      activeReplyPolls.delete(taskId);
+      let gate: HermesDeliveryGateResult | null = null;
+      if (deliveryGate) {
+        try { gate = deliveryGate(taskId); }
+        catch { gate = { taskId, projectId: null, required: true, allowed: false, reason: '无法读取独立验收状态，暂不交付', validationTaskId: null, validationVerdict: 'BLOCKED' }; }
+      }
+      if (gate?.required && !gate.allowed) {
+        const reason = gate.reason ?? '主秘书尚未取得独立验收 PASS';
+        const validation = gate.validationTaskId ? `验收任务：${gate.validationTaskId}` : '请让主秘书派发独立验收任务';
+        deliver(
+          `✅ 执行任务已完成，但交付暂缓：\n${reason}\n${validation}\n不会发送未经独立验收的产物。`,
+          `task:${taskId}:awaiting-validation`,
+          'AWAITING_VALIDATION',
+          false
+        );
+        return;
+      }
+      const summary = taskManifestSummary(db, taskId);
+      deliver(
+        `✅ 计划任务完成：\n${row.result ?? '（无文本产物）'}${summary ? `\n${summary}` : ''}`,
+        `task:${taskId}:completed`,
+        row.status
+      );
+      return;
+    }
+    if (['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(row.status)) {
+      activeReplyPolls.delete(taskId);
+      deliver(`❌ 计划任务未完成（${row.status}）：${row.error ?? '无错误信息'}`, `task:${taskId}:terminal`, row.status);
+      return;
+    }
+    if (Date.now() - started > REPLY_TIMEOUT_MS) {
+      activeReplyPolls.delete(taskId);
+      deliver('⏳ 计划任务仍在执行，请稍后使用 /状态 查看。', `task:${taskId}:timeout`, 'TIMEOUT');
+      return;
+    }
+    setTimeout(poll, REPLY_POLL_MS);
+  };
+  poll();
 }
 
 function applyChannelControlAction(db: Database, orchestrator: Orchestrator, action: ChannelControlAction): void {
@@ -258,7 +355,10 @@ export function tryChannelApproval(
 }
 
 export interface ChannelTaskPlanner {
-  dispatch(input: { ingress: ChannelIngressResult; message: string; preferredAgentId: string }): Promise<CreateTaskResult>;
+  dispatch?(input: { ingress: ChannelIngressResult; message: string; preferredAgentId: string }): Promise<CreateTaskResult>;
+  converse?(input: { ingress: ChannelIngressResult; message: string; preferredAgentId: string }): Promise<{ content: string; taskIds?: string[] }>;
+  /** Main-owned gate used before a Hermes plan task is delivered through a channel. */
+  deliveryGate?(taskId: string): HermesDeliveryGateResult;
 }
 
 async function withChannelActionLock<T>(messageId: string, run: () => Promise<T>): Promise<T> {
@@ -343,13 +443,15 @@ async function handleDurableChannelControl(opts: {
   ingressService: Pick<ChannelIngressService, 'recordOutbound'>;
   scope: ChannelControlScope;
   text: string;
+  fallThroughWhenNoTask?: boolean;
   ack: (message: string) => void;
 }): Promise<boolean> {
   const { db, orchestrator, ingress, ingressService, scope, text, ack } = opts;
   const receiptKey = `control:${ingress.messageId}`;
   let receipt = findControlReceipt(db, ingress.conversationId, receiptKey);
   if (!receipt) {
-    const planned = planChannelCommand(db, scope, text) ?? planChannelApproval(db, scope, text);
+    const planned = planChannelCommand(db, scope, text, opts.fallThroughWhenNoTask === true)
+      ?? planChannelApproval(db, scope, text, opts.fallThroughWhenNoTask === true);
     if (!planned) return false;
     const metadata: ChannelControlReceiptMetadata = {
       schemaVersion: 1,
@@ -465,9 +567,49 @@ export async function dispatchChannelTask(opts: {
       ingressService,
       scope: { agentId: route.agent_id, conversationId: ingress.conversationId },
       text,
+      fallThroughWhenNoTask: Boolean(taskPlanner.converse),
       ack
     }));
     if (handledControl) return true;
+
+    if (taskPlanner.converse) {
+      const outboundKey = `hermes:${ingress.messageId}`;
+      const existing = db.raw.prepare(`
+        SELECT content, metadata_json FROM messages
+        WHERE conversation_id = ? AND direction = 'outbound' AND external_message_key = ?
+        LIMIT 1
+      `).get(ingress.conversationId, outboundKey) as { content?: string; metadata_json?: string } | undefined;
+      if (existing?.content) {
+        final(existing.content);
+        for (const taskId of hermesTaskIds(existing.metadata_json)) {
+          trackHermesChannelTask({
+            db, taskId, ingress, ingressService,
+            deliveryGate: taskPlanner.deliveryGate ? (id) => taskPlanner.deliveryGate!(id) : undefined,
+            final
+          });
+        }
+        return true;
+      }
+      ack('已接收消息，Hermes 正在处理…');
+      const result = await taskPlanner.converse({ ingress, message: text, preferredAgentId: route.agent_id });
+      ingressService.recordOutbound(ingress, {
+        messageKey: outboundKey,
+        content: result.content,
+        metadata: { status: 'HERMES_TURN_COMPLETED', taskIds: result.taskIds ?? [] }
+      });
+      db.flush();
+      final(result.content);
+      for (const taskId of result.taskIds ?? []) {
+        if (/^[A-Za-z0-9._:-]{1,128}$/.test(taskId)) {
+          trackHermesChannelTask({
+            db, taskId, ingress, ingressService,
+            deliveryGate: taskPlanner.deliveryGate ? (id) => taskPlanner.deliveryGate!(id) : undefined,
+            final
+          });
+        }
+      }
+      return true;
+    }
 
     if (ingress.taskId) {
       taskId = ingress.taskId;
@@ -481,6 +623,7 @@ export async function dispatchChannelTask(opts: {
         ? db.raw.prepare('SELECT * FROM tasks WHERE source = ? AND source_key = ?').get('channel', legacySourceKey) as { id: string } | undefined
         : undefined;
       if (!legacy) ack('已接收消息，控制核正在规划并选择执行员工…');
+      if (!taskPlanner.dispatch) throw new Error('渠道 Hermes 路由不可用，且未配置后备任务规划器');
       const task = legacy
         ? { id: legacy.id, deduplicated: true as const }
         : await taskPlanner.dispatch({ ingress, message: text, preferredAgentId: route.agent_id });

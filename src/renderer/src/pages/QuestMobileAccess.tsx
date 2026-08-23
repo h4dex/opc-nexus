@@ -1,25 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import type {
-  DshLanGatewayCompositionStatusView,
-  DshLanGatewayConfigInput,
-  DshLanPairingOfferView,
-  DshLanRoleView
+  HermesMobileAccessStatus,
+  HermesMobileLanConfigInput,
+  HermesMobileRoute
 } from '@shared/types';
 import { IconAlert, IconPhone, IconRefresh } from '../components/icons';
+import { IconX } from '../components/icons';
 
-const DEFAULT_DSH_LAN_PORT = 18_766;
+const DEFAULT_HERMES_LAN_PORT = 18_766;
 
 function isLoopbackHost(value: string): boolean {
   return value === '127.0.0.1' || value === '::1';
 }
 
-export function preferredDshLanQuickConfig(
-  status: DshLanGatewayCompositionStatusView,
+export function preferredHermesLanQuickConfig(
+  status: HermesMobileAccessStatus,
   addresses: readonly string[]
-): DshLanGatewayConfigInput | null {
+): HermesMobileLanConfigInput | null {
   const configured = status.configured;
-  if (configured && !isLoopbackHost(configured.bindHost)) {
+  const configuredAddressIsLive = configured
+    && (status.running || addresses.includes(configured.bindHost));
+  if (configured && !isLoopbackHost(configured.bindHost) && configuredAddressIsLive) {
     return {
       bindHost: configured.bindHost,
       port: configured.port,
@@ -30,7 +32,7 @@ export function preferredDshLanQuickConfig(
 
   const address = addresses.find((candidate) => !isLoopbackHost(candidate));
   if (!address) return null;
-  const port = configured?.port ?? DEFAULT_DSH_LAN_PORT;
+  const port = configured?.port ?? DEFAULT_HERMES_LAN_PORT;
   return { bindHost: address, port, publicHost: address, publicPort: port };
 }
 
@@ -39,25 +41,28 @@ function secondsRemaining(expiresAt: number, now: number): number {
 }
 
 export function QuestMobileAccess({
+  projectId,
   projectName,
-  onRunningChange
+  onRunningChange,
+  onClose
 }: {
+  projectId: string;
   projectName: string;
   onRunningChange?: (running: boolean) => void;
+  onClose?: () => void;
 }) {
   const requestRef = useRef(0);
-  const [status, setStatus] = useState<DshLanGatewayCompositionStatusView | null>(null);
+  const [status, setStatus] = useState<HermesMobileAccessStatus | null>(null);
   const [addresses, setAddresses] = useState<string[]>([]);
   const [host, setHost] = useState('');
-  const [port, setPort] = useState(DEFAULT_DSH_LAN_PORT);
-  const [role, setRole] = useState<DshLanRoleView>('operator');
-  const [pairing, setPairing] = useState<DshLanPairingOfferView | null>(null);
+  const [port, setPort] = useState(DEFAULT_HERMES_LAN_PORT);
+  const [pairing, setPairing] = useState<HermesMobileRoute | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
 
-  const renderPairing = useCallback(async (offer: DshLanPairingOfferView) => {
+  const renderPairing = useCallback(async (offer: HermesMobileRoute) => {
     const image = await QRCode.toDataURL(offer.pairingUrl, {
       width: 236,
       margin: 1,
@@ -69,11 +74,12 @@ export function QuestMobileAccess({
     setNow(Date.now());
   }, []);
 
-  const generatePairing = useCallback(async (nextRole: DshLanRoleView = role) => {
+  const generatePairing = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      await renderPairing(await window.aibox.createDshLanPairing(nextRole));
+      await renderPairing(await window.aibox.createHermesMobilePairing(projectId));
+      setStatus(await window.aibox.getHermesMobileAccessStatus(projectId));
     } catch (nextError) {
       setPairing(null);
       setQrDataUrl(null);
@@ -81,7 +87,7 @@ export function QuestMobileAccess({
     } finally {
       setBusy(false);
     }
-  }, [renderPairing, role]);
+  }, [projectId, renderPairing]);
 
   const prepare = useCallback(async () => {
     const requestId = ++requestRef.current;
@@ -89,35 +95,35 @@ export function QuestMobileAccess({
     setError(null);
     try {
       const [current, detectedAddresses] = await Promise.all([
-        window.aibox.getDshLanGatewayStatus(),
-        window.aibox.listMobileLanAddresses()
+        window.aibox.getHermesMobileAccessStatus(projectId),
+        window.aibox.listHermesMobileLanAddresses()
       ]);
       if (requestId !== requestRef.current) return;
       setAddresses(detectedAddresses);
-      const preferred = preferredDshLanQuickConfig(current, detectedAddresses);
+      const preferred = preferredHermesLanQuickConfig(current, detectedAddresses);
       if (preferred) {
         setHost(preferred.bindHost);
-        setPort(preferred.port ?? DEFAULT_DSH_LAN_PORT);
+        setPort(preferred.port ?? DEFAULT_HERMES_LAN_PORT);
       }
 
-      const active = current.gateway.running
-        ? current
-        : preferred
-          ? await window.aibox.startDshLanGateway(preferred)
-          : current;
+      if (!current.running && !preferred) throw new Error('未发现可用于手机访问的局域网地址');
+      const needsLanRebind = !current.configured
+        || isLoopbackHost(current.configured.bindHost)
+        || (!current.running && !detectedAddresses.includes(current.configured.bindHost));
+      const offer = await window.aibox.createHermesMobilePairing(
+        projectId,
+        current.running && !needsLanRebind ? undefined : preferred ?? undefined
+      );
       if (requestId !== requestRef.current) return;
-      setStatus(active);
-      if (!active.gateway.running) {
-        throw new Error(active.lastError ?? '未发现可用于手机访问的局域网地址');
-      }
-      await renderPairing(await window.aibox.createDshLanPairing('operator'));
+      await renderPairing(offer);
+      setStatus(await window.aibox.getHermesMobileAccessStatus(projectId));
     } catch (nextError) {
       if (requestId !== requestRef.current) return;
       setError(nextError instanceof Error ? nextError.message : 'Quest 手机访问启动失败');
     } finally {
       if (requestId === requestRef.current) setBusy(false);
     }
-  }, [renderPairing]);
+  }, [projectId, renderPairing]);
 
   useEffect(() => {
     void prepare();
@@ -131,13 +137,13 @@ export function QuestMobileAccess({
   }, [pairing]);
 
   useEffect(() => {
-    onRunningChange?.(status?.gateway.running === true);
-  }, [onRunningChange, status?.gateway.running]);
+    onRunningChange?.(status?.running === true);
+  }, [onRunningChange, status?.running]);
 
   const remaining = pairing ? secondsRemaining(pairing.expiresAt, now) : 0;
-  const configuredInput = useMemo<DshLanGatewayConfigInput | null>(() => {
+  const configuredInput = useMemo<HermesMobileLanConfigInput | null>(() => {
     const value = host.trim();
-    if (!value || !Number.isInteger(port) || port < 1 || port > 65_535) return null;
+    if (!value || !Number.isInteger(port) || port < 1_024 || port > 65_535) return null;
     return { bindHost: value, port, publicHost: value, publicPort: port };
   }, [host, port]);
 
@@ -146,10 +152,8 @@ export function QuestMobileAccess({
     setBusy(true);
     setError(null);
     try {
-      const next = await window.aibox.startDshLanGateway(configuredInput);
-      setStatus(next);
-      if (!next.gateway.running) throw new Error(next.lastError ?? 'DSH LAN Gateway 尚未就绪');
-      await renderPairing(await window.aibox.createDshLanPairing(role));
+      await renderPairing(await window.aibox.createHermesMobilePairing(projectId, configuredInput));
+      setStatus(await window.aibox.getHermesMobileAccessStatus(projectId));
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : 'Quest 手机访问启动失败');
     } finally {
@@ -161,7 +165,7 @@ export function QuestMobileAccess({
     setBusy(true);
     setError(null);
     try {
-      setStatus(await window.aibox.emergencyStopDshLanGateway());
+      setStatus(await window.aibox.stopHermesMobileAccess(projectId));
       setPairing(null);
       setQrDataUrl(null);
     } catch (nextError) {
@@ -172,18 +176,19 @@ export function QuestMobileAccess({
   };
 
   return (
-    <aside className="quest-mobile-access" aria-label="Quest 手机 Web 访问">
+    <aside className="quest-mobile-access" aria-label="手机 Hermes 对话访问">
       <div className="quest-mobile-head">
-        <div><strong>手机 Web</strong><span>{projectName}</span></div>
-        <button type="button" disabled={busy} onClick={() => void prepare()} title="重新连接" aria-label="重新连接手机 Web">
+        <div><strong>手机 Hermes 对话</strong><span>{projectName}</span></div>
+        {onClose && <button type="button" onClick={onClose} title="关闭" aria-label="关闭手机 Hermes 对话"><IconX size={14} /></button>}
+        <button type="button" disabled={busy} onClick={() => void prepare()} title="重新连接" aria-label="重新连接手机 Hermes 对话">
           <IconRefresh size={14} />
         </button>
       </div>
 
       <div className="quest-mobile-scroll" aria-busy={busy}>
-        <div className="quest-mobile-status" data-running={status?.gateway.running === true}>
+        <div className="quest-mobile-status" data-running={status?.running === true}>
           <IconPhone size={16} />
-          <span><strong>{status?.gateway.running ? '局域网已共享' : busy ? '正在准备' : '尚未共享'}</strong><small>{status?.gateway.origin ?? 'DSH / Cordis'}</small></span>
+          <span><strong>{status?.running ? 'Hermes 对话已共享' : busy ? '正在准备' : '尚未共享'}</strong><small>{status?.activeRoutes[0]?.origin ?? '当前项目 Hermes 服务'}</small></span>
           <i />
         </div>
 
@@ -191,7 +196,7 @@ export function QuestMobileAccess({
 
         {pairing && qrDataUrl && remaining > 0 && (
           <section className="quest-mobile-pairing">
-            <img src={qrDataUrl} alt="Quest 手机 Web 二维码" />
+            <img src={qrDataUrl} alt="手机 Hermes 对话二维码" />
             <div className="quest-mobile-code"><span>一次性验证码</span><strong>{pairing.code}</strong><small>{remaining} 秒</small></div>
             <div className="quest-mobile-url">{pairing.pairingUrl}</div>
           </section>
@@ -202,18 +207,13 @@ export function QuestMobileAccess({
         )}
 
         <section className="quest-mobile-controls">
-          <label><span>权限</span><select value={role} disabled={busy} onChange={(event) => {
-            const nextRole = event.target.value as DshLanRoleView;
-            setRole(nextRole);
-            if (status?.gateway.running) void generatePairing(nextRole);
-          }}><option value="operator">可操作</option><option value="viewer">只读</option></select></label>
-          <label><span>局域网地址</span><input list="quest-lan-addresses" value={host} disabled={busy || status?.gateway.running} onChange={(event) => setHost(event.target.value)} /></label>
+          <label><span>局域网地址</span><input list="quest-lan-addresses" value={host} disabled={busy || status?.running} onChange={(event) => setHost(event.target.value)} /></label>
           <datalist id="quest-lan-addresses">{addresses.map((address) => <option key={address} value={address} />)}</datalist>
-          <label><span>端口</span><input type="number" min={1} max={65535} value={port} disabled={busy || status?.gateway.running} onChange={(event) => setPort(Number(event.target.value))} /></label>
+          <label><span>端口</span><input type="number" min={1024} max={65535} value={port} disabled={busy || status?.running} onChange={(event) => setPort(Number(event.target.value))} /></label>
           <div className="quest-mobile-actions">
-            {status?.gateway.running
+            {status?.running
               ? <><button className="btn small" type="button" disabled={busy} onClick={() => void generatePairing()}>刷新二维码</button><button className="btn small danger" type="button" disabled={busy} onClick={() => void stop()}>关闭访问</button></>
-              : <button className="btn small primary" type="button" disabled={busy || !configuredInput} onClick={() => void startManually()}>启动手机访问</button>}
+              : <button className="btn small primary" type="button" disabled={busy || !configuredInput} onClick={() => void startManually()}>启动 Hermes 对话</button>}
           </div>
         </section>
       </div>

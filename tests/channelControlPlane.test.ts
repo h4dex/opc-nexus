@@ -63,7 +63,7 @@ describe('ChannelControlPlane', () => {
     const request = router.plan.mock.calls[0][0];
     expect(request).toMatchObject({
       requestId: 'kernel:message-1', inputMessageId: 'message-1', preferredAgentId: 'agent-pi',
-      routingMode: 'cordis',
+      routingMode: 'direct-worker',
       memories: [{ id: 'memory-1', content: '使用中文' }]
     });
     expect(request.workers).toEqual([

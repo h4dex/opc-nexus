@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { validatePluginManifest } from '../src/main/services/pluginHost.js';
 import {
-  DSH_VISION_PLUGIN_MANIFEST,
+  NEXUS_VISION_PLUGIN_MANIFEST,
   MAX_VISION_IMAGE_BYTES,
   MAX_VISION_RESPONSE_BYTES,
   VisionService,
@@ -62,7 +62,7 @@ describe('VisionService', () => {
     await expect(service.putAttachment({ data: PNG, mimeType: 'image/jpeg' })).rejects.toMatchObject({ code: 'INVALID_ATTACHMENT' });
     await expect(service.putAttachment({ data: new Uint8Array(MAX_VISION_IMAGE_BYTES + 1), mimeType: 'image/png' })).rejects.toMatchObject({ code: 'INVALID_ATTACHMENT' });
     await expect(service.createToolHandler()({ attachmentRef: { path: 'C:\\secret.png' } }, {
-      owner: 'dsh-cordis', pluginId: 'opc.dsh.vision', pluginVersion: '1.0.0',
+      owner: 'nexus-governance', pluginId: 'opc.nexus.vision', pluginVersion: '1.0.0',
       capabilityId: 'vision.describe', capabilityKind: 'tool', signal: new AbortController().signal
     })).rejects.toMatchObject({ code: 'INVALID_ATTACHMENT' });
   });
@@ -74,7 +74,7 @@ describe('VisionService', () => {
     expect(() => service.readAttachment(ref)).toThrowError(new VisionServiceError('ATTACHMENT_NOT_FOUND', 'Attachment is missing or invalid'));
   });
 
-  it('publishes a DSH-owned tool and proxies image content without exposing credentials', async () => {
+  it('publishes a Nexus-owned tool and proxies image content without exposing credentials', async () => {
     const store = settings();
     const upstream = vi.fn(async (_url: string, init: RequestInit) => {
       expect(init.headers).toMatchObject({ authorization: 'Bearer sk-provider-secret' });
@@ -87,13 +87,13 @@ describe('VisionService', () => {
     const ref = await service.putAttachment({ data: PNG, mimeType: 'image/png' });
     service.configureBinding({ providerId: 'provider-vision', model: 'vision-model' });
     const result = await service.createToolHandler()({ attachmentRef: ref, prompt: '识别内容' }, {
-      owner: 'dsh-cordis', pluginId: 'opc.dsh.vision', pluginVersion: '1.0.0',
+      owner: 'nexus-governance', pluginId: 'opc.nexus.vision', pluginVersion: '1.0.0',
       capabilityId: 'vision.describe', capabilityKind: 'tool', signal: new AbortController().signal
     });
     expect(result).toMatchObject({ ok: true, text: '这是一张测试图片。', providerId: 'provider-vision', model: 'vision-model' });
     expect(JSON.stringify(result)).not.toContain('sk-provider-secret');
-    const manifest = validatePluginManifest(DSH_VISION_PLUGIN_MANIFEST);
-    expect(manifest).toMatchObject({ owner: 'dsh-cordis' });
+    const manifest = validatePluginManifest(NEXUS_VISION_PLUGIN_MANIFEST);
+    expect(manifest).toMatchObject({ owner: 'nexus-governance' });
     expect(manifest.executionAdapter).toBeUndefined();
     expect(manifest.capabilities[0]).toMatchObject({ risk: 'write', permissions: ['artifact.read', 'engine.use', 'network.request'] });
     expect(manifest.capabilities[1]).toMatchObject({ id: 'vision.ocr', risk: 'safe', permissions: ['artifact.read'] });
@@ -111,8 +111,8 @@ describe('VisionService', () => {
     }));
     const handler = service.createOcrToolHandler({ recognizeBytes });
     const context = {
-      owner: 'dsh-cordis' as const,
-      pluginId: 'opc.dsh.vision',
+      owner: 'nexus-governance' as const,
+      pluginId: 'opc.nexus.vision',
       pluginVersion: '1.0.0',
       capabilityId: 'vision.ocr',
       capabilityKind: 'tool' as const,

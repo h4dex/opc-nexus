@@ -47,6 +47,8 @@ export type DerivedAgentStatus = 'error' | 'running' | 'paused' | 'starting' | '
  * autonomous=项目目录内自主执行。任何模式都不授予宿主机无限访问权。
  */
 export type PermissionMode = 'readonly' | 'standard' | 'trusted' | 'autonomous';
+/** Per-employee history policy. Persona/configuration files are not memory. */
+export type AgentMemoryMode = 'long_term' | 'short_term' | 'none';
 export const DEFAULT_AGENT_PERMISSION_MODE: PermissionMode = 'autonomous';
 
 /** 数字员工身份。Android 操作员由 Hermes CLI + Mobile Gateway 专用执行链路驱动。 */
@@ -264,47 +266,9 @@ export interface MobileApkInfo {
 
 export const NEXUS_ENGINE_ID = 'eng-nexus' as const;
 export const LEGACY_NEXUS_ENGINE_ID = 'eng-hermes' as const;
-/** Legacy one-shot ACP adapter kept only for historical task compatibility. */
-export const LEGACY_DSH_ENGINE_ID = 'eng-deepseek-harness' as const;
-export const DSH_MANAGED_ENGINE_ID = 'eng-deepseek-harness-managed' as const;
 
 /** Worker engine types. Control-kernel identity is modeled separately. */
-export type EngineType = 'nexus' | 'dsh-managed' | 'hermes-cli' | 'codex' | 'claude' | 'pi' | 'opencode' | 'external';
-
-export type DshRuntimeProcessState =
-  | 'STOPPED'
-  | 'STARTING'
-  | 'READY'
-  | 'UNHEALTHY'
-  | 'BACKOFF'
-  | 'STOPPING'
-  | 'STOP_FAILED'
-  | 'CRASH_LOOP';
-
-/** Renderer-safe managed DSH status. Process arguments, environment and secrets are excluded. */
-export interface DshRuntimeStatusView {
-  agentId: string;
-  processState: DshRuntimeProcessState;
-  pid: number | null;
-  startedAt: number | null;
-  readyAt: number | null;
-  lastHealthAt: number | null;
-  nextRestartAt: number | null;
-  restartCount: number;
-  crashCount: number;
-  lastError: string | null;
-}
-
-export interface DshWorkbenchStatus {
-  runtime: DshRuntimeStatusView | null;
-  gateway: {
-    state: 'stopped' | 'starting' | 'running' | 'error';
-    running: boolean;
-    activeDesktopSessions: number;
-    lastError: string | null;
-  };
-  window: { open: boolean; visible: boolean; loading: boolean };
-}
+export type EngineType = 'nexus' | 'hermes-cli' | 'codex' | 'claude' | 'pi' | 'opencode' | 'external';
 
 /** Project-scoped request for the trusted Quest-only desktop shell. */
 export interface OpenQuestWindowInput {
@@ -319,96 +283,18 @@ export interface QuestWindowStatus {
   projectId: string | null;
 }
 
-/** CSS-pixel coordinates for the Main-owned native DSH view. */
-export interface DshEmbeddedWorkbenchBounds {
+/** CSS-pixel coordinates for a Main-owned embedded workbench view. */
+export interface EmbeddedWorkbenchBounds {
   x: number;
   y: number;
   width: number;
   height: number;
 }
 
-export interface DshEmbeddedWorkbenchStatus {
-  open: boolean;
-  attached: boolean;
-  visible: boolean;
-  loading: boolean;
-  bounds: DshEmbeddedWorkbenchBounds | null;
-}
-
-export interface OpenDshEmbeddedWorkbenchInput {
-  projectId: string;
-  agentId: string;
-  /** Optional project-root hint. The authenticated URL remains Main-only. */
-  sessionId?: string | null;
-  bounds: DshEmbeddedWorkbenchBounds;
-}
-
-export type QuestProviderPreflightCode =
-  | 'READY'
-  | 'NOT_CONFIGURED'
-  | 'CREDENTIAL_MISSING'
-  | 'CONFIGURATION_INVALID'
-  | 'CREDENTIAL_REJECTED'
-  | 'CONNECTION_FAILED';
-
-/** Secret-free result of probing the exact Provider route used by managed Cordis. */
-export interface QuestProviderPreflightView {
-  ready: boolean;
-  code: QuestProviderPreflightCode;
-  providerId: string | null;
-  providerName: string | null;
-  model: string | null;
-  latencyMs: number;
-  error: string | null;
-  checkedAt: number;
-}
-
-/** Read-only trust classification for packages discovered in the managed DSH bundle. */
-export type DshPluginSafetyLevel = 'trusted' | 'review' | 'blocked';
-export type DshPluginEnablement = 'enabled' | 'disabled' | 'blocked' | 'missing';
-
-export interface DshPluginPackageView {
-  name: string;
-  version: string | null;
-  categories: string[];
-  safety: DshPluginSafetyLevel;
-  enablement: DshPluginEnablement;
-  installed: boolean;
-  reviewed: boolean;
-  reasonCodes: string[];
-}
-
-export interface DshPluginPolicyView {
-  valid: boolean;
-  relativePath: string | null;
-  sha256: string | null;
-  requiredTokenCount: number;
-  matchedTokenCount: number;
-}
-
-/**
- * Renderer-safe inventory of the pinned managed runtime. It is intentionally
- * descriptive only: catalog membership never authorizes or loads a plugin.
- */
-export interface DshPluginCatalogView {
-  available: boolean;
-  scannedAt: number;
-  runtime: {
-    packageName: string | null;
-    expectedVersion: string | null;
-    installedVersion: string | null;
-    integrityVerified: boolean;
-  };
-  policy: DshPluginPolicyView;
-  packages: DshPluginPackageView[];
-  counts: Record<DshPluginEnablement, number>;
-  warnings: string[];
-}
-
 // ---------- Unified plugin catalog / host environment ----------
 
 /** Sources that can be managed from the single Plugins surface. */
-export type PluginCatalogSource = 'host' | 'dsh' | 'mcp' | 'skill' | 'cli' | 'acp' | 'a2a';
+export type PluginCatalogSource = 'host' | 'mcp' | 'skill' | 'cli' | 'acp' | 'a2a';
 export type PluginCatalogKind =
   | 'runtime'
   | 'engine'
@@ -432,7 +318,7 @@ export interface PluginCatalogItemView {
   version: string | null;
   source: PluginCatalogSource;
   kind: PluginCatalogKind;
-  owner: 'dsh-cordis' | 'nexus-governance' | 'legacy';
+  owner: 'nexus-governance' | 'legacy';
   status: PluginCatalogStatus;
   lifecycle: PluginLifecycleStatus;
   safety: PluginCatalogSafety;
@@ -451,8 +337,6 @@ export interface PluginCatalogView {
   counts: Record<PluginCatalogStatus, number>;
   sourceCounts: Record<PluginCatalogSource, number>;
   warnings: string[];
-  /** Raw DSH package inventory remains nested for the existing diagnostics UI. */
-  dsh: DshPluginCatalogView | null;
 }
 
 export type EnvironmentComponentKind = 'runtime' | 'toolchain' | 'worker-cli' | 'media-tool' | 'browser' | 'native-addon';
@@ -588,8 +472,55 @@ export interface ProjectArtifactManifestEntry {
   validationState: ProjectArtifactValidationState;
   previewKind: ProjectArtifactPreviewKind;
   previewable: boolean;
-  /** Launch metadata is null until a worker explicitly supplies a validated command. */
+  /** Launch metadata derived from the artifact itself (a real on-disk
+   * `package.json` script), never from model output. Null when the file
+   * declares no runnable acceptance script. */
   run: null | { command: string; cwd: string };
+}
+
+export type ProjectArtifactRuntimeState =
+  | 'STARTING'
+  | 'RUNNING'
+  | 'STOPPING'
+  | 'STOPPED'
+  | 'EXITED'
+  | 'FAILED';
+
+export interface ProjectArtifactScreenshotEvidence {
+  relativePath: string;
+  viewport: 'desktop' | 'mobile';
+  width: number;
+  height: number;
+  mediaType: 'image/png';
+  sha256: string;
+  createdAt: number;
+}
+
+/** Main-owned evidence for a real artifact preview process. The command and
+ * cwd originate from a verified manifest; host-absolute paths are never
+ * projected to Renderer. */
+export interface ProjectArtifactRuntimeEvidence {
+  taskId: string;
+  projectId: string;
+  command: string;
+  cwd: string;
+  state: ProjectArtifactRuntimeState;
+  pid: number | null;
+  url: string | null;
+  startedAt: number;
+  endedAt: number | null;
+  exitCode: number | null;
+  error: string | null;
+  stdoutTail: string;
+  stderrTail: string;
+  screenshots: ProjectArtifactScreenshotEvidence[];
+  screenshotError: string | null;
+}
+
+export interface ProjectArtifactRuntimeOperationResult {
+  ok: boolean;
+  runtime: ProjectArtifactRuntimeEvidence | null;
+  error: string | null;
 }
 
 export interface ProjectArtifactManifest {
@@ -601,175 +532,22 @@ export interface ProjectArtifactManifest {
   entries: ProjectArtifactManifestEntry[];
   truncated: boolean;
   validation: { status: 'verified'; reason: null };
-}
-
-// ---------- Controlled DSH community plugin lifecycle ----------
-
-export type DshCommunityPluginSourceKind = 'package' | 'github';
-export type DshCommunityPluginStatus =
-  | 'available'
-  | 'update-available'
-  | 'installed'
-  | 'installing'
-  | 'restart-required'
-  | 'blocked'
-  | 'broken'
-  | 'missing';
-export type DshPluginProfileState = 'running' | 'stopped' | 'unavailable' | 'unknown';
-export type DshPluginLifecycleAction = 'install' | 'update' | 'uninstall';
-export type DshCommunityPluginBoundary =
-  | 'reviewed-profile'
-  | 'explicit-profile-permission'
-  | 'main-adapter-required'
-  | 'standalone-only'
-  | 'blocked';
-export type DshCommunityPluginCompatibility =
-  | 'verified'
-  | 'unverified'
-  | 'incompatible'
-  | 'identity-conflict';
-export type DshCommunityPluginPackStatus =
-  | 'available'
-  | 'partial'
-  | 'installed'
-  | 'installing'
-  | 'blocked'
-  | 'broken'
-  | 'missing';
-export type DshCommunityPluginHealth = 'not-probed' | 'healthy' | 'unhealthy';
-export type DshBuiltInCapabilityStatus = 'integrated' | 'available' | 'unavailable';
-
-/** A capability delivered by the reviewed DSH runtime or a Main-owned host
- * adapter. It is deliberately separate from third-party package lifecycle. */
-export interface DshBuiltInCapabilityView {
-  id: string;
-  name: string;
-  description: string;
-  provider: 'dsh-core' | 'native-host';
-  status: DshBuiltInCapabilityStatus;
-  capabilities: string[];
-}
-
-/** Runtime evidence is stricter than package installation. `live` may be true
- * only after the package is attached and a package-specific health probe is
- * healthy for the current profile. */
-export interface DshCommunityPluginActivationView {
-  attached: boolean;
-  health: DshCommunityPluginHealth;
-  live: boolean;
-}
-
-/** Sanitized source descriptor from the Main-owned allowlist. */
-export interface DshCommunityPluginSourceView {
-  kind: DshCommunityPluginSourceKind;
-  packageName: string;
-  version: string | null;
-  github: { owner: string; repository: string; ref: string } | null;
-}
-
-/** Renderer-safe curated community plugin entry. */
-export interface DshCommunityPluginView {
-  id: string;
-  name: string;
-  description: string;
-  version: string;
-  source: DshCommunityPluginSourceView;
-  /** Curated provenance metadata; never used as an install instruction. */
-  publisher: string | null;
-  repositoryUrl: string | null;
-  articleUrl: string | null;
-  capabilities: string[];
-  risk: 'safe' | 'write' | 'native';
-  runtimeBoundary: DshCommunityPluginBoundary;
-  compatibility: DshCommunityPluginCompatibility;
-  /** Stable ordering used by the ten-part Quest capability pack. */
-  questPart: number | null;
-  /** The pack is present by default; third-party execution is never enabled by presence alone. */
-  defaultEnabled: boolean;
-  installable: boolean;
-  allowScripts: boolean;
-  status: DshCommunityPluginStatus;
-  installedVersion: string | null;
-  activation: DshCommunityPluginActivationView;
-  requiresRestart: boolean;
-  reasonCodes: string[];
-}
-
-/** A Main-curated, exact-version bundle projected into Quest surfaces. */
-export interface DshCommunityPluginPackView {
-  id: string;
-  name: string;
-  description: string;
-  risk: 'safe' | 'write' | 'native';
-  status: DshCommunityPluginPackStatus;
-  installable: boolean;
-  requiresConfirmation: boolean;
-  installedCount: number;
-  liveCount: number;
-  totalCount: number;
-  members: DshCommunityPluginView[];
-}
-
-export interface DshCommunityPluginCatalogView {
-  scannedAt: number;
-  profile: DshPluginProfileState;
-  busy: boolean;
-  activeOperationId: string | null;
-  builtInCapabilities: DshBuiltInCapabilityView[];
-  entries: DshCommunityPluginView[];
-  questDefaultPack?: DshCommunityPluginPackView | null;
-  warnings: string[];
-}
-
-/** A short-lived Main-issued confirmation capability for one exact entry. */
-export interface DshPluginInstallConfirmationView {
-  pluginId: string;
-  token: string;
-  expiresAt: number;
-  summary: string;
-}
-
-export interface DshPluginInstallRequest {
-  /** Agent/profile target. Omitted only for legacy single-profile callers. */
-  agentId?: string;
-  pluginId: string;
-  confirmationToken: string;
-}
-
-export interface DshPluginInstallResultView {
-  ok: boolean;
-  operationId: string;
-  status: DshCommunityPluginStatus;
-  message: string;
-  plugin: DshCommunityPluginView | null;
-  profileStopped: boolean;
-  profileResumed: boolean;
-  requiresRestart: boolean;
-}
-
-/** Action-bound capability used for update/uninstall without widening the
- * backwards-compatible install IPC. */
-export interface DshPluginLifecycleConfirmationView extends DshPluginInstallConfirmationView {
-  action: DshPluginLifecycleAction;
-}
-
-export interface DshPluginLifecycleRequest extends DshPluginInstallRequest {
-  action: DshPluginLifecycleAction;
-}
-
-export interface DshPluginLifecycleResultView extends DshPluginInstallResultView {
-  action: DshPluginLifecycleAction;
+  /** Latest runtime evidence is projected from a separate append-only task
+   * event. It is not part of the file-validation decision. */
+  runtime?: ProjectArtifactRuntimeEvidence | null;
 }
 
 // ---------- Project Workbench / Quest ----------
 
-/** Quest is always Cordis-planned; direct execution belongs to non-Quest surfaces. */
+/** One Quest conversation has exactly one reasoning/scheduling kernel. */
 export type QuestMode = 'quest';
+export type QuestOrchestrator = 'hermes';
 export type QuestSandbox = 'strict' | 'workspace' | 'host';
 
 /** Safe, persistable controls selected for a project run. Secrets never live here. */
 export interface QuestSettings {
   mode: QuestMode;
+  orchestrator: QuestOrchestrator;
   sandbox: QuestSandbox;
   permissionMode: PermissionMode;
   model: string | null;
@@ -779,73 +557,360 @@ export interface QuestSettings {
   autoApproveLowRisk: boolean;
 }
 
-export type ProjectWorkbenchSessionKind = 'root' | 'fixed-worker' | 'elastic-worker' | 'external';
-
-export interface ProjectWorkbenchSessionView {
-  sessionId: string;
-  agentId: string;
-  agentName: string;
-  engineId: string;
-  parentSessionId: string | null;
-  depth: number;
-  kind: ProjectWorkbenchSessionKind;
-  controlMode: DshControlMode;
-  revision: number;
-  lastEventCursor: number;
-  latestRunState: string | null;
-  updatedAt: number;
+export interface OpenHermesEmbeddedWorkbenchInput {
+  projectId: string;
+  bounds: EmbeddedWorkbenchBounds;
+  theme: 'dark' | 'light';
+  /** Optional conversation to focus when Quest is opened from an employee card. */
+  conversationId?: string;
 }
 
-/** Bounded renderer-safe hierarchy. Host paths and upstream DSH identifiers are excluded. */
-export interface ProjectWorkbenchSessionTreeNodeView {
-  session: ProjectWorkbenchSessionView;
-  children: ProjectWorkbenchSessionTreeNodeView[];
+export interface HermesEmbeddedWorkbenchStatus {
+  open: boolean;
+  attached: boolean;
+  visible: boolean;
+  loading: boolean;
+  bounds: EmbeddedWorkbenchBounds | null;
+  projectId: string | null;
+  runtime: HermesRuntimeStatus | null;
 }
 
-export interface ProjectWorkbenchRunView {
-  runId: string;
-  sessionId: string;
-  taskId: string | null;
-  teamRunId: string | null;
-  state: string;
-  checkpointRef: string | null;
+// ---------- Hermes project runtime ----------
+
+/** Main-owned lifecycle of one isolated Hermes service instance. */
+export type HermesRuntimeState = 'stopped' | 'starting' | 'healthy' | 'degraded' | 'error' | 'stopping';
+
+export type HermesRuntimeStartupPhase =
+  | 'idle'
+  | 'preparing'
+  | 'starting-dashboard'
+  | 'starting-gateway'
+  | 'ready'
+  | 'stopping'
+  | 'error';
+
+export interface HermesRuntimeStatus {
+  projectId: string;
+  state: HermesRuntimeState;
+  startupPhase: HermesRuntimeStartupPhase;
+  startupElapsedMs: number | null;
+  version: string | null;
+  host: '127.0.0.1';
+  port: number | null;
+  proxyPort: number | null;
+  homePath: string;
+  serviceUrl: string | null;
+  uiUrl: string | null;
+  pid: number | null;
+  lastHealthAt: number | null;
+  lastError: string | null;
+  startedAt: number | null;
+}
+
+export interface HermesProjectBinding {
+  projectId: string;
+  homePath: string;
+  runtimeVersion: string;
+  servicePort: number | null;
+  proxyPort: number | null;
+  status: HermesRuntimeState;
+  lastHealthAt: number | null;
+  lastError: string | null;
   createdAt: number;
   updatedAt: number;
 }
 
-export interface ProjectWorkbenchTeamMemberView {
-  agentId: string;
+/** Opaque short-lived lease used by a trusted Hermes Workbench window. */
+export interface HermesUiLease {
+  leaseId: string;
+  projectId: string;
+  url: string;
+  expiresAt: number;
+}
+
+export interface HermesWorkbenchStatus {
+  open: boolean;
+  visible: boolean;
+  loading: boolean;
+  projectId: string | null;
+  runtime: HermesRuntimeStatus | null;
+}
+
+export interface HermesProjectTurnResult {
+  projectId: string;
+  conversationId: string;
+  hermesSessionId: string;
+  content: string;
+  usage: { inputTokens: number; outputTokens: number; totalTokens: number };
+  runtime: {
+    provider: string | null;
+    model: string | null;
+    memoryMode?: AgentMemoryMode;
+    memoryScope?: string;
+  };
+  createdAt: number;
+}
+
+export type HermesChatQueueStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export type HermesChatActivityKind = 'reasoning' | 'tool_call' | 'tool_result' | 'system';
+export type HermesChatActivityStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+/** Renderer-safe execution trace. Raw private reasoning and credentials are never projected here. */
+export interface HermesChatActivity {
+  id: string;
+  kind: HermesChatActivityKind;
+  title: string;
+  status: HermesChatActivityStatus;
+  toolName: string | null;
+  detail: string | null;
+  startedAt: number | null;
+  updatedAt: number | null;
+}
+
+/** Durable Main-owned input queue. System prompts and credentials are never projected here. */
+export interface HermesChatQueueItem {
+  id: string;
+  projectId: string;
+  conversationId: string;
+  message: string;
+  status: HermesChatQueueStatus;
+  queuePosition: number | null;
+  attempts: number;
+  partialContent: string;
+  activities: HermesChatActivity[];
+  error: string | null;
+  /** Set while Main is waiting for Hermes to acknowledge executor settlement. */
+  cancelRequestedAt: number | null;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  updatedAt: number;
+}
+
+/** Project-scoped WebSocket event emitted by the Main Hermes proxy. */
+export interface HermesChatQueueEvent {
+  type: 'chat.queue.updated' | 'chat.queue.delta';
+  projectId: string;
+  queueId: string;
+  conversationId: string;
+  timestamp: number;
+  item?: HermesChatQueueItem;
+  delta?: string;
+}
+
+/** Project-scoped signal for live Quest scheduling/work progress refreshes. */
+export interface HermesProjectStateEvent {
+  type: 'project.state.updated';
+  projectId: string;
+  timestamp: number;
+  reason: 'task' | 'session' | 'plan' | 'clarification';
+}
+
+export type HermesProjectEvent = HermesChatQueueEvent | HermesProjectStateEvent;
+
+export interface HermesProjectChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string;
+  timestamp: number | null;
+  activities: HermesChatActivity[];
+}
+
+/** Main-authorized file attached to a Quest/Hermes conversation turn. */
+export interface HermesConversationAttachment {
+  id: string;
+  projectId: string;
+  conversationId: string;
+  name: string;
+  mediaType: string;
+  size: number;
+  sha256: string;
+  relativePath: string;
+  url: string;
+  createdAt: number;
+}
+
+export interface HermesProjectChatHistory {
+  projectId: string;
+  conversationId: string | null;
+  hermesSessionId: string | null;
+  messages: HermesProjectChatMessage[];
+}
+
+export interface HermesProjectConversationView {
+  conversationId: string;
+  title: string;
+  employee: HermesEmployeeView | null;
+  hasSession: boolean;
+  updatedAt: number;
+}
+
+/** Main-validated employee candidate exposed to the project-scoped Hermes UI. */
+export interface HermesEmployeeView {
+  id: string;
   name: string;
   role: string;
   engineId: string;
-  kind: 'fixed' | 'elastic' | 'external';
-  activeRuns: number;
-  totalRuns: number;
+  memoryMode: AgentMemoryMode;
 }
 
-export interface ProjectWorkbenchEventView {
+export interface HermesProjectPluginView {
+  id: string;
+  name: string;
+  kind: 'skill' | 'mcp';
+  status: 'ready' | 'blocked';
+  tools: Array<{ name: string; description: string }>;
+}
+
+export interface HermesPlanDraft {
+  projectId: string;
+  conversationId: string;
+  objective: string;
+  assumptions: string[];
+  scope: { included: string[]; excluded: string[] };
+  team: Array<{ workerAgentId: string; responsibility: string; capabilities: string[] }>;
+  dag: Array<{
+    id: string;
+    title: string;
+    workerAgentId: string;
+    dependsOn: string[];
+    acceptanceCriteria: string[];
+    /** Plan-level artifact paths owned by this node, each assigned exactly once. */
+    expectedArtifacts: string[];
+  }>;
+  risks: Array<{ id: string; description: string; mitigation: string; approvalRequired: boolean }>;
+  budget: { maxCost: number; maxTokens: number; maxConcurrent: number };
+  acceptanceCriteria: string[];
+  expectedArtifacts: Array<{ relativePath: string; mediaType: string; previewable: boolean; runCommand?: string }>;
+  memoryRefs: string[];
+  source: 'hermes';
+  model: string;
+}
+
+export interface HermesPlanProjection {
+  draftId: string;
+  projectId: string;
+  governanceSessionId: string;
   sessionId: string;
-  runId: string | null;
-  type: string;
+  planId: string;
+  version: number;
+  hash: string;
+  status: 'PROJECTED' | 'APPROVED' | 'DISPATCHED' | 'REJECTED' | 'PROJECTION_FAILED';
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface HermesClarifyRequest {
+  clarifyId: string;
+  projectId: string;
+  conversationId: string;
+  questionKind: 'scope' | 'acceptance' | 'risk' | 'budget' | 'execution';
+  prompt: string;
+  options: Array<{ id: string; label: string; description?: string }>;
+  allowOther: boolean;
+  expiresAt: number | null;
+  required: boolean;
+  channelTargets: string[];
+  status: 'OPEN' | 'ANSWERED' | 'EXPIRED' | 'CANCELLED';
+}
+
+export interface HermesDelegationRequest {
+  parentSessionId: string;
+  parentRunId: string;
+  projectId: string;
+  tasks: Array<{ id: string; title: string; description: string; dependsOn: string[] }>;
+  workerAgentId: string;
+  dependencies: string[];
+  permissions: { network: boolean; shell: boolean; install: boolean; browser: boolean; computer: boolean; mobile: boolean };
+  budget: { maxCost: number; maxTokens: number };
+  maxDepth: number;
+  maxConcurrentChildren: number;
+}
+
+export type HermesEmployeeTaskIntent = 'execution' | 'status_inquiry' | 'validation';
+
+export interface HermesDeliveryEvent {
+  projectId: string;
+  taskId: string;
+  entries: Array<{ relativePath: string; mediaType: string; sha256: string; previewable: boolean; runCommand?: string; screenshot?: string }>;
   summary: string;
   createdAt: number;
+}
+
+export interface HermesMobileLanConfigInput {
+  bindHost: string;
+  port?: number;
+  publicHost?: string;
+  publicPort?: number;
+}
+
+export interface HermesMobileLanConfigView {
+  bindHost: string;
+  port: number;
+  publicHost: string;
+  publicPort: number;
+}
+
+export interface HermesMobileRoute {
+  projectId: string;
+  pairingId: string;
+  runtimeId: string;
+  origin: string;
+  pairingUrl: string;
+  code: string;
+  expiresAt: number;
+  certificateFingerprint: string;
+}
+
+export interface HermesMobileAccessStatus {
+  projectId: string;
+  configured: HermesMobileLanConfigView | null;
+  running: boolean;
+  activeRoutes: Array<{
+    runtimeId: string;
+    origin: string;
+  }>;
+  lastError: string | null;
+}
+
+export interface HermesProjectWorkbenchState {
+  projectId: string;
+  runtimeState: HermesRuntimeState;
+  orchestration: {
+    scheduler: 'Hermes';
+    workerSelectionMode: 'dynamic' | 'restricted';
+    workerAgentIds: string[];
+    maxParallel: number;
+    permissionMode: PermissionMode;
+    sandbox: QuestSandbox;
+  };
+  employees: HermesEmployeeView[];
+  plugins: HermesProjectPluginView[];
+  clarifications: HermesClarifyRequest[];
+  plans: HermesPlanProjection[];
+  tasks: Array<{
+    taskId: string;
+    title: string;
+    status: TaskStatus;
+    progress: number;
+    /** Hermes employee dispatch classification. Plan DAG work is execution by default. */
+    intent: HermesEmployeeTaskIntent;
+    /** Only populated for validation tasks after a terminal result is authoritative. */
+    validationVerdict: 'PASS' | 'FAIL' | 'BLOCKED' | null;
+    /** Implementation task ids inspected by an independent validation task. */
+    relatedTaskIds: string[];
+    worker: { id: string; name: string; role: string; engineId: string };
+    files: Array<{ relativePath: string; mediaType: string; sha256: string }>;
+  }>;
+  updatedAt: number;
 }
 
 export interface ProjectWorkbenchView {
   generatedAt: number;
   project: Project;
-  rootSession: ProjectWorkbenchSessionView | null;
-  sessionTree: ProjectWorkbenchSessionTreeNodeView[];
-  sessions: ProjectWorkbenchSessionView[];
-  team: {
-    fixed: ProjectWorkbenchTeamMemberView[];
-    elastic: ProjectWorkbenchTeamMemberView[];
-    external: ProjectWorkbenchTeamMemberView[];
-  };
-  runs: ProjectWorkbenchRunView[];
-  activeRuns: ProjectWorkbenchRunView[];
   deliverables: DeliverableSummary[];
-  recentEvents: ProjectWorkbenchEventView[];
   risks: ProjectRiskItem[];
   settings: QuestSettings;
   deliveryBoard: ProjectDeliveryBoardView;
@@ -957,441 +1022,6 @@ export interface DshEventPage {
   nextCursor: number;
 }
 
-/**
- * Project-scoped, renderer-safe view of DSH delegation.  These DTOs are kept
- * separate from the Main service records so runtime/upstream identifiers,
- * workspace paths and lease capabilities cannot accidentally cross preload.
- */
-export interface DshDelegationTreeQueryInput {
-  projectId: string;
-  sessionId: string;
-  maxNodes?: number;
-  maxDepth?: number;
-}
-
-export interface DshChildResultsQueryInput {
-  projectId: string;
-  parentSessionId: string;
-  maxResults?: number;
-  maxBytes?: number;
-}
-
-export interface DshDelegationRunView {
-  runId: string;
-  state: string;
-  eventCursor: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface DshDelegationSessionView {
-  sessionId: string;
-  agentId: string;
-  conversationId: string | null;
-  parentSessionId: string | null;
-  delegationDepth: number;
-  controlMode: DshControlMode;
-  revision: number;
-  lastEventCursor: number;
-  createdAt: number;
-  updatedAt: number;
-  childSessionIds: string[];
-  latestRun: DshDelegationRunView | null;
-  active: boolean;
-  eventCount: number;
-  latestEvent: { seq: number; type: string; createdAt: number } | null;
-}
-
-export interface DshDelegationTreeView {
-  rootSessionId: string;
-  requestedSessionId: string;
-  sessions: DshDelegationSessionView[];
-  nodes: DshDelegationSessionView[];
-  edges: Array<{ parentSessionId: string; childSessionId: string }>;
-  totalNodes: number;
-  returnedNodes: number;
-  truncated: boolean;
-  orphanSessionIds: string[];
-}
-
-export interface DshChildResultView {
-  sessionId: string;
-  parentSessionId: string;
-  depth: number;
-  runId: string | null;
-  status: string;
-  summary: string;
-  artifactRefs: string[];
-  eventRefs: Array<{ seq: number; type: string }>;
-  truncated: boolean;
-  updatedAt: number;
-}
-
-export interface DshChildResultsAggregateView {
-  rootSessionId: string;
-  requestedParentSessionId: string;
-  totalChildren: number;
-  omittedChildren: number;
-  truncated: boolean;
-  results: DshChildResultView[];
-  generatedAt: number;
-}
-
-export interface DshLanGatewayConfigInput {
-  bindHost: string;
-  port?: number;
-  publicHost?: string;
-  publicPort?: number;
-}
-
-export interface DshLanGatewayConfigView {
-  bindHost: string;
-  port: number;
-  publicHost: string;
-  publicPort: number;
-}
-
-export type DshLanGatewayStateView = 'stopped' | 'starting' | 'running' | 'error';
-export type DshLanRoleView = 'viewer' | 'operator';
-
-/** Renderer-safe LAN status; certificate/key material never crosses preload. */
-export interface DshLanGatewayStatusView {
-  state: DshLanGatewayStateView;
-  enabled: boolean;
-  running: boolean;
-  bindHost: string | null;
-  port: number | null;
-  authority: string | null;
-  origin: string | null;
-  trustedAuthorities: string[];
-  runtimeId: string;
-  activeSessions: number;
-  activeRequests: number;
-  activeWebSockets: number;
-  certificateFingerprint: string | null;
-  lastError: string | null;
-}
-
-export interface DshLanBoundRuntimeView {
-  agentId: string;
-  profileId: string;
-  endpoint: string;
-}
-
-export interface DshLanGatewayCompositionStatusView {
-  desiredEnabled: boolean;
-  configured: DshLanGatewayConfigView | null;
-  gateway: DshLanGatewayStatusView;
-  lastError: string | null;
-  boundRuntime: DshLanBoundRuntimeView | null;
-  eligibleRuntimeCount: number;
-}
-
-export interface DshLanPairingOfferView {
-  code: string;
-  expiresAt: number;
-  origin: string;
-  /** Secret-free browser entry point. The one-time code is never placed in this URL. */
-  pairingUrl: string;
-  runtimeId: string;
-  role: DshLanRoleView;
-  certificateFingerprint: string;
-}
-
-// ---------- Secretary planning control plane ----------
-
-export type PlanningSessionStatusView =
-  | 'DRAFT' | 'NEEDS_INPUT' | 'PROPOSED' | 'APPROVED' | 'DISPATCHED'
-  | 'CLOSED' | 'REJECTED' | 'SUPERSEDED' | 'CANCELLED';
-
-export type PlanningGateReasonView =
-  | 'CROSS_TEAM' | 'AMBIGUOUS_OBJECTIVE' | 'AMBIGUOUS_SCOPE' | 'AMBIGUOUS_ACCEPTANCE'
-  | 'LONG_TASK' | 'HIGH_COST' | 'HIGH_TOKEN_BUDGET' | 'NEW_TEAM'
-  | 'IRREVERSIBLE_OPERATION' | 'COMPARE_ALTERNATIVES' | 'PHASED_EXECUTION'
-  | 'EXPLICIT_CONFIRMATION' | 'COMPLEXITY_SCORE';
-
-export type PlanningIrreversibleOperation =
-  | 'write_files' | 'install_software' | 'send_external_message' | 'production_change'
-  | 'payment' | 'delete_data' | 'publish';
-
-export interface PlanningComplexitySignalsInput {
-  departmentIds: string[];
-  hasCrossTeamDependencies: boolean;
-  ambiguousObjective: boolean;
-  ambiguousScope: boolean;
-  ambiguousAcceptance: boolean;
-  estimatedDurationMinutes: number;
-  estimatedCost: number;
-  estimatedTokenCount: number;
-  requiresNewTeam: boolean;
-  irreversibleOperations: PlanningIrreversibleOperation[];
-  compareAlternatives: boolean;
-  phasedExecution: boolean;
-  confirmBeforeExecution: boolean;
-  estimatedTaskCount?: number;
-}
-
-export interface PlanningGateDecisionView {
-  requiresPlanning: boolean;
-  complexityScore: number;
-  riskScore: number;
-  reasons: PlanningGateReasonView[];
-}
-
-export interface PlanningQuestionOptionView {
-  id: string;
-  label: string;
-  impact: string;
-}
-
-export interface PlanningQuestionView {
-  id: string;
-  kind: 'single' | 'multi' | 'text';
-  prompt: string;
-  options: PlanningQuestionOptionView[];
-  recommendedOptionId: string | null;
-  recommendationReason: string | null;
-  allowOther: true;
-}
-
-export interface PlanningQuestionAnswerInput {
-  questionId: string;
-  selectedOptionIds: string[];
-  text: string | null;
-}
-
-export interface PlanningQuestionSetView {
-  id: string;
-  version: number;
-  questions: PlanningQuestionView[];
-  answers: PlanningQuestionAnswerInput[] | null;
-  createdAt: number;
-  answeredAt: number | null;
-}
-
-export interface PlanningBudgetView {
-  timeMinutes: number;
-  tokenLimit: number;
-  costLimit: number;
-}
-
-export interface PlanningAgentView {
-  id: string;
-  name: string;
-  role: string;
-  engineId: string;
-  lifecycle: AgentLifecycle;
-  permissionMode: PermissionMode;
-}
-
-export interface PlanningTeamView {
-  teamId: string;
-  leadAgentId: string;
-  memberAgentIds: string[];
-  proposedEphemeralRoles: string[];
-}
-
-export interface PlanningDagNodeView {
-  nodeId: string;
-  ownerAgentId: string;
-  dependencies: string[];
-  workOrder: string;
-  expectedArtifacts: string[];
-  acceptanceCriteria: string[];
-  permissionProfile: string;
-  requiredPermissions: string[];
-  budget: PlanningBudgetView;
-  retryPolicy: { maxAttempts: number; backoff: 'none' | 'linear' | 'exponential' };
-}
-
-export interface PlanningPlanView {
-  objective: string;
-  assumptions: string[];
-  scope: { included: string[]; excluded: string[] };
-  team: PlanningTeamView[];
-  dag: PlanningDagNodeView[];
-  risks: Array<{ risk: string; mitigation: string; ownerAgentId: string }>;
-  overallBudget: PlanningBudgetView;
-  acceptanceCriteria: string[];
-}
-
-export interface PlanningPlanVersionView {
-  version: number;
-  hash: string;
-  status: 'PROPOSED' | 'APPROVED' | 'REJECTED' | 'SUPERSEDED';
-  plan: PlanningPlanView;
-  createdAt: number;
-  approvedAt: number | null;
-  rejectedAt: number | null;
-  supersedesVersion: number | null;
-  supersededByVersion: number | null;
-}
-
-export interface PlanningDispatchReceiptView {
-  nodeId: string;
-  taskId: string;
-  idempotencyKey: string;
-  createdAt: number;
-}
-
-export type PlanningDispatchStatus = 'NOT_STARTED' | 'IN_PROGRESS' | 'PARTIAL' | 'FAILED' | 'DISPATCHED';
-
-export interface PlanningDispatchView {
-  status: PlanningDispatchStatus;
-  planVersion: number | null;
-  planHash: string | null;
-  totalNodes: number;
-  receipts: PlanningDispatchReceiptView[];
-  error: { code: string; message: string } | null;
-}
-
-export interface PlanningSessionListItem {
-  id: string;
-  request: string;
-  status: PlanningSessionStatusView;
-  revision: number;
-  gateDecision: PlanningGateDecisionView;
-  latestPlanVersion: number;
-  approvedPlanVersion: number | null;
-  approvedPlanHash: string | null;
-  updatedAt: number;
-}
-
-export interface PlanningSessionView extends PlanningSessionListItem {
-  questionSetVersion: number;
-  activeQuestionSetVersion: number | null;
-  questionSet: PlanningQuestionSetView | null;
-  planVersions: PlanningPlanVersionView[];
-  agents: PlanningAgentView[];
-  dispatch: PlanningDispatchView;
-  createdAt: number;
-}
-
-export interface CreatePlanningSessionInput {
-  request: string;
-  signals: PlanningComplexitySignalsInput;
-  /** Required for legacy Local CLI planning when the approved plan will be dispatched. */
-  projectId?: string;
-}
-
-export interface AnswerPlanningQuestionsInput {
-  sessionId: string;
-  expectedRevision: number;
-  questionSetVersion: number;
-  answers: PlanningQuestionAnswerInput[];
-}
-
-export interface ProposePlanningPlanInput {
-  sessionId: string;
-  expectedRevision: number;
-}
-
-export interface DecidePlanningPlanInput {
-  sessionId: string;
-  expectedRevision: number;
-  version: number;
-  hash: string;
-}
-
-export type ApprovePlanningPlanInput = DecidePlanningPlanInput;
-export type RejectPlanningPlanInput = DecidePlanningPlanInput;
-export type DispatchPlanningPlanInput = DecidePlanningPlanInput;
-
-/**
- * Owner-side decisions for a Quest projected from a DSH/Cordis root session.
- *
- * The DSH source and project identity are deliberately part of every decision
- * payload. Main validates them against the durable governance binding before
- * calling the service; a planning-session id alone is not an authority token.
- */
-export interface DshQuestDecisionIdentityInput {
-  planningSessionId: string;
-  projectId: string;
-  dshSessionId: string;
-  principalId: string;
-  expectedRevision: number;
-}
-
-export interface AnswerDshQuestQuestionsInput extends DshQuestDecisionIdentityInput {
-  dshQuestionSetId: string;
-  dshVersion: number;
-  answers: PlanningQuestionAnswerInput[];
-}
-
-export interface DecideDshQuestPlanInput extends DshQuestDecisionIdentityInput {
-  dshPlanId: string;
-  dshVersion: number;
-  hash: string;
-}
-
-export type ApproveDshQuestPlanInput = DecideDshQuestPlanInput;
-export type RejectDshQuestPlanInput = DecideDshQuestPlanInput;
-export type DispatchDshQuestPlanInput = DecideDshQuestPlanInput;
-
-export interface DshQuestPlanningSessionView {
-  id: string;
-  organizationId: string;
-  principalId: string;
-  request: string;
-  signals?: PlanningComplexitySignalsInput;
-  status: PlanningSessionStatusView;
-  gateDecision: PlanningGateDecisionView;
-  questionSetVersion: number;
-  activeQuestionSetVersion: number | null;
-  latestPlanVersion: number;
-  approvedPlanVersion: number | null;
-  approvedPlanHash: string | null;
-  dispatchPlanVersion: number | null;
-  dispatchPlanHash: string | null;
-  dispatchStartedAt: number | null;
-  supersededBySessionId: string | null;
-  revision: number;
-  createdAt: number;
-  updatedAt: number;
-}
-
-/** Secret-free renderer projection returned by DSH Quest owner actions. */
-export interface DshQuestGovernanceView {
-  binding: {
-    planningSessionId: string;
-    projectId: string;
-    dshSessionId: string;
-    organizationId: string;
-    principalId: string;
-    createdAt: number;
-    updatedAt: number;
-  };
-  session: DshQuestPlanningSessionView;
-  activeQuestionSet: PlanningQuestionSetView | null;
-  planVersions: PlanningPlanVersionView[];
-  questionProjections: Array<{
-    dshQuestionSetId: string;
-    dshVersion: number;
-    localVersion: number;
-    payloadHash: string;
-    createdAt: number;
-  }>;
-  planProjections: Array<{
-    dshPlanId: string;
-    dshVersion: number;
-    localVersion: number;
-    planHash: string;
-    createdAt: number;
-  }>;
-  dispatchReceipts: PlanningDispatchReceiptView[];
-}
-
-export interface PlanningDispatchResult {
-  ok: boolean;
-  view: PlanningSessionView;
-  error: { code: string; message: string } | null;
-}
-
-/** Main-process decision made before a desktop chat request can create a Task. */
-export type ChatPlanningPreflightResult =
-  | { outcome: 'DIRECT_DISPATCH'; planningSession: null }
-  | { outcome: 'PLANNING_REQUIRED'; planningSession: PlanningSessionView };
-
 /** Provider wire protocol expected by a managed runtime. */
 export type ProviderProtocol = 'openai-chat' | 'openai-responses' | 'anthropic-messages';
 export type EngineProviderMode = 'native' | 'managed';
@@ -1442,9 +1072,12 @@ export interface ProjectInput {
   status?: Exclude<ProjectStatus, 'archived'>;
   color?: string;
   dueAt?: number | null;
+  /** New projects receive a Main-owned default directory or prompt through
+   * Electron's trusted directory picker before the project is persisted. */
+  workspaceMode?: 'automatic' | 'custom';
 }
 
-export type ProjectPatch = Partial<Omit<ProjectInput, 'status'>> & { status?: ProjectStatus };
+export type ProjectPatch = Partial<Omit<ProjectInput, 'status' | 'workspaceMode'>> & { status?: ProjectStatus };
 
 export type ProjectHealth = 'on_track' | 'attention' | 'at_risk' | 'completed' | 'inactive';
 export type ProjectRiskKind =
@@ -1528,6 +1161,8 @@ export interface Agent {
   engineId: string;
   workspace: string;
   permissionMode: PermissionMode;
+  /** long_term: session + accepted durable memory; short_term: current session only; none: stateless invocation. */
+  memoryMode: AgentMemoryMode;
   /** 能力开关（网络/命令/安装），未配置时默认全关 */
   capabilities: AgentCapabilities;
   /** 标签分组（如"前端组"/"运营组"） */
@@ -1786,6 +1421,8 @@ export interface Task {
   result: string | null;    // 执行产物全文（截断 16KB）
   /** 列表快照不携带结果正文时，用此标记保留“已有产物”语义。 */
   hasResult?: boolean;
+  /** 项目任务是否必须提交真实文件产物；纯对话/无文件任务明确为 false。 */
+  requiresArtifacts?: boolean;
   quality: TaskQuality;     // 人工质量标记（成果管理）
   sessionId: string | null; // 会话锚点（CLI resume / LLM 上下文重建，追问时继承）
   workspaceOverride: string | null; // 任务级工作空间覆盖（团队共享工作空间）
@@ -2023,8 +1660,8 @@ export interface TaskEvent {
   createdAt: number;
 }
 
-/** 执行器类型：真实 LLM API / 真实 CLI（含泛化 CLI）/ ACP / DSH。 */
-export type ExecutorKind = 'llm-api' | 'codex-cli' | 'claude-cli' | 'pi-cli' | 'generic-cli' | 'acp' | 'dsh' | 'unavailable';
+/** 执行器类型：真实 LLM API / 真实 CLI（含泛化 CLI）/ ACP。 */
+export type ExecutorKind = 'llm-api' | 'codex-cli' | 'claude-cli' | 'pi-cli' | 'generic-cli' | 'acp' | 'unavailable';
 
 /** 模型供应商配置（脱敏视图：密钥不离开主进程，15.1） */
 export interface ProviderConfig {
@@ -2104,17 +1741,20 @@ export interface RendererSettingMap {
 
 export type RendererSettingKey = keyof RendererSettingMap;
 
+export interface DebugLogStatus {
+  enabled: boolean;
+  logDirectory: string;
+  currentFile: string | null;
+  lastError: string | null;
+  maxFileBytes: number;
+  retainedFiles: number;
+}
+
 export interface ApiBridgeStatus {
   running: boolean;
   port: number;
   keyConfigured: boolean;
   enabled: boolean;
-}
-
-export interface WebAdminStatus {
-  port: number;
-  tokenConfigured: boolean;
-  weakToken: boolean;
 }
 
 export interface AgentRun {
@@ -2139,6 +1779,7 @@ export interface Channel {
   accountName: string;
   status: ChannelStatus;
   boundAgentIds: string[];
+  boundProjectIds: string[];
   lastConnectedAt: number | null;
   limitation: string;       // 已知限制/风险（10.2，例如微信普通群不可用）
 }
@@ -2197,8 +1838,8 @@ export interface AuditLog {
 
 // ---------- 全双工语音任务下达 ----------
 
-/** 语音识别提供方：cloud = 阿里云 NLS 实时识别；local = 本地离线模型；auto = 云端优先、未配置回退本地 */
-export type VoiceProvider = 'auto' | 'cloud' | 'local';
+/** Only the implemented Aliyun NLS path is exposed. */
+export type VoiceProvider = 'cloud';
 
 /** 语音会话状态机（与四层状态模型独立，仅描述一次语音输入的生命周期）
  *  IDLE → LISTENING（拾音中，边说边出字）→ CONFIRMING（等待用户确认）→ DISPATCHED
@@ -2214,8 +1855,6 @@ export interface VoiceConfig {
   /** AccessKeyId / AccessKeySecret 是否已配置（走 safeStorage，不回传明文） */
   hasAccessKeyId: boolean;
   hasAccessKeySecret: boolean;
-  /** 本地模型是否就绪（模型文件存在） */
-  localModelReady: boolean;
   /** 静音多久判定一句话结束（毫秒） */
   silenceMs: number;
 }
@@ -2252,7 +1891,7 @@ export interface VoiceCommandDraft {
 
 export interface VoiceTestResult {
   ok: boolean;
-  provider: 'cloud' | 'local' | null;
+  provider: 'cloud' | null;
   latencyMs: number;
   error: string | null;
 }
@@ -2359,6 +1998,7 @@ export interface CreateAgentInput {
   engineId: string;
   workspace: string;
   permissionMode: PermissionMode;
+  memoryMode?: AgentMemoryMode;
   concurrencyLimit: number;
   channelIds: string[];
   kind?: AgentKind;
@@ -2382,6 +2022,7 @@ export interface AgentPersonaPatch {
   agentsMd?: string;
   userMd?: string;
   permissionMode?: PermissionMode;
+  memoryMode?: AgentMemoryMode;
   /** 能力开关（网络/命令/安装） */
   capabilities?: Partial<AgentCapabilities>;
   /** 标签分组 */
@@ -2447,16 +2088,6 @@ export interface ConversationTimelineView {
   messages: ConversationMessageView[];
   nextCursor: ConversationTimelineCursor | null;
   hasMore: boolean;
-}
-
-/** Renderer-safe context for the unified Nexus Chat and an optional managed DSH session. */
-export interface AgentChatContextView {
-  agentId: string;
-  conversationId: string | null;
-  dsh: boolean;
-  dshSessionId: string | null;
-  dshControl: DshControlStatusView | null;
-  runtime: DshWorkbenchStatus | null;
 }
 
 // ---------- Canonical long-term memory ----------

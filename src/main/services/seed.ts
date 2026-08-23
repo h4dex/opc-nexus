@@ -3,6 +3,8 @@
  * 生产启动不创建虚构项目、员工、任务或审批。
  */
 import { randomUUID } from 'node:crypto';
+import { existsSync, rmSync } from 'node:fs';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { Database } from './database.js';
 
 // ==================== 常用 MCP 服务器预置 ====================
@@ -157,17 +159,27 @@ const SEED_SKILLS: SeedSkill[] = [
   }
 ];
 
-/** 预置 MCP 服务器（表为空时写入） */
+/**
+ * Compatibility cleanup for MCP placeholders created by older releases.
+ * New installs intentionally start with an empty MCP list: a server becomes
+ * selectable only after the owner explicitly supplies a real configuration.
+ */
 export function seedMcpServers(db: Database) {
-  const count = (db.raw.prepare('SELECT COUNT(*) c FROM mcp_servers').get() as { c: number }).c;
-  if (count > 0) return;
-
   db.transaction(() => {
-    const insert = db.raw.prepare(
-      'INSERT INTO mcp_servers(id, name, command, args, env, enabled, scope, capability) VALUES(?,?,?,?,?,1,?,?)'
+    const remove = db.raw.prepare(
+      'DELETE FROM mcp_servers WHERE name = ? AND command = ? AND args = ? AND env = ? AND scope = ? AND COALESCE(capability, ?) = ?'
     );
-    for (const s of SEED_MCP_SERVERS) {
-      insert.run(`mcp-${randomUUID().slice(0, 8)}`, s.name, s.command, JSON.stringify(s.args), JSON.stringify(s.env), s.scope, s.capability ?? '');
+    for (const server of SEED_MCP_SERVERS) {
+      const capability = server.capability ?? '';
+      remove.run(
+        server.name,
+        server.command,
+        JSON.stringify(server.args),
+        JSON.stringify(server.env),
+        server.scope,
+        '',
+        capability
+      );
     }
   });
 }
@@ -223,9 +235,80 @@ export function purgeDemoData(db: Database): { agents: number; tasks: number; pr
     db.raw.prepare('DELETE FROM agents WHERE is_demo = 1').run();
     db.raw.prepare('DELETE FROM projects WHERE is_demo = 1').run();
   });
-  db.audit({
-    id: randomUUID(), actor: 'admin', action: 'seed.purgeDemo',
-    target: `${before.agents} agents / ${before.tasks} tasks / ${before.projects} projects`, result: 'ok'
-  });
+  if (before.agents + before.tasks + before.projects > 0) {
+    db.audit({
+      id: randomUUID(), actor: 'system', action: 'demoData.removeLegacy',
+      target: `${before.agents} agents / ${before.tasks} tasks / ${before.projects} projects`, result: 'ok'
+    });
+  }
   return before;
+}
+
+/**
+ * Remove settings owned by retired product surfaces from upgraded installs.
+ *
+ * Legacy LAN command-center and unused Web-admin settings are removed,
+ * including their credentials. Private runtime tables are removed by the
+ * schema migration. Hermes owns the only mobile conversation route and stores
+ * its config and TLS identity under `hermes:*`.
+ */
+export function purgeRetiredProductState(db: Database): boolean {
+  const exactKeys = [
+    'dsh:lan:gateway',
+    'dsh:lan:tls:certificate',
+    'secret:dsh:lan:tls:privateKey',
+    'legacyWebAdminEnabled',
+    'webToken',
+    'webPort',
+    'webHost',
+    'webExposeLan',
+    'secret:webserver:token'
+  ] as const;
+  const removed = db.transaction(() => {
+    const result = db.raw
+      .prepare(`DELETE FROM settings
+        WHERE key LIKE 'dsh:lan:%'
+           OR key LIKE 'secret:dsh:lan:%'
+           OR key IN (${exactKeys.map(() => '?').join(',')})`)
+      .run(...exactKeys);
+    return Number(result.changes ?? 0);
+  });
+  if (removed < 1) return false;
+  db.audit({
+    id: randomUUID(),
+    actor: 'system',
+    action: 'legacy.productState.remove',
+    target: [...exactKeys, 'dsh:lan:*'].join(','),
+    result: `retired:${removed}`,
+    source: 'migration'
+  });
+  return true;
+}
+
+export interface RetiredRuntimeDirectoryCleanup {
+  removed: string[];
+  failed: Array<{ name: string; error: string }>;
+}
+
+/** Remove only the two app-owned runtime homes used by retired DSH products. */
+export function purgeRetiredRuntimeDirectories(dataRoot: string): RetiredRuntimeDirectoryCleanup {
+  const root = resolve(dataRoot);
+  const result: RetiredRuntimeDirectoryCleanup = { removed: [], failed: [] };
+  for (const name of ['deepseek-harness', 'deepseek-harness-managed'] as const) {
+    const target = resolve(root, name);
+    const childPath = relative(root, target);
+    if (!childPath || childPath.startsWith('..') || isAbsolute(childPath)) {
+      result.failed.push({ name, error: 'retired runtime path escaped the application data root' });
+      continue;
+    }
+    if (!existsSync(target)) continue;
+    try {
+      rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
+      if (existsSync(target)) throw new Error('directory still exists after removal');
+      result.removed.push(name);
+    } catch (error) {
+      result.failed.push({ name, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return result;
 }

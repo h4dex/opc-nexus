@@ -6,9 +6,9 @@ afterEach(() => {
 });
 
 describe('renderer store initialization', () => {
-  it('opens the regular management console by default', async () => {
+  it('opens the project center by default', async () => {
     const { useApp } = await import('../src/renderer/src/store.js');
-    expect(useApp.getState().route).toBe('dashboard');
+    expect(useApp.getState().route).toBe('projects');
   });
 
   it('carries the selected project into Quest navigation', async () => {
@@ -18,18 +18,6 @@ describe('renderer store initialization', () => {
     expect(useApp.getState()).toMatchObject({
       route: 'quest', questProjectId: 'project-1', navigationTarget: null
     });
-  });
-
-  it('carries a one-shot secretary session target across route navigation', async () => {
-    const { useApp } = await import('../src/renderer/src/store.js');
-
-    useApp.getState().openSecretarySession('planning-session-1');
-    expect(useApp.getState()).toMatchObject({
-      route: 'secretary', secretarySessionId: 'planning-session-1', navigationTarget: null
-    });
-
-    useApp.getState().clearSecretarySession();
-    expect(useApp.getState().secretarySessionId).toBeNull();
   });
 
   it('coalesces concurrent initialization and owns one listener pair', async () => {

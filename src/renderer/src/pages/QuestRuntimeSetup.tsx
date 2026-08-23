@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { EngineStatus, EnvironmentDiagnosticsView } from '@shared/types';
+import type { EnvironmentDiagnosticsView } from '@shared/types';
 import { IconAlert, IconCheck, IconRefresh } from '../components/icons';
 import { toast } from '../components/Toast';
 
@@ -13,14 +13,13 @@ interface ProviderItem {
 }
 
 export interface QuestRuntimeSetupProps {
-  agentId: string;
-  engineStatus: EngineStatus | null;
+  workerCount: number;
   onRetry: () => void;
 }
 
 const NEW_PROVIDER = '__new__';
 
-export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRuntimeSetupProps) {
+export function QuestRuntimeSetup({ workerCount, onRetry }: QuestRuntimeSetupProps) {
   const [providers, setProviders] = useState<ProviderItem[]>([]);
   const [selectedId, setSelectedId] = useState(NEW_PROVIDER);
   const [name, setName] = useState('DeepSeek');
@@ -33,6 +32,8 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [testPassed, setTestPassed] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
   const selectedIdRef = useRef(NEW_PROVIDER);
   const selectionInitializedRef = useRef(false);
 
@@ -46,6 +47,7 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
     setBaseUrl(provider?.baseUrl ?? 'https://api.deepseek.com/v1');
     setModel(provider?.model ?? 'deepseek-chat');
     setApiKey('');
+    setModels([]);
     setTestResult(null);
     setTestPassed(false);
   }, []);
@@ -154,6 +156,29 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
     }
   };
 
+  const fetchModels = async () => {
+    if (!selected) return;
+    setFetchingModels(true);
+    setError(null);
+    try {
+      const result = await window.aibox.fetchProviderModels(selected.id);
+      if (!result.ok) {
+        setError(`模型列表读取失败：${result.error ?? '上游未返回可用模型'}`);
+        return;
+      }
+      if (result.models.length === 0) {
+        setError('模型列表读取成功，但上游返回了空列表');
+        return;
+      }
+      setModels(result.models);
+      toast.ok(`已读取 ${result.models.length} 个上游模型`);
+    } catch (fetchError) {
+      setError(fetchError instanceof Error ? fetchError.message : '模型列表读取失败');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
   const repair = async () => {
     setBusy(true);
     setError(null);
@@ -173,7 +198,7 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
   return (
     <aside className="quest-runtime-setup" aria-label="Quest 连接设置">
       <div className="quest-runtime-setup-head">
-        <div><strong>连接设置</strong><span>DSH / Cordis 与模型 Provider</span></div>
+        <div><strong>连接设置</strong><span>Hermes 与模型 Provider</span></div>
         <button type="button" disabled={busy} onClick={() => void repair()} title="重新检测并连接" aria-label="重新检测并连接">
           <IconRefresh size={14} />
         </button>
@@ -181,8 +206,8 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
       <div className="quest-runtime-setup-scroll" aria-busy={loading || busy}>
         <section className="quest-runtime-status">
           <span data-ready={diagnostics?.ready === true}><i />环境 {diagnostics?.ready ? '就绪' : '需检查'}</span>
-          <span data-ready={engineStatus === 'HEALTHY'}><i />Cordis {engineStatus ?? 'UNKNOWN'}</span>
-          <span data-ready={Boolean(agentId)}><i />主员工 {agentId ? '已绑定' : '待创建'}</span>
+          <span data-ready><i />Hermes 调度 已启用</span>
+          <span data-ready={workerCount > 0}><i />执行员工 {workerCount} 名</span>
         </section>
 
         {error && <div className="quest-runtime-error"><IconAlert size={13} />{error}</div>}
@@ -206,7 +231,8 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
           </label>
           <label><span>名称</span><input value={name} maxLength={80} onChange={(event) => setName(event.target.value)} /></label>
           <label><span>Base URL</span><input value={baseUrl} maxLength={500} onChange={(event) => setBaseUrl(event.target.value)} /></label>
-          <label><span>模型</span><input value={model} maxLength={160} onChange={(event) => setModel(event.target.value)} /></label>
+          <label><span>模型</span><input value={model} list="quest-provider-models" maxLength={160} onChange={(event) => setModel(event.target.value)} /></label>
+          <datalist id="quest-provider-models">{models.map((item) => <option key={item} value={item} />)}</datalist>
           <label>
             <span>API Key{selected?.hasKey ? ' · 已安全保存' : ''}</span>
             <input
@@ -220,6 +246,7 @@ export function QuestRuntimeSetup({ agentId, engineStatus, onRetry }: QuestRunti
           </label>
           {testResult && <p className="quest-runtime-test" data-ready={testPassed}><IconCheck size={12} />{testResult}</p>}
           <div className="quest-runtime-actions">
+            <button className="btn small" type="button" disabled={busy || fetchingModels || !selected} onClick={() => void fetchModels()}>{fetchingModels ? '读取中…' : '读取模型'}</button>
             <button className="btn small" type="button" disabled={busy || !selected} onClick={() => void test()}>测试</button>
             <button className="btn small primary" type="button" disabled={busy || loading} onClick={() => void save()}>{busy ? '处理中…' : '保存并连接'}</button>
           </div>

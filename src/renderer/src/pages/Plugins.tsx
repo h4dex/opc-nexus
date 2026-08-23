@@ -4,11 +4,13 @@ import { useEffect, useMemo, useState } from 'react';
 import type { EnvironmentDiagnosticsView, PluginCatalogItemView, PluginCatalogSource, PluginCatalogView, PluginLifecycleStatus } from '../../../shared/types';
 import { IconCheck, IconPlug, IconRefresh, IconShield, IconX } from '../components/icons';
 
-const SOURCES: Array<PluginCatalogSource | 'all'> = ['all', 'host', 'dsh', 'mcp', 'skill', 'cli', 'acp', 'a2a'];
+// Execution-runtime packages are not user-installable plugins and stay out of
+// this catalog. Only capabilities admitted by the unified host are visible.
+const SOURCES: Array<PluginCatalogSource | 'all'> = ['all', 'host', 'mcp', 'skill', 'cli', 'acp', 'a2a'];
 const LIFECYCLES: Array<PluginLifecycleStatus | 'all'> = ['all', 'missing', 'installed', 'disabled', 'review', 'live', 'restart', 'broken'];
 
-const sourceLabel: Record<PluginCatalogSource | 'all', string> = {
-  all: '全部', host: '宿主插件', dsh: 'DSH/Cordis', mcp: 'MCP', skill: '技能', cli: 'CLI Worker', acp: 'ACP', a2a: 'A2A'
+const sourceLabel: Partial<Record<PluginCatalogSource | 'all', string>> = {
+  all: '全部', host: '宿主插件', mcp: 'MCP', skill: '技能', cli: 'CLI Worker', acp: 'ACP', a2a: 'A2A'
 };
 const lifecycleLabel: Record<PluginLifecycleStatus | 'all', string> = {
   all: '全部状态', missing: '未安装', installed: '已安装', disabled: '已停用', review: '待审核', live: '运行中', restart: '待重启', broken: '故障'
@@ -38,9 +40,10 @@ export function Plugins() {
 
   useEffect(() => { void load(); }, []);
 
-  const filtered = useMemo(() => (catalog?.items ?? []).filter((item) =>
+  const visibleItems = useMemo(() => catalog?.items ?? [], [catalog]);
+  const filtered = useMemo(() => visibleItems.filter((item) =>
     (source === 'all' || item.source === source) && (lifecycle === 'all' || item.lifecycle === lifecycle)
-  ), [catalog, source, lifecycle]);
+  ), [visibleItems, source, lifecycle]);
 
   const toggle = async (item: PluginCatalogItemView) => {
     if (!['host', 'mcp', 'skill'].includes(item.source) || item.lifecycle === 'broken' || item.lifecycle === 'missing') return;
@@ -59,7 +62,7 @@ export function Plugins() {
     <>
       <div className="page-head">
         <h2>插件中心</h2>
-        <span className="desc">DSH/Cordis、治理插件、MCP、技能与 Worker Adapter 统一目录</span>
+        <span className="desc">宿主治理、MCP、技能与 Worker Adapter 统一目录</span>
         <div className="right">
           <button className="btn small" onClick={() => void load()} disabled={busy !== null} title="刷新插件目录"><IconRefresh size={13} />刷新</button>
         </div>
@@ -73,7 +76,7 @@ export function Plugins() {
           <select value={lifecycle} onChange={(event) => setLifecycle(event.target.value as PluginLifecycleStatus | 'all')} style={{ padding: '6px 9px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)' }}>
             {LIFECYCLES.map((item) => <option key={item} value={item}>{lifecycleLabel[item]}</option>)}
           </select>
-          <span style={{ marginLeft: 'auto', color: 'var(--text-3)', fontSize: 12 }}>{filtered.length} / {catalog?.items.length ?? 0}</span>
+          <span style={{ marginLeft: 'auto', color: 'var(--text-3)', fontSize: 12 }}>{filtered.length} / {visibleItems.length}</span>
         </div>
       </div>
 
@@ -107,7 +110,7 @@ function PluginCard({ item, busy, onToggle }: { item: PluginCatalogItemView; bus
         {item.safety !== 'trusted' && <span style={{ padding: '2px 6px', borderRadius: 4, background: 'var(--warning-soft, rgba(234,179,8,.12))', color: 'var(--warning)', fontSize: 10.5 }}><IconShield size={10} /> {item.safety === 'blocked' ? '阻止' : '需审核'}</span>}
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-        <span style={{ color: 'var(--text-3)', fontSize: 11 }}>{item.owner}</span>
+        <span style={{ color: 'var(--text-3)', fontSize: 11 }}>{item.owner === 'nexus-governance' ? '内置治理能力' : '用户配置'}</span>
         {canToggle && <button className={`btn small ${item.enabled ? '' : 'primary'}`} disabled={busy} onClick={onToggle}>{busy ? '处理中...' : item.enabled ? <><IconX size={12} />停用</> : <><IconCheck size={12} />启用</>}</button>}
       </div>
     </div>

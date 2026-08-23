@@ -5,9 +5,7 @@ import { Modal, ProgressBar } from '../components/common';
 import { IconAlert, IconCheck, IconClock, IconFolder, IconLayers, IconPlay, IconPlus, IconTask, IconUser } from '../components/icons';
 import { toast } from '../components/Toast';
 import { TrailingRefreshController } from '../utils/trailingRefresh';
-import type {
-  Project, ProjectHealth, ProjectInput, ProjectOperationsOverview, ProjectStatus
-} from '@shared/types';
+import type { Project, ProjectHealth, ProjectInput, ProjectOperationsOverview, ProjectStatus } from '@shared/types';
 
 type ProjectFilter = 'open' | 'completed' | 'archived' | 'all';
 type ProjectView = 'operations' | 'list';
@@ -28,7 +26,7 @@ const FILTERS: { key: ProjectFilter; label: string }[] = [
 ];
 
 export function Projects() {
-  const { snapshot, navigationTarget, clearNavigationTarget } = useApp();
+  const { snapshot, navigationTarget, clearNavigationTarget, openQuest } = useApp();
   const [view, setView] = useState<ProjectView>('operations');
   const [filter, setFilter] = useState<ProjectFilter>('open');
   const [operations, setOperations] = useState<ProjectOperationsOverview | null>(null);
@@ -42,13 +40,9 @@ export function Projects() {
 
   const projects = snapshot?.projects ?? [];
   const tasks = snapshot?.tasks ?? [];
-  const openProjectQuest = useCallback(async (project: Project) => {
-    try {
-      await window.aibox.openQuestWindow({ projectId: project.id });
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : 'Quest 独立窗口打开失败');
-    }
-  }, []);
+  const openProjectWorkbench = useCallback((project: Project) => {
+    openQuest(project.id);
+  }, [openQuest]);
   const loadOperations = useCallback((immediate = false) => refresh.request({
     run: () => window.aibox.getProjectOperations(),
     accept: setOperations,
@@ -69,8 +63,8 @@ export function Projects() {
     const project = snapshot.projects.find((item) => item.id === navigationTarget.entityId);
     if (!project) return;
     clearNavigationTarget();
-    void openProjectQuest(project);
-  }, [clearNavigationTarget, navigationTarget, openProjectQuest, snapshot]);
+    void openProjectWorkbench(project);
+  }, [clearNavigationTarget, navigationTarget, openProjectWorkbench, snapshot]);
   const operationByProject = useMemo(
     () => new Map(operations?.projects.map((item) => [item.project.id, item]) ?? []),
     [operations]
@@ -118,7 +112,7 @@ export function Projects() {
         </div>
       </div>
 
-      {view === 'operations' && <ProjectOperationsDashboard value={operations} onOpen={(project) => void openProjectQuest(project)} onCreate={() => setEditing('new')} />}
+      {view === 'operations' && <ProjectOperationsDashboard value={operations} onOpen={(project) => void openProjectWorkbench(project)} onCreate={() => setEditing('new')} />}
 
       {view === 'list' && <><div className="project-filterbar" aria-label="项目状态筛选">
         {FILTERS.map((item) => (
@@ -175,8 +169,8 @@ export function Projects() {
                     className="btn small"
                     type="button"
                     disabled={project.status === 'archived'}
-                    onClick={() => void openProjectQuest(project)}
-                    title={project.status === 'archived' ? '归档项目不可运行 Quest' : '打开 Quest'}
+                    onClick={() => openProjectWorkbench(project)}
+                    title={project.status === 'archived' ? '归档项目不可打开 Quest' : '打开项目 Quest'}
                   >打开 Quest</button>
                   <button className="btn small primary" type="button" disabled={['completed', 'archived'].includes(project.status)} onClick={() => setDispatching(project)}><IconPlay size={12} />派发任务</button>
                   {project.status === 'archived' ? (
@@ -346,13 +340,15 @@ function ProjectEditor({ project, onClose }: { project: Project | null; onClose:
   const [status, setStatus] = useState<Exclude<ProjectStatus, 'archived'>>(project?.status === 'archived' ? 'active' : project?.status ?? 'active');
   const [color, setColor] = useState(project?.color ?? PROJECT_COLORS[0]);
   const [dueDate, setDueDate] = useState(project?.dueAt ? localDateValue(project.dueAt) : '');
+  const [workspaceMode, setWorkspaceMode] = useState<'automatic' | 'custom'>('automatic');
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
     if (name.trim().length < 2) return toast.err('项目名称至少需要 2 个字符');
     const input: ProjectInput = {
       name: name.trim(), objective: objective.trim(), description: description.trim(), clientName: clientName.trim(),
-      status, color, dueAt: dueDate ? new Date(`${dueDate}T23:59:59`).getTime() : null
+      status, color, dueAt: dueDate ? new Date(`${dueDate}T23:59:59`).getTime() : null,
+      ...(!project ? { workspaceMode } : {})
     };
     setSaving(true);
     try {
@@ -381,6 +377,10 @@ function ProjectEditor({ project, onClose }: { project: Project | null; onClose:
         <div className="field project-form-wide"><label>项目说明</label><textarea rows={3} value={description} maxLength={2000} onChange={(e) => setDescription(e.target.value)} placeholder="背景、范围、约束与关键资料" /></div>
         <div className="field"><label>状态</label><select value={status} onChange={(e) => setStatus(e.target.value as Exclude<ProjectStatus, 'archived'>)}><option value="planning">规划中</option><option value="active">进行中</option><option value="paused">已暂停</option><option value="completed">已完成</option></select></div>
         <div className="field"><label>截止时间</label><input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} /></div>
+        {!project && <div className="field project-form-wide"><label>交付目录</label><div className="project-workspace-mode" role="group" aria-label="项目交付目录模式">
+          <button type="button" className={workspaceMode === 'automatic' ? 'active' : ''} onClick={() => setWorkspaceMode('automatic')}><IconFolder size={13} />系统自动分配</button>
+          <button type="button" className={workspaceMode === 'custom' ? 'active' : ''} onClick={() => setWorkspaceMode('custom')}><IconFolder size={13} />创建时选择目录</button>
+        </div></div>}
         <div className="field project-form-wide"><label>识别颜色</label><div className="project-swatches">{PROJECT_COLORS.map((item) => <button key={item} type="button" className={color === item ? 'active' : ''} style={{ background: item }} aria-label={`选择颜色 ${item}`} title={item} onClick={() => setColor(item)} />)}</div></div>
       </div>
     </Modal>

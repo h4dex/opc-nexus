@@ -163,7 +163,7 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     )).toBe('unavailable');
 
     expect(fallback).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith('t-mobile-no-hermes', expect.stringContaining('不会降级到 DeepSeek Harness'));
+    expect(onError).toHaveBeenCalledWith('t-mobile-no-hermes', expect.stringContaining('不会降级到其他执行引擎'));
   });
 
   it('Pi Agent uses its dedicated JSONL executor when healthy', () => {
@@ -364,5 +364,51 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.activeTaskIdsForAgent('a1')).toEqual([]);
     expect(onReleased).toHaveBeenCalledOnce();
     expect(onReleased).toHaveBeenCalledWith('t-acp-release');
+  });
+
+  it('drops terminal callbacks from an aborted execution after the same task is redispatched', () => {
+    userCfg.engine.executionMode = 'production';
+    userCfg.engine.fallbackEngineId = null;
+    const db = makeDb({
+      'eng-nexus': { type: 'nexus', status: 'HEALTHY' }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    vi.spyOn(reg['llm'], 'isReady').mockReturnValue(true);
+    const innerCallbacks: Array<Record<string, (...args: unknown[]) => void>> = [];
+    vi.spyOn(reg['llm'], 'start').mockImplementation((_task, _agent, callbacks) => {
+      innerCallbacks.push(callbacks as unknown as Record<string, (...args: unknown[]) => void>);
+    });
+    vi.spyOn(reg['llm'], 'abort').mockImplementation(() => undefined);
+
+    const firstDone = vi.fn();
+    const firstError = vi.fn();
+    const secondDone = vi.fn();
+    const secondError = vi.fn();
+    const task = { id: 't-resumed', agentId: 'a1', title: '暂停后恢复' } as never;
+    const agent = { id: 'a1', engineId: 'eng-nexus' } as never;
+
+    expect(reg.dispatch(task, agent, {
+      onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(),
+      onDone: firstDone, onError: firstError
+    } as never)).toBe('llm-api');
+    reg.abort('t-resumed');
+    expect(reg.isExecuting('t-resumed')).toBe(false);
+
+    expect(reg.dispatch(task, agent, {
+      onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(),
+      onDone: secondDone, onError: secondError
+    } as never)).toBe('llm-api');
+    expect(reg.isExecuting('t-resumed')).toBe(true);
+
+    innerCallbacks[0].onError('t-resumed', 'old execution aborted late');
+    innerCallbacks[0].onDone('t-resumed', 'old execution completed late');
+    expect(firstError).not.toHaveBeenCalled();
+    expect(firstDone).not.toHaveBeenCalled();
+    expect(reg.isExecuting('t-resumed')).toBe(true);
+
+    innerCallbacks[1].onDone('t-resumed', 'new execution completed');
+    expect(secondDone).toHaveBeenCalledWith('t-resumed', 'new execution completed');
+    expect(secondError).not.toHaveBeenCalled();
+    expect(reg.isExecuting('t-resumed')).toBe(false);
   });
 });

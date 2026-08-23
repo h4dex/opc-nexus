@@ -183,7 +183,7 @@ export function ProjectArtifactsPanel({ projectId, projectName, onChooseWorkspac
         <div className="quest-artifacts-unconfigured">
           <IconFolder size={22} />
           <strong>尚未选择项目目录</strong>
-          <span>选择后，Cordis 和所有数字员工只在该目录内执行并交付产物。</span>
+          <span>选择后，Hermes 调度的所有数字员工只在该目录内执行并交付产物。</span>
           <button className="btn small primary" type="button" onClick={() => void chooseWorkspace()}>选择项目目录</button>
         </div>
       ) : (

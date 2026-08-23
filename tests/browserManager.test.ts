@@ -52,7 +52,7 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
-const { BrowserManager } = await import('../src/main/services/browserManager.js');
+const { BrowserManager, resolveBrowserExecutable } = await import('../src/main/services/browserManager.js');
 
 const managers: InstanceType<typeof BrowserManager>[] = [];
 
@@ -87,6 +87,17 @@ afterEach(async () => {
 });
 
 describe('BrowserManager shared Chromium lifecycle', () => {
+  it('finds an installed system browser without requiring a Playwright download', () => {
+    const edge = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+    const chrome = 'C:\\Users\\owner\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe';
+    expect(resolveBrowserExecutable('win32', {
+      'PROGRAMFILES(X86)': 'C:\\Program Files (x86)',
+      LOCALAPPDATA: 'C:\\Users\\owner\\AppData\\Local'
+    }, (path) => path === edge || path === chrome)).toBe(edge);
+    expect(resolveBrowserExecutable('linux', {}, (path) => path === '/usr/bin/chromium')).toBe('/usr/bin/chromium');
+    expect(resolveBrowserExecutable('linux', {}, () => false)).toBeNull();
+  });
+
   it('shares one local Chromium while keeping one context per agent', async () => {
     const manager = createManager();
 

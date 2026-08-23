@@ -9,7 +9,7 @@
  * - 频率约束（官方）：单会话 30 条/分钟；本端仅回执 + 终态两条，天然满足
  */
 import { randomUUID, createDecipheriv } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { app, safeStorage } from 'electron';
@@ -17,6 +17,7 @@ import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
 import { dispatchChannelTask, createWs, type ChannelTaskPlanner, type WsLike } from './common.js';
+import { readTaskArtifactManifest, resolveManifestPath } from '../projectArtifactManifest.js';
 
 export const WECOM_BOTID_SETTING = 'channel:wecom:botId';
 export const WECOM_SECRET_REF = 'secret:channel:wecom';
@@ -26,6 +27,8 @@ const CHANNEL_ID = 'ch-wecom';
 const PING_MS = 30_000;
 const SUBSCRIBE_TIMEOUT_MS = 10_000;
 const MAX_REPLY_CHARS = 2000;
+/** B.6 — 单条终态消息最多附带的产物数，避免刷屏 */
+const MAX_CHANNEL_ATTACHMENTS = 5;
 
 /** 长连接帧（下行回调 / 上行命令响应共用外层结构） */
 interface WecomFrame {
@@ -498,69 +501,41 @@ export class WecomChannel {
   }
 
   /**
-   * B.6: 发送终态结果，附加 manifest 中的真实项目产物。
-   * 不再使用正则猜测路径，改为从验证过的 artifact_manifest 中提取文件。
+   * B.6 — 只附带 manifest 已验证过的产物：路径来自 manifest，边界由
+   * `resolveManifestPath` 收口，磁盘不存在的条目直接跳过。限制前 5 个避免刷屏。
    */
+  private manifestAttachments(taskId: string): Array<{ absolutePath: string; relativePath: string }> {
+    const manifest = readTaskArtifactManifest(this.db, taskId);
+    if (!manifest) return [];
+    const project = this.db.raw
+      .prepare('SELECT workspace FROM projects WHERE id = ? LIMIT 1')
+      .get(manifest.projectId) as { workspace?: unknown } | undefined;
+    const root = typeof project?.workspace === 'string' ? project.workspace : '';
+    if (!root) return [];
+
+    const files: Array<{ absolutePath: string; relativePath: string }> = [];
+    for (const entry of manifest.entries) {
+      if (files.length >= MAX_CHANNEL_ATTACHMENTS) break;
+      if (!entry.previewable) continue;
+      const absolutePath = resolveManifestPath(root, entry.relativePath);
+      if (!absolutePath || !existsSync(absolutePath)) continue;
+      files.push({ absolutePath, relativePath: entry.relativePath });
+    }
+    return files;
+  }
+
+  /** B.6: 发送终态结果，附加 manifest 中的真实项目产物。 */
   private sendFinalResult(chatId: string, chatType: number, message: string, taskId?: string) {
     const imgExts = /\.(png|jpe?g|gif|webp|bmp)$/i;
 
-    // 从 manifest 提取已验证的项目产物文件
-    let artifactFiles: Array<{ absolutePath: string; relativePath: string; mediaType: string }> = [];
-    if (taskId) {
-      const manifestEvent = this.db.raw.prepare(
-        "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_manifest' ORDER BY created_at DESC, rowid DESC LIMIT 1"
-      ).get(taskId) as { payload: string } | undefined;
+    const artifactFiles = taskId ? this.manifestAttachments(taskId) : [];
 
-      if (manifestEvent) {
-        try {
-          const parsed = JSON.parse(manifestEvent.payload) as {
-            manifest?: {
-              projectId?: string;
-              entries?: Array<{ relativePath: string; mediaType: string; previewable?: boolean }>
-            }
-          };
-          const projectId = parsed.manifest?.projectId;
-          const entries = Array.isArray(parsed.manifest?.entries) ? parsed.manifest.entries : [];
-
-          if (projectId) {
-            const project = this.db.raw.prepare('SELECT workspace FROM projects WHERE id = ? LIMIT 1').get(projectId) as { workspace: string } | undefined;
-            if (project?.workspace) {
-              const { join, resolve } = require('node:path') as typeof import('node:path');
-              const { existsSync } = require('node:fs') as typeof import('node:fs');
-
-              // 只附加可预览的文件（图片/PDF等），限制前 5 个避免刷屏
-              for (const entry of entries.slice(0, 5)) {
-                if (!entry.previewable) continue;
-                const absolutePath = resolve(join(project.workspace, entry.relativePath));
-                if (existsSync(absolutePath)) {
-                  artifactFiles.push({
-                    absolutePath,
-                    relativePath: entry.relativePath,
-                    mediaType: entry.mediaType
-                  });
-                }
-              }
-            }
-          }
-        } catch {
-          // manifest 解析失败，回退到纯文本
-        }
-      }
-    }
-
-    let textPart = message;
-    const mediaSends: Promise<boolean>[] = [];
-
-    for (const file of artifactFiles) {
-      if (imgExts.test(file.relativePath)) {
-        mediaSends.push(this.sendImage(chatId, chatType, file.absolutePath));
-      } else {
-        mediaSends.push(this.sendFile(chatId, chatType, file.absolutePath, file.relativePath));
-      }
-    }
+    const mediaSends = artifactFiles.map((file) => imgExts.test(file.relativePath)
+      ? this.sendImage(chatId, chatType, file.absolutePath)
+      : this.sendFile(chatId, chatType, file.absolutePath, file.relativePath));
 
     // 文本走 markdown（不等待媒体上传完成，文本先发）
-    if (textPart) this.sendMarkdown(chatId, chatType, textPart);
+    if (message) this.sendMarkdown(chatId, chatType, message);
     // 媒体异步发送，失败静默
     void Promise.allSettled(mediaSends);
   }

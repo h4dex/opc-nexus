@@ -245,13 +245,13 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result : result ? [result] : [];
   }
 
-  if (/SELECT content FROM messages\s+WHERE conversation_id = \? AND direction = 'outbound' AND external_message_key = \?/.test(sql)) {
+  if (/SELECT content(?:, metadata_json)? FROM messages\s+WHERE conversation_id = \? AND direction = 'outbound' AND external_message_key = \?/.test(sql)) {
     const row = [...tables.messages.values()].find((item) =>
       item.conversation_id === args[0]
       && item.direction === 'outbound'
       && item.external_message_key === args[1]
     );
-    const result = row ? { content: row.content } : undefined;
+    const result = row ? { content: row.content, metadata_json: row.metadata_json } : undefined;
     return mode === 'get' ? result : result ? [result] : [];
   }
 
@@ -1001,7 +1001,7 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     const [
       id, agentId, projectId, conversationId, inputMessageId, title, content,
       source, sourceKey, parentId, status, priority, stage, error, sessionId,
-       workspaceOverride, engineOverride, now, startedAt, endedAt
+       workspaceOverride, engineOverride, requiresArtifacts, now, startedAt, endedAt
     ] = args;
     if (sourceKey != null && [...tables.tasks.values()].some(row => row.source === source && row.source_key === sourceKey)) {
       return { changes: 0 };
@@ -1011,6 +1011,7 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
       input_message_id: inputMessageId, title, content, source, source_key: sourceKey, parent_id: parentId, status,
        priority, progress: 0, stage, error: error ?? null, session_id: sessionId,
        workspace_override: workspaceOverride, engine_override: engineOverride ?? null,
+       artifacts_required: requiresArtifacts ?? 0,
        is_demo: 0, created_at: now, started_at: startedAt, ended_at: endedAt ?? null, deleted_at: null, result: null, quality: null
     });
     return { changes: 1 };
@@ -1258,11 +1259,11 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
-  if (/UPDATE tasks SET stage = '等待 DSH 取消确认', error = NULL WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
+  if (/UPDATE tasks SET stage = '等待执行取消确认', error = NULL WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
     const [id] = args;
     const task = tables.tasks.get(id as string);
     if (task && task.status === 'RUNNING') {
-      task.stage = '等待 DSH 取消确认';
+      task.stage = '等待执行取消确认';
       task.error = null;
       return { changes: 1 };
     }

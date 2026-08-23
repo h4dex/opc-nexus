@@ -8,19 +8,15 @@
  * 云端凭据必须留在主进程（安全基线 15.1：密钥绝不进 Renderer）。
  * 若让 Renderer 直连阿里云 WebSocket，就得把 AccessKeySecret 下发到渲染进程，违反基线。
  *
- * 【双路策略】
- * - cloud：阿里云 NLS 实时识别（WebSocket 流式，真全双工，边说边出字）
- * - local：本地离线模型（无需联网/凭据，数据不出本机）
- * - auto（默认）：云端凭据齐备走云端，否则回退本地；两者都不可用时如实报错，不静默失败
+ * 当前仅开放已经实现并可真实自检的阿里云 NLS 通道。未实现的本地
+ * 离线识别不出现在配置、探测和会话状态中。
  *
  * 【诚实性】识别不可用时明确报错，绝不返回伪造文本让用户以为在工作。
  *
  * @author liyingjie <y@senke.com>
  */
 import { createHmac, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { app, safeStorage } from 'electron';
+import { safeStorage } from 'electron';
 import type { Database } from './database.js';
 import type { VoiceConfig, VoiceConfigInput, VoiceProvider, VoiceTestResult, VoiceTranscript } from '../../shared/types.js';
 
@@ -42,12 +38,7 @@ interface StoredConfig {
   silenceMs: number;
 }
 
-const DEFAULTS: StoredConfig = { enabled: false, provider: 'auto', appKey: '', silenceMs: DEFAULT_SILENCE_MS };
-
-/** 本地离线模型目录（与 OCR 模型同级，缺失时本地路不可用） */
-function localModelDir(): string {
-  return join(app.getPath('userData'), 'aibox-data', 'models', 'asr');
-}
+const DEFAULTS: StoredConfig = { enabled: false, provider: 'cloud', appKey: '', silenceMs: DEFAULT_SILENCE_MS };
 
 /**
  * RFC3986 百分号编码（阿里云签名要求）。
@@ -136,7 +127,8 @@ export class VoiceService {
   // ---------- 配置 ----------
 
   private stored(): StoredConfig {
-    return { ...DEFAULTS, ...this.db.getSetting<Partial<StoredConfig>>(SETTING, {}) };
+    const stored = this.db.getSetting<Partial<StoredConfig> & { provider?: string }>(SETTING, {});
+    return { ...DEFAULTS, ...stored, provider: 'cloud' };
   }
 
   /** 脱敏配置视图：凭据只回传「是否已配置」，明文不出主进程 */
@@ -148,13 +140,15 @@ export class VoiceService {
       appKey: c.appKey,
       hasAccessKeyId: this.db.getSetting<string | null>(KEY_ID_REF, null) !== null,
       hasAccessKeySecret: this.db.getSetting<string | null>(KEY_SECRET_REF, null) !== null,
-      localModelReady: existsSync(localModelDir()),
       silenceMs: c.silenceMs
     };
   }
 
   /** 保存配置；凭据留空表示沿用已存值，写入前经 safeStorage 加密 */
   saveConfig(input: VoiceConfigInput): VoiceConfig {
+    if (input.provider !== undefined && input.provider !== 'cloud') {
+      throw new Error('该语音识别通道尚未实现，不能启用');
+    }
     const cur = this.stored();
     const next: StoredConfig = {
       enabled: input.enabled ?? cur.enabled,
@@ -183,13 +177,9 @@ export class VoiceService {
     return !!c.appKey && decrypt(this.db, KEY_ID_REF) !== null && decrypt(this.db, KEY_SECRET_REF) !== null;
   }
 
-  /** 实际生效的识别路径；两路都不可用返回 null（调用方须如实报错，不得静默降级） */
-  resolveProvider(): 'cloud' | 'local' | null {
-    const { provider } = this.stored();
-    if (provider === 'cloud') return this.cloudReady() ? 'cloud' : null;
-    if (provider === 'local') return existsSync(localModelDir()) ? 'local' : null;
-    if (this.cloudReady()) return 'cloud';
-    return existsSync(localModelDir()) ? 'local' : null;
+  /** No fallback exists: missing cloud credentials is an explicit failure. */
+  resolveProvider(): 'cloud' | null {
+    return this.cloudReady() ? 'cloud' : null;
   }
 
   /** 连通性自检：如实返回可用路径与延迟，不可用时给出可操作的原因 */
@@ -199,11 +189,8 @@ export class VoiceService {
     if (!provider) {
       return {
         ok: false, provider: null, latencyMs: 0,
-        error: '云端凭据未配置且本地模型缺失：请在设置页填写阿里云 AppKey / AccessKey，或下载本地识别模型'
+        error: '云端语音凭据未配置：请在设置页填写阿里云 AppKey、AccessKeyId 和 AccessKeySecret'
       };
-    }
-    if (provider === 'local') {
-      return { ok: true, provider: 'local', latencyMs: Date.now() - started, error: null };
     }
     try {
       const token = await this.fetchNlsToken();
@@ -237,7 +224,7 @@ export class VoiceService {
   // ---------- 会话生命周期 ----------
 
   /** 开始一次语音会话；返回 sessionId 供后续推送音频与停止 */
-  async start(): Promise<{ ok: boolean; sessionId: string | null; provider: 'cloud' | 'local' | null; message: string }> {
+  async start(): Promise<{ ok: boolean; sessionId: string | null; provider: 'cloud' | null; message: string }> {
     if (!this.stored().enabled) {
       return { ok: false, sessionId: null, provider: null, message: '语音任务下达未启用，请先在设置页开启' };
     }
@@ -245,7 +232,7 @@ export class VoiceService {
     if (!provider) {
       return {
         ok: false, sessionId: null, provider: null,
-        message: '无可用语音识别通道：请配置阿里云凭据或安装本地识别模型'
+        message: '无可用语音识别通道：请配置阿里云 AppKey、AccessKeyId 和 AccessKeySecret'
       };
     }
 
@@ -262,11 +249,7 @@ export class VoiceService {
     this.sessions.set(sessionId, session);
 
     try {
-      if (provider === 'cloud') {
-        await session.connectCloud(NLS_ENDPOINT, this.stored().appKey, await this.fetchNlsToken());
-      } else {
-        await session.startLocal(localModelDir());
-      }
+      await session.connectCloud(NLS_ENDPOINT, this.stored().appKey, await this.fetchNlsToken());
     } catch (err) {
       this.sessions.delete(sessionId);
       session.close();
@@ -338,7 +321,7 @@ export class VoiceService {
 
 /**
  * 单次语音会话：持有识别后端连接，把音频流转发过去并回吐识别结果。
- * 云端走阿里云 NLS WebSocket 协议；本地走离线模型（模型缺失时如实报错）。
+ * 通过阿里云 NLS WebSocket 协议执行真实流式识别。
  */
 export class VoiceSession {
   private ws: import('ws').WebSocket | null = null;
@@ -350,7 +333,7 @@ export class VoiceSession {
 
   constructor(
     readonly id: string,
-    readonly provider: 'cloud' | 'local',
+    readonly provider: 'cloud',
     private onText: (text: string, isFinal: boolean) => void,
     private onFail: (message: string) => void
   ) {}
@@ -422,18 +405,8 @@ export class VoiceSession {
     }
   }
 
-  /**
-   * 本地离线识别：模型目录存在才可用。
-   * 当前版本仅校验模型存在性并如实报告未实现，绝不返回伪造文本
-   * （宁可明确报错，也不让用户以为识别在工作）。
-   */
-  async startLocal(modelDir: string): Promise<void> {
-    if (!existsSync(modelDir)) throw new Error(`本地识别模型缺失：${modelDir}`);
-    throw new Error('本地离线识别尚未实现，请先配置阿里云凭据使用云端识别');
-  }
-
   pushAudio(chunk: Buffer): void {
-    if (this.provider !== 'cloud' || !this.ws) return;
+    if (!this.ws) return;
     if (!this.ready) {
       // 未就绪时最多缓存 100 片（约 3 秒），防止异常时无限堆积
       if (this.pending.length < 100) this.pending.push(chunk);

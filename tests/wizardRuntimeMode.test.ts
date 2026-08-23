@@ -1,20 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { DSH_MANAGED_ENGINE_ID, LEGACY_DSH_ENGINE_ID, type Engine } from '../src/shared/types.js';
+import type { Engine } from '../src/shared/types.js';
 import {
   isSelectableLocalEngine,
   selectDefaultLocalEngineId
 } from '../src/renderer/src/wizard/runtimeMode.js';
 
 type EngineFixture = Pick<Engine, 'id' | 'isDefault' | 'status'>;
+const RETIRED_ENGINE_IDS = ['eng-deepseek-harness', 'eng-deepseek-harness-managed'] as const;
 
 function engine(id: string, status: Engine['status'], isDefault = false): EngineFixture {
   return { id, status, isDefault };
 }
 
 describe('digital employee runtime mode engine selection', () => {
-  it('never treats the managed DSH engine as a local CLI default', () => {
+  it('never treats a retired execution engine as a local CLI default', () => {
     const engines = [
-      engine(DSH_MANAGED_ENGINE_ID, 'HEALTHY', true),
+      engine(RETIRED_ENGINE_IDS[1], 'HEALTHY', true),
       engine('eng-codex', 'HEALTHY'),
       engine('eng-claude', 'AUTH_REQUIRED')
     ];
@@ -23,8 +24,8 @@ describe('digital employee runtime mode engine selection', () => {
     expect(isSelectableLocalEngine(engines[0]!)).toBe(false);
   });
 
-  it('keeps the legacy one-shot DSH adapter out of new employee choices', () => {
-    const legacy = engine(LEGACY_DSH_ENGINE_ID, 'HEALTHY', true);
+  it('keeps the retired one-shot adapter out of new employee choices', () => {
+    const legacy = engine(RETIRED_ENGINE_IDS[0], 'HEALTHY', true);
     const codex = engine('eng-codex', 'HEALTHY');
 
     expect(isSelectableLocalEngine(legacy)).toBe(false);
@@ -38,7 +39,7 @@ describe('digital employee runtime mode engine selection', () => {
     ])).toBe('eng-claude');
 
     expect(selectDefaultLocalEngineId([
-      engine(DSH_MANAGED_ENGINE_ID, 'AUTH_REQUIRED', true),
+      engine(RETIRED_ENGINE_IDS[1], 'AUTH_REQUIRED', true),
       engine('eng-codex', 'NOT_INSTALLED')
     ])).toBe('');
   });

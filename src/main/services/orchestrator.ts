@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readdirSync, rmdirSync } from 'node:fs';
 import { app } from 'electron';
 import type { Database } from './database.js';
 import type { ExecutorRegistry } from './executor/index.js';
-import type { ExecutionBinding, ExecutorAbortResult, ExecutorCallbacks } from './executor/types.js';
+import type { ExecutionBinding, ExecutorCallbacks } from './executor/types.js';
 import type { ApprovalBroker, ApprovalRequest } from './approvalBroker.js';
 import type { ToolHost } from './executor/tools.js';
 import type { DatabaseKernelState } from './kernel/databaseKernelState.js';
@@ -28,9 +28,13 @@ import type {
   Agent, AgentCardView, Approval, ApprovalScope, CreateAgentInput, DashboardStats, DerivedAgentStatus,
   EngineStatus, ProjectArtifactManifest, Task, TaskEvent, TaskQuality, TaskStatus, TodoItem
 } from '../../shared/types.js';
-import { DSH_MANAGED_ENGINE_ID } from '../../shared/types.js';
+import { engineDisplayName } from '../../shared/engineVisibility.js';
 
 type Row = Record<string, unknown>;
+
+export function ownerFacingEngineName(engineId: string, name: string | undefined): string {
+  return engineDisplayName(engineId, name);
+}
 
 export interface AgentCreationCheckpoint {
   existing: Row | null;
@@ -68,6 +72,8 @@ export interface CreateTaskOptions {
   allowAncestorAgentDelegation?: boolean;
   /** Main-process commit hook. Runs in the task transaction before any Worker starts. */
   onPersisted?: (taskId: string) => void;
+  /** Project tasks require real file evidence by default; pure conversation tasks opt out explicitly. */
+  requiresArtifacts?: boolean;
 }
 
 export interface ProjectArtifactCompletionValidator {
@@ -619,12 +625,8 @@ export class Orchestrator {
         .filter((approval) => approvalScope(approval.type) === 'dispatch_plan')
         .map((approval) => approval.task_id as string)
     );
-    // A managed DSH task has a durable session/run and can reconnect after a
-    // host restart. Leave it RUNNING so the normal scheduler can reattach and
-    // reconcile history; only legacy/local executors use the interrupt rule.
     const interruptedCandidates = active.filter((task) =>
-      !this.isManagedDshTask(task.id)
-      && (task.status !== 'WAITING_APPROVAL' || !durablePlanTasks.has(task.id))
+      task.status !== 'WAITING_APPROVAL' || !durablePlanTasks.has(task.id)
     );
     const recoveryDelegationIds = this.recoveryDelegationIds(new Set(interruptedCandidates.map((task) => task.id)));
     // Delegated descendants are abandoned as CANCELLED. A delegated row may
@@ -725,9 +727,6 @@ export class Orchestrator {
       .prepare("SELECT id, agent_id, title, started_at FROM tasks WHERE status = 'RUNNING' AND started_at IS NOT NULL AND started_at < ?")
       .all(deadline) as { id: string; agent_id: string; title: string; started_at: number }[];
     for (const t of rows) {
-      // DSH owns its wall-clock/idle/budget policy and may legitimately run
-      // for hours. The generic watchdog must never manufacture an interrupt.
-      if (this.isManagedDshTask(t.id)) continue;
       const now = Date.now();
       this.broker.abandonTask(t.id);
       this.executors.abort(t.id);
@@ -780,6 +779,9 @@ export class Orchestrator {
       lifecycle: r.lifecycle as Agent['lifecycle'],
       engineId: r.engine_id as string, workspace: r.workspace as string,
       permissionMode: r.permission_mode as Agent['permissionMode'],
+      memoryMode: (['long_term', 'short_term', 'none'].includes(String(r.memory_mode))
+        ? r.memory_mode
+        : 'short_term') as Agent['memoryMode'],
       capabilities, tags, modelOverrides,
       modelOverride: (r.model_override as string) || undefined,
       concurrencyLimit: r.concurrency_limit as number, archived: (r.archived as number) === 1,
@@ -803,6 +805,7 @@ export class Orchestrator {
       quality: (r.quality as TaskQuality) ?? null,
       sessionId: (r.session_id as string | null) ?? null,
       workspaceOverride: (r.workspace_override as string | null) ?? null,
+      requiresArtifacts: Number(r.artifacts_required ?? 0) === 1,
       engineOverride: (r.engine_override as string | null) ?? null,
       createdAt: r.created_at as number, startedAt: r.started_at as number | null, endedAt: r.ended_at as number | null
     };
@@ -935,6 +938,10 @@ export class Orchestrator {
     if (patch.agentsMd !== undefined) { fields.push('agents_md = ?'); values.push(patch.agentsMd); }
     if (patch.userMd !== undefined) { fields.push('user_md = ?'); values.push(patch.userMd); }
     if (patch.permissionMode !== undefined) { fields.push('permission_mode = ?'); values.push(patch.permissionMode); }
+    if (patch.memoryMode !== undefined) {
+      if (!['long_term', 'short_term', 'none'].includes(patch.memoryMode)) throw new Error('员工记忆策略无效');
+      fields.push('memory_mode = ?'); values.push(patch.memoryMode);
+    }
     const nextKind = patch.kind ?? agent.kind;
     const nextEngineId = patch.kind === 'android_operator'
       ? ANDROID_OPERATOR_ENGINE_ID
@@ -985,14 +992,6 @@ export class Orchestrator {
     }));
   }
 
-  private isManagedDshTask(taskId: string): boolean {
-    const row = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Row | undefined;
-    if (!row) return false;
-    if (row.engine_override === DSH_MANAGED_ENGINE_ID) return true;
-    const agent = this.getAgent(String(row.agent_id ?? ''));
-    return agent?.engineId === DSH_MANAGED_ENGINE_ID;
-  }
-
   // ---------- 用量统计 ----------
 
   usageStats(): { total: { input: number; output: number; total: number }; byModel: { model: string; input: number; output: number; total: number; count: number }[]; recent: { id: string; agentId: string; model: string; input: number; output: number; total: number; createdAt: number }[] } {
@@ -1012,7 +1011,7 @@ export class Orchestrator {
       ? `id, agent_id, project_id, conversation_id, input_message_id, title, content,
          source, parent_id, status, priority, progress, stage, error,
          NULL AS result, CASE WHEN result IS NOT NULL AND LENGTH(TRIM(result)) > 0 THEN 1 ELSE 0 END AS has_result,
-         quality, session_id, workspace_override, engine_override, created_at, started_at, ended_at`
+         quality, session_id, workspace_override, engine_override, artifacts_required, created_at, started_at, ended_at`
       : '*';
     return (this.db.raw.prepare(`SELECT ${select} FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200`).all() as Row[])
       .map((r) => this.mapTask(r));
@@ -1113,7 +1112,7 @@ export class Orchestrator {
           : null,
         uptimeText: since ? formatDuration(Date.now() - since) : '',
         channels: [...(channelsByAgent.get(agent.id) ?? [])] as AgentCardView['channels'],
-        engineName: engineNames.get(agent.engineId) ?? '未配置引擎',
+        engineName: ownerFacingEngineName(agent.engineId, engineNames.get(agent.engineId)),
         modelName: modelByAgent.get(agent.id) ?? '',
         needsAttention: derived === 'error' || engineStatus !== 'HEALTHY' || task?.status === 'WAITING_APPROVAL',
         skills: skillsByAgent.get(agent.id) ?? [],
@@ -1168,6 +1167,8 @@ export class Orchestrator {
     if (input.name.length < 2 || input.name.length > 30) throw new Error('名称需为 2—30 字');
     if (input.role.length < 2 || input.role.length > 500) throw new Error('职责描述需为 2—500 字');
     const kind = input.kind ?? 'general';
+    const memoryMode = input.memoryMode ?? 'short_term';
+    if (!['long_term', 'short_term', 'none'].includes(memoryMode)) throw new Error('员工记忆策略无效');
     const engineId = kind === 'android_operator' ? ANDROID_OPERATOR_ENGINE_ID : input.engineId;
     if (kind === 'android_operator' && input.concurrencyLimit !== 1) throw new Error('Android 手机操作员并发数必须为 1');
     const engine = this.db.raw.prepare("SELECT status FROM engines WHERE id = ?").get(engineId) as { status: string } | undefined;
@@ -1180,8 +1181,8 @@ export class Orchestrator {
       if (existing.archived === 1) {
         // 已归档的同名员工：重新激活并更新配置
         this.db.raw.prepare(
-          `UPDATE agents SET archived = 0, role = ?, system_prompt = ?, soul_md = ?, agents_md = ?, user_md = ?, engine_id = ?, permission_mode = ?, agent_kind = ?, concurrency_limit = ?, lifecycle = 'READY', updated_at = ? WHERE id = ?`
-        ).run(input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '', engineId, input.permissionMode, kind, kind === 'android_operator' ? 1 : input.concurrencyLimit, Date.now(), existing.id);
+          `UPDATE agents SET archived = 0, role = ?, system_prompt = ?, soul_md = ?, agents_md = ?, user_md = ?, engine_id = ?, permission_mode = ?, memory_mode = ?, agent_kind = ?, concurrency_limit = ?, lifecycle = 'READY', updated_at = ? WHERE id = ?`
+        ).run(input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '', engineId, input.permissionMode, memoryMode, kind, kind === 'android_operator' ? 1 : input.concurrencyLimit, Date.now(), existing.id);
         this.emit();
         return this.listAgents().find((a) => a.id === existing.id)!;
       }
@@ -1201,11 +1202,11 @@ export class Orchestrator {
     }
     this.db.transaction(() => {
       this.db.raw.prepare(
-        `INSERT INTO agents(id, name, role, system_prompt, soul_md, agents_md, user_md, lifecycle, engine_id, workspace, permission_mode, concurrency_limit, archived, avatar_color, agent_kind, capabilities_json, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+        `INSERT INTO agents(id, name, role, system_prompt, soul_md, agents_md, user_md, lifecycle, engine_id, workspace, permission_mode, memory_mode, concurrency_limit, archived, avatar_color, agent_kind, capabilities_json, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
       ).run(
         id, input.name, input.role, input.systemPrompt, input.soulMd ?? '', input.agentsMd ?? '', input.userMd ?? '',
-        engineId, workspace, input.permissionMode, kind === 'android_operator' ? 1 : input.concurrencyLimit, color, kind,
+        engineId, workspace, input.permissionMode, memoryMode, kind === 'android_operator' ? 1 : input.concurrencyLimit, color, kind,
         JSON.stringify(kind === 'android_operator'
           ? { network: false, shell: false, install: false, browser: false, computer: false, mobile: true }
           : { network: false, shell: false, install: false, browser: false, computer: false, mobile: false }),
@@ -1429,6 +1430,7 @@ export class Orchestrator {
     }
     const projectId = this.resolveTaskProject(agentId, opts.parentId, opts.projectId);
     const workspaceOverride = this.resolveProjectWorkspace(projectId, opts.workspaceOverride);
+    const requiresArtifacts = opts.requiresArtifacts ?? Boolean(projectId);
     const active = this.agentOccupancy(agentId);
     const guardReason = this.dispatchGuard();
     const canRun = dependencyGate.ready && !approvalRequest && agent.lifecycle === 'READY' && active < Math.max(1, agent.concurrencyLimit) && guardReason === null && (!mobileState || mobileState.ready);
@@ -1457,13 +1459,13 @@ export class Orchestrator {
         `INSERT INTO tasks(
           id, agent_id, project_id, conversation_id, input_message_id, title, content,
           source, source_key, parent_id, status, priority, progress, stage, error,
-          session_id, workspace_override, engine_override, created_at, started_at, ended_at
-         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+          session_id, workspace_override, engine_override, artifacts_required, created_at, started_at, ended_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(source, source_key) WHERE source_key IS NOT NULL DO NOTHING`
       ).run(
         id, agentId, projectId, opts.conversationId ?? null, opts.inputMessageId ?? null,
         title, content, source, sourceKey, opts.parentId ?? null, initialStatus, priority,
-         initialStage, dependencyError, opts.sessionId ?? null, workspaceOverride, engineOverride,
+         initialStage, dependencyError, opts.sessionId ?? null, workspaceOverride, engineOverride, requiresArtifacts ? 1 : 0,
          now, canRun ? now : null, dependencyError ? now : null
       ).changes > 0;
       if (!inserted) return;
@@ -1640,7 +1642,8 @@ export class Orchestrator {
       parentId: parent.id,
       sessionId: parent.sessionId ?? undefined,
       conversationId: parent.conversationId ?? undefined,
-      content: title
+      content: title,
+      requiresArtifacts: parent.requiresArtifacts
     });
   }
 
@@ -1657,7 +1660,8 @@ export class Orchestrator {
       conversationId: original.conversationId ?? undefined,
       workspaceOverride: original.workspaceOverride ?? undefined,
       engineOverride: original.engineOverride ?? undefined,
-      content: original.content
+      content: original.content,
+      requiresArtifacts: original.requiresArtifacts
     });
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'task.retry', target: taskId, result: retried.id });
     return retried;
@@ -1768,11 +1772,19 @@ export class Orchestrator {
       let artifactManifest: ProjectArtifactManifest | null = null;
 
       if (status === 'COMPLETED' && this.projectArtifactCompletionValidator) {
-        const task = this.db.raw.prepare(
-          'SELECT * FROM tasks WHERE id = ?'
-        ).get(taskId) as { project_id: string | null; started_at: number | null } | undefined;
-        if (task?.project_id) {
-          const startedAt = Number.isSafeInteger(task.started_at) ? Number(task.started_at) : completionSignaledAt;
+          const task = this.db.raw.prepare(
+            'SELECT * FROM tasks WHERE id = ?'
+          ).get(taskId) as { project_id: string | null; artifacts_required?: number; started_at: number | null; created_at: number | null } | undefined;
+        if (task?.project_id && Number(task.artifacts_required ?? 0) === 1) {
+          const executionStartedAt = Number.isSafeInteger(task.started_at)
+            ? Number(task.started_at) : completionSignaledAt;
+          // Approval and dependency resumes reset started_at for watchdog
+          // purposes. A worker can have already written a real artifact while
+          // that resume is being finalized, so the task creation time remains
+          // the lower bound for admission. The scanner still rejects stale,
+          // symlinked, out-of-root, and unchanged files.
+          const createdAt = Number.isSafeInteger(task.created_at) ? Number(task.created_at) : executionStartedAt;
+          const startedAt = Math.min(createdAt, executionStartedAt);
           this.db.transaction(() => {
             const changed = this.db.raw.prepare(
               "UPDATE tasks SET stage = ? WHERE id = ? AND status = 'RUNNING'"
@@ -2045,6 +2057,24 @@ export class Orchestrator {
     this.scheduleNext(agentId);
   }
 
+  /** Resource guard recovery is system-wide, so every durable FIFO with queued work must be reconsidered. */
+  wakeQueuedAgentQueues(releasedReason?: string): number {
+    if (this.dispatchGuard() !== null) return 0;
+    const queued = (this.db.raw.prepare(
+      'SELECT * FROM tasks WHERE deleted_at IS NULL ORDER BY created_at DESC'
+    ).all() as Row[]).filter((task) => task.status === 'QUEUED');
+    if (releasedReason) {
+      for (const task of queued) {
+        if (task.stage !== releasedReason) continue;
+        this.db.raw.prepare("UPDATE tasks SET stage = '排队中' WHERE id = ? AND status = 'QUEUED'").run(task.id as string);
+      }
+    }
+    const agentIds = [...new Set(queued.map((task) => task.agent_id as string))];
+    for (const agentId of agentIds) this.scheduleNext(agentId);
+    if (queued.length > 0) this.emit();
+    return agentIds.length;
+  }
+
   /** Return the root task and delegated descendants, cycle-safe. parent_id is
    * also used by follow-ups/retries, which are independent executions and
    * must not be cancelled as delegation children. */
@@ -2092,105 +2122,6 @@ export class Orchestrator {
     }
   }
 
-  private executorNeedsCancellationAck(taskId: string): boolean {
-    const registry = this.executors as unknown as {
-      requiresCancellationConfirmation?: (id: string) => boolean;
-    };
-    return registry.requiresCancellationConfirmation?.(taskId) === true;
-  }
-
-  /** Complete a DSH cancellation only after its upstream turn boundary is durable. */
-  private settleDshCancellation(task: CancelledTaskRecord, result: ExecutorAbortResult): void {
-    if (result.status === 'COMPLETED') {
-      const agent = this.getAgent(task.agentId);
-      if (agent) {
-        this.makeCallbacks(task.id, task.agentId, {
-          requestedEngineId: agent.engineId,
-          resolvedEngineId: agent.engineId,
-          executorKind: 'dsh',
-          usedFallback: false
-        }, agent.kind).onDone(task.id, result.result ?? '');
-        return;
-      }
-      result = { status: 'FAILED', reason: 'DSH 完成回执无法关联执行员工' };
-    }
-    const now = Date.now();
-    const boundedResult = typeof result.result === 'string' ? result.result.slice(0, MAX_TASK_RESULT_CHARS) : null;
-    const finalStatus = result.status === 'CONFIRMED'
-      ? 'CANCELLED'
-      : result.status === 'COMPLETED'
-        ? 'COMPLETED'
-        : result.status === 'FAILED'
-          ? 'FAILED'
-          : 'INTERRUPTED';
-    const error = finalStatus === 'CANCELLED'
-      ? task.error
-      : finalStatus === 'INTERRUPTED'
-        ? `DSH 取消未获确认${result.reason ? `：${result.reason}` : ''}`
-        : result.reason ?? (finalStatus === 'FAILED' ? 'DSH 执行失败' : null);
-    let applied = false;
-    this.db.transaction(() => {
-      if (finalStatus === 'COMPLETED') {
-        applied = this.db.raw.prepare(
-          "UPDATE tasks SET status = 'COMPLETED', progress = 100, stage = '完成', result = ?, error = NULL, ended_at = ? WHERE id = ? AND status = 'RUNNING'"
-        ).run(boundedResult, now, task.id).changes > 0;
-        if (applied) {
-          this.recordEvent(task.id, 'result', { available: Boolean(boundedResult), chars: boundedResult?.length ?? 0 }, now);
-          this.recordEvent(task.id, 'completed', { progress: 100, cancellationRace: true }, now);
-        }
-      } else {
-        applied = this.db.raw.prepare(
-          'UPDATE tasks SET status = ?, error = ?, ended_at = ? WHERE id = ? AND status = \'RUNNING\''
-        ).run(finalStatus, error, now, task.id).changes > 0;
-        if (applied) this.recordEvent(task.id, finalStatus === 'CANCELLED' ? 'cancelled' : finalStatus === 'FAILED' ? 'failed' : 'interrupted', {
-          reason: finalStatus === 'CANCELLED' ? task.error : error ?? ''
-        }, now);
-      }
-      if (applied) {
-        this.db.raw.prepare('UPDATE agent_runs SET ended_at = ?, status = ? WHERE task_id = ? AND ended_at IS NULL')
-          .run(now, finalStatus, task.id);
-      }
-    });
-    if (!applied) return;
-    // The task stayed RUNNING while the remote DSH cancellation was being
-    // confirmed. Now that its terminal state is durable, release or wake all
-    // prerequisite dependents through the canonical gate.
-    this.settleTaskDependents(task.id, finalStatus, error ?? 'DSH cancellation completed');
-    if (finalStatus === 'FAILED') notify(this.db, '任务执行失败', `${task.title}：${(error ?? '').slice(0, 120)}`);
-    for (const fn of this.finishListeners) {
-      try {
-        fn({
-          taskId: task.id,
-          agentId: task.agentId,
-          status: finalStatus,
-          title: task.title,
-          result: boundedResult,
-          error: finalStatus === 'COMPLETED' ? null : error
-        });
-      } catch { /* notification failure must not alter the canonical state */ }
-    }
-    this.emit();
-    this.scheduleNext(task.agentId);
-  }
-
-  private beginDshCancellation(task: CancelledTaskRecord): void {
-    this.closeOutputState(task.id);
-    try { this.broker.abandonTask(task.id); } catch { /* best effort */ }
-    const registry = this.executors as unknown as {
-      abortWithResult?: (id: string) => Promise<ExecutorAbortResult>;
-    };
-    const request = registry.abortWithResult
-      ? registry.abortWithResult(task.id)
-      : Promise.resolve<ExecutorAbortResult>({ status: 'UNCONFIRMED', reason: 'executor cannot confirm cancellation' });
-    void request.then(
-      (result) => this.settleDshCancellation(task, result),
-      (error) => this.settleDshCancellation(task, {
-        status: 'UNCONFIRMED',
-        reason: error instanceof Error ? error.message : String(error)
-      })
-    );
-  }
-
   /**
    * Cancel a set of tasks atomically, then release broker/executor resources.
    * The caller supplies root/descendant messages for finish subscribers.
@@ -2204,7 +2135,6 @@ export class Orchestrator {
     beforePersist?: () => void
   ): CancelledTaskRecord[] {
     const cancelled: CancelledTaskRecord[] = [];
-    const awaiting: CancelledTaskRecord[] = [];
     this.db.transaction(() => {
       beforePersist?.();
       for (const taskId of taskIds) {
@@ -2217,19 +2147,6 @@ export class Orchestrator {
           title: String(row.title ?? taskId),
           error
         };
-        // A live DSH turn is an at-least-once remote operation. Keep it RUNNING
-        // with an explicit cancellation stage until the upstream turn/end is
-        // observed; queued work and local executors retain the old fast path.
-        if (row.status === 'RUNNING' && this.executorNeedsCancellationAck(taskId)) {
-          const requested = this.db.raw.prepare(
-            "UPDATE tasks SET stage = '等待 DSH 取消确认', error = NULL WHERE id = ? AND status = 'RUNNING'"
-          ).run(taskId).changes > 0;
-          if (!requested) continue;
-          this.db.raw.prepare("UPDATE approvals SET status = 'rejected', decided_at = ? WHERE task_id = ? AND status = 'pending'").run(now, taskId);
-          this.recordEvent(taskId, 'cancel_requested', { reason: error, upstream: 'dsh' }, now);
-          awaiting.push(record);
-          continue;
-        }
         if (!this.cancelTaskInternal(taskId, now, error)) continue;
         cancelled.push(record);
       }
@@ -2239,7 +2156,6 @@ export class Orchestrator {
     // touched. A failing abort must not prevent the rest of the tree from
     // being released.
     this.releaseCancelledTasks(cancelled);
-    for (const task of awaiting) this.beginDshCancellation(task);
     return cancelled;
   }
 
@@ -2256,9 +2172,7 @@ export class Orchestrator {
   /**
    * A cancellation request may include a delegation tree. Every task that was
    * durably cancelled is an upstream prerequisite in its own right, so settle
-   * each distinct id instead of only settling the user-facing root. DSH tasks
-   * waiting for remote confirmation are settled by settleDshCancellation once
-   * their terminal status is known.
+   * each distinct id instead of only settling the user-facing root.
    */
   private settleCancelledTaskDependents(cancelled: readonly CancelledTaskRecord[]): void {
     const settled = new Set<string>();
@@ -2283,7 +2197,7 @@ export class Orchestrator {
       // duplicate cancellation event.
       const latest = this.db.raw.prepare('SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL').get(taskId) as Row | undefined;
       if (!latest) throw new Error('任务不存在或已删除');
-      if (latest.status === 'RUNNING' && latest.stage === '等待 DSH 取消确认') return;
+      if (latest.status === 'RUNNING' && latest.stage === '等待执行取消确认') return;
       if (!ACTIVE_TASK_STATUSES.includes(latest.status as typeof ACTIVE_TASK_STATUSES[number])) throw new Error('任务已经结束，不能取消');
       return;
     }

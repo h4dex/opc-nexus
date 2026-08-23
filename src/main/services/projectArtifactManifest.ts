@@ -1,15 +1,23 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, readdir, realpath } from 'node:fs/promises';
+import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import type { ProjectArtifactManifest, ProjectArtifactManifestEntry } from '../../shared/types.js';
+import type {
+  ProjectArtifactManifest,
+  ProjectArtifactManifestEntry,
+  ProjectArtifactRuntimeEvidence
+} from '../../shared/types.js';
+import type { Database } from './database.js';
 import { projectArtifactMediaType, projectArtifactPreviewKind } from './projectArtifactService.js';
 
 const EXCLUDED_DIRECTORIES = new Set(['.git', '.hg', '.svn', '.aibox', 'node_modules']);
 const MAX_SCANNED_ENTRIES = 100_000;
 const MAX_MANIFEST_ENTRIES = 1_000;
 const CLOCK_TOLERANCE_MS = 2_000;
+/** B.4 — 只读 package.json 里真实存在的脚本；上限防止把巨型文件读进内存。 */
+const MAX_RUN_MANIFEST_BYTES = 256 * 1024;
+const RUN_SCRIPT_PRIORITY = ['preview', 'start', 'dev', 'serve'] as const;
 
 export interface ProjectArtifactCompletionInput {
   taskId: string;
@@ -47,6 +55,86 @@ async function sha256(path: string): Promise<string> {
   const digest = createHash('sha256');
   for await (const chunk of createReadStream(path)) digest.update(chunk as Buffer);
   return digest.digest('hex');
+}
+
+/**
+ * B.6 — Manifest 是产物的唯一权威来源：IPC 预览、启动命令、渠道附件、渠道摘要
+ * 全部从这里读，任何调用方都不得自己猜路径或重复解析 payload。
+ */
+export function readTaskArtifactManifest(db: Database, taskId: string): ProjectArtifactManifest | null {
+  const event = db.raw.prepare(
+    "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_manifest' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+  ).get(taskId) as { payload?: unknown } | undefined;
+  if (typeof event?.payload !== 'string') return null;
+  try {
+    const parsed = JSON.parse(event.payload) as { manifest?: ProjectArtifactManifest };
+    const manifest = parsed.manifest;
+    return manifest && Array.isArray(manifest.entries)
+      ? { ...manifest, runtime: readTaskArtifactRuntimeEvidence(db, taskId) }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function readTaskArtifactRuntimeEvidence(db: Database, taskId: string): ProjectArtifactRuntimeEvidence | null {
+  const event = db.raw.prepare(
+    "SELECT payload FROM task_events WHERE task_id = ? AND event_type = 'artifact_runtime' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+  ).get(taskId) as { payload?: unknown } | undefined;
+  if (typeof event?.payload !== 'string') return null;
+  try {
+    const parsed = JSON.parse(event.payload) as { runtime?: ProjectArtifactRuntimeEvidence };
+    const runtime = parsed.runtime;
+    return runtime && runtime.taskId === taskId && typeof runtime.state === 'string' ? runtime : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 产物体积的统一人读格式（渠道摘要与 UI 共用一套口径）。 */
+export function formatManifestBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** 把 manifest 相对路径解析到项目根内；词法越界或绝对路径一律拒绝。 */
+export function resolveManifestPath(root: string, relativePath: string): string | null {
+  if (isAbsolute(relativePath)) return null;
+  const absolute = resolve(root, relativePath);
+  return within(root, absolute) ? absolute : null;
+}
+
+/**
+ * B.4 — 从产物本身推导验收启动命令。只承认磁盘上真实存在的 `package.json`
+ * 脚本，命令不来自模型输出，因此「声明可运行」等价于「真的可运行」。
+ */
+async function deriveRunConfig(
+  absolutePath: string,
+  relativePath: string,
+  size: number
+): Promise<{ command: string; cwd: string } | null> {
+  if (!relativePath.endsWith('package.json') || size > MAX_RUN_MANIFEST_BYTES) return null;
+  let scripts: Record<string, unknown>;
+  let packageManager = 'npm';
+  try {
+    const parsed = JSON.parse(await readFile(absolutePath, 'utf8')) as {
+      scripts?: Record<string, unknown>;
+      packageManager?: unknown;
+    };
+    scripts = parsed.scripts ?? {};
+    if (typeof parsed.packageManager === 'string') {
+      const declared = /^(npm|pnpm|yarn)@/.exec(parsed.packageManager.trim())?.[1];
+      if (declared) packageManager = declared;
+    }
+  } catch {
+    return null;
+  }
+  const script = RUN_SCRIPT_PRIORITY.find((name) => typeof scripts[name] === 'string' && (scripts[name] as string).trim());
+  if (!script) return null;
+  const slash = relativePath.lastIndexOf('/');
+  const command = packageManager === 'yarn' ? `yarn ${script}` : `${packageManager} run ${script}`;
+  return { command, cwd: slash === -1 ? '.' : relativePath.slice(0, slash) };
 }
 
 /**
@@ -110,7 +198,7 @@ export class ProjectArtifactManifestService {
           validationState: 'verified',
           previewKind,
           previewable: previewKind !== 'unsupported',
-          run: null
+          run: await deriveRunConfig(file.absolutePath, file.relativePath, current.size)
         });
         totalBytes += current.size;
       } catch (error) {

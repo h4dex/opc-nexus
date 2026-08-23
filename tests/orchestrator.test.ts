@@ -14,7 +14,6 @@ vi.mock('../src/main/services/notifier.js', () => ({
 import { Orchestrator, formatDuration } from '../src/main/services/orchestrator.js';
 import type { ExecutorRegistry } from '../src/main/services/executor/index.js';
 import type { ApprovalBroker } from '../src/main/services/approvalBroker.js';
-import { DSH_MANAGED_ENGINE_ID } from '../src/shared/types.js';
 
 function createMockExecutors(): ExecutorRegistry {
   return {
@@ -331,7 +330,7 @@ describe('Orchestrator 状态机', () => {
       });
       orch.setMobileDispatchPolicy({ canDispatch: () => ({ bound: true, ready: true, reason: '' }) });
 
-      expect(() => orch.createTask(agentId, '操作手机')).toThrow('DeepSeek Harness 和其他执行引擎目前没有 Android 工具桥接');
+      expect(() => orch.createTask(agentId, '操作手机')).toThrow('其他执行引擎目前没有 Android 工具桥接');
       expect(executors.dispatch).not.toHaveBeenCalled();
     });
 
@@ -527,6 +526,27 @@ describe('Orchestrator 状态机', () => {
       });
     });
 
+    it('项目内纯对话任务不强制要求文件产物', async () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const validateTaskCompletion = vi.fn();
+      orch.setProjectArtifactCompletionValidator({ validateTaskCompletion });
+      const task = orch.createTask(agentId, '返回一句路由确认，不创建文件', 'team', {
+        projectId,
+        requiresArtifacts: false
+      });
+      const callbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+
+      callbacks.onDone(task.id, '路由确认完成');
+
+      await vi.waitFor(() => expect(db.tables.tasks.get(task.id)?.status).toBe('COMPLETED'));
+      expect(db.tables.tasks.get(task.id)?.result).toBe('路由确认完成');
+      expect(validateTaskCompletion).not.toHaveBeenCalled();
+      expect([...db.tables.task_events.values()].some((event) =>
+        event.task_id === task.id && event.event_type === 'artifact_manifest'
+      )).toBe(false);
+    });
+
     it('项目任务没有真实文件时拒绝假完成并阻断依赖任务', async () => {
       const upstreamAgent = seedAgent(db, { name: '项目执行员工' });
       const downstreamAgent = seedAgent(db, { name: '项目验收员工' });
@@ -549,6 +569,32 @@ describe('Orchestrator 状态机', () => {
       expect([...db.tables.task_events.values()].some((event) =>
         event.task_id === upstream.id && event.event_type === 'artifact_validation_failed'
       )).toBe(true);
+    });
+
+    it('审批恢复重置 started_at 时仍接纳任务创建后写入的真实产物', async () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const validateTaskCompletion = vi.fn().mockResolvedValue({
+        ok: true,
+        manifest: {
+          schemaVersion: 1, projectId, sourceTaskId: 'pending', generatedAt: 123,
+          totalBytes: 1, entries: [], truncated: false,
+          validation: { status: 'verified', reason: null }
+        }
+      });
+      orch.setProjectArtifactCompletionValidator({ validateTaskCompletion });
+      const task = orch.createTask(agentId, '审批恢复后的项目成果', 'desktop', { projectId });
+      const row = db.tables.tasks.get(task.id)!;
+      const createdAt = Number(row.created_at);
+      row.started_at = createdAt + 60_000;
+      const callbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+
+      callbacks.onDone(task.id, '执行器完成');
+
+      await vi.waitFor(() => expect(db.tables.tasks.get(task.id)?.status).toBe('COMPLETED'));
+      expect(validateTaskCompletion).toHaveBeenCalledWith(expect.objectContaining({
+        taskId: task.id, projectId, startedAt: createdAt
+      }));
     });
 
     it('allows parent and project associations inside one organization', () => {
@@ -789,28 +835,6 @@ describe('Orchestrator 状态机', () => {
       expect(db.tables.tasks.get(t2.id)?.status).toBe('RUNNING');
     });
 
-    it('DSH 取消确认落库后会阻断依赖它的后继任务', async () => {
-      const upstreamAgent = seedAgent(db, { name: 'DSH 前置' });
-      const downstreamAgent = seedAgent(db, { name: 'DSH 后继' });
-      const upstream = orch.createTask(upstreamAgent, 'DSH 长任务');
-      const downstream = orch.createTask(downstreamAgent, '等待 DSH 结果', 'team', {
-        dependencyTaskIds: [upstream.id]
-      });
-      let resolveAbort!: (result: { status: 'CONFIRMED' }) => void;
-      const abortResult = new Promise<{ status: 'CONFIRMED' }>((resolve) => { resolveAbort = resolve; });
-      (executors as any).requiresCancellationConfirmation = vi.fn().mockReturnValue(true);
-      (executors as any).abortWithResult = vi.fn().mockReturnValue(abortResult);
-
-      orch.cancelTask(upstream.id, '老板取消 DSH');
-      expect(db.tables.tasks.get(upstream.id)).toMatchObject({ status: 'RUNNING', stage: '等待 DSH 取消确认' });
-      expect(db.tables.tasks.get(downstream.id)?.status).toBe('QUEUED');
-
-      resolveAbort({ status: 'CONFIRMED' });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(db.tables.tasks.get(upstream.id)?.status).toBe('CANCELLED');
-      expect(db.tables.tasks.get(downstream.id)).toMatchObject({ status: 'CANCELLED', stage: '依赖失败' });
-    });
-
     it('取消等待审批任务时同步关闭待审批记录', () => {
       const agentId = seedAgent(db);
       const task = orch.createTask(agentId, '等待审批任务');
@@ -1009,36 +1033,6 @@ describe('Orchestrator 状态机', () => {
   });
 
   describe('崩溃恢复', () => {
-    it('recoverAfterRestart 保留 managed DSH RUNNING 并由启动调度器重新接管', () => {
-      vi.useFakeTimers();
-      try {
-        seedEngine(db, DSH_MANAGED_ENGINE_ID);
-        const agentId = seedAgent(db, { engine_id: DSH_MANAGED_ENGINE_ID });
-        const task = orch.createTask(agentId, 'DSH 可恢复长任务');
-        expect(task.status).toBe('RUNNING');
-        vi.mocked(executors.dispatch).mockClear();
-
-        const restarted = new Orchestrator(db as never, executors, createMockBroker());
-        restarted.recoverAfterRestart();
-
-        expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'RUNNING', ended_at: null, error: null });
-        expect([...db.tables.task_events.values()].filter((event) => event.task_id === task.id))
-          .not.toContainEqual(expect.objectContaining({ event_type: 'interrupted' }));
-        expect(executors.dispatch).not.toHaveBeenCalled();
-
-        restarted.startScheduler();
-        expect(executors.dispatch).toHaveBeenCalledOnce();
-        expect(executors.dispatch).toHaveBeenCalledWith(
-          expect.objectContaining({ id: task.id, status: 'RUNNING' }),
-          expect.objectContaining({ id: agentId, engineId: DSH_MANAGED_ENGINE_ID }),
-          expect.anything(),
-          expect.anything()
-        );
-      } finally {
-        vi.useRealTimers();
-      }
-    });
-
     it('recoverAfterRestart 将 RUNNING 标记为 INTERRUPTED', () => {
       const agentId = seedAgent(db);
       const finished = vi.fn();
@@ -1239,17 +1233,19 @@ describe('Orchestrator 状态机', () => {
     });
 
     it('dispatchGuard 解除后恢复正常派发', () => {
-      orch.setDispatchGuard(() => '资源保护中');
+      let guardReason: string | null = '资源保护中';
+      orch.setDispatchGuard(() => guardReason);
       const agentId = seedAgent(db);
       const task = orch.createTask(agentId, '等待任务');
-      expect(task.status).toBe('QUEUED');
+      expect(task).toMatchObject({ status: 'QUEUED', stage: '资源保护中' });
 
-      // 解除保护
-      orch.setDispatchGuard(() => null);
-      // 取消另一个任务触发 scheduleNext 不太方便，直接创建新任务验证
+      guardReason = null;
+      expect(orch.wakeQueuedAgentQueues('资源保护中')).toBe(1);
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'RUNNING', stage: '理解需求' });
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+
       const task2 = orch.createTask(agentId, '新任务');
-      // 并发限制 1，第一个还在 QUEUED 不算活跃，所以 task2 应该 RUNNING
-      expect(task2.status).toBe('RUNNING');
+      expect(task2).toMatchObject({ status: 'QUEUED', stage: '排队中' });
     });
   });
 });

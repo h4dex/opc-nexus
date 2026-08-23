@@ -14,6 +14,7 @@ import { app } from 'electron';
 import { dirname, join } from 'node:path';
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { LEGACY_NEXUS_ENGINE_ID, NEXUS_ENGINE_ID } from '../../shared/types.js';
+import { isRetiredExecutionEngine } from '../../shared/engineVisibility.js';
 
 export interface UserConfig {
   wecom: {
@@ -180,7 +181,14 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
       webhookUrl: sanitizeWebhookUrl(str(wecom.webhookUrl, ''))
     },
     engine: {
-      fallbackEngineId: configuredFallback === LEGACY_NEXUS_ENGINE_ID ? NEXUS_ENGINE_ID : configuredFallback
+      // Retired DSH runtimes and the pre-v39 Hermes identity must never remain
+      // as a fallback target after an upgrade. Use the documented OpenCode
+      // fallback instead of preserving a dead adapter ID.
+      fallbackEngineId: configuredFallback === LEGACY_NEXUS_ENGINE_ID
+        ? NEXUS_ENGINE_ID
+        : isRetiredExecutionEngine({ id: configuredFallback })
+          ? d.engine.fallbackEngineId
+          : configuredFallback
     },
     task: { maxRunMinutes: maxRun },
     provider: {

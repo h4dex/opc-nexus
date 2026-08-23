@@ -20,18 +20,14 @@ import {
 } from '../components/icons';
 import { toast } from '../components/Toast';
 import { useApp } from '../store';
-import { DSH_MANAGED_ENGINE_ID } from '@shared/types';
 import type {
-  DshCommunityPluginCatalogView,
-  DshCommunityPluginView,
-  DshPluginLifecycleAction,
-  DshEmbeddedWorkbenchBounds,
+  EmbeddedWorkbenchBounds,
+  HermesRuntimeStatus,
   PermissionMode,
   PluginCatalogItemView,
   PluginCatalogView,
   Project,
   ProjectWorkbenchView,
-  QuestProviderPreflightView,
   QuestSandbox,
   QuestSettings,
   Task
@@ -47,12 +43,14 @@ export interface QuestWorkbenchProps {
   projects?: Project[];
   onProjectChange?: (projectId: string) => void;
   standalone?: boolean;
+  initialConversationId?: string | null;
+  active?: boolean;
 }
 
 type EmbedPhase = 'idle' | 'opening' | 'ready' | 'error' | 'unavailable';
 
-const DSH_EMBEDDED_MIN_WIDTH = 320;
-const DSH_EMBEDDED_MIN_HEIGHT = 240;
+const HERMES_EMBEDDED_MIN_WIDTH = 320;
+const HERMES_EMBEDDED_MIN_HEIGHT = 240;
 
 const ACTIVE_TASK_STATUSES = new Set<Task['status']>([
   'RUNNING',
@@ -61,48 +59,8 @@ const ACTIVE_TASK_STATUSES = new Set<Task['status']>([
   'PAUSED'
 ]);
 
-const PLUGIN_STATUS_LABELS: Record<DshCommunityPluginView['status'], string> = {
-  available: '可安装',
-  'update-available': '可更新',
-  installed: '仅已安装',
-  installing: '安装中',
-  'restart-required': '重启后生效',
-  blocked: '策略阻止',
-  broken: '版本异常',
-  missing: '不可用'
-};
-
-const BUILTIN_STATUS_LABELS: Record<DshCommunityPluginCatalogView['builtInCapabilities'][number]['status'], string> = {
-  integrated: '已集成',
-  available: '当前可用',
-  unavailable: '当前不可用'
-};
-
-const PLUGIN_BOUNDARY_LABELS: Record<DshCommunityPluginView['runtimeBoundary'], string> = {
-  'reviewed-profile': '已核验 Profile',
-  'explicit-profile-permission': '需显式授权',
-  'main-adapter-required': '需宿主适配',
-  'standalone-only': '独立运行',
-  blocked: '策略阻止'
-};
-
-const PLUGIN_COMPATIBILITY_LABELS: Record<DshCommunityPluginView['compatibility'], string> = {
-  verified: '已验证',
-  unverified: '待验证',
-  incompatible: '不兼容',
-  'identity-conflict': '包身份冲突'
-};
-
-const PROFILE_STATUS_LABELS: Record<DshCommunityPluginCatalogView['profile'], string> = {
-  running: 'Profile 运行中',
-  stopped: 'Profile 已停止',
-  unavailable: 'Profile 不可用',
-  unknown: 'Profile 状态未知'
-};
-
 const PLUGIN_SOURCE_LABELS: Record<PluginCatalogItemView['source'], string> = {
   host: '宿主',
-  dsh: 'DSH',
   mcp: 'MCP',
   skill: '技能',
   cli: 'CLI',
@@ -112,34 +70,9 @@ const PLUGIN_SOURCE_LABELS: Record<PluginCatalogItemView['source'], string> = {
 
 const REQUIRED_PROJECT_PLUGIN_IDS = new Set(['host:opc-nexus-governance']);
 const WORKER_PLUGIN_SOURCES = new Set<PluginCatalogItemView['source']>(['cli', 'acp', 'a2a']);
+const HERMES_PROJECT_CAPABILITY_SOURCES = new Set<PluginCatalogItemView['source']>(['mcp', 'skill']);
 
-const PLUGIN_REASON_LABELS: Record<string, string> = {
-  NOT_A_CORDIS_PLUGIN: '不是 Cordis 插件',
-  MANAGED_POLICY_CONFLICT: '与托管沙箱冲突',
-  AGGREGATE_PRIVILEGE_ESCALATION: '聚合包权限过宽',
-  COMMUNITY_ENHANCEMENTS_NOT_BUILT_IN: '社区增强未内置',
-  EXPLICIT_PERMISSION_REQUIRED: '需要目录或进程授权',
-  NATIVE_PTY: '包含原生终端',
-  FILESYSTEM_WRITE: '需要文件写入',
-  MAIN_ADAPTER_REQUIRED: '需要宿主安全适配',
-  VISION_CREDENTIAL_PROXY_REQUIRED: '需要视觉凭据代理',
-  RUNTIME_INSTALL_DISABLED: '运行时安装已关闭',
-  STANDALONE_ONLY: '只能独立运行',
-  PACKAGE_IDENTITY_CONFLICT: '包身份存在冲突',
-  BROWSER_NETWORK_WRITE_PERMISSION: '需要浏览器网络写权限',
-  DSH_RC6_INCOMPATIBLE: '与 DSH rc.6 不兼容',
-  RUNTIME_AUTHORING_DISABLED: '动态运行时编排已关闭',
-  CHAT_HISTORY_SCOPE_REQUIRED: '需要聊天历史目录授权',
-  SESSION_WRITE: '会写入会话',
-  NETWORK_PROXY_REQUIRED: '需要受控网络代理',
-  UNTRUSTED_INSTALL_COMMAND_OUTPUT: '发现结果含未治理安装命令',
-  INSTALLED_OUTSIDE_APPROVED_BOUNDARY: '已安装但未获运行授权',
-  VERSION_UPDATE_AVAILABLE: '存在固定版本更新',
-  BUNDLE_PATCH_INVALID: 'Bundle 补丁无效',
-  VERSION_MISMATCH: '安装版本不匹配'
-};
-
-function sameBounds(left: DshEmbeddedWorkbenchBounds | null, right: DshEmbeddedWorkbenchBounds): boolean {
+function sameBounds(left: EmbeddedWorkbenchBounds | null, right: EmbeddedWorkbenchBounds): boolean {
   return left !== null
     && left.x === right.x
     && left.y === right.y
@@ -147,7 +80,7 @@ function sameBounds(left: DshEmbeddedWorkbenchBounds | null, right: DshEmbeddedW
     && left.height === right.height;
 }
 
-function visibleBounds(element: HTMLElement): DshEmbeddedWorkbenchBounds {
+function visibleBounds(element: HTMLElement): EmbeddedWorkbenchBounds {
   const rect = element.getBoundingClientRect();
   const x = Math.max(0, Math.floor(rect.left));
   const y = Math.max(0, Math.floor(rect.top));
@@ -161,8 +94,13 @@ function visibleBounds(element: HTMLElement): DshEmbeddedWorkbenchBounds {
   };
 }
 
-export function isUsableDshEmbeddedBounds(bounds: DshEmbeddedWorkbenchBounds): boolean {
-  return bounds.width >= DSH_EMBEDDED_MIN_WIDTH && bounds.height >= DSH_EMBEDDED_MIN_HEIGHT;
+export function isUsableHermesEmbeddedBounds(bounds: EmbeddedWorkbenchBounds): boolean {
+  return bounds.width >= HERMES_EMBEDDED_MIN_WIDTH && bounds.height >= HERMES_EMBEDDED_MIN_HEIGHT;
+}
+
+export function isSupersededHermesWorkbenchError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /Quest embedded Workbench request was superseded/i.test(message);
 }
 
 function formatTokens(value: number): string {
@@ -179,18 +117,42 @@ function formatUpdatedAt(value: number): string {
   return new Date(value).toLocaleDateString('zh-CN');
 }
 
-export function QuestWorkbench({ project, onBack, projects = [project], onProjectChange, standalone = false }: QuestWorkbenchProps) {
-  const { snapshot } = useApp();
+function hermesTaskIntent(task: Task): 'execution' | 'status_inquiry' | 'validation' {
+  const match = /^Task intent: (execution|status_inquiry|validation)$/m.exec(task.content ?? '');
+  return (match?.[1] ?? 'execution') as 'execution' | 'status_inquiry' | 'validation';
+}
+
+function hermesValidationVerdict(task: Task): 'PASS' | 'FAIL' | 'BLOCKED' | null {
+  if (hermesTaskIntent(task) !== 'validation' || task.status !== 'COMPLETED' || typeof task.result !== 'string') return null;
+  const match = /^\s*(?:\*\*(PASS|FAIL|BLOCKED)\*\*|__(PASS|FAIL|BLOCKED)__|`(PASS|FAIL|BLOCKED)`|(PASS|FAIL|BLOCKED))(?=$|[\s:：.,，。;；!?！？])/i.exec(task.result);
+  const verdict = match?.slice(1).find(Boolean);
+  return verdict ? verdict.toUpperCase() as 'PASS' | 'FAIL' | 'BLOCKED' : 'BLOCKED';
+}
+
+function hermesRelatedTaskCount(task: Task): number {
+  if (hermesTaskIntent(task) !== 'validation') return 0;
+  const marker = 'Related project tasks:';
+  const start = (task.content ?? '').indexOf(marker);
+  if (start < 0) return 0;
+  const block = (task.content ?? '').slice(start + marker.length).split(/\r?\n\s*\r?\n/, 1)[0] ?? '';
+  return block.split(/\r?\n/).map((value) => value.trim()).filter((value) => /^[A-Za-z0-9._:-]{1,128}$/.test(value)).length;
+}
+
+export function QuestWorkbench({ project, onBack, projects = [project], onProjectChange, standalone = false, initialConversationId = null, active = true }: QuestWorkbenchProps) {
+  const { snapshot, theme, setRoute } = useApp();
   const embeddedHostRef = useRef<HTMLDivElement>(null);
   const activeProjectIdRef = useRef(project.id);
   activeProjectIdRef.current = project.id;
+  const initialConversationIdRef = useRef(initialConversationId);
+  initialConversationIdRef.current = initialConversationId;
   const openedRef = useRef(false);
   const loadRequestRef = useRef(0);
   const settingsSaveRequestRef = useRef(0);
   const pluginCatalogRequestRef = useRef(0);
   const reportFrameRef = useRef<number | null>(null);
-  const lastBoundsRef = useRef<DshEmbeddedWorkbenchBounds | null>(null);
+  const lastBoundsRef = useRef<EmbeddedWorkbenchBounds | null>(null);
   const lastVisibleRef = useRef<boolean | null>(null);
+  const mobileOpenRef = useRef(false);
   const [workbench, setWorkbench] = useState<ProjectWorkbenchView | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<QuestSettings | null>(null);
   const [settingsDirty, setSettingsDirty] = useState(false);
@@ -201,20 +163,20 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
   const [workbenchError, setWorkbenchError] = useState<string | null>(null);
   const [embedPhase, setEmbedPhase] = useState<EmbedPhase>('idle');
   const [embedError, setEmbedError] = useState<string | null>(null);
-  const [providerPreflight, setProviderPreflight] = useState<QuestProviderPreflightView | null>(null);
-  const [governanceOpen, setGovernanceOpen] = useState(false);
+  const [runtimeStatus, setRuntimeStatus] = useState<HermesRuntimeStatus | null>(null);
+  const [contextOpen, setContextOpen] = useState(true);
+  const [governanceOpen, setGovernanceOpen] = useState(true);
   const [pluginsOpen, setPluginsOpen] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [artifactsOpen, setArtifactsOpen] = useState(false);
   const [mobileRunning, setMobileRunning] = useState(false);
-  const [pluginCatalog, setPluginCatalog] = useState<DshCommunityPluginCatalogView | null>(null);
   const [unifiedPluginCatalog, setUnifiedPluginCatalog] = useState<PluginCatalogView | null>(null);
   const [pluginsLoading, setPluginsLoading] = useState(false);
   const [pluginsError, setPluginsError] = useState<string | null>(null);
-  const [pluginBusyId, setPluginBusyId] = useState<string | null>(null);
   const [popupOpening, setPopupOpening] = useState(false);
   const [embedRevision, setEmbedRevision] = useState(0);
+  mobileOpenRef.current = mobileOpen;
 
   const projectTasks = useMemo(
     () => (snapshot?.tasks ?? [])
@@ -225,38 +187,44 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       }),
     [project.id, snapshot?.tasks]
   );
-  const agentsById = useMemo(
-    () => new Map((snapshot?.agentCards ?? []).map((card) => [card.agent.id, card.agent])),
-    [snapshot?.agentCards]
-  );
-  const dshAgents = useMemo(
-    () => (snapshot?.agentCards ?? []).filter((card) => (
-      !card.agent.archived && card.agent.engineId === DSH_MANAGED_ENGINE_ID
-    )),
-    [snapshot?.agentCards]
-  );
   const workerAgents = useMemo(
     () => (snapshot?.agentCards ?? []).filter((card) => (
-      !card.agent.archived && card.agent.engineId !== DSH_MANAGED_ENGINE_ID
+      !card.agent.archived
     )),
     [snapshot?.agentCards]
   );
-  const agentId = useMemo(() => {
-    if (workbench?.rootSession?.agentId) return workbench.rootSession.agentId;
-    return dshAgents[0]?.agent.id ?? '';
-  }, [dshAgents, workbench?.rootSession?.agentId]);
-  const agentName = agentsById.get(agentId)?.name
-    ?? workbench?.rootSession?.agentName
-    ?? 'DSH / Cordis';
-
-  useEffect(() => {
-    const previous = document.documentElement.dataset.questFocus;
-    document.documentElement.dataset.questFocus = 'true';
-    return () => {
-      if (previous === undefined) delete document.documentElement.dataset.questFocus;
-      else document.documentElement.dataset.questFocus = previous;
-    };
-  }, []);
+  const projectTeam = useMemo(() => {
+    const cards = new Map(workerAgents.map((card) => [card.agent.id, card]));
+    const members = new Map<string, {
+      agentId: string;
+      name: string;
+      role: string;
+      engineId: string;
+      activeTasks: number;
+      totalTasks: number;
+    }>();
+    for (const task of projectTasks) {
+      const card = cards.get(task.agentId);
+      const member = members.get(task.agentId) ?? {
+        agentId: task.agentId,
+        name: card?.agent.name ?? task.agentId,
+        role: card?.agent.role ?? '',
+        engineId: card?.agent.engineId ?? task.engineOverride ?? '',
+        activeTasks: 0,
+        totalTasks: 0
+      };
+      member.totalTasks += 1;
+      if (ACTIVE_TASK_STATUSES.has(task.status)) member.activeTasks += 1;
+      members.set(task.agentId, member);
+    }
+    return [...members.values()].sort((left, right) => (
+      right.activeTasks - left.activeTasks || right.totalTasks - left.totalTasks || left.name.localeCompare(right.name, 'zh-CN')
+    ));
+  }, [projectTasks, workerAgents]);
+  const recentProjectTasks = useMemo(() => [...projectTasks]
+    .sort((left, right) => (
+      (right.endedAt ?? right.startedAt ?? right.createdAt) - (left.endedAt ?? left.startedAt ?? left.createdAt)
+    )), [projectTasks]);
 
   const loadWorkbench = useCallback(async (initial = false) => {
     const requestId = ++loadRequestRef.current;
@@ -296,11 +264,56 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
   }, [loadWorkbench]);
 
   useEffect(() => {
+    if (!active || project.status === 'archived') return;
+    // Start the project-scoped Hermes service while governance data and the
+    // embedded WebContentsView are still being prepared. The Main process
+    // coalesces this with the later open request, so entering Quest no longer
+    // serializes project loading and Python runtime startup.
+    void window.aibox.startHermesProject(project.id).catch(() => undefined);
+  }, [active, project.id, project.status]);
+
+  useEffect(() => {
     if (standalone) return;
     return window.aibox.onQuestWindowClosed(() => {
       setEmbedRevision((value) => value + 1);
     });
   }, [standalone]);
+
+  useEffect(() => {
+    let active = true;
+    let checking = false;
+    const checkRuntime = async () => {
+      if (checking || (embedPhase !== 'opening' && embedPhase !== 'ready')) return;
+      checking = true;
+      try {
+        const runtime = await window.aibox.getHermesRuntimeStatus(project.id);
+        if (!active || activeProjectIdRef.current !== project.id) return;
+        setRuntimeStatus(runtime);
+        if (runtime.state !== 'error' && runtime.state !== 'stopped') return;
+        if (embedPhase !== 'ready') return;
+        openedRef.current = false;
+        lastBoundsRef.current = null;
+        lastVisibleRef.current = null;
+        await window.aibox.closeEmbeddedHermesWorkbench().catch(() => undefined);
+        if (!active || activeProjectIdRef.current !== project.id) return;
+        setEmbedPhase(runtime.state === 'error' ? 'error' : 'unavailable');
+        setEmbedError(runtime.lastError || (runtime.state === 'error'
+          ? 'Hermes 项目运行时已停止'
+          : 'Hermes 项目服务未运行'));
+      } catch {
+        // The embedded open flow owns initial connection errors. Runtime
+        // polling only reacts to an authoritative stopped/error state.
+      } finally {
+        checking = false;
+      }
+    };
+    void checkRuntime();
+    const timer = window.setInterval(() => { void checkRuntime(); }, 1_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [embedPhase, project.id]);
 
   const reportEmbeddedGeometry = useCallback(() => {
     if (reportFrameRef.current !== null) return;
@@ -312,7 +325,8 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       const bounds = visibleBounds(element);
       const visible = document.visibilityState === 'visible'
         && element.isConnected
-        && isUsableDshEmbeddedBounds(bounds);
+        && !mobileOpenRef.current
+        && isUsableHermesEmbeddedBounds(bounds);
       const api = window.aibox;
 
       // A native WebContentsView always sits above Renderer DOM. When a drawer
@@ -320,11 +334,11 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       // bounds that Main correctly rejects and leaving the drawer covered.
       if (visible && !sameBounds(lastBoundsRef.current, bounds)) {
         lastBoundsRef.current = bounds;
-        void api.setEmbeddedDshWorkbenchBounds(bounds).catch(() => undefined);
+        void api.setEmbeddedHermesWorkbenchBounds(bounds).catch(() => undefined);
       }
       if (lastVisibleRef.current !== visible) {
         lastVisibleRef.current = visible;
-        void api.setEmbeddedDshWorkbenchVisible(visible).catch(() => undefined);
+        void api.setEmbeddedHermesWorkbenchVisible(visible).catch(() => undefined);
       }
     });
   }, []);
@@ -351,50 +365,40 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
   }, [reportEmbeddedGeometry]);
 
   useEffect(() => {
-    if (workbenchLoading || resolvedProjectId !== project.id) return;
-    if (!agentId) {
-      setEmbedPhase('unavailable');
-      setEmbedError(null);
-      return;
-    }
+    reportEmbeddedGeometry();
+  }, [mobileOpen, reportEmbeddedGeometry]);
+
+  useEffect(() => {
+    if (!active || workbenchLoading || resolvedProjectId !== project.id) return;
     const element = embeddedHostRef.current;
     if (!element) return;
 
     const api = window.aibox;
     const bounds = visibleBounds(element);
-    let active = true;
+    let alive = true;
     let statusTimer: number | null = null;
     setEmbedPhase('opening');
     setEmbedError(null);
-    setProviderPreflight(null);
+    setRuntimeStatus(null);
     lastBoundsRef.current = bounds;
     lastVisibleRef.current = null;
 
     void (async () => {
-      const preflight = await api.preflightQuestProvider(project.id, agentId);
-      if (!active) return;
-      setProviderPreflight(preflight);
-      if (!preflight.ready) {
-        setEmbedPhase('error');
-        setEmbedError(preflight.error ?? '模型 Provider 尚未就绪');
-        return;
-      }
-
-      const status = await api.openEmbeddedDshWorkbench({
+      const status = await api.openEmbeddedHermesWorkbench({
         projectId: project.id,
-        agentId,
-        sessionId: workbench?.rootSession?.sessionId ?? null,
-        bounds
+        bounds,
+        theme,
+        ...(initialConversationIdRef.current ? { conversationId: initialConversationIdRef.current } : {})
       });
-      if (!active) return;
+      if (!alive) return;
       openedRef.current = true;
       setEmbedPhase(status.loading ? 'opening' : status.attached ? 'ready' : 'error');
       reportEmbeddedGeometry();
 
       if (status.loading) {
         statusTimer = window.setInterval(() => {
-          void api.getEmbeddedDshWorkbenchStatus().then((next) => {
-            if (!active) return;
+          void api.getEmbeddedHermesWorkbenchStatus().then((next) => {
+            if (!alive) return;
             setEmbedPhase(next.loading ? 'opening' : next.attached ? 'ready' : 'error');
             if (!next.loading && statusTimer !== null) {
               window.clearInterval(statusTimer);
@@ -404,29 +408,48 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
         }, 750);
       }
     })().catch((error) => {
-      if (!active) return;
+      if (!alive) return;
+      if (isSupersededHermesWorkbenchError(error)) return;
       openedRef.current = false;
       setEmbedPhase('error');
-      setEmbedError(error instanceof Error ? error.message : 'DSH 工作区打开失败');
+      setEmbedError(error instanceof Error ? error.message : 'Hermes 工作区打开失败');
     });
 
     return () => {
-      active = false;
+      alive = false;
       openedRef.current = false;
       lastBoundsRef.current = null;
       lastVisibleRef.current = null;
       if (statusTimer !== null) window.clearInterval(statusTimer);
-      // React runs the previous effect cleanup before opening the next project.
-      // Dispatch close immediately so the old teardown cannot arrive after the
-      // next project's open request and destroy its newly attached native View.
-      void api.closeEmbeddedDshWorkbench().catch(() => undefined);
+      void api.setEmbeddedHermesWorkbenchVisible(false).catch(() => undefined);
     };
     // Workspace changes bump embedRevision explicitly. Keeping the root id out
     // avoids reopening the same View when an initial null binding is persisted.
-  }, [agentId, embedRevision, project.id, reportEmbeddedGeometry, resolvedProjectId, workbenchLoading]);
+  }, [active, embedRevision, project.id, reportEmbeddedGeometry, resolvedProjectId, theme, workbenchLoading]);
+
+  useEffect(() => () => {
+    void window.aibox.closeEmbeddedHermesWorkbench().catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!active || !initialConversationId || embedPhase !== 'ready' || workbenchLoading || resolvedProjectId !== project.id) return;
+    const element = embeddedHostRef.current;
+    if (!element) return;
+    const bounds = visibleBounds(element);
+    if (!isUsableHermesEmbeddedBounds(bounds)) return;
+    void window.aibox.openEmbeddedHermesWorkbench({
+      projectId: project.id,
+      bounds,
+      theme,
+      conversationId: initialConversationId
+    }).catch((error) => {
+      if (isSupersededHermesWorkbenchError(error)) return;
+      setEmbedError(error instanceof Error ? error.message : '员工会话切换失败');
+    });
+  }, [active, embedPhase, initialConversationId, project.id, resolvedProjectId, theme, workbenchLoading]);
 
   const openPopup = async () => {
-    if (!agentId || popupOpening) return;
+    if (popupOpening) return;
     setPopupOpening(true);
     try {
       await window.aibox.openQuestWindow({ projectId: project.id });
@@ -448,24 +471,19 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
   const loadPluginCatalog = useCallback(async () => {
     const requestId = ++pluginCatalogRequestRef.current;
     setPluginsLoading(true);
+    setPluginsError(null);
     try {
-      const [communityResult, unifiedResult] = await Promise.allSettled([
-        agentId
-          ? window.aibox.getDshCommunityPluginCatalog(agentId)
-          : Promise.reject(new Error('没有可用的 DSH 数字员工')),
-        window.aibox.getPluginCatalog()
-      ]);
+      const unifiedResult = await window.aibox.getPluginCatalog();
       if (requestId !== pluginCatalogRequestRef.current) return;
-      setPluginCatalog(communityResult.status === 'fulfilled' ? communityResult.value : null);
-      setUnifiedPluginCatalog(unifiedResult.status === 'fulfilled' ? unifiedResult.value : null);
-      const errors = [communityResult, unifiedResult]
-        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-        .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason));
-      setPluginsError(errors.length > 0 ? errors.join('；') : null);
+      setUnifiedPluginCatalog(unifiedResult);
+    } catch (error) {
+      if (requestId !== pluginCatalogRequestRef.current) return;
+      setUnifiedPluginCatalog(null);
+      setPluginsError(error instanceof Error ? error.message : String(error));
     } finally {
       if (requestId === pluginCatalogRequestRef.current) setPluginsLoading(false);
     }
-  }, [agentId]);
+  }, []);
 
   useEffect(() => {
     if (pluginsOpen) void loadPluginCatalog();
@@ -473,67 +491,11 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
 
   useEffect(() => {
     let active = true;
-    void window.aibox.getDshLanGatewayStatus().then((status) => {
-      if (active) setMobileRunning(status.gateway.running);
+    void window.aibox.getHermesMobileAccessStatus(project.id).then((status) => {
+      if (active) setMobileRunning(status.running);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, []);
-
-  const installCommunityPlugin = async (plugin: DshCommunityPluginView) => {
-    if (!agentId || pluginBusyId || !plugin.installable) return;
-    setPluginBusyId(plugin.id);
-    try {
-      const confirmation = await window.aibox.prepareDshCommunityPluginInstall(agentId, plugin.id);
-      const accepted = window.confirm(
-        `确认安装 ${plugin.name}？\n\n${confirmation.summary}\n运行边界：${PLUGIN_BOUNDARY_LABELS[plugin.runtimeBoundary]}\n版本：${plugin.version}`
-      );
-      if (!accepted) return;
-      const result = await window.aibox.installDshCommunityPlugin({
-        agentId,
-        pluginId: plugin.id,
-        confirmationToken: confirmation.token
-      });
-      if (result.ok) toast.ok(result.message || `${plugin.name} 已安装`);
-      else toast.err(result.message || `${plugin.name} 安装失败`);
-      await loadPluginCatalog();
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : 'DSH 插件安装失败');
-    } finally {
-      setPluginBusyId(null);
-    }
-  };
-
-  const applyCommunityPluginLifecycle = async (
-    plugin: DshCommunityPluginView,
-    action: Exclude<DshPluginLifecycleAction, 'install'>
-  ) => {
-    const allowed = action === 'uninstall'
-      ? plugin.installedVersion !== null && plugin.status !== 'installing' && plugin.status !== 'missing'
-      : plugin.installable && (plugin.status === 'update-available' || plugin.status === 'broken');
-    if (!agentId || pluginBusyId || !allowed) return;
-    setPluginBusyId(plugin.id);
-    const actionLabel = action === 'uninstall' ? '卸载' : '更新';
-    try {
-      const confirmation = await window.aibox.prepareDshCommunityPluginLifecycle(agentId, plugin.id, action);
-      const accepted = window.confirm(
-        `确认${actionLabel} ${plugin.name}？\n\n${confirmation.summary}\n当前版本：${plugin.installedVersion ?? '未知'}\n目标版本：${plugin.version}`
-      );
-      if (!accepted) return;
-      const result = await window.aibox.applyDshCommunityPluginLifecycle({
-        agentId,
-        pluginId: plugin.id,
-        action,
-        confirmationToken: confirmation.token
-      });
-      if (result.ok) toast.ok(result.message || `${plugin.name} 已${actionLabel}`);
-      else toast.err(result.message || `${plugin.name} ${actionLabel}失败`);
-      await loadPluginCatalog();
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : `DSH 插件${actionLabel}失败`);
-    } finally {
-      setPluginBusyId(null);
-    }
-  };
+  }, [project.id]);
 
   const toggleGovernance = () => {
     const next = !governanceOpen;
@@ -554,6 +516,8 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       setSetupOpen(false);
       setMobileOpen(false);
       setArtifactsOpen(false);
+    } else {
+      setGovernanceOpen(true);
     }
   };
 
@@ -565,18 +529,13 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       setPluginsOpen(false);
       setMobileOpen(false);
       setArtifactsOpen(false);
+    } else {
+      setGovernanceOpen(true);
     }
   };
 
   const toggleMobile = () => {
-    const next = !mobileOpen;
-    setMobileOpen(next);
-    if (next) {
-      setGovernanceOpen(false);
-      setPluginsOpen(false);
-      setSetupOpen(false);
-      setArtifactsOpen(false);
-    }
+    setMobileOpen((value) => !value);
   };
 
   const toggleArtifacts = () => {
@@ -587,6 +546,8 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       setPluginsOpen(false);
       setSetupOpen(false);
       setMobileOpen(false);
+    } else {
+      setGovernanceOpen(true);
     }
   };
 
@@ -627,6 +588,12 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
     if (!settingsDraft || settingsSaving) return;
     const requestId = ++settingsSaveRequestRef.current;
     const projectId = project.id;
+    const currentSettings = workbench?.settings;
+    const reconnectHermes = Boolean(currentSettings) && (
+      settingsDraft.model !== currentSettings?.model
+      || settingsDraft.workerAgentIds.join('\u0000') !== currentSettings?.workerAgentIds.join('\u0000')
+      || settingsDraft.pluginIds.join('\u0000') !== currentSettings?.pluginIds.join('\u0000')
+    );
     setSettingsSaving(true);
     try {
       const saved = await window.aibox.saveQuestSettings(projectId, { ...settingsDraft, mode: 'quest' });
@@ -636,6 +603,7 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       setSettingsDirty(false);
       setSettingsDraft(normalized);
       setWorkbench((current) => current ? { ...current, settings: normalized } : current);
+      if (reconnectHermes) setEmbedRevision((value) => value + 1);
       toast.ok('Quest 运行设置已保存');
     } catch (error) {
       if (requestId !== settingsSaveRequestRef.current || projectId !== activeProjectIdRef.current) return;
@@ -646,32 +614,48 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
   };
 
   const activeTasks = projectTasks.filter((task) => ACTIVE_TASK_STATUSES.has(task.status));
-  const teamSize = workbench
-    ? workbench.team.fixed.length + workbench.team.elastic.length + workbench.team.external.length
-    : 0;
-  const pluginPack = pluginCatalog?.questDefaultPack ?? null;
-  const pluginPackMembers = pluginPack
-    ? [...pluginPack.members].sort((left, right) => (left.questPart ?? 99) - (right.questPart ?? 99))
-    : [];
-  const builtInCapabilities = pluginCatalog?.builtInCapabilities ?? [];
-  const integratedBuiltInCount = builtInCapabilities.filter((capability) => capability.status !== 'unavailable').length;
+  const validationTasks = projectTasks.filter((task) => hermesTaskIntent(task) === 'validation');
+  const latestValidationTask = validationTasks[0] ?? null;
+  const validationVerdict = latestValidationTask ? hermesValidationVerdict(latestValidationTask) : null;
+  const validationLabel = latestValidationTask
+    ? latestValidationTask.status === 'COMPLETED'
+      ? validationVerdict === 'PASS' ? '验收通过' : validationVerdict === 'FAIL' ? '验收未通过' : '验收被阻塞'
+      : `验收${TASK_STATUS_META[latestValidationTask.status].label}`
+    : '主秘书尚未派发独立验收';
+  const validationTone = latestValidationTask?.status === 'COMPLETED' && validationVerdict === 'PASS'
+    ? 'accepted'
+    : latestValidationTask?.status === 'COMPLETED'
+      ? 'rejected'
+      : latestValidationTask
+        ? 'pending'
+        : 'muted';
+  const teamSize = projectTeam.length;
   const projectPlugins = (unifiedPluginCatalog?.items ?? [])
-    .filter((plugin) => !REQUIRED_PROJECT_PLUGIN_IDS.has(plugin.id) && !WORKER_PLUGIN_SOURCES.has(plugin.source))
+    .filter((plugin) => HERMES_PROJECT_CAPABILITY_SOURCES.has(plugin.source)
+      && !REQUIRED_PROJECT_PLUGIN_IDS.has(plugin.id)
+      && !WORKER_PLUGIN_SOURCES.has(plugin.source))
     .sort((left, right) => `${PLUGIN_SOURCE_LABELS[left.source]}:${left.name}`.localeCompare(`${PLUGIN_SOURCE_LABELS[right.source]}:${right.name}`, 'zh-CN'));
   const selectedProjectPluginCount = settingsDraft?.pluginIds.filter((id) => projectPlugins.some((plugin) => plugin.id === id)).length ?? 0;
+  const startupLabel = runtimeStatus?.startupPhase === 'preparing'
+    ? '准备运行环境'
+    : runtimeStatus?.startupPhase === 'starting-dashboard'
+      ? '启动对话界面'
+      : runtimeStatus?.startupPhase === 'starting-gateway'
+        ? '启动执行引擎'
+        : '启动 Hermes';
   const phaseLabel = embedPhase === 'ready'
-    ? '已连接'
+    ? runtimeStatus?.state === 'starting' ? '界面可用 · 引擎启动中' : '已连接'
     : embedPhase === 'opening'
-      ? '连接中'
+      ? startupLabel
       : embedPhase === 'unavailable'
         ? '未配置'
         : embedPhase === 'error'
-          ? providerPreflight && !providerPreflight.ready ? '模型不可用' : '连接失败'
+          ? '连接失败'
           : '准备中';
 
   return (
     <section
-      className={`quest-workbench${governanceOpen ? ' governance-open' : ''}${pluginsOpen ? ' plugins-open' : ''}${setupOpen ? ' setup-open' : ''}${mobileOpen ? ' mobile-open' : ''}${artifactsOpen ? ' artifacts-open' : ''}`}
+      className={`quest-workbench${standalone ? ' is-standalone' : ''}${contextOpen ? ' context-open' : ''}${governanceOpen ? ' governance-open' : ''}${pluginsOpen ? ' plugins-open' : ''}${setupOpen ? ' setup-open' : ''}${artifactsOpen ? ' artifacts-open' : ''}`}
       style={{ '--quest-project-color': project.color } as CSSProperties}
       aria-label={`${project.name} Quest 工作区`}
     >
@@ -693,15 +677,22 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
               {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
             </select>
           ) : <strong>{project.name}</strong>}
-          <span>{agentName}</span>
+          <span>Hermes 调度</span>
         </div>
         <span
           className={`quest-embed-status is-${embedPhase}`}
-          title={providerPreflight?.ready
-            ? `${providerPreflight.providerName ?? 'Provider'} · ${providerPreflight.model ?? '默认模型'} · ${providerPreflight.latencyMs}ms`
-            : providerPreflight?.error ?? undefined}
         ><i />{phaseLabel}</span>
         <div className="quest-toolbar-actions">
+          <button
+            className={`quest-toolbar-icon${contextOpen ? ' active' : ''}`}
+            type="button"
+            onClick={() => setContextOpen((value) => !value)}
+            title={contextOpen ? '收起项目上下文' : '展开项目上下文'}
+            aria-label={contextOpen ? '收起 Quest 项目上下文' : '展开 Quest 项目上下文'}
+            aria-expanded={contextOpen}
+          >
+            {contextOpen ? <IconChevronLeft size={15} /> : <IconChevronRight size={15} />}
+          </button>
           {standalone && (
             <button
               className="quest-toolbar-icon"
@@ -717,7 +708,7 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
             <button
               className="quest-toolbar-icon"
               type="button"
-              disabled={!agentId || popupOpening}
+              disabled={popupOpening}
               onClick={() => void openPopup()}
               title="在独立窗口打开 Quest"
               aria-label="在独立窗口打开 Quest"
@@ -725,6 +716,18 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
               <IconFullscreen size={15} />
             </button>
           )}
+          <button
+            className={`quest-toolbar-icon${mobileOpen ? ' active' : ''}`}
+            data-running={mobileRunning}
+            type="button"
+            onClick={toggleMobile}
+            title={mobileOpen ? '关闭手机 Hermes 对话' : mobileRunning ? '手机 Hermes 对话已共享' : '连接手机 Hermes 对话'}
+            aria-label={mobileOpen ? '关闭手机 Hermes 对话' : '连接手机 Hermes 对话'}
+            aria-expanded={mobileOpen}
+          >
+            <IconPhone size={15} />
+            <span className="quest-mobile-indicator" aria-hidden="true" />
+          </button>
           <button
             className={`quest-toolbar-icon${setupOpen ? ' active' : ''}`}
             type="button"
@@ -769,33 +772,100 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
       </header>
 
       <div className="quest-workbench-body">
+        {contextOpen && (
+          <aside className="quest-context" aria-label="Quest 项目与员工上下文">
+            <section className="quest-context-section quest-context-projects">
+              <header><span>项目</span><b>{projects.length}</b></header>
+              <div>
+                {projects.map((item) => (
+                  <button
+                    key={item.id}
+                    className={item.id === project.id ? 'active' : ''}
+                    type="button"
+                    disabled={!onProjectChange || item.id === project.id}
+                    onClick={() => onProjectChange?.(item.id)}
+                    title={item.objective || item.name}
+                  >
+                    <i style={{ background: item.color }} />
+                    <span><strong>{item.name}</strong><small>{item.status === 'active' ? '进行中' : item.status === 'planning' ? '规划中' : item.status === 'paused' ? '已暂停' : '已完成'}</small></span>
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section className="quest-context-section quest-context-sessions">
+              <header><span>当前任务</span><b>{projectTasks.length}</b></header>
+              <div>
+                {projectTasks.slice(0, 8).map((task) => {
+                  const worker = workerAgents.find((card) => card.agent.id === task.agentId)?.agent;
+                  return <div key={task.id}>
+                    <IconTask size={13} />
+                    <span><strong>{task.title}</strong><small>{worker?.name ?? task.agentId} · {TASK_STATUS_META[task.status].label}</small></span>
+                  </div>;
+                })}
+                {!workbenchLoading && projectTasks.length === 0 && <p>Hermes 派工后，真实任务会显示在这里</p>}
+              </div>
+            </section>
+
+            <section className="quest-context-section quest-context-employees">
+              <header><span>数字员工</span><b>{workerAgents.length}</b></header>
+              <div>
+                {workerAgents.slice(0, 10).map((card) => {
+                  const fixed = settingsDraft?.workerAgentIds.includes(card.agent.id) ?? false;
+                  return (
+                    <div key={card.agent.id} data-fixed={fixed ? 'true' : 'false'}>
+                      <span className="quest-context-avatar">{card.agent.name.slice(0, 1).toUpperCase()}</span>
+                      <span><strong>{card.agent.name}</strong><small>{card.agent.role || card.agent.engineId}</small></span>
+                      <b>{fixed ? '固定' : '可调度'}</b>
+                    </div>
+                  );
+                })}
+                {workerAgents.length === 0 && <p>暂无可用数字员工</p>}
+              </div>
+            </section>
+
+            <footer className={`quest-context-footer${standalone ? ' is-standalone' : ''}`}>
+              {standalone ? (
+                <button className="quest-main-console-button" type="button" onClick={() => void openMainConsole()}>
+                  <IconHome size={13} />
+                  <span><strong>主控制台</strong><small>打开全部功能菜单</small></span>
+                </button>
+              ) : (
+                <>
+                  <button type="button" onClick={() => setRoute('projects')}><IconFolder size={13} />项目中心</button>
+                  <button type="button" onClick={() => setRoute('agents')}><IconUser size={13} />数字员工</button>
+                </>
+              )}
+            </footer>
+          </aside>
+        )}
+
         <div className="quest-embedded-column">
           <div
             ref={embeddedHostRef}
             className={`quest-embedded-host is-${embedPhase}`}
             aria-busy={embedPhase === 'opening'}
           >
-            {embedPhase === 'opening' && <div className="quest-embedded-state"><span className="quest-state-spinner" />正在启动 DSH 工作区</div>}
-            {embedPhase === 'unavailable' && <div className="quest-embedded-state"><IconAlert size={20} /><strong>没有可用的 DSH 数字员工</strong><button className="btn small" type="button" onClick={toggleSetup}>打开连接设置</button></div>}
-            {embedPhase === 'error' && <div className="quest-embedded-state error"><IconAlert size={20} /><strong>{providerPreflight && !providerPreflight.ready ? '模型连接不可用' : 'DSH 工作区连接失败'}</strong><span>{embedError}</span><div className="quest-embedded-state-actions"><button className="btn small" type="button" onClick={() => retryEmbed()}><IconRefresh size={13} />重试</button><button className="btn small" type="button" onClick={toggleSetup}>连接设置</button></div></div>}
+            {embedPhase === 'opening' && <div className="quest-embedded-state"><span className="quest-state-spinner" />{startupLabel}</div>}
+            {embedPhase === 'unavailable' && <div className="quest-embedded-state"><IconAlert size={20} /><strong>Hermes 项目服务不可用</strong><button className="btn small" type="button" onClick={toggleSetup}>打开连接设置</button></div>}
+            {embedPhase === 'error' && <div className="quest-embedded-state error"><IconAlert size={20} /><strong>Hermes 工作区连接失败</strong><span>{embedError}</span><div className="quest-embedded-state-actions"><button className="btn small" type="button" onClick={() => retryEmbed()}><IconRefresh size={13} />重试</button><button className="btn small" type="button" onClick={toggleSetup}>连接设置</button></div></div>}
           </div>
-          <footer className="quest-embedded-footer">
-            <button
-              className={mobileOpen ? 'active' : ''}
-              data-running={mobileRunning}
-              type="button"
-              onClick={toggleMobile}
-              title={mobileOpen ? '收起手机 Web' : mobileRunning ? '手机 Web 已共享' : '连接手机 Web'}
-              aria-label={mobileOpen ? '收起 Quest 手机 Web' : '连接 Quest 手机 Web'}
-              aria-expanded={mobileOpen}
-            >
-              <IconPhone size={17} />
-              <span className="quest-mobile-indicator" aria-hidden="true" />
-            </button>
-          </footer>
         </div>
 
-        {mobileOpen && <QuestMobileAccess projectName={project.name} onRunningChange={setMobileRunning} />}
+        {mobileOpen && (
+          <div className="quest-mobile-modal-backdrop" role="presentation" onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setMobileOpen(false);
+          }}>
+            <div className="quest-mobile-modal" role="dialog" aria-modal="true" aria-label="手机 Hermes 对话">
+              <QuestMobileAccess
+                projectId={project.id}
+                projectName={project.name}
+                onRunningChange={setMobileRunning}
+                onClose={() => setMobileOpen(false)}
+              />
+            </div>
+          </div>
+        )}
 
         {artifactsOpen && (
           <ProjectArtifactsPanel
@@ -807,8 +877,7 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
 
         {setupOpen && (
           <QuestRuntimeSetup
-            agentId={agentId}
-            engineStatus={snapshot?.engines.find((engine) => engine.id === DSH_MANAGED_ENGINE_ID)?.status ?? null}
+            workerCount={workerAgents.length}
             onRetry={retryEmbed}
           />
         )}
@@ -825,10 +894,22 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
               {workbenchError && <div className="quest-governance-error"><IconAlert size={13} />{workbenchError}</div>}
               <div className="quest-governance-kpis">
                 <div><span>活跃任务</span><strong>{activeTasks.length}</strong></div>
-                <div><span>运行会话</span><strong>{workbench?.activeRuns.length ?? 0}</strong></div>
+                <div><span>已完成</span><strong>{projectTasks.filter((task) => task.status === 'COMPLETED').length}</strong></div>
                 <div><span>协作成员</span><strong>{teamSize}</strong></div>
                 <div><span>Token</span><strong>{formatTokens(workbench?.usage.totalTokens ?? 0)}</strong></div>
               </div>
+
+              {!standalone && (
+                <section className="quest-governance-section quest-governance-shortcuts">
+                  <header><span>业务入口</span></header>
+                  <div>
+                    <button type="button" onClick={() => setRoute('tasks')}><IconTask size={13} /><span>任务</span></button>
+                    <button type="button" onClick={() => setRoute('deliverables')}><IconFile size={13} /><span>成果</span></button>
+                    <button type="button" onClick={() => setRoute('plugins')}><IconPlug size={13} /><span>插件</span></button>
+                    <button type="button" onClick={() => setRoute('channels')}><IconPhone size={13} /><span>渠道</span></button>
+                  </div>
+                </section>
+              )}
 
               {settingsDraft && (
                 <section className="quest-governance-section quest-governance-settings">
@@ -869,7 +950,7 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
                       <input
                         value={settingsDraft.model ?? ''}
                         maxLength={160}
-                        placeholder="DSH 默认"
+                        placeholder="Hermes 默认"
                         onChange={(event) => updateSettings({ model: event.target.value || null })}
                       />
                     </label>
@@ -889,7 +970,7 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
                   </div>
                   {workerAgents.length > 0 && (
                     <div className="quest-governance-workers">
-                      <span>优先调度固定员工</span>
+                      <span>固定员工池（不选择则由主 Agent 动态组队）</span>
                       {workerAgents.map((card) => (
                         <label key={card.agent.id}>
                           <input
@@ -926,6 +1007,19 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
                 </div>
               </section>
 
+              <section className="quest-governance-section quest-governance-acceptance" data-nexus-acceptance-status>
+                <header><span><IconCheck size={14} />主秘书验收</span><b className={`is-${validationTone}`}>{validationLabel}</b></header>
+                {latestValidationTask ? (
+                  <div className="quest-governance-acceptance-detail">
+                    <strong>{latestValidationTask.title}</strong>
+                    <span>{latestValidationTask.agentId} · {hermesRelatedTaskCount(latestValidationTask)} 项实现任务</span>
+                    <small>{validationVerdict ? `权威结论：${validationVerdict}` : '等待独立验收员工返回权威结论'}</small>
+                  </div>
+                ) : (
+                  <p className="quest-governance-empty">复杂交付完成后，主秘书必须让未参与实现的子 Agent 独立验收；没有 PASS 不会正式交付。</p>
+                )}
+              </section>
+
               {(workbench?.risks.length ?? 0) > 0 && (
                 <section className="quest-governance-section quest-governance-risks">
                   <header><span><IconAlert size={14} />风险与阻塞</span><b>{workbench?.risks.length}</b></header>
@@ -941,23 +1035,23 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
               <section className="quest-governance-section">
                 <header><span><IconUser size={14} />当前团队</span><b>{teamSize}</b></header>
                 <div className="quest-governance-team">
-                  {workbench && [...workbench.team.fixed, ...workbench.team.elastic, ...workbench.team.external].slice(0, 8).map((member) => (
-                    <div key={`${member.kind}:${member.agentId}`}>
+                  {projectTeam.slice(0, 8).map((member) => (
+                    <div key={member.agentId}>
                       <span><strong>{member.name}</strong><small>{member.role || member.engineId}</small></span>
-                      <b>{member.activeRuns > 0 ? `${member.activeRuns} 运行中` : member.kind === 'elastic' ? '弹性' : member.kind === 'external' ? 'A2A' : '固定'}</b>
+                      <b>{member.activeTasks > 0 ? `${member.activeTasks} 项进行中` : `${member.totalTasks} 项任务`}</b>
                     </div>
                   ))}
                   {!workbenchLoading && teamSize === 0 && <span className="quest-governance-empty">团队将在派工后显示</span>}
                 </div>
               </section>
 
-              {(workbench?.recentEvents.length ?? 0) > 0 && (
+              {recentProjectTasks.length > 0 && (
                 <section className="quest-governance-section quest-governance-activity">
                   <header><span>最近活动</span></header>
-                  {workbench?.recentEvents.slice(0, 6).map((event, index) => (
-                    <div key={`${event.sessionId}:${event.createdAt}:${index}`}>
+                  {recentProjectTasks.slice(0, 6).map((task) => (
+                    <div key={task.id}>
                       <i />
-                      <span><strong>{event.summary || event.type}</strong><small>{formatUpdatedAt(event.createdAt)}</small></span>
+                      <span><strong>{task.title} · {TASK_STATUS_META[task.status].label}</strong><small>{formatUpdatedAt(task.endedAt ?? task.startedAt ?? task.createdAt)}</small></span>
                     </div>
                   ))}
                 </section>
@@ -967,15 +1061,15 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
         )}
 
         {pluginsOpen && (
-          <aside className="quest-plugin-drawer" aria-label="Quest 能力与社区候选">
+          <aside className="quest-plugin-drawer" aria-label="Quest 项目能力">
             <div className="quest-plugin-head">
               <div>
                 <strong>Quest 能力</strong>
-                <span>内置集成与社区候选分开核验</span>
+                <span>选择已真实接入 Hermes 的 MCP 与技能</span>
               </div>
               <button
                 type="button"
-                disabled={pluginsLoading || !agentId}
+                disabled={pluginsLoading}
                 onClick={() => void loadPluginCatalog()}
                 title="刷新插件状态"
                 aria-label="刷新插件状态"
@@ -985,26 +1079,6 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
             </div>
 
             <div className="quest-plugin-scroll" aria-busy={pluginsLoading}>
-              <div className="quest-plugin-summary">
-                <span className={`is-${pluginCatalog?.profile ?? 'unknown'}`}>
-                  {PROFILE_STATUS_LABELS[pluginCatalog?.profile ?? 'unknown']}
-                </span>
-                <b>社区候选 · 安装 {pluginPack?.installedCount ?? 0}/{pluginPack?.totalCount ?? 10} · 运行 {pluginPack?.liveCount ?? 0}/{pluginPack?.totalCount ?? 10}</b>
-              </div>
-              <section className="quest-plugin-builtins" aria-label="已接入的内置能力">
-                <header>
-                  <span>内置能力</span>
-                  <b>{integratedBuiltInCount}/{builtInCapabilities.length} 已集成</b>
-                </header>
-                {builtInCapabilities.map((capability) => (
-                  <div key={capability.id} data-status={capability.status}>
-                    <IconCheck size={12} />
-                    <span><strong>{capability.name}</strong><small>{capability.description}</small></span>
-                    <b>{BUILTIN_STATUS_LABELS[capability.status]}</b>
-                  </div>
-                ))}
-              </section>
-
               <section className="quest-project-plugins" aria-label="项目启用能力">
                 <header>
                   <span>项目启用能力</span>
@@ -1055,74 +1129,8 @@ export function QuestWorkbench({ project, onBack, projects = [project], onProjec
               </section>
 
               {pluginsError && <div className="quest-plugin-error"><IconAlert size={13} />{pluginsError}</div>}
-              {pluginsLoading && !pluginPack && (
-                <div className="quest-plugin-loading"><span className="quest-state-spinner" />正在读取插件治理状态</div>
-              )}
-              {!pluginsLoading && !pluginsError && !pluginPack && (
-                <div className="quest-plugin-empty">当前 DSH Profile 未提供 Quest 默认能力包。</div>
-              )}
-
-              {pluginPackMembers.length > 0 && (
-                <div className="quest-plugin-list">
-                  {pluginPackMembers.map((plugin) => {
-                    const officialWebUiActive = plugin.reasonCodes.includes('OFFICIAL_DSH_WEB_UI_ACTIVE');
-                    const reasons = plugin.reasonCodes
-                      .map((code) => PLUGIN_REASON_LABELS[code])
-                      .filter((label): label is string => Boolean(label));
-                    return (
-                      <article key={plugin.id} data-boundary={plugin.runtimeBoundary}>
-                        <div className="quest-plugin-title-row">
-                          <span className="quest-plugin-part">PART {String(plugin.questPart ?? 0).padStart(2, '0')}</span>
-                          <strong>{plugin.name}</strong>
-                          <code>v{plugin.version}</code>
-                        </div>
-                        <div className="quest-plugin-labels">
-                          <span className={`is-${plugin.compatibility}`}>{PLUGIN_COMPATIBILITY_LABELS[plugin.compatibility]}</span>
-                          <span className={`is-${plugin.runtimeBoundary}`}>{PLUGIN_BOUNDARY_LABELS[plugin.runtimeBoundary]}</span>
-                          <span className={`is-${plugin.status}`}>{PLUGIN_STATUS_LABELS[plugin.status]}</span>
-                          <span className={plugin.activation.live ? 'is-live' : plugin.installedVersion ? 'is-not-probed' : 'is-candidate'}>
-                            {plugin.activation.live ? '运行已验证' : plugin.installedVersion ? '未验证运行' : '社区候选'}
-                          </span>
-                        </div>
-                        {officialWebUiActive && <p className="quest-plugin-official">官方基础 UI 已集成；社区增强包仍需独立核验</p>}
-                        {reasons.length > 0 && <p className="quest-plugin-reasons">{[...new Set(reasons)].slice(0, 3).join(' · ')}</p>}
-                        <div className="quest-plugin-foot">
-                          <span title={plugin.source.packageName}>{plugin.source.packageName}</span>
-                          <div className="quest-plugin-actions">
-                          {plugin.installable && plugin.status === 'available' && (
-                            <button
-                              type="button"
-                              disabled={pluginBusyId !== null || pluginCatalog?.busy}
-                              onClick={() => void installCommunityPlugin(plugin)}
-                            >
-                              {pluginBusyId === plugin.id ? '安装中…' : '安装'}
-                            </button>
-                          )}
-                          {plugin.installable && (plugin.status === 'update-available' || plugin.status === 'broken') && (
-                            <button
-                              type="button"
-                              disabled={pluginBusyId !== null || pluginCatalog?.busy}
-                              onClick={() => void applyCommunityPluginLifecycle(plugin, 'update')}
-                            >
-                              {pluginBusyId === plugin.id ? '处理中…' : '更新'}
-                            </button>
-                          )}
-                          {plugin.installedVersion !== null && plugin.status !== 'installing' && plugin.status !== 'missing' && (
-                            <button
-                              className="danger"
-                              type="button"
-                              disabled={pluginBusyId !== null || pluginCatalog?.busy}
-                              onClick={() => void applyCommunityPluginLifecycle(plugin, 'uninstall')}
-                            >
-                              {pluginBusyId === plugin.id ? '处理中…' : '卸载'}
-                            </button>
-                          )}
-                          </div>
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
+              {pluginsLoading && (
+                <div className="quest-plugin-loading"><span className="quest-state-spinner" />正在读取统一插件目录</div>
               )}
             </div>
           </aside>

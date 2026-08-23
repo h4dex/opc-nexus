@@ -1,5 +1,5 @@
 /** Quest 一级入口：项目只是上下文，不是工作台的父路由。 */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { IconFolder } from '../components/icons';
 import { toast } from '../components/Toast';
 import { useApp } from '../store';
@@ -29,15 +29,18 @@ export function selectQuestProject(projects: Project[], selectedProjectId: strin
 export interface QuestProps {
   standalone?: boolean;
   initialProjectId?: string | null;
+  active?: boolean;
 }
 
-export function Quest({ standalone = false, initialProjectId = null }: QuestProps = {}) {
-  const { snapshot, questProjectId, setRoute, openQuest } = useApp();
+export function Quest({ standalone = false, initialProjectId = null, active = true }: QuestProps = {}) {
+  const { snapshot, questProjectId, questEmployeeId, clearQuestEmployee, setRoute, openQuest } = useApp();
   const [standaloneSync, setStandaloneSync] = useState<{ projectId: string; error: string | null } | null>(null);
   const [recoveryProjectId, setRecoveryProjectId] = useState('');
   const [newProjectName, setNewProjectName] = useState('');
   const [creatingProject, setCreatingProject] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+  const [launchConversationId, setLaunchConversationId] = useState<string | null>(null);
+  const launchKeyRef = useRef<string | null>(null);
   const selectedProjectId = standalone ? initialProjectId : questProjectId ?? initialProjectId;
   const projects = useMemo(
     () => (snapshot?.projects ?? []).filter((item) => item.status !== 'archived'),
@@ -53,6 +56,31 @@ export function Quest({ standalone = false, initialProjectId = null }: QuestProp
     () => selectQuestProject(projects, recoveryProjectId || null),
     [projects, recoveryProjectId]
   );
+
+  useEffect(() => {
+    setLaunchConversationId(null);
+    launchKeyRef.current = null;
+  }, [project?.id]);
+
+  useEffect(() => {
+    if (!project || !questEmployeeId) return;
+    const key = `${project.id}:${questEmployeeId}`;
+    if (launchKeyRef.current === key) return;
+    launchKeyRef.current = key;
+    let active = true;
+    void window.aibox.createHermesProjectConversation(project.id, questEmployeeId)
+      .then((conversation) => {
+        if (!active) return;
+        setLaunchConversationId(conversation.conversationId);
+        clearQuestEmployee();
+      })
+      .catch((error) => {
+        if (!active) return;
+        launchKeyRef.current = null;
+        setBootstrapError(error instanceof Error ? error.message : '无法创建员工会话');
+      });
+    return () => { active = false; };
+  }, [clearQuestEmployee, project, questEmployeeId]);
 
   const openStandaloneProject = async (projectId: string): Promise<boolean> => {
     setStandaloneSync({ projectId, error: null });
@@ -174,6 +202,8 @@ export function Quest({ standalone = false, initialProjectId = null }: QuestProp
       onProjectChange={changeProject}
       onBack={standalone ? undefined : () => setRoute('projects')}
       standalone={standalone}
+      initialConversationId={launchConversationId}
+      active={active}
     />
   );
 

@@ -30,7 +30,16 @@ interface OwnedAgentRow {
 }
 
 export class ChannelManager {
-  constructor(private db: Database) {}
+  constructor(private db: Database) {
+    this.db.raw.prepare(`
+      CREATE TABLE IF NOT EXISTS hermes_channel_bindings (
+        channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `).run();
+  }
 
   ensureChannels() {
     const count = (this.db.raw.prepare('SELECT COUNT(*) c FROM channels').get() as { c: number }).c;
@@ -41,40 +50,36 @@ export class ChannelManager {
       stmt.run('ch-weixin', 'weixin', '', 'UNCONFIGURED', CHANNEL_META.weixin.limitation);
       stmt.run('ch-wecom', 'wecom', '', 'UNCONFIGURED', CHANNEL_META.wecom.limitation);
       stmt.run('ch-feishu', 'feishu', '', 'UNCONFIGURED', CHANNEL_META.feishu.limitation);
-      stmt.run('ch-qq', 'qq', '', 'UNCONFIGURED', CHANNEL_META.qq.limitation);
       return;
     }
     // 存量库：限制文案随版本演进同步（真实接入方式变化后不留旧描述）
     const sync = this.db.raw.prepare('UPDATE channels SET limitation = ? WHERE type = ?');
     for (const [type, meta] of Object.entries(CHANNEL_META)) sync.run(meta.limitation, type);
+    this.db.raw.prepare("UPDATE channels SET status = 'DISABLED', limitation = 'QQ Adapter 尚未实现，当前版本不可用' WHERE type = 'qq'").run();
   }
 
   list(): Channel[] {
-    const rows = this.db.raw.prepare('SELECT * FROM channels ORDER BY rowid').all() as unknown as ChannelRow[];
+    const rows = this.db.raw.prepare("SELECT * FROM channels WHERE type <> 'qq' ORDER BY rowid").all() as unknown as ChannelRow[];
     const routes = this.db.raw.prepare('SELECT channel_id, agent_id FROM channel_routes').all() as { channel_id: string; agent_id: string }[];
     const byChannel = new Map<string, string[]>();
     for (const r of routes) {
       if (!byChannel.has(r.channel_id)) byChannel.set(r.channel_id, []);
       byChannel.get(r.channel_id)!.push(r.agent_id);
     }
+    const projectBindings = this.db.raw.prepare(
+      'SELECT channel_id, project_id FROM hermes_channel_bindings'
+    ).all() as Array<{ channel_id: string; project_id: string }>;
+    const projectsByChannel = new Map(projectBindings.map((item) => [item.channel_id, [item.project_id]]));
     return rows.map((r) => ({
       id: r.id,
       type: r.type as ChannelType,
       accountName: r.account_name || CHANNEL_META[r.type as ChannelType].name,
       status: r.status as Channel['status'],
       boundAgentIds: byChannel.get(r.id) ?? [],
+      boundProjectIds: projectsByChannel.get(r.id) ?? [],
       lastConnectedAt: r.last_connected_at,
       limitation: r.limitation
     }));
-  }
-
-  /** 启动配置向导（真实环境：唤起 Gateway 扫码/WebSocket 配置流程） */
-  setup(id: string, accountName: string) {
-    this.db.raw.prepare("UPDATE channels SET status = 'CONNECTING', account_name = ? WHERE id = ?").run(accountName, id);
-    setTimeout(() => {
-      this.db.raw.prepare("UPDATE channels SET status = 'ONLINE', last_connected_at = ? WHERE id = ? AND status = 'CONNECTING'").run(Date.now(), id);
-    }, 1200);
-    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'channel.setup', target: id, result: 'started' });
   }
 
   disconnect(id: string) {
@@ -82,6 +87,7 @@ export class ChannelManager {
     this.db.transaction(() => {
       this.db.raw.prepare("UPDATE channels SET status = 'DISABLED' WHERE id = ?").run(id);
       this.db.raw.prepare('DELETE FROM channel_routes WHERE channel_id = ?').run(id);
+      this.db.raw.prepare('DELETE FROM hermes_channel_bindings WHERE channel_id = ?').run(id);
     });
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'channel.disable', target: id, result: 'ok' });
   }
@@ -104,5 +110,23 @@ export class ChannelManager {
 
   unbindAgent(channelId: string, agentId: string) {
     this.db.raw.prepare('DELETE FROM channel_routes WHERE channel_id = ? AND agent_id = ?').run(channelId, agentId);
+  }
+
+  bindProject(channelId: string, projectId: string): void {
+    const owned = this.db.raw.prepare(`
+      SELECT c.id AS channel_id, p.id AS project_id
+      FROM channels c JOIN projects p ON p.id = ? AND p.status <> 'archived'
+      WHERE c.id = ? AND c.type <> 'qq' AND c.organization_id = p.organization_id
+    `).get(projectId, channelId) as { channel_id?: string; project_id?: string } | undefined;
+    if (owned?.channel_id !== channelId || owned.project_id !== projectId) {
+      throw new Error('渠道和项目必须存在、可用且属于同一组织');
+    }
+    const now = Date.now();
+    this.db.raw.prepare(`
+      INSERT INTO hermes_channel_bindings(channel_id, project_id, created_at, updated_at)
+      VALUES(?, ?, ?, ?)
+      ON CONFLICT(channel_id) DO UPDATE SET project_id = excluded.project_id, updated_at = excluded.updated_at
+    `).run(channelId, projectId, now, now);
+    this.db.audit({ id: randomUUID(), actor: 'admin', action: 'channel.bind-project', target: `${channelId}->${projectId}`, result: 'ok' });
   }
 }

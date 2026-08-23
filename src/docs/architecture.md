@@ -1,30 +1,30 @@
 # 系统架构设计
 
-> **v2.0.0 迁移说明（2026-08-17）**：本文后续章节记录 v1.x 兼容实现，不再代表目标产品权威边界。v2 以 DSH/Cordis 为唯一主 AI、规划与执行内核；原 OPC-Nexus 能力收敛为 `opc-nexus-governance` Cordis 核心特色插件，Electron Main 仅保留无业务智能的 `aibox-native-host` 特权边界。Hermes Leader、Nexus fallback、DSH Advisor、Nexus Scheduler 及一次性 DSH Worker 等描述只用于迁移期兼容，禁止据此新增第二套规划、Session、Job 或子 Agent 状态源。目标架构与验收以 `docs/adr/ADR-DSH-003-DSH-AS-OWNER.md` 和 `docs/V2.0.0-DSH-CORDIS-PROJECT-QUEST-IMPLEMENTATION-PLAN.md` 为准。
+> **当前架构说明（2026-08-22）**：Hermes 是唯一面向老板的调度、澄清、计划和会话入口；OPC-Nexus Main 负责项目、员工、权限、预算、任务状态、审批、审计和交付事实。旧 DSH/Cordis 产品与执行链已退出生产运行图，只保留不可见的一次性数据库迁移识别。Quest 右上角二维码只连接当前项目 Hermes `/chat` Operator 会话；Android 执行设备配对仅供实体设备 Worker 使用。
 
 ## 0. v2.0.0 权威运行模型
 
 ```mermaid
 flowchart TD
-    OWNER["老板：桌面、手机、渠道"] --> WEB["官方 DSH Web UI"]
-    WEB --> CORDIS["DSH/Cordis：对话、Quest、规划、长任务、多 Agent"]
-    CORDIS --> CHILD["弹性 child Session / Goal"]
-    CORDIS --> WORKERS["固定数字员工与 CLI / ACP / A2A Worker"]
+    OWNER["老板：桌面、手机、渠道"] --> WEB["Quest / Hermes Web UI"]
+    WEB --> HERMES["Hermes：对话、澄清、计划、长任务、多 Agent"]
+    HERMES --> CHILD["弹性 child Session / Goal"]
+    HERMES --> WORKERS["固定数字员工与 CLI / ACP / A2A Worker"]
     CHILD --> ARTIFACTS["项目制品与交付事实"]
     WORKERS --> ARTIFACTS
-    GOVERNANCE["opc-nexus-governance 核心特色插件"] -. "项目、员工、策略、审批、审计、投影" .-> CORDIS
+    GOVERNANCE["OPC-Nexus 治理层"] -. "项目、员工、策略、审批、审计、投影" .-> HERMES
     ARTIFACTS --> GOVERNANCE
     HOST["aibox-native-host：凭据、文件、进程、网络、数据库、原生扩展"] -. "最小权限 Host Contract" .-> GOVERNANCE
 ```
 
 当前所有权规则：
 
-1. DSH/Cordis 是唯一面向老板的主 AI，也是 QuestionSet、Plan、root/child Session、Goal 和多 Agent 编排的唯一业务 owner。
-2. `opc-nexus-governance` 是 DSH/Cordis 的核心特色插件，不是并列内核。它只维护组织/项目/员工目录、权限预算、审批审计、记忆归档、渠道和兼容看板投影。
+1. Hermes 是唯一面向老板的主 AI，也是 QuestionSet、Plan、root/child Session、Goal 和多 Agent 编排的唯一业务 owner。
+2. OPC-Nexus 治理层维护组织/项目/员工目录、权限预算、审批审计、记忆归档、渠道和看板投影；它不是第二个调度器。
 3. `aibox-native-host` 是 Electron Main 中的薄特权边界，不理解业务目标，不生成计划，不组队。
-4. Hermes、Codex、Pi、Claude、ACP/A2A、MCP 与 Skill 都是 Cordis 可选择的能力或 worker adapter。
-5. 官方 DSH Web UI 是桌面与 LAN/手机的统一会话界面；本项目不复制或 fork 另一套 DSH 对话页。旧 Chat 与 Secretary 仅作为隐藏迁移兼容入口。
-6. `@deepseek-ai/dsh-jobs-local` 的 Job 状态只在当前进程内有效。当前可持久恢复的是 Session、Goal 与 child-session 事实，不能把进程内 Job 宣称为跨重启无人值守任务。
+4. Codex、Pi、Claude、ACP/A2A、MCP 与 Skill 都是 Hermes 可选择的能力或 Worker Adapter。
+5. Hermes Web UI 是桌面与手机的统一项目会话界面；旧 Chat、Secretary 和其他调度入口已退役。
+6. Worker 不能直接修改权威任务状态。所有执行结果必须由 Orchestrator 核验并形成真实任务、运行和交付记录。
 
 以下章节用于说明仍存在的 v1 兼容表、服务和状态机约束。任何新增功能都必须先服从本节所有权，再决定是否复用这些兼容实现。
 
@@ -94,7 +94,7 @@ UNCONFIGURED → CONNECTING → ONLINE / RECONNECTING / AUTH_EXPIRED / DISABLED 
 | DesktopIngressService | `desktopIngressService.ts` | 桌面会话、本地管理员身份、消息归一化与幂等入站 |
 | ChannelControlPlane | `channelControlPlane.ts` | canonical memory 召回、控制核规划、计划持久化与 Orchestrator 提交 |
 | DesktopControlPlane | `desktopControlPlane.ts` | 将桌面聊天接入与渠道相同的 canonical 控制路径 |
-| KernelRouter | `kernel/kernelRouter.ts` | Hermes 主控制核、确定性 Nexus 备用控制核与 DSH 顾问/复核器的单 Leader 路由 |
+| KernelRouter | `kernel/kernelRouter.ts` | Hermes 唯一主控制核与受治理 Worker 的单 Leader 路由 |
 | MemoryService | `memoryService.ts` | OPC-Nexus 持有的分域长期记忆、版本、召回与遗忘 |
 | MemoryProposalService | `memoryProposalService.ts` | 控制核记忆建议的持久化、审核、接受/拒绝与启动恢复 |
 | TaskScheduleProposalService | `taskScheduleProposalService.ts` | 控制核定时任务建议的持久化、审核及 Scheduler 提交 |
@@ -112,7 +112,7 @@ UNCONFIGURED → CONNECTING → ONLINE / RECONNECTING / AUTH_EXPIRED / DISABLED 
 | ApprovalBroker | `approvalBroker.ts` | 人工审批挂起/唤醒 |
 | ResourceMonitor | `resourceMonitor.ts` | CPU/内存/GPU/磁盘采集与告警 |
 | BrowserManager | `browserManager.ts` | Playwright 浏览器自动化 |
-| WebServer | `webServer.ts` | 局域网 REST API 管理服务 |
+| HermesMobileGateway | `hermesMobileGateway.ts` | 当前项目 Hermes `/chat` 手机安全代理 |
 | ApiBridge | `apiBridge.ts` | OpenAI 兼容 API 反向代理 |
 
 ## 4. 控制面与执行器架构
@@ -127,13 +127,10 @@ flowchart TD
     DI --> CP
     M["OPC MemoryService<br/>长期记忆唯一权威"] -->|"按租户与作用域召回"| CP
     CP --> KR["KernelRouter<br/>每个请求只有一个 Leader"]
-    KR -. "复杂任务建议与计划复核" .-> DSH["DeepSeek Harness<br/>Advisor / Reviewer"]
-    KR --> H["Hermes Agent<br/>首选 Leader"]
-    KR -->|"Hermes 不可用、超时、鉴权失败或输出非法"| N["Nexus<br/>本地确定性备用 Leader"]
+    KR --> H["Hermes Agent<br/>唯一 Leader"]
     H --> O["Orchestrator<br/>DispatchPlan 唯一提交点"]
-    N --> O
     O --> ER["ExecutorRegistry"]
-    ER --> W["Codex / Claude Code / Pi / DSH / Hermes Workers"]
+    ER --> W["Codex / Claude Code / Pi / Hermes / ACP-A2A Workers"]
     O --> MP["MemoryProposalService<br/>pending review"]
     MP -->|"接受后"| M
     O --> SP["TaskScheduleProposalService<br/>pending review"]
@@ -152,9 +149,8 @@ flowchart TD
 
 1. `KernelRouter` 对同一 conversation 串行规划，并确保每个请求只有一个 Leader。
 2. Hermes 是首选 Leader。它只返回结构化 DispatchPlan，不直接创建任务、写记忆、创建定时任务或执行渠道副作用。
-3. DSH 仅在复杂任务上作为可选 Advisor/Reviewer；成功建议由 Router 传给 Leader，确定性 Nexus 不依赖该建议派单。已参与规划的 DSH reviewer 若拒绝、超时、掉线或返回非法结果，均 fail-closed 到人工审批而不是自动执行；预检阶段本就不就绪的 DSH 不参与该次计划。DSH 无派单权，但可经 `AcpExecutor` 作为普通 Worker 执行已提交任务。
-4. Nexus 是无 Provider 依赖的本地确定性回退：优先选择当前入口绑定的员工，否则按角色/能力稳定匹配；高风险指令自动要求审批。它没有长期记忆。
-5. Orchestrator 是 DispatchPlan、Task 创建和状态转换的唯一提交点；控制核、Advisor、Worker 和入口适配器都不能绕过它。
+3. 所有 CLI、ACP 和 A2A 适配器都只是 Worker；它们不参与 Quest 规划、澄清、审批或委派决策。
+4. Orchestrator 是 DispatchPlan、Task 创建和状态转换的唯一提交点；Hermes、Worker 和入口适配器都不能绕过它。
 
 ### 4.3 Worker 边界
 
@@ -163,27 +159,26 @@ flowchart TD
 | Codex CLI | `CliExecutor` | 支持保存 thread id，并在后续任务中 `exec resume` |
 | Claude Code | `CliExecutor` | 支持保存 session id，并在后续任务中 `--resume` |
 | Pi Agent CLI | `PiAgentExecutor` | 使用 OPC 管理的独立 profile 与显式 Provider 配置 |
-| DeepSeek Harness | `AcpExecutor` | 每次任务创建新的 ACP session；当前不恢复上一次任务 |
 | Hermes Agent | `HermesAgentExecutor` | 使用 OPC 管理的员工 profile；原生 session 仅作续接缓存 |
+| 自定义 ACP/A2A | 对应受治理适配器 | 只按批准的任务和工作目录运行，不取得调度权 |
 
-控制核身份与 Worker 身份互相独立：Hermes 可以同时实现首选控制核和 Hermes Worker，DSH 可以同时实现 Advisor/Reviewer 和 DSH Worker，但两种角色不会共享派单权限。
+控制核身份与 Worker 身份互相独立：Hermes 可以同时实现唯一 Leader 和 Hermes Worker；任何 Worker 适配器都永远不拥有派单权限。
 
 canonical DispatchPlan 会固定 `(workerAgentId, workerEngineId)`。Orchestrator 提交前重新核验员工、候选引擎与组织边界，并将批准引擎写入 Task；ExecutorRegistry 对 canonical Task 禁止静默 fallback 或模拟执行，批准引擎不可用时如实失败。只有不来自 canonical 控制面的旧式内部任务才保留主/辅执行引擎回退。
 
-Android 手机操作员是更严格的专用 Worker：当前仅允许 `eng-hermes-cli`，由 `HermesAgentExecutor` 注入任务级 Mobile Gateway 地址和短期 Token，并加载受管 `android_*` 工具插件。DSH rc.6 的 ACP 入口拒绝非空 `mcpServers`，OPC 的 DSH sidecar 也不启用 Shell，因此 DSH Worker 当前不能操控手机。即使 Hermes 未就绪，手机任务也不会回退到 DSH 或其他执行器；旧数据库或任务级 override 若形成错误组合，会以明确配置错误失败。已绑定但离线的手机不会被误判为执行失败：任务保持 `QUEUED` 并显示“手机离线，等待连接”，收到 `device_connected` 后由 Orchestrator 自动唤醒。
+Android 手机操作员是更严格的专用 Worker：当前仅允许 `eng-hermes-cli`，由 `HermesAgentExecutor` 注入任务级 Mobile Gateway 地址和短期 Token，并加载受管 `android_*` 工具插件。即使 Hermes 未就绪，手机任务也不会回退到其他执行器；错误的历史绑定或任务级 override 会以明确配置错误失败。已绑定但离线的手机不会被误判为执行失败：任务保持 `QUEUED` 并显示“手机离线，等待连接”，收到 `device_connected` 后由 Orchestrator 自动唤醒。
 
 ### 4.4 记忆所有权与提案
 
 - OPC-Nexus 数据库是身份、会话、长期记忆、定时任务、审批和审计的唯一事实源。`MemoryService` 按 organization 以及 principal、channel、conversation、agent、project 作用域隔离数据，并提供版本化的 recall/remember/update/forget。
 - Hermes controller 按 `(organization, principal, conversation)` 使用独立 `HERMES_HOME`，Hermes Worker 使用员工级独立 profile。普通与 Android Hermes Worker 都通过同一个员工 → 引擎 → 默认 Provider 解析得到原子化的 Provider/model/key/base URL 绑定；Provider/model 被显式固定为 OPC 管理的 `opcnexus` Provider，密钥只注入子进程环境，从而避免用户全局 Hermes/OpenRouter 配置引起的 401/403 串线。缺少完整绑定时任务 fail-closed，不继承用户全局 Hermes 配置。
 - Hermes 原生 session、profile memory 与 `kernel_sessions` 锚点只作为可丢弃的连续对话缓存。每次规划仍显式接收 `MemoryService` 召回的 canonical memory；删除或升级 Hermes profile 不会改变 OPC 的长期记忆事实。
-- DSH 上游具备 JSONL 历史、checkpoint、SQLite/FTS 会话索引等持久化基础组件，但这些不等于跨会话用户长期记忆。当前集成没有长期记忆或跨任务 resume：`AcpExecutor` 每次调用 `session/new`，为任务建立独立 session root，并在进程结束后清理；没有接入 session list/resume/fork/delete 或跨会话语义召回。
 - 控制核只能在 DispatchPlan 中返回 `memoryProposals`。计划成功提交后，`MemoryProposalService` 以 `(request_id, proposal_index)` 幂等捕获为 `pending`；用户可在审核队列接受或拒绝。接受操作在同一事务中通过 `MemoryService` 创建 canonical memory 并标记 `accepted`，拒绝只标记 `rejected`。启动恢复会补捕获已提交计划中遗漏的提案。
 - 仅 conversation 作用域可通过显式本地设置启用策略自动接受；默认仍需人工审核。未经接受的提案不会参与长期记忆召回。
 
 ### 4.5 定时任务提案
 
-- Hermes/Nexus 只能在 DispatchPlan 中返回 `taskScheduleProposals`，操作类型限定为 `create_task_schedule`。提案不能自行指定员工或经营报表类型，最终员工固定为该计划已经选择并提交的 Worker。
+- Hermes 只能在 DispatchPlan 中返回 `taskScheduleProposals`，操作类型限定为 `create_task_schedule`。提案不能自行指定员工或经营报表类型，最终员工固定为该计划已经选择并提交的 Worker。
 - KernelRouter 会校验标题、任务内容和 cron：支持 0.5-168 小时间隔、每日、每周和每月任务。控制核不能直接写 `schedules`。
 - DispatchPlan 成功提交后，`TaskScheduleProposalService` 以 `(request_id, proposal_index)` 幂等捕获为 `pending`；启动恢复会补捕获已提交计划中遗漏的提案。
 - 接受时再次校验 organization、员工和 project 归属，并通过 `Scheduler.createWithCommit()` 在同一事务中创建 `automationKind='task'` 的 schedule、记录审计并将提案标为 `accepted`；拒绝只标为 `rejected`。重复接受返回同一 schedule，不会创建第二份计划。
@@ -299,9 +294,8 @@ Android 手机操作员是更严格的专用 Worker：当前仅允许 `eng-herme
 | Runtime | 当前证据 | 仍需注意 |
 |------|------|------|
 | Hermes Agent v0.19.0 | **PASS**：真实首轮 `-z + --usage-file` 和第二轮 `chat -Q -q --resume` 使用同一原生 session 成功 | 证明原生续接可用，不代表 Hermes profile 是 canonical 长期记忆；生产仍依赖 OPC Provider 与密钥可用 |
-| DeepSeek Harness v0.1.0-rc.6 | **PASS**：内置 sidecar 完成 Provider 校验和真实 ACP 模型任务 | 它不是 PATH 中的 `dsh` CLI；当前 ACP 不支持 resume 或非空 `mcpServers`，进程结束会删除任务 session root，也不能作为 Android 手机操作员 |
 | Pi Agent v0.84.2 | **PASS**：认证检查、真实任务和两轮 session 续接成功 | 目标机器仍需安装 Pi CLI，并由 OPC 管理的 profile 注入匹配 Provider |
 | Claude Code v2.1.220 | **部分通过**：CLI 已安装，参数协议修复和单元测试通过 | 本轮没有重新执行在线真实模型 smoke，不能仅凭安装状态宣称端到端可用 |
 | Codex CLI | 执行适配与 thread resume 路径已接入 | 本轮未重新执行独立在线 smoke；应由目标机器的 EngineManager 探测确认鉴权和最小任务 |
 
-验证分三层解释：单元测试证明参数构造、状态映射、解析和脱敏；`npm run harness:verify` 证明已准备的 DSH sidecar 依赖、原生模块与 ACP `initialize/session/new` 能工作；只有带实际 Provider 凭据的最小模型任务才能证明该 Runtime 当下端到端可用。
+验证分三层解释：单元测试证明参数构造、状态映射、解析和脱敏；构建验证证明 Electron 产物闭包完整；只有带实际 Provider 凭据的 Hermes/CLI 最小任务和桌面、手机黑盒证据才能证明当下端到端可用。

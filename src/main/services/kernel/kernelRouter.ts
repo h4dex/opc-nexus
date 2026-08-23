@@ -138,9 +138,9 @@ function validateDraft(draft: DispatchPlanDraft, request: KernelRequest): Dispat
 }
 
 /**
- * Selects exactly one ingress route. Cordis is the sole owner-facing AI;
- * Local CLI is a deterministic adapter for an employee selected explicitly.
- * A failed Cordis route is never retried through the Local CLI adapter.
+ * Selects exactly one ingress route. Hermes owns project planning; the Local
+ * CLI adapter is only for an employee selected explicitly. A failed Hermes
+ * route is never retried through the Local CLI adapter.
  */
 export class KernelRouter {
   private readonly conversationTails = new Map<string, Promise<void>>();
@@ -151,7 +151,9 @@ export class KernelRouter {
     private readonly recorder: KernelAttemptRecorder = NOOP_RECORDER,
     private readonly now: () => number = Date.now
   ) {
-    if (primary.id !== 'cordis') throw new Error('Cordis must be the primary control kernel');
+    if (primary.id !== 'hermes') {
+      throw new Error('Hermes must be the primary control kernel');
+    }
     if (directWorker.id !== 'local-cli') {
       throw new Error('The secondary route must be the explicit Local CLI dispatch adapter');
     }
@@ -176,7 +178,7 @@ export class KernelRouter {
   private async planUnlocked(request: KernelRequest): Promise<DispatchPlan> {
     const failures: string[] = [];
     let sequence = 0;
-    const route = request.routingMode === 'direct-worker' ? 'direct-worker' : 'cordis';
+    const route = request.routingMode === 'direct-worker' ? 'direct-worker' : 'hermes';
     const kernel = route === 'direct-worker' ? this.directWorker : this.primary;
     const startedAt = this.now();
     if (!kernel.isReady()) {
@@ -186,7 +188,7 @@ export class KernelRouter {
       throw new KernelRoutingError('The selected dispatch route is unavailable', failures);
     }
     try {
-      const draft = validateDraft(await kernel.plan(request, []), request);
+      const draft = validateDraft(await kernel.plan(request), request);
       await this.record({ request, componentId: kernel.id, role: 'leader', sequence: ++sequence, status: 'succeeded', startedAt, error: null });
       const worker = request.workers.find((candidate) => candidate.agentId === draft.workerAgentId)!;
       return Object.freeze({
@@ -197,7 +199,7 @@ export class KernelRouter {
         leaderKernel: kernel.id,
         workerEngineId: worker.engineId,
         // Retained in schema v1 for old persisted projections. Quest
-        // clarification/review now lives inside the authoritative Cordis run.
+        // clarification/review lives inside the authoritative Hermes run.
         advisorAdvice: [],
         advisorReviews: []
       });

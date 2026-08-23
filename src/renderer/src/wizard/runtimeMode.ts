@@ -1,4 +1,5 @@
-import { DSH_MANAGED_ENGINE_ID, LEGACY_DSH_ENGINE_ID, type Engine } from '@shared/types';
+import type { Engine } from '@shared/types';
+import { isQuestVisibleEngine } from '@shared/engineVisibility';
 
 const LOCAL_ENGINE_STATUSES = new Set<Engine['status']>([
   'HEALTHY',
@@ -9,9 +10,7 @@ const LOCAL_ENGINE_STATUSES = new Set<Engine['status']>([
 type SelectableEngine = Pick<Engine, 'id' | 'isDefault' | 'status'>;
 
 export function isSelectableLocalEngine(engine: SelectableEngine): boolean {
-  return engine.id !== DSH_MANAGED_ENGINE_ID
-    && engine.id !== LEGACY_DSH_ENGINE_ID
-    && LOCAL_ENGINE_STATUSES.has(engine.status);
+  return isQuestVisibleEngine(engine) && LOCAL_ENGINE_STATUSES.has(engine.status);
 }
 
 export function selectDefaultLocalEngineId(engines: readonly SelectableEngine[]): string {

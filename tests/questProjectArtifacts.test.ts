@@ -9,7 +9,7 @@ describe('Quest project artifact panel source contract', () => {
   const app = readFileSync(join(rendererRoot, 'App.tsx'), 'utf8');
   const html = readFileSync(join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
 
-  it('keeps the office visualization while adding artifacts to each project Quest', () => {
+  it('keeps the office visualization and its requested primary navigation entry', () => {
     expect(app).toContain("{ key: 'office', label: '办公室'");
     expect(app).toContain("case 'office': return <Office />;");
     expect(workbench).toContain('<ProjectArtifactsPanel');

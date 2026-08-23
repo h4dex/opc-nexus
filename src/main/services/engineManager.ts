@@ -1,6 +1,6 @@
 /**
  * 引擎中心（PRD 9.x）
- * 引擎目录：内置 Nexus Runtime、真实 Hermes Agent CLI、受管 Harness，
+ * 引擎目录：内置 Nexus Runtime、真实 Hermes Agent CLI，
  * 以及本机 Worker CLI（Codex / Claude Code / Pi / OpenCode）。
  * 检测：where/which 定位可执行文件 + --version 取版本 → NOT_INSTALLED / AUTH_REQUIRED，不做假安装。
  * 自动安装：存在官方 npm 包的引擎支持 npm -g 真实安装（下载地址取配置文件 npmRegistry）。
@@ -17,6 +17,7 @@ import { loadConfig, sanitizeRegistry } from './config.js';
 import { runCli } from './cliLauncher.js';
 import { acpCommandFor, probeAcpEngine, probeAcpTask } from './executor/acpExecutor.js';
 import {
+  claudeProviderBaseUrl,
   childProcessEnv,
   engineRequiresManagedProvider,
   engineSupportsNativeAuth,
@@ -49,29 +50,13 @@ import {
   buildClaudeProbeArgs,
   buildCodexManagedArgs,
   buildOpenCodeManagedArgs,
+  managedClaudeProcessEnv,
   managedCodexProcessEnv,
+  prepareManagedCodexModelCatalog,
   parseClaudeAuthStatus,
   parseClaudeProbeOutput,
   redactClaudeText
 } from './executor/cliExecutor.js';
-import {
-  DEEPSEEK_HARNESS_ENGINE_ID,
-  DEEPSEEK_HARNESS_VERSION,
-  deepseekHarnessCommand,
-  deepseekHarnessProbeEnv,
-  deepseekHarnessRuntimePaths
-} from './deepseekHarnessRuntime.js';
-import {
-  DSH_MANAGED_ENGINE_ID,
-  DSH_MANAGED_VERSION,
-  deepseekHarnessManagedAvailable,
-  deepseekHarnessManagedRuntimePaths
-} from './deepseekHarnessManagedRuntime.js';
-import {
-  harnessProviderFingerprint,
-  harnessProviderVerificationIsCurrent,
-  saveHarnessProviderFingerprint
-} from './harnessProviderVerification.js';
 import {
   NEXUS_ENGINE_ID,
   type Engine,
@@ -82,8 +67,10 @@ import {
   type EngineType,
   type ProviderProtocol
 } from '../../shared/types.js';
+import { engineDisplayName } from '../../shared/engineVisibility.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
+const CLI_MODEL_PROBE_TIMEOUT_MS = 120_000;
 
 /** 四级探活信号在 settings 中的存储键 */
 function healthSignalsKey(engineId: string): string {
@@ -101,14 +88,6 @@ function managedProviderState(db: Database, engineId: string): { configured: boo
 function managedProviderReady(db: Database, engineId: string): boolean {
   const state = managedProviderState(db, engineId);
   return state.error === null && state.configured;
-}
-
-export interface EngineManagerOptions {
-  /** Main-process Provider proxy readiness. Kept as a callback because the
-   * proxy is constructed after the engine catalog during application startup. */
-  managedDshProxyReady?: () => boolean;
-  /** Test seam for the prepared, pinned managed runtime contract. */
-  managedDshRuntimeAvailable?: () => boolean;
 }
 
 /** Installing a CLI only proves that its executable launches. A fresh install
@@ -142,28 +121,18 @@ export interface CatalogEntry {
 }
 
 /**
- * 引擎目录：Nexus Agent（内置自研 Runtime）/ DeepSeek Harness（受管 ACP sidecar）/
- * Hermes Agent（真实 CLI）/ Claude Code / OpenCode / Codex CLI。
+ * 引擎目录：Nexus Agent（内置自研 Runtime）/ Hermes Agent（真实 CLI）/
+ * Claude Code / OpenCode / Codex CLI。
  * ZCode / Kimi Code 已下线；Claude Code 以经过验证的无交互 Worker 重新接入。
  */
 export const ENGINE_CATALOG: CatalogEntry[] = [
   {
-    id: NEXUS_ENGINE_ID, type: 'nexus', name: 'Nexus Agent', bin: null, npmPackage: null,
+    id: NEXUS_ENGINE_ID, type: 'nexus', name: 'OPC-Nexus Worker', bin: null, npmPackage: null,
     dataBoundary: '本地运行；模型请求发送至所配置模型提供商',
     guide: { guide: '内置引擎无需安装，在设置页完成模型供应商配置即可启用', url: null }
   },
   {
-    id: DEEPSEEK_HARNESS_ENGINE_ID, type: 'external', name: 'DeepSeek Harness', bin: null, npmPackage: null,
-    dataBoundary: 'Harness 与会话在本机 sidecar 运行；模型请求发送至所配置的 DeepSeek/OpenAI 兼容供应商',
-    guide: { guide: 'DeepSeek Harness 随 OPC-Nexus 安装包分发；开发环境请运行 npm run harness:prepare', url: 'https://github.com/deepseek-ai/deepseek-harness' }
-  },
-  {
-    id: DSH_MANAGED_ENGINE_ID, type: 'dsh-managed', name: 'DSH / Cordis', bin: null, npmPackage: null,
-    dataBoundary: '完整 DSH Web Runtime 与持久会话在本机隔离目录运行；桌面仅经 loopback 安全网关访问',
-    guide: { guide: 'managed DSH 随 OPC-Nexus 安装包分发；开发环境请运行 npm run harness:managed:prepare', url: 'https://github.com/deepseek-ai/deepseek-harness' }
-  },
-  {
-    id: 'eng-hermes-cli', type: 'hermes-cli', name: 'Hermes Agent', bin: 'hermes', npmPackage: null,
+    id: 'eng-hermes-cli', type: 'hermes-cli', name: 'Hermes Agent CLI Worker', bin: 'hermes', npmPackage: null,
     dataBoundary: '本地 Hermes Agent Runtime；继承 OPC-Nexus 解析后的供应商、模型与 Base URL',
     guide: { guide: '请按 Hermes Agent 官方方式安装 hermes CLI；如可执行名或运行参数不同，可在配置文件 engines["eng-hermes-cli"] 中覆写 bin/runArgs', url: null }
   },
@@ -194,6 +163,29 @@ export const ENGINE_CATALOG: CatalogEntry[] = [
 
 /** 已下线引擎：v26 迁移把绑定它们的员工改绑 Nexus，并从 engines 表清理 */
 export const RETIRED_ENGINE_IDS = ['eng-zcode', 'eng-kimi'] as const;
+
+const RETIRED_ROUTING_ENGINE_IDS = new Set([
+  'eng-deepseek-harness',
+  'eng-deepseek-harness-managed',
+  'eng-hermes'
+]);
+
+/** Remove routes written by retired schedulers/runtimes from upgraded stores. */
+export function sanitizeEngineRouting(
+  value: unknown,
+  availableIds: ReadonlySet<string>
+): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [source, target] of Object.entries(value as Record<string, unknown>)) {
+    if (!/^(desktop|channel|schedule|team)$/.test(source)) continue;
+    if (typeof target !== 'string' || !target.trim()) continue;
+    const id = target.trim();
+    if (RETIRED_ROUTING_ENGINE_IDS.has(id) || !availableIds.has(id)) continue;
+    result[source] = id;
+  }
+  return result;
+}
 
 interface ExternalAcpEntry {
   id: string;
@@ -290,73 +282,7 @@ export class EngineManager {
   /** 正在安装的引擎（防重复触发） */
   private installing = new Set<string>();
 
-  constructor(private db: Database, private readonly options: EngineManagerOptions = {}) {}
-
-  private managedDshReadiness(): {
-    status: Engine['status'];
-    authStatus: Engine['authStatus'];
-    available: boolean;
-    launchable: boolean;
-    authenticated: boolean;
-    detail: string;
-  } {
-    let available = false;
-    try {
-      available = (this.options.managedDshRuntimeAvailable ?? deepseekHarnessManagedAvailable)();
-    } catch {
-      available = false;
-    }
-    if (!available) {
-      return {
-        status: 'NOT_INSTALLED', authStatus: 'unknown', available: false,
-        launchable: false, authenticated: false,
-        detail: 'managed DSH Runtime is not prepared'
-      };
-    }
-    const provider = managedProviderState(this.db, DSH_MANAGED_ENGINE_ID);
-    if (!provider.configured || provider.error) {
-      return {
-        status: 'SETUP_REQUIRED', authStatus: 'required', available: true,
-        launchable: false, authenticated: false,
-        detail: provider.error ? 'managed DSH Provider configuration is incompatible' : 'managed DSH requires a configured Provider'
-      };
-    }
-    let proxyReady = false;
-    try { proxyReady = this.options.managedDshProxyReady?.() === true; } catch { proxyReady = false; }
-    if (!proxyReady) {
-      return {
-        status: 'DEGRADED', authStatus: 'authed', available: true,
-        launchable: false, authenticated: true,
-        detail: 'managed DSH Provider proxy is unavailable'
-      };
-    }
-    return {
-      status: 'HEALTHY', authStatus: 'authed', available: true,
-      launchable: true, authenticated: true,
-      detail: 'managed DSH Runtime and opaque Provider proxy are ready'
-    };
-  }
-
-  private applyManagedDshReadiness(): ReturnType<EngineManager['managedDshReadiness']> {
-    const readiness = this.managedDshReadiness();
-    const paths = deepseekHarnessManagedRuntimePaths();
-    this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
-      readiness.status,
-      readiness.authStatus,
-      readiness.available ? DSH_MANAGED_VERSION : null,
-      readiness.available ? paths.root : null,
-      DSH_MANAGED_ENGINE_ID
-    );
-    this.saveHealthSignals(DSH_MANAGED_ENGINE_ID, {
-      detected: readiness.available,
-      launchable: readiness.launchable,
-      authenticated: readiness.authenticated,
-      // The first real Cordis turn remains the model-task verification boundary.
-      taskVerified: false,
-      detail: readiness.detail
-    });
-    return readiness;
-  }
+  constructor(private db: Database) {}
 
   /** Provider mutations invalidate every affected engine's real-task proof.
    * Native-login CLIs with no managed binding remain untouched. */
@@ -366,7 +292,6 @@ export class EngineManager {
       type: string;
       status: string;
     }[];
-    let harnessAffected = false;
     for (const row of rows) {
       let configured = false;
       let explicitError = false;
@@ -381,7 +306,7 @@ export class EngineManager {
       } catch {
         explicitError = true;
       }
-      const customExternal = row.type === 'external' && row.id !== DEEPSEEK_HARNESS_ENGINE_ID;
+      const customExternal = row.type === 'external';
       const legacyManagedBinding = customExternal
         ? Boolean(runtimeConfig?.providerId)
         : Boolean(runtimeConfig?.providerId || runtimeConfig?.modelOverride || runtimeConfig?.protocol);
@@ -414,14 +339,6 @@ export class EngineManager {
       ));
       if (!affected) continue;
 
-      // The managed Cordis runtime has no separate user-login probe. Its
-      // dispatch readiness is the conjunction of the pinned runtime, a
-      // resolvable Provider, and the opaque Main-process Provider proxy.
-      if (row.id === DSH_MANAGED_ENGINE_ID) {
-        this.applyManagedDshReadiness();
-        continue;
-      }
-
       // Nexus is an in-process Worker whose readiness contract is complete
       // Provider configuration; it has no separate CLI authentication step.
       if (row.id === NEXUS_ENGINE_ID) {
@@ -430,28 +347,6 @@ export class EngineManager {
           : explicitError ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED';
         this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
           .run(nextStatus, nextStatus === 'HEALTHY' ? 'authed' : 'required', row.id);
-        continue;
-      }
-
-      // A prepared Harness can advance from "missing Provider" to "awaiting
-      // real model probe" as soon as the first complete default is created.
-      if (row.id === DEEPSEEK_HARNESS_ENGINE_ID) {
-        harnessAffected = true;
-        const previous = this.getHealthSignals(row.id);
-        const nextStatus = configured && !explicitError && previous?.launchable
-          ? 'AUTH_REQUIRED'
-          : explicitError ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED';
-        this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
-          .run(nextStatus, 'required', row.id);
-        this.saveHealthSignals(row.id, {
-          detected: previous?.detected ?? true,
-          launchable: previous?.launchable ?? false,
-          authenticated: false,
-          taskVerified: false,
-          detail: nextStatus === 'AUTH_REQUIRED'
-            ? '模型供应商配置已变化；请重新运行“验证可用性”完成真实模型任务探测'
-            : '请先配置可用的模型供应商和 API Key'
-        });
         continue;
       }
 
@@ -493,12 +388,6 @@ export class EngineManager {
           : '请先配置可用的模型供应商和 API Key'
       });
     }
-    if (harnessAffected || !change) saveHarnessProviderFingerprint(this.db, null);
-  }
-
-  /** Backward-compatible name retained for v1.8.0 callers/tests. */
-  invalidateHarnessProviderVerification(): void {
-    this.invalidateProviderVerification();
   }
 
   /** 目录中的引擎逐个补齐；旧配置文件里的 ACP 条目只在数据库尚无该 ID 时导入。 */
@@ -511,6 +400,29 @@ export class EngineManager {
     for (const e of ENGINE_CATALOG) {
       const initial = e.id === NEXUS_ENGINE_ID ? 'SETUP_REQUIRED' : 'NOT_INSTALLED';
       stmt.run(e.id, e.type, e.name, initial, e.id === NEXUS_ENGINE_ID ? 1 : 0, e.dataBoundary);
+    }
+
+    // Older builds persisted DSH (and the pre-v39 `eng-hermes`) as global
+    // routing targets. Those IDs are no longer execution adapters; retaining
+    // them makes the UI show a stale selection and can silently route work to
+    // a row that no longer exists. Keep valid custom ACP targets, remove only
+    // retired or missing IDs, and audit the repair once.
+    const availableIds = new Set<string>([
+      ...ENGINE_CATALOG.map((entry) => entry.id),
+      ...externalAcpEntries(this.db).map((entry) => entry.id)
+    ]);
+    const currentRouting = this.db.getSetting<Record<string, string>>('engine_routing', {});
+    const nextRouting = sanitizeEngineRouting(currentRouting, availableIds);
+    if (JSON.stringify(currentRouting) !== JSON.stringify(nextRouting)) {
+      this.db.setSetting('engine_routing', nextRouting);
+      this.db.audit({
+        id: randomUUID(),
+        actor: 'system',
+        action: 'engine.routing.migrate',
+        target: 'engine_routing',
+        result: 'removed-retired-targets',
+        source: 'migration'
+      });
     }
 
     const legacyStmt = this.db.raw.prepare(
@@ -558,7 +470,7 @@ export class EngineManager {
       return {
         id: r.id,
         type: r.type as EngineType,
-        name: r.name,
+        name: engineDisplayName(r.id, r.name),
         version: r.version,
         path: r.path,
         status: r.status as Engine['status'],
@@ -605,68 +517,7 @@ export class EngineManager {
    */
   async detect(): Promise<Engine[]> {
     this.ensureBuiltinEngines(); // 兼容导入旧配置后，外部引擎统一从数据库发现
-    this.applyManagedDshReadiness();
-    const harnessCommand = deepseekHarnessCommand();
-    if (!harnessCommand) {
-      this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?")
-        .run(DEEPSEEK_HARNESS_ENGINE_ID);
-      this.db.setSetting(healthSignalsKey(DEEPSEEK_HARNESS_ENGINE_ID), {
-        detected: false, launchable: false, authenticated: false, taskVerified: false,
-        detail: '未找到已准备的 DeepSeek Harness sidecar；开发环境请运行 npm run harness:prepare', checkedAt: Date.now()
-      });
-      saveHarnessProviderFingerprint(this.db, null);
-    } else {
-      const providerState = managedProviderState(this.db, DEEPSEEK_HARNESS_ENGINE_ID);
-      if (providerState.error) {
-        this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required', version = ?, path = ? WHERE id = ?").run(
-          DEEPSEEK_HARNESS_VERSION,
-          deepseekHarnessRuntimePaths().root,
-          DEEPSEEK_HARNESS_ENGINE_ID
-        );
-        this.db.setSetting(healthSignalsKey(DEEPSEEK_HARNESS_ENGINE_ID), {
-          detected: true, launchable: false, authenticated: false, taskVerified: false,
-          detail: `模型供应商配置不兼容：${providerState.error}`, checkedAt: Date.now()
-        });
-        saveHarnessProviderFingerprint(this.db, null);
-      } else {
-      const probe = await probeAcpEngine(
-        harnessCommand,
-        deepseekHarnessProbeEnv(this.db),
-        { managedHarness: true }
-      );
-      const configured = providerState.configured;
-      const previous = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?')
-        .get(DEEPSEEK_HARNESS_ENGINE_ID) as { status: string } | undefined;
-      const alreadyVerified = previous?.status === 'HEALTHY'
-        && this.getHealthSignals(DEEPSEEK_HARNESS_ENGINE_ID)?.taskVerified === true
-        && harnessProviderVerificationIsCurrent(this.db);
-      const status = probe.ok
-        ? (configured ? (alreadyVerified ? 'HEALTHY' : 'AUTH_REQUIRED') : 'SETUP_REQUIRED')
-        : 'ERROR';
-      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
-        status,
-        status === 'HEALTHY' ? 'authed' : 'required',
-        probe.ok ? DEEPSEEK_HARNESS_VERSION : null,
-        deepseekHarnessRuntimePaths().root,
-        DEEPSEEK_HARNESS_ENGINE_ID
-      );
-      if (!alreadyVerified || status !== 'HEALTHY') {
-        this.db.setSetting(healthSignalsKey(DEEPSEEK_HARNESS_ENGINE_ID), {
-          detected: true,
-          launchable: probe.ok,
-          authenticated: false,
-          taskVerified: false,
-          detail: probe.ok
-            ? (configured ? 'Harness 可启动；请运行“验证登录”完成真实模型任务探测' : 'Harness 可启动；请先配置模型供应商凭据')
-            : `ACP 握手失败：${probe.message}`,
-          checkedAt: Date.now()
-        });
-        saveHarnessProviderFingerprint(this.db, null);
-      }
-      }
-    }
     for (const entry of ENGINE_CATALOG) {
-      if (entry.id === DEEPSEEK_HARNESS_ENGINE_ID || entry.id === DSH_MANAGED_ENGINE_ID) continue;
       if (!entry.bin) continue;
       if (this.installing.has(entry.id)) continue; // 安装中不覆盖 INSTALLING 状态
       const { bin } = effective(entry);
@@ -827,68 +678,6 @@ export class EngineManager {
       return probe;
     }
 
-    if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
-      const command = deepseekHarnessCommand();
-      if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备，请先运行 harness:prepare 或重新安装应用' };
-      const providerState = managedProviderState(this.db, id);
-      if (!providerState.configured) {
-        const detail = providerState.error
-          ? `模型供应商配置不兼容：${providerState.error}`
-          : '请先配置可用的模型供应商和 API Key';
-        this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required' WHERE id = ?").run(id);
-        this.saveHealthSignals(id, {
-          detected: true, launchable: true, authenticated: false, taskVerified: false,
-          detail
-        });
-        saveHarnessProviderFingerprint(this.db, null);
-        return { ok: false, message: detail };
-      }
-      const providerFingerprint = harnessProviderFingerprint(this.db);
-      const probe = await probeAcpTask(
-        command,
-        deepseekHarnessProbeEnv(this.db),
-        deepseekHarnessRuntimePaths().root,
-        60_000,
-        { managedHarness: true }
-      );
-      const providerUnchanged = providerFingerprint === harnessProviderFingerprint(this.db);
-      const verified = probe.ok && providerUnchanged;
-      const probeMessage = providerUnchanged
-        ? probe.message
-        : '模型供应商配置在验证过程中发生变化，请重新验证';
-      const status = verified
-        ? 'HEALTHY'
-        : (!providerUnchanged || AUTH_ERROR_PATTERN.test(probeMessage) ? 'AUTH_REQUIRED' : 'DEGRADED');
-      const authStatus = verified ? 'authed' : (status === 'AUTH_REQUIRED' ? 'required' : 'unknown');
-      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
-        .run(status, authStatus, id);
-      this.saveHealthSignals(id, {
-        detected: true,
-        launchable: probe.initialized,
-        authenticated: verified,
-        taskVerified: verified,
-        detail: verified ? probe.output.slice(0, 200) : probeMessage
-      });
-      saveHarnessProviderFingerprint(this.db, verified ? providerFingerprint : null);
-      this.db.audit({
-        id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id,
-        result: verified ? 'authed-and-task-verified' : probeMessage.slice(0, 80)
-      });
-      this.addLog(id, verified ? 'info' : 'warn', `Harness 最小任务探测：${probeMessage}`);
-      return { ok: verified, message: verified ? 'DeepSeek Harness 已完成真实模型任务验证' : `DeepSeek Harness 最小任务失败：${probeMessage}` };
-    }
-
-    if (id === DSH_MANAGED_ENGINE_ID) {
-      const readiness = this.applyManagedDshReadiness();
-      this.db.audit({
-        id: randomUUID(), actor: 'admin', action: 'engine.auth', target: id,
-        result: readiness.status
-      });
-      return readiness.status === 'HEALTHY'
-        ? { ok: true, message: 'Cordis Runtime、模型供应商与安全代理均已就绪' }
-        : { ok: false, message: readiness.detail };
-    }
-
     // 内置 Nexus：凭据即供应商配置
     if (entry.bin === null) {
       const ready = managedProviderReady(this.db, id);
@@ -1011,55 +800,16 @@ export class EngineManager {
     return { ok: true, message: `${entry.name} 已卸载` };
   }
 
-  /** 重启引擎：重新检测指定引擎（受管引擎重读供应商配置，CLI 重新定位二进制 + 取版本）。
+  /** 重启引擎：重新检测指定引擎（CLI 重新定位二进制 + 取版本）。
    *  用于修改配置后刷新引擎状态，无需重启整个应用。 */
   async restart(id: string): Promise<EngineInstallResult> {
     const entry = ENGINE_CATALOG.find((e) => e.id === id);
-    if (id === DSH_MANAGED_ENGINE_ID) {
-      const readiness = this.applyManagedDshReadiness();
-      return readiness.status === 'HEALTHY'
-        ? { ok: true, message: 'Cordis Runtime 已重新检测并可接收任务' }
-        : { ok: false, message: readiness.detail };
-    }
-    if (id === DEEPSEEK_HARNESS_ENGINE_ID) {
-      const command = deepseekHarnessCommand();
-      if (!command) return { ok: false, message: 'DeepSeek Harness sidecar 未准备' };
-      const providerState = managedProviderState(this.db, id);
-      if (providerState.error) {
-        this.db.raw.prepare("UPDATE engines SET status = 'SETUP_REQUIRED', auth_status = 'required' WHERE id = ?").run(id);
-        this.saveHealthSignals(id, {
-          detected: true, launchable: false, authenticated: false, taskVerified: false,
-          detail: `模型供应商配置不兼容：${providerState.error}`
-        });
-        saveHarnessProviderFingerprint(this.db, null);
-        return { ok: false, message: `DeepSeek Harness 模型供应商配置不兼容：${providerState.error}` };
-      }
-      const probe = await probeAcpEngine(
-        command,
-        deepseekHarnessProbeEnv(this.db),
-        { managedHarness: true }
-      );
-      const configured = providerState.configured;
-      this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ?, version = ?, path = ? WHERE id = ?').run(
-        probe.ok ? (configured ? 'AUTH_REQUIRED' : 'SETUP_REQUIRED') : 'ERROR',
-        'required',
-        probe.ok ? DEEPSEEK_HARNESS_VERSION : null,
-        deepseekHarnessRuntimePaths().root,
-        id
-      );
-      this.saveHealthSignals(id, {
-        detected: true, launchable: probe.ok, authenticated: false, taskVerified: false,
-        detail: probe.ok ? 'Harness 已重新加载；请运行“验证登录”完成真实模型任务探测' : probe.message
-      });
-      saveHarnessProviderFingerprint(this.db, null);
-      return { ok: probe.ok, message: probe.ok ? 'DeepSeek Harness 已重新加载，请继续验证登录' : `DeepSeek Harness 连接失败：${probe.message}` };
-    }
     if (id === NEXUS_ENGINE_ID) {
-      // Nexus Agent：重新检测供应商配置是否就绪
+      // OPC-Nexus Worker：重新检测供应商配置是否就绪
       const ready = managedProviderReady(this.db, NEXUS_ENGINE_ID);
       this.db.raw.prepare('UPDATE engines SET status = ?, auth_status = ? WHERE id = ?')
         .run(ready ? 'HEALTHY' : 'SETUP_REQUIRED', ready ? 'authed' : 'required', NEXUS_ENGINE_ID);
-      return { ok: ready, message: ready ? 'Nexus Agent 引擎已重新加载，供应商配置生效' : 'Nexus Agent 引擎未就绪：请先在设置页完成模型供应商配置' };
+      return { ok: ready, message: ready ? 'OPC-Nexus Worker 已重新加载，供应商配置生效' : 'OPC-Nexus Worker 未就绪：请先在设置页完成模型供应商配置' };
     }
     if (!entry) {
       // 外部 ACP 引擎
@@ -1233,9 +983,8 @@ export class EngineManager {
     const existing = this.getConfig(id) ?? {};
     const nextRunArgs = config.runArgs === undefined ? existing.runArgs : config.runArgs;
     const nextEnv = config.env === undefined ? existing.env : config.env;
-    const supportsNative = engineSupportsNativeAuth(id)
-      || (engine.type === 'external' && id !== DEEPSEEK_HARNESS_ENGINE_ID);
-    const customExternal = engine.type === 'external' && id !== DEEPSEEK_HARNESS_ENGINE_ID;
+    const supportsNative = engineSupportsNativeAuth(id) || engine.type === 'external';
+    const customExternal = engine.type === 'external';
     const existingManagedFields = customExternal
       ? Boolean(existing.providerId)
       : Boolean(existing.providerId || existing.modelOverride || existing.protocol);
@@ -1615,15 +1364,19 @@ export async function probeCliAuth(
         ? resolveOpenCodeEngineEnv(db, engineId)
         : resolveEngineEnv(db, engineId);
   let env = childProcessEnv({ ...engineEnv, ...hermesRuntime?.env, ...piRuntime?.env });
+  let managedCodexCatalogPath: string | null = null;
   const managedProviderApplied = managedProvider && (
     engineId === CLAUDE_ENGINE_ID
       ? env.ANTHROPIC_API_KEY === managedProvider.key
-        && env.ANTHROPIC_BASE_URL === managedProvider.baseUrl.replace(/\/+$/, '')
+        && env.ANTHROPIC_BASE_URL === claudeProviderBaseUrl(managedProvider.baseUrl)
       : env.OPENAI_API_KEY === managedProvider.key
         && env.OPENAI_BASE_URL === managedProvider.baseUrl.replace(/\/+$/, '')
   ) ? managedProvider : null;
   if (engineId === 'eng-codex' && managedProviderApplied) {
     env = managedCodexProcessEnv(env, 'probe');
+    managedCodexCatalogPath = prepareManagedCodexModelCatalog('probe', managedProviderApplied.model);
+  } else if (engineId === CLAUDE_ENGINE_ID && managedProviderApplied) {
+    env = managedClaudeProcessEnv(env, 'probe');
   }
 
   // 第 1 级：launchable —— 用 --version 验证进程真能起来（最轻量、不消耗额度）
@@ -1688,7 +1441,7 @@ export async function probeCliAuth(
       : engineId === CLAUDE_ENGINE_ID
         ? buildClaudeProbeArgs(managedProviderApplied?.model, claudeUsesManagedProvider)
         : engineId === 'eng-codex' && managedProviderApplied
-          ? buildCodexManagedArgs('ping', managedProviderApplied.model, managedProviderApplied)
+          ? buildCodexManagedArgs('ping', managedProviderApplied.model, managedProviderApplied, managedCodexCatalogPath!)
           : engineId === 'eng-opencode' && managedProviderApplied
             ? buildOpenCodeManagedArgs(['run', 'ping'], 'ping', managedProviderApplied.model)
             : AUTH_PROBE_ARGS[engineId];
@@ -1700,8 +1453,10 @@ export async function probeCliAuth(
     };
   }
 
-  // 60s：真实模型请求可能较慢
-  const run = await runCli(binPath, args, { timeoutMs: 60_000, env });
+  // Cold CLI startup plus a real upstream model turn can exceed one minute.
+  // This remains a hard timeout: a slow or broken Provider is never promoted
+  // to HEALTHY, but its partial terminal output is preserved for diagnosis.
+  const run = await runCli(binPath, args, { timeoutMs: CLI_MODEL_PROBE_TIMEOUT_MS, env });
   const piProbe = piRuntime ? parsePiProbeOutput(run.stdout) : null;
   const claudeProbe = engineId === CLAUDE_ENGINE_ID ? parseClaudeProbeOutput(run.stdout) : null;
   const rawDetail = piProbe?.error || claudeProbe?.error || run.stderr || run.stdout || run.error || 'no output';
@@ -1714,9 +1469,12 @@ export async function probeCliAuth(
   if (run.error && run.code === null) {
     // 超时/启动异常：不确定，不可乐观判定为已登录
     signals.detail = detail;
+    const diagnostic = detail && detail !== 'no output'
+      ? ` 最近输出：${detail}`
+      : '';
     return {
       ok: false, status: 'DEGRADED', authStatus: 'unknown', signals,
-      message: `最小任务未能完成：${run.error}。未能确认登录状态，请稍后重试或在终端手工验证`
+      message: `最小任务未能完成：${run.error}。${diagnostic} 未能确认登录状态，请稍后重试或在终端手工验证`
     };
   }
 

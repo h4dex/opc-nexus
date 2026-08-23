@@ -7,6 +7,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { safeStorage } from 'electron';
+import { WebSocket, WebSocketServer } from 'ws';
 import type { Database } from './database.js';
 import type { ProviderManager } from './providerManager.js';
 import type { ApiBridgeStatus } from '../../shared/types.js';
@@ -14,8 +15,204 @@ import type { ApiBridgeStatus } from '../../shared/types.js';
 const DEFAULT_PORT = 29998;
 export const BRIDGE_KEY_SECRET_REF = 'secret:bridge:key';
 const LEGACY_BRIDGE_KEY_SETTING = 'bridge_key';
+/** Main-only fact: the port actually bound by the current listener. This is
+ * distinct from bridge_port because port 0 asks the OS for an ephemeral port. */
+export const BRIDGE_RUNTIME_PORT_SETTING = 'bridge_runtime_port';
 /** 请求体上限：chat/completions 的正常体量远低于此，超限即拒绝以免被单请求打满内存 */
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
+
+export interface BusinessGatewayHandlers {
+  command: (command: string, payload: JsonRecord) => Promise<unknown>;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function anthropicContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content == null ? '' : JSON.stringify(content);
+  return content.map((block) => {
+    if (!block || typeof block !== 'object') return '';
+    const item = block as JsonRecord;
+    if (item.type === 'text' && typeof item.text === 'string') return item.text;
+    return '';
+  }).filter(Boolean).join('');
+}
+
+/** Translate the Anthropic Messages request used by Claude Code into the
+ * OpenAI Chat Completions shape accepted by most local gateways. Tool results
+ * remain individual tool messages so the model can continue a real tool loop. */
+export function anthropicToOpenAiRequest(input: JsonRecord): JsonRecord {
+  const messages: JsonRecord[] = [];
+  if (typeof input.system === 'string' && input.system.trim()) {
+    messages.push({ role: 'system', content: input.system });
+  } else if (Array.isArray(input.system)) {
+    const systemText = anthropicContentText(input.system);
+    if (systemText) messages.push({ role: 'system', content: systemText });
+  }
+  for (const raw of Array.isArray(input.messages) ? input.messages : []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const message = raw as JsonRecord;
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const content = Array.isArray(message.content) ? message.content : [];
+    const toolUses = content.filter((block): block is JsonRecord => Boolean(block && typeof block === 'object' && (block as JsonRecord).type === 'tool_use'));
+    const toolResults = content.filter((block): block is JsonRecord => Boolean(block && typeof block === 'object' && (block as JsonRecord).type === 'tool_result'));
+    if (toolResults.length > 0) {
+      for (const result of toolResults) {
+        const toolCallId = typeof result.tool_use_id === 'string' ? result.tool_use_id : `tool-${randomUUID()}`;
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: anthropicContentText(result.content) || (result.is_error ? 'tool_error' : '')
+        });
+      }
+      const text = anthropicContentText(Array.isArray(message.content) ? content : message.content).trim();
+      if (text) messages.push({ role, content: text });
+      continue;
+    }
+    const text = anthropicContentText(Array.isArray(message.content) ? content : message.content);
+    const toolCalls = toolUses.map((use) => ({
+      id: typeof use.id === 'string' ? use.id : `tool-${randomUUID()}`,
+      type: 'function',
+      function: {
+        name: typeof use.name === 'string' ? use.name : 'unknown_tool',
+        arguments: JSON.stringify(use.input && typeof use.input === 'object' ? use.input : {})
+      }
+    }));
+    messages.push({
+      role,
+      content: text || null,
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+    });
+  }
+  const tools = Array.isArray(input.tools)
+    ? input.tools.filter((tool): tool is JsonRecord => Boolean(tool && typeof tool === 'object')).map((tool) => ({
+      type: 'function',
+      function: {
+        name: String(tool.name ?? 'tool'),
+        description: typeof tool.description === 'string' ? tool.description : '',
+        parameters: tool.input_schema && typeof tool.input_schema === 'object' ? tool.input_schema : { type: 'object', properties: {} }
+      }
+    }))
+    : [];
+  return {
+    model: typeof input.model === 'string' ? input.model : '',
+    messages,
+    ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
+    stream: input.stream === true,
+    ...(typeof input.max_tokens === 'number' ? { max_tokens: input.max_tokens } : {}),
+    ...(typeof input.temperature === 'number' ? { temperature: input.temperature } : {})
+  };
+}
+
+function anthropicResponseFromOpenAi(input: JsonRecord, model: string): JsonRecord {
+  const choice = Array.isArray(input.choices) && input.choices[0] && typeof input.choices[0] === 'object'
+    ? input.choices[0] as JsonRecord : {};
+  const message = choice.message && typeof choice.message === 'object' ? choice.message as JsonRecord : {};
+  const content: JsonRecord[] = [];
+  if (typeof message.content === 'string' && message.content) content.push({ type: 'text', text: message.content });
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  for (const raw of toolCalls) {
+    if (!raw || typeof raw !== 'object') continue;
+    const call = raw as JsonRecord;
+    const fn = call.function && typeof call.function === 'object' ? call.function as JsonRecord : {};
+    let inputValue: unknown = {};
+    try { inputValue = JSON.parse(typeof fn.arguments === 'string' ? fn.arguments : '{}'); } catch { inputValue = {}; }
+    content.push({ type: 'tool_use', id: String(call.id ?? `tool-${randomUUID()}`), name: String(fn.name ?? 'unknown_tool'), input: inputValue });
+  }
+  const usage = input.usage && typeof input.usage === 'object' ? input.usage as JsonRecord : {};
+  const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
+  return {
+    id: `msg_${randomBytes(12).toString('hex')}`,
+    type: 'message', role: 'assistant', model,
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: Number(usage.prompt_tokens ?? 0),
+      output_tokens: Number(usage.completion_tokens ?? 0)
+    }
+  };
+}
+
+function anthropicSseEvent(event: string, data: JsonRecord): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/** Convert an OpenAI SSE body to the Anthropic event stream consumed by the
+ * Claude SDK. The adapter preserves text and fragmented tool input deltas. */
+export async function openAiSseToAnthropicSse(body: ReadableStream<Uint8Array>, model: string, write: (chunk: string) => Promise<void> | void): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let blockIndex = 0;
+  let textBlock = false;
+  const toolBlocks = new Set<number>();
+  let stopReason: 'end_turn' | 'tool_use' = 'end_turn';
+  let outputTokens = 0;
+  await write(anthropicSseEvent('message_start', {
+    type: 'message_start',
+    message: { id: `msg_${randomBytes(12).toString('hex')}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+  }));
+  const closeText = async () => {
+    if (!textBlock) return;
+    await write(anthropicSseEvent('content_block_stop', { type: 'content_block_stop', index: blockIndex }));
+    textBlock = false;
+  };
+  const process = async (data: string) => {
+    if (data === '[DONE]') return;
+    let frame: JsonRecord;
+    try { frame = JSON.parse(data) as JsonRecord; } catch { return; }
+    const choice = Array.isArray(frame.choices) && frame.choices[0] && typeof frame.choices[0] === 'object'
+      ? frame.choices[0] as JsonRecord : {};
+    const delta = choice.delta && typeof choice.delta === 'object' ? choice.delta as JsonRecord : {};
+    const reason = typeof choice.finish_reason === 'string' ? choice.finish_reason : '';
+    if (reason === 'tool_calls' || Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) stopReason = 'tool_use';
+    if (typeof delta.content === 'string' && delta.content) {
+      if (!textBlock) {
+        await write(anthropicSseEvent('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } }));
+        textBlock = true;
+      }
+      await write(anthropicSseEvent('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } }));
+    }
+    for (const rawCall of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      if (!rawCall || typeof rawCall !== 'object') continue;
+      const call = rawCall as JsonRecord;
+      const index = Number(call.index ?? 0);
+      const fn = call.function && typeof call.function === 'object' ? call.function as JsonRecord : {};
+      await closeText();
+      if (!toolBlocks.has(index)) {
+        toolBlocks.add(index);
+        blockIndex = Math.max(blockIndex, index + 1);
+        await write(anthropicSseEvent('content_block_start', {
+          type: 'content_block_start', index,
+          content_block: { type: 'tool_use', id: String(call.id ?? `tool-${randomUUID()}`), name: String(fn.name ?? 'unknown_tool'), input: {} }
+        }));
+      }
+      if (typeof fn.arguments === 'string' && fn.arguments) {
+        await write(anthropicSseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
+      }
+    }
+    const usage = frame.usage && typeof frame.usage === 'object' ? frame.usage as JsonRecord : null;
+    if (usage) outputTokens = Number(usage.completion_tokens ?? outputTokens);
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline: number;
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (line.startsWith('data:')) await process(line.slice(5).trim());
+    }
+  }
+  await closeText();
+  for (const index of [...toolBlocks].sort((a, b) => a - b)) {
+    await write(anthropicSseEvent('content_block_stop', { type: 'content_block_stop', index }));
+  }
+  await write(anthropicSseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }));
+  await write(anthropicSseEvent('message_stop', { type: 'message_stop' }));
+}
 
 /**
  * 取 URL 的 pathname。客户端常在 URL 上附加 query（如 `/v1/models?limit=1`），
@@ -37,6 +234,9 @@ function safeEqual(a: string, b: string): boolean {
 
 export class ApiBridge {
   private server: Server | null = null;
+  private websocketServer: WebSocketServer | null = null;
+  private readonly businessClients = new Map<WebSocket, Set<string>>();
+  private businessHandlers: BusinessGatewayHandlers | null = null;
   private startAttempt: {
     server: Server;
     promise: Promise<void>;
@@ -46,6 +246,25 @@ export class ApiBridge {
   private port = DEFAULT_PORT;
 
   constructor(private db: Database, private providers: ProviderManager) {}
+
+  setBusinessGatewayHandlers(handlers: BusinessGatewayHandlers | null): void {
+    this.businessHandlers = handlers;
+  }
+
+  /** Broadcast a project-scoped event to authenticated OA/business clients. */
+  publishBusinessEvent(event: JsonRecord): void {
+    const projectId = typeof event.projectId === 'string' ? event.projectId : null;
+    let encoded: string;
+    try { encoded = JSON.stringify(event); } catch { return; }
+    for (const [client, projects] of this.businessClients) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      // A business client is deny-by-default. It must explicitly subscribe to
+      // a project before receiving any project-scoped event; otherwise one
+      // valid Bridge key would expose every project's progress and artifacts.
+      if (projectId && !projects.has(projectId)) continue;
+      try { client.send(encoded); } catch { client.terminate(); }
+    }
+  }
 
   private closeServer(candidate: Server): Promise<void> {
     return new Promise((resolve) => {
@@ -196,6 +415,19 @@ export class ApiBridge {
     const candidate = createServer((req, res) => {
       void this.handleRequest(req, res).catch((error) => this.failRequest(res, error));
     });
+    const websocketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_BODY_BYTES });
+    candidate.on('upgrade', (request, socket, head) => {
+      let url: URL;
+      try { url = new URL(request.url ?? '/', 'http://127.0.0.1'); }
+      catch { socket.destroy(); return; }
+      if (url.pathname !== '/v1/business/events' || url.search) { socket.destroy(); return; }
+      try {
+        if (!this.authorizeRequest(request)) { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
+      } catch {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
+      }
+      websocketServer.handleUpgrade(request, socket, head, (client) => this.attachBusinessClient(client));
+    });
     let settled = false;
     let resolveStart!: () => void;
     let rejectStart!: (error: Error) => void;
@@ -214,6 +446,7 @@ export class ApiBridge {
     };
 
     this.server = candidate;
+    this.websocketServer = websocketServer;
     this.startAttempt = attempt;
 
     candidate.once('listening', () => {
@@ -229,6 +462,7 @@ export class ApiBridge {
       }
       const address = candidate.address();
       if (address && typeof address !== 'string') this.port = address.port;
+      try { this.db.setSetting(BRIDGE_RUNTIME_PORT_SETTING, String(this.port)); } catch { /* best effort */ }
       settled = true;
       if (this.startAttempt === attempt) this.startAttempt = null;
       console.log(`[ApiBridge] 本地 API 代理已启动: http://127.0.0.1:${this.port}/v1`);
@@ -239,6 +473,7 @@ export class ApiBridge {
       const active = this.server === candidate;
       if (active) {
         this.server = null;
+        try { this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(BRIDGE_RUNTIME_PORT_SETTING); } catch { /* best effort */ }
         try { this.db.setSetting('bridge_enabled', 'false'); } catch { /* best-effort state repair */ }
         this.trackServerClose(candidate);
         try {
@@ -275,6 +510,11 @@ export class ApiBridge {
     const candidate = this.server;
     if (!candidate) return;
     if (this.server === candidate) this.server = null;
+    try { this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(BRIDGE_RUNTIME_PORT_SETTING); } catch { /* best effort */ }
+    this.websocketServer?.clients.forEach((client) => client.terminate());
+    this.businessClients.clear();
+    this.websocketServer?.close();
+    this.websocketServer = null;
     if (this.startAttempt?.server === candidate) {
       const attempt = this.startAttempt;
       this.startAttempt = null;
@@ -332,9 +572,10 @@ export class ApiBridge {
     }
 
     // 验证 bridge key（定长比较，避免时序侧信道）
-    const auth = req.headers.authorization ?? '';
-    const token = auth.replace(/^Bearer\s+/i, '');
-    if (!safeEqual(token, this.getBridgeKey())) {
+    let authorized = false;
+    try { authorized = this.authorizeRequest(req); }
+    catch (error) { this.failRequest(res, error); return; }
+    if (!authorized) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'Invalid bridge key', type: 'authentication_error', code: 'invalid_api_key' } }));
       return;
@@ -357,9 +598,70 @@ export class ApiBridge {
       return;
     }
 
+    // Claude Code uses the Anthropic Messages protocol. The bridge adapts it
+    // to the configured OpenAI-compatible Provider instead of forwarding
+    // /v1/messages to an upstream that explicitly rejects that route.
+    if (pathname === '/v1/messages' && req.method === 'POST') {
+      await this.proxyAnthropicMessages(req, res);
+      return;
+    }
+
     // 其他请求返回 404
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `Not found: ${req.method} ${pathname}`, type: 'invalid_request_error' } }));
+  }
+
+  private authorizeRequest(req: IncomingMessage): boolean {
+    const auth = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+    const apiKeyHeader = req.headers['x-api-key'] ?? req.headers['api-key'] ?? '';
+    const headerKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
+    const token = auth.replace(/^Bearer\s+/i, '') || (typeof headerKey === 'string' ? headerKey : '');
+    return safeEqual(token, this.getBridgeKey());
+  }
+
+  private attachBusinessClient(client: WebSocket): void {
+    const projects = new Set<string>();
+    this.businessClients.set(client, projects);
+    client.send(JSON.stringify({ type: 'business.events.ready', protocol: 1 }));
+    client.on('message', (data, binary) => {
+      if (binary || !this.businessHandlers) return;
+      let message: JsonRecord;
+      try { message = JSON.parse(data.toString()) as JsonRecord; }
+      catch { client.send(JSON.stringify({ type: 'error', error: 'Invalid JSON message' })); return; }
+      const type = typeof message.type === 'string' ? message.type : '';
+      const requestId = typeof message.requestId === 'string' ? message.requestId : null;
+      if (type === 'subscribe') {
+        const projectId = typeof message.projectId === 'string' ? message.projectId.trim() : '';
+        if (!projectId || projectId.length > 128) {
+          client.send(JSON.stringify({ type: 'error', requestId, error: 'projectId is required' }));
+          return;
+        }
+        projects.add(projectId);
+        client.send(JSON.stringify({ type: 'subscribed', requestId, projectId }));
+        return;
+      }
+      const command = type.replace(/^business\./, '');
+      if (!/^(submit|cancel|snapshot)$/.test(command)) {
+        client.send(JSON.stringify({ type: 'error', requestId, error: 'Unsupported business gateway command' }));
+        return;
+      }
+      const projectId = typeof message.projectId === 'string' ? message.projectId.trim() : '';
+      if (!projectId || !projects.has(projectId)) {
+        client.send(JSON.stringify({
+          type: 'ack', requestId, command, ok: false,
+          error: 'Subscribe to the project before issuing business commands'
+        }));
+        return;
+      }
+      void this.businessHandlers.command(command, message).then((result) => {
+        if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: 'ack', requestId, command, ok: true, result }));
+      }).catch((error: unknown) => {
+        if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: 'ack', requestId, command, ok: false, error: error instanceof Error ? error.message : String(error) }));
+      });
+    });
+    const cleanup = () => this.businessClients.delete(client);
+    client.once('close', cleanup);
+    client.once('error', cleanup);
   }
 
   private async proxyChatCompletions(req: IncomingMessage, res: ServerResponse) {
@@ -444,6 +746,79 @@ export class ApiBridge {
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: `Upstream error: ${err instanceof Error ? err.message : String(err)}`, type: 'upstream_error' } }));
       }
+    }
+  }
+
+  private async proxyAnthropicMessages(req: IncomingMessage, res: ServerResponse) {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      size += buf.length;
+      if (size > MAX_BODY_BYTES) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request body too large' } }));
+        req.destroy();
+        return;
+      }
+      chunks.push(buf);
+    }
+    let input: JsonRecord;
+    try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')) as JsonRecord; }
+    catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } }));
+      return;
+    }
+    const model = typeof input.model === 'string' ? input.model : '';
+    const resolved = this.providers.resolveByModel(model);
+    if (!resolved) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `No provider configured for model "${model}"` } }));
+      return;
+    }
+    const openAiBody = anthropicToOpenAiRequest(input);
+    const targetUrl = `${resolved.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+    try {
+      const upstream = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(resolved.key ? { Authorization: `Bearer ${resolved.key}` } : {}) },
+        body: JSON.stringify(openAiBody),
+        redirect: 'error'
+      });
+      const isStream = input.stream === true;
+      if (!upstream.ok || !upstream.body) {
+        const body = await upstream.text().catch(() => '');
+        res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: upstream.status >= 500 ? 'api_error' : 'invalid_request_error', message: body.slice(0, 4_000) || `Provider returned HTTP ${upstream.status}` } }));
+        return;
+      }
+      res.setHeader('Cache-Control', 'no-store');
+      if (isStream) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+        let clientGone = false;
+        const onClose = () => { clientGone = true; };
+        res.once('close', onClose);
+        try {
+          await openAiSseToAnthropicSse(upstream.body, model, (chunk) => {
+            if (!clientGone && !res.destroyed) res.write(chunk);
+          });
+        } finally {
+          res.removeListener('close', onClose);
+          if (!clientGone && !res.writableEnded) res.end();
+        }
+      } else {
+        const body = await upstream.json() as JsonRecord;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(anthropicResponseFromOpenAi(body, model)));
+      }
+      try {
+        this.db.audit({ id: randomUUID(), actor: 'system', action: 'bridge.anthropic.adapter', target: model, result: 'openai-chat', source: 'api-bridge' });
+      } catch { /* adapter audit is best effort */ }
+    } catch (error) {
+      if (res.headersSent) { res.destroy(); return; }
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: `Upstream error: ${error instanceof Error ? error.message : String(error)}` } }));
     }
   }
 }

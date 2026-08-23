@@ -5,12 +5,7 @@ import { IconMoon, IconSun } from '../components/icons';
 import { toast } from '../components/Toast';
 import type {
   ApiBridgeStatus,
-  DshLanGatewayConfigInput,
-  DshLanGatewayCompositionStatusView,
-  DshLanPairingOfferView,
-  DshLanRoleView,
-  DshPluginCatalogView,
-  DshPluginPackageView,
+  DebugLogStatus,
   VisionModelBindingView,
   SystemInfo,
   VoiceConfig,
@@ -56,8 +51,7 @@ export function Settings() {
         <VoiceCard />
         <RegistryCard />
         <BridgeCard />
-        <DshLanGatewayCard />
-        <DshPluginCatalogCard />
+        <DebugLogCard />
 
         <div className="card">
           <div className="card-title">外观</div>
@@ -80,7 +74,6 @@ export function Settings() {
                 onChange={(e) => { setNotifications(e.target.checked); void window.aibox.setSetting('notifications', e.target.checked); }} />
               系统通知（审批到达 / 任务失败 / 引擎待登录 / 资源告警）
             </label>
-            <DemoDataPurge />
           </div>
         </div>
 
@@ -138,282 +131,64 @@ export function Settings() {
   );
 }
 
-/**
- * 演示数据清理（H-3）：演示种子与真实数据同表，此处展示残留量并提供一键清空。
- * 只删 is_demo = 1 的行，用户自己创建的员工/任务/项目不受影响。
- */
-function DemoDataPurge() {
-  const [stats, setStats] = useState<{ agents: number; tasks: number; projects: number } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-
-  useEffect(() => { void window.aibox.getDemoDataStats().then(setStats); }, []);
-
-  const total = stats ? stats.agents + stats.tasks + stats.projects : 0;
-  if (!stats || total === 0) return null;
-
-  const purge = async () => {
-    setBusy(true);
-    try {
-      const removed = await window.aibox.purgeDemoData();
-      toast.ok(`已清空演示数据：${removed.agents} 名员工 / ${removed.tasks} 条任务 / ${removed.projects} 个项目`);
-      setStats(await window.aibox.getDemoDataStats());
-      setConfirming(false);
-    } finally { setBusy(false); }
-  };
-
-  return (
-    <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10, marginTop: 2 }}>
-      <div style={{ fontSize: 12.5, color: 'var(--warning)', lineHeight: 1.7 }}>
-        当前库中有演示数据：<b>{stats.agents}</b> 名员工 · <b>{stats.tasks}</b> 条任务 · <b>{stats.projects}</b> 个项目
-        <div style={{ color: 'var(--text-3)', fontSize: 11.5 }}>
-          演示数据已从首页统计中排除，但仍显示在列表页。清空后不可恢复（仅删除演示数据，真实数据保留）。
-        </div>
-      </div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
-        {!confirming && <button className="btn small danger" onClick={() => setConfirming(true)}>清空演示数据</button>}
-        {confirming && (
-          <>
-            <span style={{ fontSize: 12.5 }}>确认删除全部演示数据？</span>
-            <button className="btn small danger" disabled={busy} onClick={() => void purge()}>{busy ? '清理中…' : '确认删除'}</button>
-            <button className="btn small" disabled={busy} onClick={() => setConfirming(false)}>取消</button>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/**
- * 语音任务下达配置：阿里云 NLS 凭据 + 双路策略。
- * 凭据经 IPC 交给主进程走 safeStorage 加密，此处只显示「是否已配置」，不回显明文。
- */
-/** DSH LAN Gateway: the renderer receives status only, never TLS key material. */
-function DshLanGatewayCard() {
-  const [status, setStatus] = useState<DshLanGatewayCompositionStatusView | null>(null);
-  const [bindHost, setBindHost] = useState('127.0.0.1');
-  const [port, setPort] = useState('18766');
-  const [publicHost, setPublicHost] = useState('');
-  const [publicPort, setPublicPort] = useState('18766');
-  const [role, setRole] = useState<DshLanRoleView>('operator');
-  const [pairing, setPairing] = useState<DshLanPairingOfferView | null>(null);
+function DebugLogCard() {
+  const [status, setStatus] = useState<DebugLogStatus | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = async (hydrate = false) => {
-    try {
-      const next = await window.aibox.getDshLanGatewayStatus();
-      setStatus(next);
-      if (hydrate && next.configured) {
-        setBindHost(next.configured.bindHost);
-        setPort(String(next.configured.port));
-        setPublicHost(next.configured.publicHost);
-        setPublicPort(String(next.configured.publicPort));
-      }
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : 'Unable to read DSH LAN status');
-    }
+  const load = async () => {
+    try { setStatus(await window.aibox.getDebugLogStatus()); }
+    catch (error) { toast.err(error instanceof Error ? error.message : '无法读取调试日志状态'); }
   };
 
-  useEffect(() => {
-    void load(true);
-    const timer = window.setInterval(() => { void load(); }, 3000);
-    return () => window.clearInterval(timer);
-  }, []);
+  useEffect(() => { void load(); }, []);
 
-  const run = async (operation: () => Promise<DshLanGatewayCompositionStatusView>, message: string) => {
+  const toggle = async (enabled: boolean) => {
     setBusy(true);
     try {
-      setStatus(await operation());
-      toast.ok(message);
+      setStatus(await window.aibox.setDebugMode(enabled));
+      toast.ok(enabled ? '调试模式已开启' : '调试模式已关闭');
     } catch (error) {
-      toast.err(error instanceof Error ? error.message : String(error));
+      toast.err(error instanceof Error ? error.message : '调试模式更新失败');
       await load();
     } finally {
       setBusy(false);
     }
   };
 
-  const start = () => {
-    const input: DshLanGatewayConfigInput = {
-      bindHost: bindHost.trim(),
-      port: Number(port),
-      publicHost: publicHost.trim() || undefined,
-      publicPort: Number(publicPort)
-    };
-    void run(() => window.aibox.startDshLanGateway(input), 'DSH LAN Gateway configuration saved');
-  };
-
-  const createPairing = async () => {
-    setBusy(true);
-    try {
-      setPairing(await window.aibox.createDshLanPairing(role));
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const copyPairingUrl = async () => {
-    if (!pairing) return;
-    try {
-      await navigator.clipboard.writeText(pairing.pairingUrl);
-      toast.ok('Pairing address copied');
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : 'Unable to copy pairing address');
-    }
-  };
-
-  const gateway = status?.gateway;
-  const fieldStyle: React.CSSProperties = {
-    width: '100%', padding: '7px 10px', borderRadius: 6,
-    border: '1px solid var(--border)', background: 'var(--input-bg)',
-    color: 'var(--text-1)', fontSize: 12.5, outline: 'none'
-  };
-
   return (
     <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title">
-        DSH LAN Gateway
-        <span className="sub">TLS/Auth gateway for the managed DSH Web UI</span>
+      <div className="card-title">调试日志<span className="sub">仅在开启时写入，敏感凭据自动脱敏</span></div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: busy ? 'wait' : 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={status?.enabled ?? false}
+            disabled={busy || !status}
+            onChange={(event) => void toggle(event.target.checked)}
+          />
+          启用调试模式
+        </label>
+        <span className={`tag ${status?.enabled ? 'green' : 'gray'}`}>{status?.enabled ? '正在记录' : '已关闭'}</span>
+        <button className="btn small" type="button" disabled={!status} onClick={() => {
+          void window.aibox.openDebugLogDirectory().catch((error) => {
+            toast.err(error instanceof Error ? error.message : '无法打开日志目录');
+          });
+        }}>打开日志目录</button>
       </div>
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
-        <span className={`tag ${gateway?.running ? 'green' : gateway?.state === 'error' ? 'red' : 'gray'}`}>
-          {gateway?.running ? 'Running' : gateway?.state === 'error' ? 'Error' : status?.desiredEnabled ? 'Waiting for runtime' : 'Stopped'}
-        </span>
-        <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>Eligible runtimes: {status?.eligibleRuntimeCount ?? 0}</span>
-        <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>Sessions: {gateway?.activeSessions ?? 0}</span>
-        {status?.lastError && <span style={{ fontSize: 11.5, color: 'var(--danger)' }}>{status.lastError}</span>}
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px 1fr 120px', gap: 10, marginBottom: 12 }}>
-        <label className="field"><span>Bind host</span><input value={bindHost} onChange={(event) => setBindHost(event.target.value)} placeholder="127.0.0.1 or 192.168.1.10" /></label>
-        <label className="field"><span>Listen port</span><input type="number" min={1024} max={65535} value={port} onChange={(event) => setPort(event.target.value)} /></label>
-        <label className="field"><span>Public host / certificate name</span><input value={publicHost} onChange={(event) => setPublicHost(event.target.value)} placeholder="LAN hostname or IP" /></label>
-        <label className="field"><span>Public port</span><input style={fieldStyle} type="number" min={1} max={65535} value={publicPort} onChange={(event) => setPublicPort(event.target.value)} /></label>
-      </div>
-
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
-        <button className="btn primary" disabled={busy} onClick={start}>Save &amp; start</button>
-        <button className="btn" disabled={busy} onClick={() => void run(() => window.aibox.restoreDshLanGateway(), 'Restore requested')}>Restore</button>
-        <button className="btn" disabled={busy} onClick={() => void run(() => window.aibox.shutdownDshLanGateway(), 'Gateway stopped')}>Stop listener</button>
-        <button className="btn danger" disabled={busy} onClick={() => {
-          if (window.confirm('Emergency stop revokes all LAN sessions and disables automatic restore. Continue?')) {
-            void run(() => window.aibox.emergencyStopDshLanGateway(), 'LAN access disabled');
-          }
-        }}>Emergency stop</button>
-        <button className="btn" disabled={busy} onClick={() => {
-          if (window.confirm('Reset the DSH LAN certificate? Existing device trust must be re-established.')) {
-            void run(() => window.aibox.resetDshLanCertificate(), 'Certificate reset');
-          }
-        }}>Reset certificate</button>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
-        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', fontSize: 12, lineHeight: 1.8, wordBreak: 'break-word' }}>
-          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>Gateway</div>
-          <div>Origin: <code>{gateway?.origin ?? '-'}</code></div>
-          <div>Authority: <code>{gateway?.authority ?? '-'}</code></div>
-          <div>Certificate fingerprint: <code>{gateway?.certificateFingerprint ?? '-'}</code></div>
-        </div>
-        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'var(--input-bg)', fontSize: 12, lineHeight: 1.8, wordBreak: 'break-word' }}>
-          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>Bound managed runtime</div>
-          {status?.boundRuntime ? <>
-            <div>Agent: <code>{status.boundRuntime.agentId}</code></div>
-            <div>Profile: <code>{status.boundRuntime.profileId}</code></div>
-            <div>Loopback upstream: <code>{status.boundRuntime.endpoint}</code></div>
-          </> : <span style={{ color: 'var(--text-3)' }}>No runtime bound</span>}
-        </div>
-      </div>
-
-      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10 }}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 12.5, fontWeight: 600 }}>One-time pairing code</span>
-          <select value={role} onChange={(event) => setRole(event.target.value as DshLanRoleView)} style={{ ...fieldStyle, width: 120 }}>
-            <option value="operator">Operator</option>
-            <option value="viewer">Viewer</option>
-          </select>
-          <button className="btn small" disabled={busy || !gateway?.running} onClick={() => void createPairing()}>Generate code</button>
-          {pairing && <button className="btn small" onClick={() => setPairing(null)}>Hide</button>}
-        </div>
-        {pairing && <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: 'var(--accent-soft)' }}>
-          <code style={{ fontSize: 18, letterSpacing: 2 }}>{pairing.code}</code>
-          <span style={{ marginLeft: 12, fontSize: 11.5 }}>Expires {new Date(pairing.expiresAt).toLocaleTimeString()}</span>
-          <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginTop: 4, wordBreak: 'break-all' }}>{pairing.pairingUrl} · {pairing.role}</div>
-          <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-            <button className="btn small" type="button" onClick={() => void copyPairingUrl()}>Copy address</button>
-            <button className="btn small" type="button" onClick={() => void window.aibox.openExternal(pairing.pairingUrl)}>Open pairing page</button>
-          </div>
-        </div>}
+      <div style={{ marginTop: 10, fontSize: 11.5, color: 'var(--text-2)', lineHeight: 1.8, wordBreak: 'break-all' }}>
+        <div>目录：<code>{status?.logDirectory ?? '读取中'}</code></div>
+        <div>当前文件：<code>{status?.currentFile ?? '尚未写入'}</code></div>
+        <div>轮转：单文件最多 {status ? Math.round(status.maxFileBytes / 1024 / 1024) : 5} MB，当前保留 {status?.retainedFiles ?? 0} 个文件</div>
+        {status?.lastError && <div style={{ color: 'var(--danger)' }}>写入错误：{status.lastError}</div>}
       </div>
     </div>
   );
 }
 
-/** Read-only managed DSH package inventory. Execution is never enabled here. */
-function DshPluginCatalogCard() {
-  const [catalog, setCatalog] = useState<DshPluginCatalogView | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  const load = async () => {
-    setLoading(true);
-    try {
-      setCatalog(await window.aibox.getDshPluginCatalog());
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : 'Unable to read managed DSH catalog');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { void load(); }, []);
-  if (!catalog) return null;
-
-  const safetyColor = (safety: DshPluginPackageView['safety']) =>
-    safety === 'trusted' ? 'var(--success)' : safety === 'blocked' ? 'var(--danger)' : 'var(--warning)';
-  return (
-    <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title">
-        Managed DSH plugin catalog
-        <span className="sub">Read-only supply-chain and policy projection</span>
-        <button className="btn small" style={{ marginLeft: 'auto' }} disabled={loading} onClick={() => void load()}>
-          {loading ? 'Scanning...' : 'Refresh'}
-        </button>
-      </div>
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
-        <span className={`tag ${catalog.available ? 'green' : 'red'}`}>{catalog.available ? 'Verified' : 'Fail-closed'}</span>
-        <span style={{ fontSize: 11.5, color: 'var(--text-2)' }}>
-          Runtime {catalog.runtime.installedVersion ?? '-'} / policy {catalog.policy.valid ? 'valid' : 'invalid'}
-        </span>
-        <span style={{ fontSize: 11.5, color: 'var(--text-3)' }}>
-          Enabled {catalog.counts.enabled} · Review {catalog.counts.disabled} · Blocked {catalog.counts.blocked} · Missing {catalog.counts.missing}
-        </span>
-      </div>
-      <div style={{ overflowX: 'auto' }}>
-        <table className="table" style={{ minWidth: 620 }}>
-          <thead><tr><th>Package</th><th>Category</th><th>Safety</th><th>Exposure</th><th>Version</th></tr></thead>
-          <tbody>
-            {catalog.packages.slice(0, 20).map((item) => (
-              <tr key={item.name}>
-                <td><code>{item.name}</code></td>
-                <td>{item.categories.join(', ') || '-'}</td>
-                <td style={{ color: safetyColor(item.safety), fontWeight: 600 }}>{item.safety}</td>
-                <td>{item.enablement}</td>
-                <td>{item.version ?? '-'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {catalog.packages.length > 20 && <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 6 }}>Showing first 20 of {catalog.packages.length} packages.</div>}
-      {catalog.warnings.length > 0 && <div style={{ marginTop: 8, color: 'var(--warning)', fontSize: 11.5 }}>{catalog.warnings.join(' · ')}</div>}
-      <div style={{ marginTop: 8, color: 'var(--text-3)', fontSize: 11.5 }}>
-        Package presence does not grant execution. Unlisted or approval-gated capabilities stay disabled until an audited adapter and policy exist.
-      </div>
-    </div>
-  );
-}
-
+/**
+ * 语音任务下达配置：阿里云 NLS 凭据。
+ * 凭据经 IPC 交给主进程走 safeStorage 加密，此处只显示是否已配置，不回显明文。
+ */
 function VoiceCard() {
   const [cfg, setCfg] = useState<VoiceConfig | null>(null);
   const [appKey, setAppKey] = useState('');
@@ -443,7 +218,7 @@ function VoiceCard() {
       const r = await window.aibox.testVoice();
       setTestMsg({
         ok: r.ok,
-        text: r.ok ? `可用（${r.provider === 'cloud' ? '云端' : '本地'}，${r.latencyMs}ms）` : r.error ?? '不可用'
+        text: r.ok ? `可用（阿里云 NLS，${r.latencyMs}ms）` : r.error ?? '不可用'
       });
     } finally { setTesting(false); }
   };
@@ -466,23 +241,12 @@ function VoiceCard() {
       </label>
 
       <label style={labelStyle}>识别通道</label>
-      <select
-        value={cfg.provider}
-        onChange={(e) => void save({ provider: e.target.value as VoiceConfig['provider'] })}
-        style={{ ...inputStyle, marginBottom: 12 }}
-      >
-        <option value="auto">自动（云端凭据齐备走云端，否则用本地模型）</option>
-        <option value="cloud">仅云端（阿里云 NLS 实时识别）</option>
-        <option value="local">仅本地（离线，数据不出本机）</option>
-      </select>
+      <div style={{ ...inputStyle, marginBottom: 12 }}>阿里云 NLS 实时识别</div>
 
       <div style={{ fontSize: 12, color: 'var(--text-2)', background: 'var(--input-bg)', borderRadius: 8, padding: '8px 12px', marginBottom: 12, lineHeight: 1.8 }}>
         云端凭据：AppKey {cfg.appKey ? '已填' : <span style={{ color: 'var(--danger)' }}>未填</span>} ·
         AccessKeyId {cfg.hasAccessKeyId ? '已配置' : <span style={{ color: 'var(--danger)' }}>未配置</span>} ·
         AccessKeySecret {cfg.hasAccessKeySecret ? '已配置' : <span style={{ color: 'var(--danger)' }}>未配置</span>}
-        <div style={{ color: 'var(--text-3)', fontSize: 11.5 }}>
-          本地模型：{cfg.localModelReady ? '已就绪' : '未安装（本地离线识别尚未实现，当前请使用云端）'}
-        </div>
       </div>
 
       <label style={labelStyle}>AppKey（阿里云智能语音交互项目 AppKey）</label>
@@ -780,7 +544,7 @@ function BridgeCard() {
 }
 
 /** OCR 文字识别服务卡片（PaddleOCR WASM） */
-/** Configure the DSH/Cordis visual model without exposing provider secrets. */
+/** Configure the shared visual model without exposing provider secrets. */
 function VisionCard() {
   const [providers, setProviders] = useState<{ id: string; name: string; model: string; hasKey: boolean }[]>([]);
   const [binding, setBinding] = useState<VisionModelBindingView | null>(null);
@@ -828,7 +592,7 @@ function VisionCard() {
 
   return (
     <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title">DSH / Cordis 视觉模型<span className="sub">图片理解由主进程代理，凭据不会进入界面</span></div>
+      <div className="card-title">视觉模型<span className="sub">图片理解由主进程代理，凭据不会进入界面</span></div>
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) minmax(180px, 1fr)', gap: 10 }}>
         <div className="field"><label>Provider</label><select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
           <option value="">选择已配置 Provider</option>

@@ -10,11 +10,12 @@
 /* eslint-disable */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { createServer } from 'node:http';
+import { WebSocket } from 'ws';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
 const { safeStorage } = await import('electron');
-const { ApiBridge, pathOf } = await import('../src/main/services/apiBridge.js');
+const { ApiBridge, pathOf, anthropicToOpenAiRequest } = await import('../src/main/services/apiBridge.js');
 
 function makeDb(settings: Record<string, unknown> = {}) {
   const store: Record<string, unknown> = { ...settings };
@@ -32,6 +33,29 @@ const providers = (list = [], resolved = null) => ({
   list: () => list,
   resolveByModel: () => resolved
 }) as never;
+
+function nextSocketMessage(socket: WebSocket): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (data: WebSocket.RawData) => {
+      cleanup();
+      try { resolve(JSON.parse(data.toString())); } catch (error) { reject(error); }
+    };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const cleanup = () => {
+      socket.off('message', onMessage);
+      socket.off('error', onError);
+    };
+    socket.once('message', onMessage);
+    socket.once('error', onError);
+  });
+}
+
+function openBusinessSocket(bridge: any, base: string, key = bridge.getBridgeKey()): WebSocket {
+  const socket = new WebSocket(`${base.replace(/^http:/, 'ws:')}/v1/business/events`, {
+    headers: { Authorization: `Bearer ${key}` }
+  });
+  return socket;
+}
 
 /** 启动 bridge 并返回操作系统分配的临时端口基址。 */
 async function boot(db, prov) {
@@ -135,6 +159,23 @@ describe('Bridge Key 管理', () => {
 });
 
 describe('路由', () => {
+  it('Anthropic Messages 请求转换为 OpenAI 工具消息', () => {
+    const request = anthropicToOpenAiRequest({
+      model: 'm',
+      system: '你是工程师',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '继续' }, { type: 'tool_result', tool_use_id: 'call-1', content: '已写入' }] }
+      ],
+      tools: [{ name: 'write_file', description: 'write', input_schema: { type: 'object', properties: {} } }]
+    });
+    expect(request.messages).toEqual([
+      { role: 'system', content: '你是工程师' },
+      { role: 'tool', tool_call_id: 'call-1', content: '已写入' },
+      { role: 'user', content: '继续' }
+    ]);
+    expect(request.tools[0].function.name).toBe('write_file');
+  });
+
   it('/v1/models 列出已配置供应商的模型', async () => {
     const list = [{ id: 'p1', name: 'DeepSeek', model: 'deepseek-chat', createdAt: 1700000000000 }];
     const { bridge, base } = await boot(makeDb(), providers(list));
@@ -250,6 +291,100 @@ describe('chat/completions 代理', () => {
     } finally {
       globalThis.fetch = orig;
     }
+  });
+});
+
+describe('Anthropic Messages 协议适配', () => {
+  const auth = (b) => ({ 'x-api-key': b.getBridgeKey(), 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' });
+
+  it('将 /v1/messages 转换到上游 /chat/completions 并返回 Anthropic 响应', async () => {
+    const orig = globalThis.fetch;
+    const { bridge, base } = await boot(makeDb(), providers([], { baseUrl: 'https://up.test/v1', model: 'm', key: 'sk-real-provider' }));
+    running.push(bridge);
+    let forwarded: any = null;
+    globalThis.fetch = ((url, init) => {
+      if (String(url).includes('up.test')) {
+        forwarded = JSON.parse(init.body);
+        return Promise.resolve(new Response(JSON.stringify({
+          id: 'chatcmpl-1', choices: [{ message: { role: 'assistant', content: '已完成' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 2 }
+        }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      }
+      return orig(url, init);
+    }) as never;
+    try {
+      const response = await fetch(`${base}/v1/messages`, {
+        method: 'POST', headers: auth(bridge),
+        body: JSON.stringify({ model: 'm', max_tokens: 100, messages: [{ role: 'user', content: '你好' }] })
+      });
+      expect(response.status).toBe(200);
+      expect((await response.json()).content).toEqual([{ type: 'text', text: '已完成' }]);
+      expect(forwarded.messages).toEqual([{ role: 'user', content: '你好' }]);
+    } finally { globalThis.fetch = orig; }
+  });
+
+  it('Anthropic 路由缺少 bridge key 时拒绝，不会触达上游', async () => {
+    const { bridge, base } = await boot(makeDb(), providers([], { baseUrl: 'https://up.test/v1', model: 'm', key: 'k' }));
+    running.push(bridge);
+    const response = await fetch(`${base}/v1/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'm', messages: [] })
+    });
+    expect(response.status).toBe(401);
+  });
+});
+
+describe('OA/业务中台 WebSocket', () => {
+  it('必须先订阅项目，且只接收已订阅项目的状态和产物事件', async () => {
+    const db = makeDb({ bridge_port: '0' });
+    const { bridge, base } = await boot(db, providers());
+    running.push(bridge);
+    const command = vi.fn(async (name, payload) => ({ name, projectId: payload.projectId }));
+    bridge.setBusinessGatewayHandlers({ command });
+    const socket = await openBusinessSocket(bridge, base);
+    try {
+      const ready = await nextSocketMessage(socket);
+      expect(ready.type).toBe('business.events.ready');
+
+      socket.send(JSON.stringify({ type: 'snapshot', requestId: 'before', projectId: 'p1' }));
+      const beforeAck = await nextSocketMessage(socket);
+      expect(beforeAck).toMatchObject({ type: 'ack', requestId: 'before', ok: false });
+      expect(command).not.toHaveBeenCalled();
+
+      socket.send(JSON.stringify({ type: 'subscribe', requestId: 'sub', projectId: 'p1' }));
+      const subscribed = await nextSocketMessage(socket);
+      expect(subscribed).toMatchObject({ type: 'subscribed', requestId: 'sub', projectId: 'p1' });
+      socket.send(JSON.stringify({ type: 'snapshot', requestId: 'after', projectId: 'p1' }));
+      const afterAck = await nextSocketMessage(socket);
+      expect(afterAck).toMatchObject({ type: 'ack', requestId: 'after', ok: true, result: { projectId: 'p1' } });
+
+      bridge.publishBusinessEvent({ type: 'task.finished', projectId: 'p2', taskId: 'hidden' });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(command).toHaveBeenCalledTimes(1);
+
+      const visibleEvent = nextSocketMessage(socket);
+      bridge.publishBusinessEvent({ type: 'task.finished', projectId: 'p1', taskId: 'visible' });
+      const visible = await visibleEvent;
+      expect(visible).toMatchObject({ projectId: 'p1', taskId: 'visible' });
+    } finally {
+      socket.close();
+    }
+  });
+
+  it('错误的 Bridge key 在 WebSocket 握手阶段被拒绝', async () => {
+    const { bridge, base } = await boot(makeDb({ bridge_port: '0' }), providers());
+    running.push(bridge);
+    const socket = new WebSocket(`${base.replace(/^http:/, 'ws:')}/v1/business/events`, {
+      headers: { Authorization: 'Bearer sk-wrong' }
+    });
+    await expect(new Promise<void>((resolve, reject) => {
+      socket.once('open', () => reject(new Error('socket unexpectedly opened')));
+      socket.once('unexpected-response', (_request, response) => {
+        response.resume();
+        resolve();
+      });
+      socket.once('error', () => resolve());
+    })).resolves.toBeUndefined();
   });
 });
 

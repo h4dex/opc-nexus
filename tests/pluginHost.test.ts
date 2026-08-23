@@ -30,8 +30,8 @@ describe('plugin manifest validation', () => {
   it('normalizes and freezes a valid declaration', () => {
     const value = validatePluginManifest(manifest());
     expect(value.id).toBe('com.example.image-tools');
-    expect(value.owner).toBe('dsh-cordis');
-    expect(value.capabilities[0]?.owner).toBe('dsh-cordis');
+    expect(value.owner).toBe('nexus-governance');
+    expect(value.capabilities[0]?.owner).toBe('nexus-governance');
     expect(Object.isFrozen(value)).toBe(true);
     expect(Object.isFrozen(value.capabilities)).toBe(true);
     expect(satisfiesPluginHostVersion(PLUGIN_HOST_API_VERSION, '^1.0.0')).toBe(true);
@@ -65,19 +65,15 @@ describe('plugin manifest validation', () => {
     }));
     expect(governance.owner).toBe('nexus-governance');
     expect(governance.capabilities[0]?.owner).toBe('nexus-governance');
-    expect(() => validatePluginManifest(manifest({ owner: 'nexus-secretary' }))).toThrow(/dsh-cordis or nexus-governance/);
-    expect(() => validatePluginManifest(manifest({
-      owner: 'dsh-cordis',
-      capabilities: [{ id: 'x', kind: 'skill', version: '1.0.0', owner: 'nexus-governance' }]
-    }))).toThrow(/must match plugin owner/);
+    expect(() => validatePluginManifest(manifest({ owner: 'nexus-secretary' }))).toThrow(/must be nexus-governance/);
   });
 
-  it('normalizes DSH execution adapters without granting them orchestration ownership', () => {
+  it('normalizes execution adapters without granting them orchestration ownership', () => {
     const value = validatePluginManifest(manifest({
       executionAdapter: 'hermes-cli',
       capabilities: [{ id: 'worker', kind: 'engine', version: '1.0.0' }]
     }));
-    expect(value.owner).toBe('dsh-cordis');
+    expect(value.owner).toBe('nexus-governance');
     expect(value.executionAdapter).toBe('hermes-cli');
     expect(value.capabilities[0]?.executionAdapter).toBe('hermes-cli');
     expect(() => validatePluginManifest(manifest({ executionAdapter: 'nexus-secretary' }))).toThrow(/supported execution adapter/);
@@ -123,8 +119,8 @@ describe('PluginHost', () => {
     expect(host.isAttached('com.example.image-tools')).toBe(true);
     expect(host.isAttached('com.example.image-tools', 'vision.describe')).toBe(true);
     await expect(host.invoke({ pluginId: 'com.example.image-tools', capabilityId: 'vision.describe', input: { id: 1 } }))
-      .resolves.toEqual({ input: { id: 1 }, kind: 'tool', owner: 'dsh-cordis', adapter: undefined });
-    expect(authorize).toHaveBeenCalledWith(expect.objectContaining({ permission: 'artifact.read', owner: 'dsh-cordis' }), expect.any(AbortSignal));
+      .resolves.toEqual({ input: { id: 1 }, kind: 'tool', owner: 'nexus-governance', adapter: undefined });
+    expect(authorize).toHaveBeenCalledWith(expect.objectContaining({ permission: 'artifact.read', owner: 'nexus-governance' }), expect.any(AbortSignal));
     expect(handler).toHaveBeenCalledTimes(1);
     binding.detach();
     expect(host.isAttached('com.example.image-tools')).toBe(false);

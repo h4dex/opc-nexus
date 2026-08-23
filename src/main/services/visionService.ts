@@ -1,10 +1,10 @@
 /**
- * Main-process vision proxy for the DSH vision tool.
+ * Main-process vision proxy for the Nexus vision tool.
  *
  * The service deliberately accepts content-addressed attachment references,
  * never arbitrary renderer paths or data URLs. Provider credentials are
  * resolved through the injected Main-process provider boundary and are never
- * returned from this module. DSH/Cordis owns the tool/orchestration contract;
+ * returned from this module. Hermes owns the tool/orchestration contract;
  * The native host only stores attachments, applies limits, and proxies the model call.
  */
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -25,7 +25,7 @@ import type {
   PluginManifest
 } from './pluginHost.js';
 
-export const VISION_PLUGIN_ID = 'opc.dsh.vision';
+export const VISION_PLUGIN_ID = 'opc.nexus.vision';
 export const VISION_TOOL_CAPABILITY_ID = 'vision.describe';
 export const VISION_OCR_TOOL_CAPABILITY_ID = 'vision.ocr';
 export const VISION_MODEL_BINDING_SETTING = 'vision:model-binding';
@@ -152,18 +152,18 @@ export class VisionServiceError extends Error {
   }
 }
 
-/** DSH/Cordis owns this capability; aibox-native-host only supplies the safe proxy. */
-export const DSH_VISION_PLUGIN_MANIFEST: PluginManifest = {
+/** Nexus owns this built-in capability; Main only supplies a safe proxy. */
+export const NEXUS_VISION_PLUGIN_MANIFEST: PluginManifest = {
   schemaVersion: 1,
   id: VISION_PLUGIN_ID,
-  name: 'DSH Vision Tool',
+  name: 'Nexus Vision Tool',
   version: '1.0.0',
-  owner: 'dsh-cordis',
+  owner: 'nexus-governance',
   capabilities: [{
     id: VISION_TOOL_CAPABILITY_ID,
     kind: 'tool',
     version: '1.0.0',
-    owner: 'dsh-cordis',
+    owner: 'nexus-governance',
     toolName: VISION_TOOL_CAPABILITY_ID,
     // The model call sends attachment bytes to the configured Provider.
     risk: 'write',
@@ -181,7 +181,7 @@ export const DSH_VISION_PLUGIN_MANIFEST: PluginManifest = {
     id: VISION_OCR_TOOL_CAPABILITY_ID,
     kind: 'tool',
     version: '1.0.0',
-    owner: 'dsh-cordis',
+    owner: 'nexus-governance',
     toolName: VISION_OCR_TOOL_CAPABILITY_ID,
     risk: 'safe',
     permissions: ['artifact.read'],
@@ -512,10 +512,10 @@ export class VisionService {
     }
   }
 
-  /** Attach the DSH tool to a PluginHost without exposing a path or secret. */
+  /** Attach the Nexus tool to a PluginHost without exposing a path or secret. */
   createToolHandler(): PluginCapabilityHandler {
     return async (input: unknown, context: Readonly<PluginInvocationContext>) => {
-      if (context.owner !== 'dsh-cordis' || context.capabilityId !== VISION_TOOL_CAPABILITY_ID) {
+      if (context.owner !== 'nexus-governance' || context.capabilityId !== VISION_TOOL_CAPABILITY_ID) {
         throw new VisionServiceError('VISION_PROVIDER_UNAVAILABLE', 'Vision tool ownership is invalid');
       }
       if (!input || typeof input !== 'object' || Array.isArray(input)) throw new VisionServiceError('INVALID_ATTACHMENT', 'Vision tool input is invalid');
@@ -528,7 +528,7 @@ export class VisionService {
   /** Local OCR shares the exact attachment identity and integrity boundary. */
   createOcrToolHandler(runtime: VisionOcrRuntime): PluginCapabilityHandler {
     return async (input: unknown, context: Readonly<PluginInvocationContext>) => {
-      if (context.owner !== 'dsh-cordis' || context.capabilityId !== VISION_OCR_TOOL_CAPABILITY_ID) {
+      if (context.owner !== 'nexus-governance' || context.capabilityId !== VISION_OCR_TOOL_CAPABILITY_ID) {
         throw new VisionServiceError('VISION_PROVIDER_UNAVAILABLE', 'OCR tool ownership is invalid');
       }
       if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -557,6 +557,6 @@ export class VisionService {
 }
 
 /** Keep the plugin handler export easy to inject in bootstrap code. */
-export function createDshVisionToolHandler(service: VisionService): PluginCapabilityHandler {
+export function createHostVisionToolHandler(service: VisionService): PluginCapabilityHandler {
   return service.createToolHandler();
 }

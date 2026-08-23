@@ -34,7 +34,14 @@ vi.mock('../src/main/services/engineEnv.js', async (importOriginal) => ({
         OPENCODE_CONFIG_CONTENT: '{}'
       }
     : {},
-  resolveClaudeEngineEnv: () => ({ ...managedEnv }),
+  resolveClaudeEngineEnv: () => providerState.current
+    ? {
+        ANTHROPIC_API_KEY: providerState.current.key,
+        ANTHROPIC_AUTH_TOKEN: providerState.current.key,
+        ANTHROPIC_BASE_URL: providerState.current.baseUrl.replace(/\/v1$/i, ''),
+        ANTHROPIC_MODEL: providerState.current.model
+      }
+    : { ...managedEnv },
   resolveConfiguredEngineEnv: () => ({ ...managedEnv }),
   splitSecretEnv: (env: Record<string, string>) => ({ safe: env, secrets: {} })
 }));
@@ -80,15 +87,45 @@ describe('Claude Code EngineManager probe', () => {
 
     expect(result.ok).toBe(true);
     expect(runCli.mock.calls[1][1]).toEqual(expect.arrayContaining([
-      '--ignore-user-config',
       'model_providers.opcnexus.name="OPC-Nexus"',
       'model_providers.opcnexus.wire_api="responses"',
       '--model',
       'worker-model'
     ]));
+    expect(runCli.mock.calls[1][1]).not.toContain('--ignore-user-config');
     expect(runCli.mock.calls[1][2].env.OPENAI_API_KEY).toBe('managed-codex-key');
     expect(runCli.mock.calls[1][2].env.CODEX_HOME).toContain('aibox-data');
     expect(runCli.mock.calls[1][2].env.CODEX_HOME).toContain('codex');
+    expect(runCli.mock.calls[1][2].timeoutMs).toBe(120_000);
+  });
+
+  it('reports the real managed Codex upstream error when the process misses the hard timeout', async () => {
+    providerState.current = {
+      baseUrl: 'https://provider.test/v1',
+      model: 'worker-model',
+      key: 'managed-codex-key'
+    };
+    runCli
+      .mockResolvedValueOnce({ ok: true, code: 0, stdout: 'codex-cli 0.145.0', stderr: '' })
+      .mockResolvedValueOnce({
+        ok: false,
+        code: null,
+        stdout: '{"type":"error","message":"unexpected status 502 Bad Gateway"}',
+        stderr: '',
+        error: '执行超时（120 秒）'
+      });
+
+    const result = await probeCliAuth('eng-codex', 'codex', {} as never);
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 'DEGRADED',
+      authStatus: 'unknown',
+      signals: { taskVerified: false }
+    });
+    expect(result.message).toContain('502 Bad Gateway');
+    expect(result.message).toContain('执行超时（120 秒）');
+    expect(result.message).not.toContain('managed-codex-key');
   });
 
   it('runs managed OpenCode probes without external plugins', async () => {
@@ -136,6 +173,31 @@ describe('Claude Code EngineManager probe', () => {
     ]));
     expect(runCli.mock.calls[2][1].at(-1)).toContain('OPC_CLAUDE_OK');
     expect(runCli.mock.calls[2][2].env.ANTHROPIC_API_KEY).toBe('claude-secret');
+  });
+
+  it('isolates managed Claude probes from the user Claude settings directory', async () => {
+    providerState.current = {
+      baseUrl: 'https://provider.test/v1',
+      model: 'worker-model',
+      key: 'managed-claude-key'
+    };
+    runCli
+      .mockResolvedValueOnce(versionResult)
+      .mockResolvedValueOnce({
+        ok: true,
+        code: 0,
+        stdout: JSON.stringify({ type: 'result', is_error: false, result: 'OPC_CLAUDE_OK' }),
+        stderr: ''
+      });
+
+    const result = await probeCliAuth('eng-claude', 'claude', {} as never);
+
+    expect(result.ok).toBe(true);
+    const env = runCli.mock.calls[1][2].env;
+    expect(env.CLAUDE_CONFIG_DIR).toContain('aibox-data');
+    expect(env.CLAUDE_CONFIG_DIR).toContain('claude');
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('managed-claude-key');
   });
 
   it('stops before the paid model probe when Claude is not logged in', async () => {

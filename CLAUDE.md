@@ -8,7 +8,7 @@ OPC-Nexus(package 名 `aibox-control-center`)— 本地优先的桌面 AI Agent 
 
 更详细的约定与检查清单见 `AGENTS.md`,深入文档见 `src/docs/`(architecture / features / api-reference)。
 
-当前正处于 v2.0.0 验收收敛期,动手前先读三份文档:[缺陷审计](docs/FUNCTIONAL-UX-AUDIT-2026-08-18.md)(已知缺陷与证据)、[DSH/Cordis 实施计划](docs/V2.0.0-DSH-CORDIS-PROJECT-QUEST-IMPLEMENTATION-PLAN.md)(架构决议与验收契约)、[验收执行计划](docs/V2-ACCEPTANCE-EXECUTION-PLAN.md)(阶段划分与优先级)。
+当前正处于 v2.0.0 Quest/Hermes 验收收敛期。动手前先读 [持续优化目标](docs/GOAL-QUEST-HERMES-CONTINUOUS-OPTIMIZATION.md)、[当前验收报告](docs/ACCEPTANCE-REPORT-2026-08-22.md) 和 [用户指南](docs/USER-GUIDE.md)。更早的 DSH/Cordis 文档只记录历史决策，不代表当前架构。
 
 ## Git 工作流(必须遵守)
 
@@ -37,16 +37,13 @@ OPC-Nexus(package 名 `aibox-control-center`)— 本地优先的桌面 AI Agent 
 | `npm run test:watch` | 监听模式测试 |
 | `npm run build` | 生产构建 → `out/{main,preload,renderer}` |
 | `npm run dev:quest` / `start:quest` | 仅 Quest 入口(不创建主控制台) |
-| `npm run harness:managed:verify` | 校验内置 DSH managed runtime 闭包 |
-| `npm run harness:managed:smoke:web` | 真实启动 rc.6 Web runtime 验证工具目录 |
-| `npm run harness:managed:smoke:quest` | 真实 typed owner question/answer 往返 |
 | `npm run pack:win` / `pack:linux` | 构建并打包安装程序 |
 
 - **没有 `lint` 脚本**,也没有独立的 `e2e` 脚本;不要在文档或 CI 中引用它们。Playwright 通过 `_electron` 驱动(`scripts/mobile-e2e.cjs`),且 `playwright` 目前是未声明的传递依赖(仅 `@playwright/mcp` 与 `playwright-core` 在 `package.json` 中),写 E2E 前需先显式声明并锁版本。
 - 依赖安装走 npmmirror 镜像(`.npmrc` 已配置)
 - CI(`.cnb.yml`,CNB 平台)在 push/PR 时**只执行** typecheck + test;构建与打包在 `.github/workflows/`。提交前 typecheck 与 test 必须通过
-- 验证顺序:`typecheck` → `test` →(涉及构建配置时)`build` →(涉及 DSH runtime 时)`harness:managed:verify` →(涉及 UI 时)`dev`
-- 当前基线(2026-08-18):typecheck 通过;144 个测试文件 / 1537 passed + 2 skipped。**全绿不等于闭环可用** —— 现有单测主要覆盖模块内部行为,未守住「老板下令 → 可打开成果」的跨模块契约。
+- 验证顺序:`typecheck` → `test` →(涉及构建配置时)`build` →(涉及 UI 时)`dev` →桌面/手机黑盒脚本。
+- 当前基线以最新命令输出和 `docs/ACCEPTANCE-REPORT-2026-08-22.md` 为准。**全绿不等于闭环可用**，还必须验证「老板下令 → Hermes 调度 → 真实 Worker → 可打开成果」和手机项目对话边界。
 
 ## 架构
 
@@ -101,20 +98,20 @@ assertString(v, field, min = 1, max = 500)     // ipc.ts
 
 状态转换只能发生在主进程 `orchestrator.ts` 或对应 Manager 中,Renderer 不可直接修改。首页派生状态 `DerivedAgentStatus` 由编排器计算,互斥优先级 `error > running > paused > starting > idle`。**状态机变更必须有对应测试覆盖。**
 
-### v2.0.0 产品分层:DSH/Cordis 为核心 AI 平面
+### v2.0.0 产品分层:Hermes 为唯一调度平面
 
-v2 的主轴是「主控制台管理项目 → 每个项目弹出独立 Quest 窗口 → DSH/Cordis 作为主 AI 规划派工」。三层职责不可混淆:
+v2 的主轴是「主控制台管理项目 → Quest 打开项目会话 → Hermes 澄清、规划和组队 → Nexus 治理后交给真实 Worker 执行」。三层职责不可混淆:
 
-- **DSH/Cordis** — 核心 AI 平面,拥有对话、上下文、问题集、计划版本、root/child Session、Jobs/Goals 和多 Agent 编排。**Session/Run/Job/Goal/计划状态的唯一权威。**
-- **`opc-nexus-governance`** — Cordis 核心特色插件(`opcNexusGovernancePlugin.ts`,manifest `2.0.0`):项目/员工目录、权限预算沙箱策略、审计、记忆归档、看板投影、渠道、artifact admission。只对 DSH 事实做**有界投影**,不反向编排 DSH。
-- **`aibox-native-host`** — 薄特权边界:safeStorage、文件、进程、TLS/Origin、原生扩展、持久化。**不对话、不规划、不组队。**
+- **Hermes** — 唯一面向老板的调度器，负责对话、澄清、计划内容、长期会话和动态子 Agent 推理。
+- **`opc-nexus-governance`** — 项目/员工目录、权限预算、任务状态、审批、审计、渠道和 artifact admission 的权威层；它不作为第二调度器。
+- **`aibox-native-host`** — safeStorage、文件、进程、TLS/Origin、数据库和原生扩展的薄特权边界；它不对话、不规划、不组队。
 
 关键约束:
 
-- 旧 `Orchestrator` / `Task` 表在迁移期仅负责写**兼容投影**,不再拥有业务规划或执行权威;该投影**不得反向覆盖** DSH 事实,也不得创建第二套业务计划。
-- 老板决策(回答/批准/拒绝/派发)遇到 DSH marker 或 durable binding 时**强制转入** DSH governance(`dshQuestGovernance.ts`),禁止降级回 Secretary 控制面。
-- DSH 临时子 Agent 不会因出现在同步树中而自动晋升为持久数字员工。
-- Quest 默认路由并非首屏:`store.ts` 初始 `route` 为 `dashboard`;Quest-only 仅由 `--quest` / `--quest-only[=projectId]` / `--quest-project=<id>` 或 `AIBOX_QUEST_ONLY=1` 触发(`questLaunch.ts`)。项目内打开 Quest 走 `window.aibox.openQuestWindow({ projectId })`,主控制台保持打开。
+- 旧调度器、Workbench、手机网关、插件目录、Runtime 和 Renderer IPC 已退出生产运行图，不得重新引入。
+- 数据库只保留一次性升级识别：旧活动任务迁移为 `INTERRUPTED`，旧员工迁移为 `ERROR`，历史终态和审计证据保留，不静默改绑 Hermes。
+- Codex、Claude Code、Pi、Hermes CLI、ACP/A2A 适配器都是 Worker 能力，不能取得调度权或直接伪造完成状态。
+- 手机二维码只由当前项目 Quest 右上角生成，只开放该项目 Hermes `/chat` Operator 会话；Android 执行设备配对是独立链路。
 
 产物交付相关服务当前**并未打通**:`deliverableManager.ts` 只把任务 `result` 文本包装为 Markdown;`artifactRef.ts` / `projectArtifactService.ts` 是内容寻址(SHA-256/magic/大小/grant)的独立体系,尚未接入交付与导出链路。新增交付能力时应向 ArtifactRef 收敛,不要扩展文本包装路径。
 
@@ -123,7 +120,7 @@ v2 的主轴是「主控制台管理项目 → 每个项目弹出独立 Quest �
 1. Nexus 内置 Worker → `LlmApiExecutor`(已配置供应商时)
 2. Hermes / Pi → 专用 CLI Executor
 3. Codex / Claude Code / OpenCode → 对应 CLI Executor
-4. DeepSeek Harness / 自定义引擎 → `AcpExecutor`(ACP 协议) / `DshManagedExecutor`
+4. 其他明确配置的 ACP/A2A 或自定义 CLI → 对应受治理执行适配器
 5. 无可用引擎 → `resolve()` 返回 `null`,任务转 `FAILED`
 
 `executionMode` 默认 `production`(`userConfig.ts`),此时**不存在**任何模拟回退。`SimulatedExecutor` 仅在 `executionMode !== 'production'` 时可达(`executor/index.ts:160`),属于**待移除的历史路径**,不要为其新增功能或在文档中把它描述为可选执行模式。
@@ -191,8 +188,10 @@ sql.js(SQLite WASM,零原生编译),数据库位于 `userData/aibox-data/aibox.d
 
 ### 已知覆盖缺口(修改相关代码时必须补齐)
 
-当前基线 1540 passed + 2 skipped(144 测试文件)。曾出现「全绿却漏掉两个确定性 P0」,原因是覆盖面偏向模块内部行为:
+当前基线 1554 passed + 2 skipped(145 测试文件)。曾出现「全绿却漏掉两个确定性 P0」,原因是覆盖面偏向模块内部行为:
+
+**`.mjs` 不得带 shebang。** `runtime/**/*.mjs` 一律以 `node <path>` 显式调用,`#!` 只是装饰;但 Vitest 的 ESM transform 会把 `#!` 当作非法 token,导致**导入它的测试文件整体解析失败**,报错却指向 import 语句所在行,极易误判为 vitest/vite 的解析 bug(曾因此让 8 个测试静默失效)。
 
 - **IPC 契约层无测试**:多数 IPC 只在 service 层被测,绕过了 `ipc.ts` 的参数校验。新增或修改 IPC 时必须从 `window.aibox.*` 公开 API 驱动。
 - **跨模块业务闭环无测试**:没有任何测试覆盖「下令 → 澄清 → 计划 → 批准 → 派工 → 产出可打开成果」的完整链路。
-- **`tests/v2ScenarioAcceptance.test.ts` 的 4/4 通过是确定性 fixture**:QuestionSet、Plan、worker 结果和 Provider 全为 fake,它证明治理与持久化契约,**不证明**真实 DSH 运行、真实 transport 或 UI 操作链。不要把它当作产品级 E2E 依据。
+- **确定性 fixture 只证明治理与持久化契约**，不证明真实 Provider、Hermes transport、CLI、桌面 UI 或手机 UI 可用。产品级结论必须引用真实黑盒证据和错误日志。

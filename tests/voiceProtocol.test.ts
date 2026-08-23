@@ -121,7 +121,7 @@ describe('语音配置与就绪判定', () => {
   });
 
   it('已启用但无任何通道时如实报错，不静默失败', async () => {
-    const svc = new VoiceService(makeDb({ 'voice:config': { enabled: true, provider: 'auto', appKey: '', silenceMs: 800 } }));
+    const svc = new VoiceService(makeDb({ 'voice:config': { enabled: true, provider: 'cloud', appKey: '', silenceMs: 800 } }));
     const r = await svc.start();
     expect(r.ok).toBe(false);
     expect(r.provider).toBeNull();
@@ -150,9 +150,8 @@ describe('语音配置与就绪判定', () => {
     expect(svc.saveConfig({ silenceMs: 99999 }).silenceMs).toBeLessThanOrEqual(5000);
   });
 
-  it('provider=local 但模型缺失时不可用（本地识别尚未实现）', async () => {
-    const svc = new VoiceService(makeDb({ 'voice:config': { enabled: true, provider: 'local', appKey: '', silenceMs: 800 } }));
-    const r = await svc.start();
-    expect(r.ok).toBe(false);
+  it('rejects legacy local provider input instead of exposing an unfinished mode', () => {
+    const svc = new VoiceService(makeDb());
+    expect(() => svc.saveConfig({ provider: 'local' as never })).toThrow('尚未实现');
   });
 });

@@ -143,7 +143,13 @@ function v35Database(): { db: Database; inner: InstanceType<Awaited<ReturnType<t
   return { db: database(inner), inner };
 }
 
-describe('database v44 reliability gates', () => {
+describe('database v47 reliability gates', () => {
+  it('returns a committed transaction result to IPC callers', () => {
+    const db = database(new SQL.Database());
+
+    expect(db.transaction(() => ({ id: 'project-created' }))).toEqual({ id: 'project-created' });
+  });
+
   it.each(['', '0', '-1', '35.5', 'not-a-version'])('rejects illegal schema version %j before running DDL', (version) => {
     const inner = new SQL.Database();
     inner.exec('CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)');
@@ -156,7 +162,7 @@ describe('database v44 reliability gates', () => {
 
   it('rejects a future schema before running DDL', () => {
     const inner = new SQL.Database();
-    inner.exec("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '45')");
+    inner.exec("CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO schema_meta VALUES('schema_version', '48')");
     const db = database(inner);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).toThrow('高于当前应用支持');
@@ -172,12 +178,12 @@ describe('database v44 reliability gates', () => {
     expect(count(inner, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_meta'")).toBe(0);
   });
 
-  it('migrates a truly empty database to v44 with project-autonomous defaults and foreign keys enabled', () => {
+  it('migrates a truly empty database to v47 with project-autonomous defaults and foreign keys enabled', () => {
     const inner = new SQL.Database();
     const db = database(inner);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('47');
     expect(value(inner, 'PRAGMA foreign_keys')).toBe(1);
     expect(count(inner, 'PRAGMA foreign_key_check')).toBe(0);
     expectTaskDependenciesSchema(inner);
@@ -229,7 +235,7 @@ describe('database v44 reliability gates', () => {
 
     expect(value(inner, "SELECT permission_mode FROM agents WHERE id='agent-standard'")).toBe('autonomous');
     expect(value(inner, "SELECT permission_mode FROM agents WHERE id='agent-readonly'")).toBe('readonly');
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('47');
   });
 
   it('renames the legacy built-in Hermes engine and every live engine reference to Nexus', () => {
@@ -328,21 +334,24 @@ describe('database v44 reliability gates', () => {
     `);
 
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('47');
     expect(count(inner, "SELECT COUNT(*) FROM engines WHERE id='eng-hermes'")).toBe(0);
     expect(value(inner, "SELECT type FROM engines WHERE id='eng-nexus'")).toBe('nexus');
     expect(value(inner, "SELECT config_json FROM engines WHERE id='eng-nexus'")).toContain('legacy-model');
     expect(value(inner, "SELECT engine_id FROM agents WHERE id='agent-migration'")).toBe('eng-nexus');
-    expect(value(inner, "SELECT engine_id FROM agents WHERE id='agent-mobile-migration'")).toBe('eng-hermes-cli');
+    expect(value(inner, "SELECT engine_id FROM agents WHERE id='agent-mobile-migration'")).toBe('eng-deepseek-harness');
+    expect(value(inner, "SELECT lifecycle FROM agents WHERE id='agent-mobile-migration'")).toBe('ERROR');
     expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-migration'")).toBe('eng-nexus');
-    expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-mobile-active'")).toBeNull();
+    expect(value(inner, "SELECT status FROM tasks WHERE id='task-mobile-active'")).toBe('INTERRUPTED');
+    expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-mobile-active'")).toBe('eng-deepseek-harness');
     expect(value(inner, "SELECT engine_override FROM tasks WHERE id='task-mobile-terminal'")).toBe('eng-deepseek-harness');
     expect(value(inner, "SELECT requested_engine_id FROM agent_runs WHERE id='run-migration'")).toBe('eng-nexus');
     expect(value(inner, "SELECT resolved_engine_id FROM agent_runs WHERE id='run-migration'")).toBe('eng-nexus');
     expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-migration'")).toBe('eng-nexus');
     expect(value(inner, "SELECT plan_json FROM dispatch_plans WHERE id='plan-migration'")).toContain('eng-nexus');
-    expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-mobile-active'")).toBe('eng-hermes-cli');
-    expect(value(inner, "SELECT plan_json FROM dispatch_plans WHERE id='plan-mobile-active'")).toContain('eng-hermes-cli');
+    expect(value(inner, "SELECT status FROM dispatch_plans WHERE id='plan-mobile-active'")).toBe('failed');
+    expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-mobile-active'")).toBe('eng-deepseek-harness');
+    expect(value(inner, "SELECT plan_json FROM dispatch_plans WHERE id='plan-mobile-active'")).toContain('eng-deepseek-harness');
     expect(value(inner, "SELECT worker_engine_id FROM dispatch_plans WHERE id='plan-mobile-terminal'")).toBe('eng-deepseek-harness');
     expect(value(inner, "SELECT payload FROM task_events WHERE id='event-migration'")).toContain('eng-nexus');
     expect(value(inner, "SELECT engine_id FROM engine_logs WHERE id='log-migration'")).toBe('eng-nexus');
@@ -413,7 +422,7 @@ describe('database v44 reliability gates', () => {
     const { db, inner } = v35Database();
     expect(() => (db as unknown as { migrate: () => void }).migrate()).not.toThrow();
 
-    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('44');
+    expect(value(inner, "SELECT value FROM schema_meta WHERE key='schema_version'")).toBe('47');
     expect(value(inner, 'PRAGMA foreign_keys')).toBe(1);
     expectTaskDependenciesSchema(inner);
     expect(value(inner, "SELECT input_message_id FROM tasks WHERE id='task-winner'")).toBe('message-1');

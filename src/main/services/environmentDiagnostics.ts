@@ -5,7 +5,7 @@
  * Nothing here dlopens, imports, or executes a DLL/SO/Node addon.
  */
 import { execFile } from 'node:child_process';
-import { lstatSync, readFileSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import type {
@@ -39,7 +39,6 @@ export interface EnvironmentDiagnosticAuditEvent {
 }
 
 export interface EnvironmentDiagnosticsOptions {
-  managedRuntimeRoot?: string;
   nativeRoots?: string[];
   nativeExtensions?: NativeExtensionDeclaration[];
   commands?: EnvironmentCommandSpec[];
@@ -182,8 +181,8 @@ async function probeCommand(spec: EnvironmentCommandSpec): Promise<EnvironmentCo
   return { id, name, kind, source: 'system', available: true, ready: true, required: spec.required === true, version, path, reason: null };
 }
 
-function bundledComponents(options: EnvironmentDiagnosticsOptions, platform: NodeJS.Platform, architecture: string): EnvironmentComponentView[] {
-  const components: EnvironmentComponentView[] = [{
+function bundledComponents(options: EnvironmentDiagnosticsOptions): EnvironmentComponentView[] {
+  return [{
     id: 'aibox-electron-node',
     name: 'AI Box 内置 Node.js',
     kind: 'runtime',
@@ -206,47 +205,6 @@ function bundledComponents(options: EnvironmentDiagnosticsOptions, platform: Nod
     path: process.execPath ?? null,
     reason: null
   }];
-  if (!options.managedRuntimeRoot) return components;
-  const root = resolve(options.managedRuntimeRoot);
-  const manifestPath = join(root, 'package.json');
-  let version: string | null = null;
-  let validManifest = false;
-  if (regularDirectory(root) && regularFile(manifestPath)) {
-    try {
-      const parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as { version?: unknown };
-      version = bounded(parsed.version, MAX_VERSION_LENGTH);
-      validManifest = version !== null;
-    } catch {
-      validManifest = false;
-    }
-  }
-  const dependencyRoots = [join(root, 'dist', 'node_modules'), join(root, 'node_modules')];
-  const nodeModules = dependencyRoots.find(regularDirectory) ?? dependencyRoots[0];
-  const runtimeEntry = join(nodeModules, '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  const ready = validManifest && regularDirectory(nodeModules) && regularFile(runtimeEntry);
-  components.push({
-    id: 'dsh-managed-runtime',
-    name: 'DSH/Cordis 内置运行时',
-    kind: 'runtime',
-    source: 'bundled',
-    available: validManifest,
-    ready,
-    required: true,
-    version,
-    path: validManifest ? root : null,
-    reason: !regularDirectory(root)
-      ? 'RUNTIME_ROOT_MISSING'
-      : !validManifest
-        ? 'RUNTIME_MANIFEST_INVALID'
-        : !regularDirectory(nodeModules)
-          ? 'RUNTIME_DEPENDENCIES_MISSING'
-          : ready ? null : 'RUNTIME_ENTRY_MISSING'
-  });
-  // Keep parameters used to make platform/architecture intent explicit in
-  // this pure diagnostic helper; native declarations are checked below.
-  void platform;
-  void architecture;
-  return components;
 }
 
 function nativeComponents(
@@ -325,7 +283,7 @@ export class EnvironmentDiagnosticsService {
   async diagnose(): Promise<EnvironmentDiagnosticsView> {
     const platform = this.options.platform ?? process.platform;
     const architecture = this.options.architecture ?? process.arch;
-    const components = bundledComponents(this.options, platform, architecture);
+    const components = bundledComponents(this.options);
     const commands = this.options.commands ?? defaultEnvironmentCommands(platform);
     const probed = await Promise.all(commands.slice(0, MAX_COMPONENTS).map((command) => probeCommand(command)));
     components.push(...probed);

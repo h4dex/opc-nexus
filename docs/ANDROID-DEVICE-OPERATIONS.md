@@ -1,12 +1,12 @@
 # Android 设备操作功能文档
 
-> 本文档描述 DSH/Cordis 工作台 `2.0.0` 中由 `opc-nexus-governance` 提供的 Android Bridge `0.4.3` 能力：设备接入、控制、脚本、媒体采集和安全边界。文中的既有截图仍来自「手机控制台」；Android Launcher 图标已在 API 34 模拟器验证。
+> 本文档描述 OPC-Nexus `2.0.0` 中由 `opc-nexus-governance` 提供的 Android Bridge `0.4.3` 能力：设备接入、控制、脚本、媒体采集和安全边界。文中的既有截图来自旧版页面；Android Launcher 图标已在 API 34 模拟器验证。
 
 ## 1. 功能范围
 
-`opc-nexus-governance` 通过 Android Bridge App 把 Android 设备接入 `aibox-native-host` 的 Mobile Gateway，再由 Cordis 指派的 Android 操作员 worker 或「手机控制台」调用受策略约束的 Android 工具。
+`opc-nexus-governance` 通过 Android Bridge App 把 Android 设备接入 `aibox-native-host` 的 Mobile Gateway，再由 Hermes 指派的 Android 操作员 worker 或「Android 执行设备」页面调用受策略约束的 Android 工具。Quest 的手机扫码仅用于 Hermes 对话访问，不用于 Android 设备配对。
 
-DSH/Cordis 是自动化任务的规划和派工权威。Android 工具目录以治理插件 capability 暴露，Cordis 只能把 `android_*` 调用交给已绑定设备、已批准权限和工具白名单的固定 worker；Local CLI、ACP/A2A worker 不会因被选中而自动获得设备权限。旧 OPC Orchestrator 只保留兼容 Task/审计投影，不再决定团队或计划。
+Hermes/Quest 是自动化任务的唯一规划和派工入口。Android 工具目录以治理插件 capability 暴露，Hermes 只能把 `android_*` 调用交给已绑定设备、已批准权限和工具白名单的固定 worker；Local CLI、ACP/A2A worker 不会因被选中而自动获得设备权限。DSH 仅作为受治理执行适配器，不能创建计划、审批或手机对话入口。
 
 当前链路支持：
 
@@ -32,7 +32,7 @@ DSH/Cordis 是自动化任务的规划和派工权威。Android 工具目录以�
 
 ## 2. 页面入口
 
-启动 OPC-Nexus 后，在左侧导航的「系统」分组进入「手机控制台」。页面分为：
+启动 OPC-Nexus 后，在左侧导航的「系统」分组进入「Android 执行设备」。页面分为：
 
 | 区域 | 用途 |
 |---|---|
@@ -53,7 +53,7 @@ DSH/Cordis 是自动化任务的规划和派工权威。Android 工具目录以�
 
 ### 3.1 使用桌面端安装页
 
-1. 在桌面端进入「手机控制台」→「安装」。
+1. 在桌面端进入「Android 执行设备」→「安装」。
 2. 在 Android 手机上启用开发者选项和 USB 调试，并通过 USB 连接电脑。
 3. 在安装页点击刷新，确认 ADB 设备状态为 `device`。
 4. 点击对应设备的「安装」。
@@ -101,7 +101,7 @@ APK 包名为 `com.senke.opcnexus.bridge`，当前工程配置的最低 Android 
 ### 4.1 桌面端启动 Gateway
 
 1. 确保电脑和手机在同一个局域网。
-2. 在「手机控制台」网关栏选择电脑的 RFC1918 局域网 IPv4 地址，例如 `192.168.x.x`、`10.x.x.x` 或 `172.16.x.x` 至 `172.31.x.x`。
+2. 在「Android 执行设备」网关栏选择电脑的 RFC1918 局域网 IPv4 地址，例如 `192.168.x.x`、`10.x.x.x` 或 `172.16.x.x` 至 `172.31.x.x`。
 3. 使用默认端口 `18765`，或选择未占用的 `1024-65535` 端口。
 4. 点击「启动网关」。
 5. 点击「配对手机」，生成一次性配对二维码。
@@ -230,7 +230,7 @@ Gateway 只绑定局域网 IPv4，不接受公网地址；设备通道为 `wss:/
 
 创建或编辑固定数字员工时，将类型设置为 `android_operator`，然后选择设备、工具策略并确认授权。治理插件会注册一个可由 Cordis 发现的固定 worker manifest；当前兼容实现可使用独立 Hermes Profile 执行工具，但 Hermes 只是 Local CLI adapter，不是规划内核。
 
-绑定完成后，Cordis 可以在 Quest/项目计划中选择该固定 worker，用户也可以从员工目录发起显式直达任务。执行环境只暴露批准的 `android` 工具集；普通员工看不到手机工具。未绑定设备时任务会被拒绝，设备离线或正被占用时任务保持排队。
+绑定完成后，Hermes 可以在 Quest/项目计划中选择该固定 worker，用户也可以从员工目录发起显式直达任务。执行环境只暴露批准的 `android` 工具集；普通员工看不到手机工具。未绑定设备时任务会被拒绝，设备离线或正被占用时任务保持排队。
 
 Agent 能否使用 Android 工具由三层共同决定：
 
@@ -292,7 +292,7 @@ Agent 能否使用 Android 工具由三层共同决定：
 | `src/main/services/mobileCatalog.ts` | 工具目录加载、AJV 参数校验、路由映射、权限和脱敏 |
 | `src/main/services/mobileProfileService.ts` | Android 操作员 Hermes Profile 和插件资源注入 |
 | `src/main/services/mobileAgentProvisioning.ts` | Android Agent 创建、绑定和失败回滚 |
-| `src/renderer/src/pages/Mobile.tsx` | 手机控制台页面、脚本、日志、媒体和安装视图 |
+| `src/renderer/src/pages/Mobile.tsx` | Android 执行设备页面、脚本、日志、媒体和安装视图 |
 | `src/main/ipc.ts` / `src/preload/index.ts` | Mobile IPC 白名单和类型安全 Renderer API |
 | `mobile/hermes-plugin/android_tool.py` | Hermes Android 工具适配器 |
 | `mobile/android-bridge/app/src/main/kotlin/` | Android Bridge、Relay、权限、Accessibility 和媒体实现 |
@@ -302,7 +302,7 @@ Agent 能否使用 Android 工具由三层共同决定：
 | IPC | 用途 |
 |---|---|
 | `aibox:mobile:getStatus` / `startGateway` / `stopGateway` | Gateway 生命周期 |
-| `aibox:mobile:createPairing` / `resetCertificate` | 配对和证书 |
+| `aibox:androidBridge:createPairing` / `aibox:mobile:resetCertificate` | Android Bridge 执行设备配对和证书；Quest 手机对话二维码由 Hermes 项目入口负责 |
 | `aibox:mobile:listDevices` / `bindAgent` / `unbindAgent` / `updateToolPolicy` | 设备和 Agent 绑定 |
 | `aibox:mobile:getToolCatalog` / `execute` | 目录和人工工具调用 |
 | `aibox:mobile:refreshPreview` / `readUiTree` | 观察设备界面 |

@@ -83,4 +83,23 @@ describe('ProjectArtifactManifestService', () => {
       taskId: 'task-1', projectId: 'project-1', startedAt: 1, endedAt: 2
     })).resolves.toEqual({ ok: false, error: expect.stringContaining('尚未配置工作目录') });
   });
+
+  it('derives only a real preview script and respects the declared package manager', async () => {
+    const root = workspace();
+    const startedAt = Date.now() - 1_000;
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      packageManager: 'pnpm@10.0.0',
+      scripts: { test: 'vitest', build: 'vite build', preview: 'vite preview' }
+    }));
+    const service = new ProjectArtifactManifestService({ getProjectRoot: () => root });
+
+    const result = await service.validateTaskCompletion({
+      taskId: 'task-preview', projectId: 'project-1', startedAt, endedAt: Date.now() + 100
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.entries.find((entry) => entry.relativePath === 'package.json')?.run)
+      .toEqual({ command: 'pnpm run preview', cwd: '.' });
+  });
 });

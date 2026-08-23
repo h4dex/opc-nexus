@@ -2,52 +2,39 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
-## [2.0.0] - 2026-08-18
+## [2.0.0] - 2026-08-24
 
-> DSH/Cordis 完整接入：OPC-Nexus 升级为本地优先 AI Agent 管理器的 v2 架构，引入 DSH 子智能体运行时、Quest 工作台、Secretary Planning 控制面、插件目录与治理层，以及全自主权限模型。
+> Hermes v0.19.0 是 Quest 的唯一调度引擎。旧 Nexus/DSH 调度路径不再作为第二套状态机运行；OPC-Nexus Main 保留项目、权限、任务、审批、产物和审计事实。
 
-### 架构
+### Hermes 与 Quest
 
-- **DSH/Cordis 控制核**：`CordisControlKernel` 取代旧 Hermes/Nexus 双核设计，统一通过 Cordis 插件协议路由到 DSH 子智能体，`KernelRouter` 保留降级策略。
-- **四层运行时分离**：DSH（会话/Run/Job 权威）→ `opc-nexus-governance`（Cordis 插件，有界投影）→ `aibox-native-host`（特权边界）→ Renderer（无 Node.js API）。
-- **全自主权限模型**：数字员工与专家团默认获完全自主权限，`autonomousApproval` 白名单机制代替逐步审批；人类只做最终验收。每位数字员工严格限定在对应项目目录内。
-- **删除旧内核文件**：移除 `hermesControlKernel.ts`、`nexusControlKernel.ts`、`deepseekPlanningAdvisor.ts`、`planningPrompt.ts`、`simulatedExecutor.ts` 与对应测试。
+- Quest 项目工作台内嵌 Hermes Web UI，桌面与 Hermes 手机访问使用同一项目会话和代理边界。
+- Hermes 负责对话理解、澄清、记忆、计划草案和员工委派建议；Main/Orchestrator 负责正式任务状态、权限、预算、审批、取消、恢复和审计。
+- 项目可以使用动态员工池，也可以配置固定员工范围；员工不是项目的强制绑定关系。
+- 每个项目使用独立 `HERMES_HOME`、loopback 服务端口、短期认证租约和工作目录。
+- 所有实际交付均从项目工作目录生成，支持目录打开、文件预览、启动命令和交付摘要。
 
-### 新增服务
+### 运行时与连接恢复
 
-- **DSH 集成层**：`dshControlClient`、`dshDelegationService`、`dshDelegationSyncService`、`dshEmbeddedWorkbench`、`dshIntegrationService`、`dshLanGateway`、`dshLanGatewayComposition`、`dshLanGatewayController`、`dshPolicyBroker`、`dshProviderBinding`、`dshQuestGovernance`、`dshQuestSessionBinding`、`dshSessionService`、`dshSessionWriteCoordinator`、`dshSupervisor`、`dshTypedQuestBridge`、`dshWebGateway`、`dshWindowManager`。
-- **插件体系**：`pluginCatalog`、`pluginHost`、`opcNexusGovernancePlugin`、`dshCommunityPluginService`、`dshPluginCatalog`、`dshPluginPolicy`、`navigationPolicy`。
-- **Secretary Planning**：`secretaryPlanning`、`secretaryPlanningAdapters`、`secretaryPlanningClassifier`、`secretaryPlanningControlPlane`。
-- **项目产物管理**：`projectArtifactService`（FS 遍历 + TOCTOU 安全 `openVerified`）、`projectArtifactManifest`、`projectWorkbench`、`artifactRef`（SHA-256 + magic byte）、`artifactProtocol`（`aibox-project:` 特权协议，15 分钟 grant token）。
-- **运行时基础设施**：`deepseekHarnessManagedRuntime`、`dshManagedExecutor`、`environmentDiagnostics`、`nativeAdapterHost`、`providerCredentialProxy`、`cordisBootstrap`、`questLaunch`、`questWindowManager`、`visionService`、`chatService`、`mobileConsole`。
+- 新增 Hermes fork 固定版本、上游 commit、内置 Python 3.11 runtime 和 Web 资源校验。
+- Hermes Dashboard 与 API Gateway 必须分别通过健康检查，任一进程停止都会如实显示离线/错误。
+- 启动前检查项目工作目录和 Provider 的 API Key、Base URL、模型；缺少配置时持久化可恢复错误，并引导到 Quest「连接设置」，不显示伪在线状态。
+- Provider 密钥只由 Main 进程 safeStorage 管理，通过短期子进程环境注入，不进入 Renderer、记忆文件或调试日志。
+- 旧用户数据目录迁移到 `数字员工 AI Box/aibox-data`，项目工作目录、会话和历史任务继续保留。
 
-### 界面
+### UI、手机与能力中心
 
-- **Quest 工作台**：`Quest.tsx`、`QuestWorkbench.tsx`（含内嵌 Webview 产物预览）、`QuestRuntimeSetup.tsx`、`QuestMobileAccess.tsx`。
-- **项目产物面板**：`ProjectArtifactsPanel.tsx`，实时目录浏览 + SHA-256 指纹展示。
-- **Secretary Planning 页面**：`SecretaryPlanning.tsx`。
-- **插件页面**：`Plugins.tsx`。
-- **可见性过滤**：`engineVisibility.ts`；运行时模式向导 `runtimeMode.ts`。
+- Hermes Web UI 支持 OPC-Nexus 亮色/暗色主题和简体中文默认语言。
+- Quest 右侧治理面板展示澄清、计划、员工进度、验收、交付物、项目插件和 Hermes 手机配对。
+- 手机端只代理当前项目的 Hermes 对话、REST 和 WebSocket；viewer/operator 权限与项目范围保持一致。
+- MCP 与 Skill 通过统一插件中心按项目选择，所有执行器使用同一份能力策略。
 
-### 安全
+### 安全与验证
 
-- **IPC 参数校验**：`assertKeys` 扩展 `required` 参数，`parseDshQuestIdentity` 强制 `principalId` 等必需字段；`aibox:hashProjectArtifact` 新 handler。
-- **产物协议 TOCTOU 修复**：`openVerified()` 在 stat 校验后立即 `open()`，通过 dev/ino 对比检测路径替换；`unowned` 标志防止双重关闭。
-- **错误文本脱敏**：`errorText()` 对 `api_key`、`token`、`password`、`secret` 等字段值自动 `[REDACTED]`。
-- **CSP 维持**：主进程与渲染侧 `script-src 'none'` 保持一致，`aibox-project:` 仅在 Renderer base-uri 中允许。
-
-### 测试
-
-- 新增 145 个测试文件（含 135 个新文件），**1554 tests passed / 2 skipped**（+14 相较于 1.8.1 基线），typecheck 全量通过。
-- 新增测试覆盖：DSH 全链路、插件目录/策略/治理、Secretary Planning 分类与控制面、LAN Gateway 组合、Quest 路由/启动/窗口管理、项目产物服务、Cordis 引导、`v2ScenarioAcceptance` 端到端场景。
-
-### 文档
-
-- `docs/V2.0.0-DSH-CORDIS-PROJECT-QUEST-IMPLEMENTATION-PLAN.md`：v2 完整实施规划。
-- `docs/V2-ACCEPTANCE-EXECUTION-PLAN.md`：验收执行计划（Phase A 已完成）。
-- `docs/FUNCTIONAL-UX-AUDIT-2026-08-18.md`：功能与 UX 审计报告。
-- `docs/adr/`：ADR-DSH-001/002/003 决策记录。
-- `CLAUDE.md` 更新：v2 架构、自主权限模型、产物浏览、IPC 校验陷阱、安全基线补充。
+- 保持 `contextIsolation: true`、`nodeIntegration: false`、IPC 白名单和项目路径越界检查。
+- 调试模式日志写入用户数据目录的 `logs/`，字段和文本自动脱敏。
+- CI 现在准备并验证 Hermes runtime，执行 Dashboard/Gateway smoke，并检查 Windows/Linux 打包产物中的 Hermes 版本、Web 资源和 Python import。
+- 本次修复新增 Provider 缺失预检持久化测试；真实中转站验证了 `/v1/models` 和 Hermes 0.19.0 双进程健康检查。
 
 ## [1.8.1] - 2026-08-16
 

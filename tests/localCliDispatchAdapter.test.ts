@@ -18,19 +18,19 @@ function request(overrides: Partial<KernelRequest> = {}): KernelRequest {
 
 describe('LocalCliDispatchAdapter', () => {
   it('dispatches only to the explicitly selected employee', async () => {
-    const plan = await new LocalCliDispatchAdapter().plan(request(), []);
+    const plan = await new LocalCliDispatchAdapter().plan(request());
     expect(plan).toMatchObject({ workerAgentId: 'agent-codex', requiresHumanApproval: false });
     expect(plan.rationale).toContain('不参与规划或选人');
   });
 
   it('does not become an implicit fallback selector', async () => {
     const adapter = new LocalCliDispatchAdapter();
-    await expect(adapter.plan(request({ routingMode: 'cordis' }), [])).rejects.toThrow('direct-worker');
-    await expect(adapter.plan(request({ preferredAgentId: null }), [])).rejects.toThrow('explicitly selected');
+    await expect(adapter.plan(request({ routingMode: 'legacy' as never }))).rejects.toThrow('direct-worker');
+    await expect(adapter.plan(request({ preferredAgentId: null }))).rejects.toThrow('explicitly selected');
   });
 
   it('keeps destructive direct commands behind host approval', async () => {
-    const plan = await new LocalCliDispatchAdapter().plan(request({ message: '删除全部发布记录' }), []);
+    const plan = await new LocalCliDispatchAdapter().plan(request({ message: '删除全部发布记录' }));
     expect(plan.requiresHumanApproval).toBe(true);
   });
 });

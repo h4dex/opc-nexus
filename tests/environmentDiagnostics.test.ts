@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EnvironmentDiagnosticsService, defaultEnvironmentCommands } from '../src/main/services/environmentDiagnostics.js';
@@ -7,13 +7,9 @@ import { EnvironmentDiagnosticsService, defaultEnvironmentCommands } from '../sr
 describe('EnvironmentDiagnosticsService', () => {
   it('detects the bundled runtime and a declared native library without loading it', async () => {
     const root = mkdtempSync(join(tmpdir(), 'aibox-env-'));
-    mkdirSync(join(root, 'node_modules', '@deepseek-ai', 'dsh', 'lib'), { recursive: true });
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'managed-runtime', version: '2.0.0' }));
-    writeFileSync(join(root, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'), 'export {};');
     writeFileSync(join(root, 'vision.dll'), 'not a real library');
 
     const view = await new EnvironmentDiagnosticsService({
-      managedRuntimeRoot: root,
       nativeRoots: [root],
       nativeExtensions: [{
         id: 'vision-native', name: 'Vision native bridge', kind: 'dll', relativePaths: ['vision.dll'],
@@ -28,8 +24,8 @@ describe('EnvironmentDiagnosticsService', () => {
     expect(view.scannedAt).toBe(42);
     expect(view.ready).toBe(true);
     expect(view.runtimeSelection).toEqual({ requested: 'bundled', selected: 'bundled', fallbackUsed: false, reason: null });
-    expect(view.components.find((component) => component.id === 'dsh-managed-runtime')).toMatchObject({
-      available: true, ready: true, version: '2.0.0', source: 'bundled'
+    expect(view.components.find((component) => component.id === 'aibox-electron-node')).toMatchObject({
+      available: true, ready: true, source: 'bundled'
     });
     expect(view.components.find((component) => component.id === 'vision-native')).toMatchObject({
       available: true, ready: true, source: 'declared', path: join(root, 'vision.dll')
@@ -57,21 +53,15 @@ describe('EnvironmentDiagnosticsService', () => {
     expect(view.components.find((component) => component.id === 'wrong-arch')?.reason).toBe('ARCHITECTURE_UNSUPPORTED');
   });
 
-  it('covers DSH dist layout, ffmpeg, browsers and worker CLIs, with an explicit system fallback', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'aibox-env-'));
-    mkdirSync(join(root, 'dist', 'node_modules', '@deepseek-ai', 'dsh', 'lib'), { recursive: true });
-    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'managed-runtime', version: '2.0.0' }));
-    writeFileSync(join(root, 'dist', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'), 'export {};');
+  it('covers bundled browser, media tools and worker CLIs, with an explicit system fallback', async () => {
     const audit: unknown[] = [];
     const view = await new EnvironmentDiagnosticsService({
-      managedRuntimeRoot: root,
       commands: [{ id: 'node', name: 'System Node', bin: 'definitely-not-an-aibox-command', kind: 'toolchain' }],
       preferredRuntime: 'system',
       audit: (event) => audit.push(event)
     }).diagnose();
 
     expect(view.ready).toBe(true);
-    expect(view.components.find((component) => component.id === 'dsh-managed-runtime')).toMatchObject({ ready: true, required: true });
     expect(view.components.find((component) => component.id === 'aibox-electron-browser')).toMatchObject({ kind: 'browser', ready: true });
     expect(view.runtimeSelection).toEqual({
       requested: 'system', selected: 'bundled', fallbackUsed: true, reason: 'SYSTEM_NODE_NOT_FOUND'

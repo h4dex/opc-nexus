@@ -1,6 +1,6 @@
 /**
  * Skills 管理：可复用的指令模板（markdown），按助手绑定后注入 system prompt。
- * CRUD + 绑定/解绑；支持从 ~/.hermes/skills/ 同步导入。
+ * CRUD + 绑定/解绑；支持从 Hermes 项目技能目录同步导入。
  */
 import { randomUUID } from 'node:crypto';
 import type { Database } from './database.js';
@@ -20,7 +20,7 @@ export const VISION_UNDERSTANDING_SKILL_ID = 'skill-vision-understanding';
 const VISION_UNDERSTANDING_SKILL_CONTENT = `# 图片理解
 
 ## 使用方式
-- 需要理解截图、照片、界面或图表时，调用 DSH/Cordis 工具 \`vision.describe\`。
+- 需要理解截图、照片、界面或图表时，调用 Nexus 受控视觉工具 \`vision.describe\`。
 - 需要精确抄录图片文字时，调用本地工具 \`vision.ocr\`；它与图片理解共用同一个 \`attachmentRef\`。
 - 工具只接受宿主生成的 \`attachmentRef\`，不要传入文件路径、网络 URL、Base64 或凭据。
 - 根据任务给出明确提示词，例如：识别界面状态、解释图表趋势、提取关键字段或检查视觉异常。
@@ -105,7 +105,7 @@ export class SkillManager {
     return this.list().find((skill) => skill.id === BROWSER_SKILL_ID)!;
   }
 
-  /** Ensure the DSH-owned image-understanding skill exists with a stable id. */
+  /** Ensure the Nexus-owned image-understanding skill exists with a stable id. */
   ensureVisionUnderstanding(): Skill {
     const existing = this.db.raw.prepare('SELECT id FROM skills WHERE id = ?').get(VISION_UNDERSTANDING_SKILL_ID) as
       | { id: string }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useApp } from '../store';
 import type {
   MobileAdbDevice,
   MobileApkInfo,
@@ -6,7 +7,6 @@ import type {
   MobileCommandLog,
   MobileDevice,
   MobileGatewayStatus,
-  MobilePairingOffer,
   MobileScriptDefinition,
   MobileScriptStep,
   MobileToolCatalog,
@@ -16,10 +16,10 @@ import { Modal, formatBytes } from '../components/common';
 import { toast } from '../components/Toast';
 import {
   IconChevronLeft,
-  IconCopy,
   IconDownload,
   IconHome,
   IconLayers,
+  IconMessage,
   IconPhone,
   IconPlay,
   IconPlus,
@@ -60,6 +60,7 @@ function statusTag(status: string): string {
 }
 
 export function Mobile() {
+  const { openQuest } = useApp();
   const [gateway, setGateway] = useState<MobileGatewayStatus | null>(null);
   const [addresses, setAddresses] = useState<string[]>([]);
   const [host, setHost] = useState('');
@@ -68,7 +69,6 @@ export function Mobile() {
   const [selectedId, setSelectedId] = useState('');
   const [catalog, setCatalog] = useState<MobileToolCatalog | null>(null);
   const [view, setView] = useState<ViewKey>('control');
-  const [pairing, setPairing] = useState<MobilePairingOffer | null>(null);
   const [busy, setBusy] = useState('');
   const [previewUri, setPreviewUri] = useState('');
   const [tree, setTree] = useState<Record<string, unknown> | null>(null);
@@ -143,7 +143,7 @@ export function Mobile() {
 
   useEffect(() => {
     void Promise.all([loadGateway(), loadDevices(), window.aibox.getMobileToolCatalog().then(setCatalog)])
-      .catch((error) => toast.err(errorText(error, '手机控制台加载失败')));
+      .catch((error) => toast.err(errorText(error, 'Android 执行设备加载失败')));
     return window.aibox.onMobileEvent((event) => {
       if (event.type.startsWith('gateway_')) void loadGateway();
       if (event.type.startsWith('device_') || event.type === 'binding_changed' || event.type.startsWith('session_')) void loadDevices();
@@ -221,15 +221,8 @@ export function Mobile() {
     setBusy('gateway');
     try {
       setGateway(await window.aibox.startMobileGateway(host, port));
-      toast.ok('Mobile Gateway 已启动');
+      toast.ok('Android Worker 网关已启动');
     } catch (error) { toast.err(errorText(error, 'Gateway 启动失败')); }
-    finally { setBusy(''); }
-  };
-
-  const createPairing = async () => {
-    setBusy('pairing');
-    try { setPairing(await window.aibox.createMobilePairing()); }
-    catch (error) { toast.err(errorText(error, '配对码生成失败')); }
     finally { setBusy(''); }
   };
 
@@ -248,13 +241,14 @@ export function Mobile() {
   return (
     <div className="mobile-page">
       <div className="page-head">
-        <h2>手机控制台</h2>
-        <span className="desc">{devices.length} 台设备 · 协议 v{catalog?.protocolVersion ?? '-'}</span>
+        <h2>Android 执行设备</h2>
+        <span className="desc">{devices.length} 台设备 · Android worker 控制与媒体采集 · 协议 v{catalog?.protocolVersion ?? '-'}</span>
         <div className="right">
           {gateway?.running
-            ? <button className="btn danger" disabled={busy === 'gateway'} onClick={() => void window.aibox.stopMobileGateway().then(loadGateway)}><IconStop size={14} />停止网关</button>
-            : <button className="btn primary" disabled={busy === 'gateway' || !host} onClick={() => void startGateway()}><IconPlay size={14} />启动网关</button>}
-          <button className="btn" disabled={!gateway?.running || busy === 'pairing'} onClick={() => void createPairing()}><IconPlus size={14} />配对手机</button>
+            ? <button className="btn danger" disabled={busy === 'gateway'} onClick={() => void window.aibox.stopMobileGateway().then(loadGateway)}><IconStop size={14} />停止 Android 网关</button>
+            : <button className="btn primary" disabled={busy === 'gateway' || !host} onClick={() => void startGateway()}><IconPlay size={14} />启动 Android 网关</button>}
+          <span className="mobile-hermes-hint">手机对话扫码请在 Quest 右上角进行</span>
+          <button className="btn small" type="button" onClick={() => openQuest()} title="打开 Quest 手机对话入口"><IconMessage size={13} />打开 Quest</button>
         </div>
       </div>
 
@@ -265,7 +259,7 @@ export function Mobile() {
           {addresses.map((address) => <option key={address} value={address}>{address}</option>)}
         </select>
         <input aria-label="网关端口" type="number" min={1024} max={65535} value={port} disabled={gateway?.running} onChange={(event) => setPort(Number(event.target.value))} />
-        <span className="mobile-gateway-endpoint">{gateway?.running ? `wss://${gateway.host}:${gateway.wssPort}/v1/device` : '网关未运行'}</span>
+        <span className="mobile-gateway-endpoint">{gateway?.running ? `wss://${gateway.host}:${gateway.wssPort}/v1/device` : 'Android Worker 网关未运行'}</span>
         {gateway?.certificateFingerprint && <span className="mobile-fingerprint" title={gateway.certificateFingerprint}>{gateway.certificateFingerprint}</span>}
       </div>
 
@@ -336,7 +330,6 @@ export function Mobile() {
         </aside>
       </div>
 
-      {pairing && <PairingModal offer={pairing} onClose={() => setPairing(null)} />}
       {scriptEditor && catalog && <ScriptEditor
         value={scriptEditor === 'new' ? null : scriptEditor} catalog={catalog} device={selected}
         onClose={() => setScriptEditor(null)} onSave={async (input, id) => {
@@ -510,43 +503,6 @@ function InstallView({ apk, devices, busy, onRefresh, onInstall, onExport }: {
     </div>)}
     {devices.length === 0 && <div className="empty">未发现 ADB 设备</div>}
   </div>;
-}
-
-function PairingModal({ offer, onClose }: { offer: MobilePairingOffer; onClose: () => void }) {
-  const [now, setNow] = useState(Date.now());
-  const [copying, setCopying] = useState(false);
-  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
-  const seconds = Math.max(0, Math.ceil((offer.expiresAt - now) / 1_000));
-  const endpoint = `wss://${offer.host}:${offer.port}/v1/device`;
-  const copyConfig = async () => {
-    setCopying(true);
-    try {
-      await window.aibox.copyMobilePairingConfig(offer.id);
-      toast.ok('完整配对配置已复制');
-    } catch (error) {
-      toast.err(errorText(error, '复制配对配置失败'));
-    } finally {
-      setCopying(false);
-    }
-  };
-  return <Modal title="配对 Android 手机" width={680} onClose={onClose} footer={<>
-    <button className="btn" disabled={copying || seconds === 0} onClick={() => void copyConfig()}><IconCopy size={14} />{copying ? '复制中...' : '复制完整配置'}</button>
-    <button className="btn primary" onClick={onClose}>完成</button>
-  </>}>
-    <div className="mobile-pairing">
-      <img src={offer.qrUri} alt="OPC-Nexus 手机配对二维码" />
-      <div className="mobile-pairing-meta">
-        <div className="mobile-pairing-state"><span className={`tag ${seconds > 0 ? 'orange' : 'red'}`}>{seconds > 0 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : '已过期'}</span><span>一次性配置</span></div>
-        <dl>
-          <dt>协议</dt><dd>v{offer.protocolVersion}</dd>
-          <dt>网关</dt><dd><code>{endpoint}</code></dd>
-          <dt>配对 ID</dt><dd><code>{offer.id}</code></dd>
-          <dt>SPKI</dt><dd><code>{offer.certificateFingerprint}</code></dd>
-          <dt>过期时间</dt><dd>{formatTime(offer.expiresAt)}</dd>
-        </dl>
-      </div>
-    </div>
-  </Modal>;
 }
 
 function ScriptEditor({ value, catalog, device, onClose, onSave }: {

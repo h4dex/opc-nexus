@@ -17,11 +17,10 @@ function request(overrides: Partial<KernelRequest> = {}): KernelRequest {
     conversationId: 'conversation-1',
     inputMessageId: 'message-1',
     message: '请整理今天的客户反馈并生成摘要',
-    routingMode: 'cordis',
-    preferredAgentId: 'agent-cordis',
+    preferredAgentId: 'agent-writer',
     projectId: null,
     workers: [
-      { agentId: 'agent-cordis', name: 'Cordis', role: '主 AI', engineId: 'eng-deepseek-harness-managed', capabilities: [] },
+      { agentId: 'agent-writer', name: '文案员工', role: '内容', engineId: 'eng-claude', capabilities: [] },
       { agentId: 'agent-ops', name: '运营员工', role: '运营', engineId: 'eng-codex', capabilities: ['files'] }
     ],
     memories: [],
@@ -31,10 +30,10 @@ function request(overrides: Partial<KernelRequest> = {}): KernelRequest {
 
 function draft(overrides: Partial<DispatchPlanDraft> = {}): DispatchPlanDraft {
   return {
-    workerAgentId: 'agent-cordis',
+    workerAgentId: 'agent-writer',
     title: '整理客户反馈',
     objective: '整理全部客户反馈并输出结构化摘要',
-    rationale: '交给 Cordis 根会话',
+    rationale: 'Hermes 根据能力选择文案员工',
     priority: 0,
     expectedOutputs: ['Markdown 摘要'],
     requiresHumanApproval: false,
@@ -45,7 +44,7 @@ function draft(overrides: Partial<DispatchPlanDraft> = {}): DispatchPlanDraft {
 }
 
 function kernel(
-  id: 'cordis' | 'local-cli',
+  id: 'hermes' | 'local-cli',
   implementation: (input: KernelRequest) => Promise<DispatchPlanDraft>,
   ready = true
 ): ControlKernel {
@@ -57,56 +56,56 @@ function directAdapter(output: DispatchPlanDraft = draft({ workerAgentId: 'agent
 }
 
 describe('KernelRouter', () => {
-  it('uses Cordis as the only owner-facing leader', async () => {
-    const cordis = kernel('cordis', async () => draft());
+  it('uses Hermes as the only owner-facing leader', async () => {
+    const hermes = kernel('hermes', async () => draft());
     const direct = directAdapter();
-    const plan = await new KernelRouter(cordis, direct).plan(request());
+    const plan = await new KernelRouter(hermes, direct).plan(request());
 
     expect(plan).toMatchObject({
-      leaderKernel: 'cordis', workerAgentId: 'agent-cordis',
-      workerEngineId: 'eng-deepseek-harness-managed'
+      leaderKernel: 'hermes', workerAgentId: 'agent-writer',
+      workerEngineId: 'eng-claude'
     });
-    expect(cordis.plan).toHaveBeenCalledOnce();
+    expect(hermes.plan).toHaveBeenCalledOnce();
     expect(direct.plan).not.toHaveBeenCalled();
   });
 
-  it('fails closed instead of promoting the direct adapter when Cordis fails', async () => {
+  it('fails closed instead of promoting the direct adapter when Hermes fails', async () => {
     const attempts: KernelAttemptRecord[] = [];
-    const cordis = kernel('cordis', async () => { throw new Error('runtime unavailable'); });
+    const hermes = kernel('hermes', async () => { throw new Error('runtime unavailable'); });
     const direct = directAdapter();
-    const router = new KernelRouter(cordis, direct, { record: (record) => { attempts.push(record); } });
+    const router = new KernelRouter(hermes, direct, { record: (record) => { attempts.push(record); } });
 
     await expect(router.plan(request())).rejects.toBeInstanceOf(KernelRoutingError);
     expect(direct.plan).not.toHaveBeenCalled();
     expect(attempts).toEqual([
-      expect.objectContaining({ componentId: 'cordis', status: 'failed' })
+      expect.objectContaining({ componentId: 'hermes', status: 'failed' })
     ]);
   });
 
   it('uses Local CLI only for an explicitly marked direct-worker route', async () => {
-    const cordis = kernel('cordis', async () => draft());
+    const hermes = kernel('hermes', async () => draft());
     const direct = directAdapter();
-    const plan = await new KernelRouter(cordis, direct).plan(request({
+    const plan = await new KernelRouter(hermes, direct).plan(request({
       routingMode: 'direct-worker', preferredAgentId: 'agent-ops'
     }));
 
     expect(plan).toMatchObject({ leaderKernel: 'local-cli', workerAgentId: 'agent-ops', workerEngineId: 'eng-codex' });
     expect(direct.plan).toHaveBeenCalledOnce();
-    expect(cordis.plan).not.toHaveBeenCalled();
+    expect(hermes.plan).not.toHaveBeenCalled();
   });
 
-  it('does not fall back when Cordis selects a worker outside the eligible catalog', async () => {
+  it('does not fall back when Hermes selects a worker outside the eligible catalog', async () => {
     const direct = directAdapter();
     const router = new KernelRouter(
-      kernel('cordis', async () => draft({ workerAgentId: 'unknown-agent' })), direct
+      kernel('hermes', async () => draft({ workerAgentId: 'unknown-agent' })), direct
     );
     await expect(router.plan(request())).rejects.toBeInstanceOf(KernelRoutingError);
     expect(direct.plan).not.toHaveBeenCalled();
   });
 
-  it('validates and normalizes Cordis task schedule projections', async () => {
+  it('validates and normalizes Hermes task schedule projections', async () => {
     const plan = await new KernelRouter(
-      kernel('cordis', async () => draft({
+      kernel('hermes', async () => draft({
         taskScheduleProposals: [{
           operation: 'create_task_schedule', title: 'Daily report', content: 'Prepare the report',
           cronKind: 'interval', cronValue: '01.50'
@@ -117,10 +116,10 @@ describe('KernelRouter', () => {
     expect(plan.taskScheduleProposals[0]).toMatchObject({ cronKind: 'interval', cronValue: '1.5' });
   });
 
-  it('fails closed when Cordis proposes an invalid projection', async () => {
+  it('fails closed when Hermes proposes an invalid projection', async () => {
     const direct = directAdapter();
     const router = new KernelRouter(
-      kernel('cordis', async () => draft({
+      kernel('hermes', async () => draft({
         taskScheduleProposals: [{
           operation: 'create_task_schedule', title: 'Daily report', content: 'Prepare the report',
           cronKind: 'daily', cronValue: '25:00'
@@ -137,7 +136,7 @@ describe('KernelRouter', () => {
     let firstRunning = false;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
     const calls: string[] = [];
-    const cordis = kernel('cordis', async (input) => {
+    const hermes = kernel('hermes', async (input) => {
       calls.push(`start:${input.requestId}`);
       if (input.requestId === 'request-1') {
         firstRunning = true;
@@ -146,7 +145,7 @@ describe('KernelRouter', () => {
       calls.push(`end:${input.requestId}`);
       return draft();
     });
-    const router = new KernelRouter(cordis, directAdapter());
+    const router = new KernelRouter(hermes, directAdapter());
 
     const first = router.plan(request());
     await vi.waitFor(() => expect(firstRunning).toBe(true));
@@ -163,7 +162,7 @@ describe('KernelRouter', () => {
 
   it('rejects construction with a legacy Nexus fallback', () => {
     const nexus = { id: 'nexus', isReady: () => true, plan: vi.fn(async () => draft()) } as ControlKernel;
-    expect(() => new KernelRouter(kernel('cordis', async () => draft()), nexus))
+    expect(() => new KernelRouter(kernel('hermes', async () => draft()), nexus))
       .toThrow('explicit Local CLI dispatch adapter');
   });
 });

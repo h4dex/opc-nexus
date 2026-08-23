@@ -266,7 +266,8 @@ describe('供应商凭据下发给第三方引擎', () => {
     const env = resolveClaudeEngineEnv(db as never, 'eng-claude');
     expect(env).toMatchObject({
       ANTHROPIC_API_KEY: 'managed-claude-key',
-      ANTHROPIC_BASE_URL: 'https://gateway.example/v1',
+      ANTHROPIC_AUTH_TOKEN: 'managed-claude-key',
+      ANTHROPIC_BASE_URL: 'https://gateway.example',
       ANTHROPIC_MODEL: 'claude-compatible'
     });
   });
@@ -279,8 +280,6 @@ describe('引擎 Provider 协议边界', () => {
   it.each([
     ['eng-hermes-cli', 'openai-chat'],
     ['eng-pi', 'openai-chat'],
-    ['eng-deepseek-harness', 'openai-chat'],
-    ['eng-deepseek-harness-managed', 'openai-chat'],
     ['eng-opencode', 'openai-chat'],
     ['eng-codex', 'openai-responses'],
     ['eng-claude', 'anthropic-messages']
@@ -293,7 +292,6 @@ describe('引擎 Provider 协议边界', () => {
   it.each([
     ['eng-hermes-cli', 'openai-responses'],
     ['eng-pi', 'anthropic-messages'],
-    ['eng-deepseek-harness', 'openai-responses'],
     ['eng-opencode', 'anthropic-messages'],
     ['eng-codex', 'openai-chat'],
     ['eng-claude', 'openai-chat']

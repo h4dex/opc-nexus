@@ -1,6 +1,5 @@
-export type ControlKernelId = 'cordis' | 'local-cli' | 'hermes' | 'nexus';
-export type PlanningAdvisorId = 'deepseek-harness';
-export type KernelRoutingMode = 'cordis' | 'direct-worker';
+export type ControlKernelId = 'local-cli' | 'hermes';
+export type KernelRoutingMode = 'direct-worker';
 
 export interface WorkerCandidate {
   agentId: string;
@@ -29,9 +28,8 @@ export interface KernelRequest {
   inputMessageId: string;
   message: string;
   /**
-   * `cordis` is the default owner-facing route. `direct-worker` is only for
-   * an employee that the user selected explicitly; it never acts as a
-   * fallback planner when Cordis is unavailable.
+   * `direct-worker` is the compatibility route for an explicitly selected
+   * execution worker. Hermes is the sole owner-facing scheduler.
    */
   routingMode?: KernelRoutingMode;
   preferredAgentId: string | null;
@@ -40,13 +38,15 @@ export interface KernelRequest {
   memories: KernelMemoryContext[];
 }
 
+/** Read-only shape retained for schema-v1 dispatch-plan history. */
 export interface AdvisorAdvice {
-  advisorId: PlanningAdvisorId;
+  advisorId: string;
   summary: string;
 }
 
+/** Read-only shape retained for schema-v1 dispatch-plan history. */
 export interface AdvisorReview {
-  advisorId: PlanningAdvisorId;
+  advisorId: string;
   accepted: boolean;
   summary: string;
 }
@@ -63,7 +63,7 @@ export interface MemoryProposal {
 
 export type TaskScheduleCronKind = 'interval' | 'daily' | 'weekly' | 'monthly';
 
-/** A legacy projection suggestion. Cordis remains the schedule/run owner. */
+/** A legacy projection suggestion. Hermes remains the schedule/run owner. */
 export interface TaskScheduleProposal {
   operation: 'create_task_schedule';
   title: string;
@@ -97,15 +97,7 @@ export interface DispatchPlan extends DispatchPlanDraft {
 export interface ControlKernel {
   readonly id: ControlKernelId;
   isReady(): boolean;
-  plan(request: KernelRequest, advice: AdvisorAdvice[]): Promise<DispatchPlanDraft>;
-}
-
-export interface PlanningAdvisor {
-  readonly id: PlanningAdvisorId;
-  isReady(): boolean;
-  shouldAdvise(request: KernelRequest): boolean;
-  advise(request: KernelRequest): Promise<AdvisorAdvice>;
-  review?(request: KernelRequest, plan: DispatchPlanDraft): Promise<AdvisorReview>;
+  plan(request: KernelRequest): Promise<DispatchPlanDraft>;
 }
 
 export type KernelAttemptRole = 'advisor' | 'leader' | 'reviewer';
@@ -114,7 +106,7 @@ export type KernelAttemptStatus = 'succeeded' | 'failed' | 'skipped';
 export interface KernelAttemptRecord {
   requestId: string;
   conversationId: string;
-  componentId: ControlKernelId | PlanningAdvisorId;
+  componentId: ControlKernelId;
   role: KernelAttemptRole;
   sequence: number;
   status: KernelAttemptStatus;
@@ -127,8 +119,8 @@ export interface KernelAttemptRecorder {
   record(attempt: KernelAttemptRecord): void | Promise<void>;
 }
 
-/** Legacy native-controller sessions are an optimization/cache. Cordis owns
- * the canonical AI session; governance keeps only the bounded host projection. */
+/** Native controller sessions are an optimization/cache. Hermes owns the
+ * canonical AI session; governance keeps only the bounded host projection. */
 export interface KernelSessionStore {
   get(conversationId: string, kernelId: ControlKernelId): string | null;
   set(conversationId: string, kernelId: ControlKernelId, sessionId: string): void;

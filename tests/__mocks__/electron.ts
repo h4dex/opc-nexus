@@ -18,7 +18,9 @@ export const app = {
   getAppPath: () => process.cwd(),
   getPath: testPath,
   getName: () => 'aibox-test',
-  getVersion: () => '1.0.0'
+  getVersion: () => '1.0.0',
+  setName: vi.fn(),
+  setAppUserModelId: vi.fn()
 };
 
 export class Notification {

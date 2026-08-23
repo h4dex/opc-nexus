@@ -1,15 +1,14 @@
 // @ts-nocheck
 /* eslint-disable */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, rmSync } from 'node:fs';
 
 vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
 const { BrowserWindow, clipboard, dialog, ipcMain, shell } = await import('electron');
 const { registerIpc } = await import('../src/main/ipc.js');
-const { SecretaryPlanningControlPlane } = await import('../src/main/services/secretaryPlanningControlPlane.js');
 const { BRIDGE_KEY_SECRET_REF } = await import('../src/main/services/apiBridge.js');
-const { WEB_TOKEN_SECRET_REF } = await import('../src/main/services/webServer.js');
-const { DSH_MANAGED_ENGINE_ID } = await import('../src/shared/types.js');
+const RETIRED_ENGINE_ID = 'eng-deepseek-harness-managed';
 
 function service(overrides: Record<string, unknown> = {}) {
   return new Proxy(overrides, {
@@ -21,7 +20,7 @@ function service(overrides: Record<string, unknown> = {}) {
 }
 
 function register(
-  webOverrides: Record<string, unknown> = {},
+  _retiredWebOverrides: Record<string, unknown> = {},
   bridgeOverrides: Record<string, unknown> = {},
   dshQuestGovernance: Record<string, unknown> | undefined = undefined,
   projectWorkbench: Record<string, unknown> | undefined = undefined,
@@ -48,13 +47,6 @@ function register(
     start: vi.fn(),
     toggle: vi.fn(),
     ...bridgeOverrides
-  });
-  const webServer = service({
-    getStatus: vi.fn(() => ({ port: 28889, tokenConfigured: true, weakToken: false })),
-    regenerateToken: vi.fn(),
-    start: vi.fn(async () => {}),
-    ...webOverrides,
-    get token() { return 'web-private-token'; }
   });
   const memory = service({
     list: vi.fn(() => []),
@@ -99,7 +91,6 @@ function register(
   const deps = service({
     db,
     apiBridge,
-    webServer,
     memory,
     memoryProposals,
     taskScheduleProposals,
@@ -118,6 +109,9 @@ function register(
     vision,
     ocr,
     visionPluginHost: null,
+    hermesEmbedded: null,
+    hermesServices: null,
+    debugLogs: null,
     dshLan: service({
       selectRuntime: vi.fn(async () => ({}))
     }),
@@ -135,7 +129,7 @@ function register(
   registerIpc(deps as never);
   const handlers = new Map(ipcMain.handle.mock.calls.map(([name, handler]) => [name, handler]));
   return {
-    audit, handlers, webServer, memory, memoryProposals, taskScheduleProposals,
+    audit, handlers, memory, memoryProposals, taskScheduleProposals,
     orchestrator, desktopControlPlane, engines, vision, ocr
   };
 }
@@ -145,6 +139,52 @@ beforeEach(() => {
 });
 
 describe('IPC credential boundary', () => {
+  it('assigns a real automatic workspace while creating a project', async () => {
+    const setWorkspacePath = vi.fn();
+    const projectWorkbench = service({
+      getExplicitWorkspacePath: vi.fn(() => null),
+      getWorkspacePath: vi.fn(() => null),
+      setWorkspacePath
+    });
+    const projects = service({
+      create: vi.fn((input) => ({ id: 'project-auto', name: input.name }))
+    });
+    const { handlers } = register({}, {}, undefined, projectWorkbench, { projects });
+
+    await expect(handlers.get('aibox:createProject')({ sender: {} }, {
+      name: '官网交付', workspaceMode: 'automatic'
+    })).resolves.toMatchObject({ id: 'project-auto' });
+    expect(setWorkspacePath).toHaveBeenCalledTimes(1);
+    const workspace = setWorkspacePath.mock.calls[0][1] as string;
+    expect(workspace).toContain('opc-nexus');
+    expect(workspace).toContain('projects');
+    expect(existsSync(workspace)).toBe(true);
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it('uses the trusted directory picker for a custom project workspace', async () => {
+    const workspace = process.cwd();
+    const questWindow = { isDestroyed: () => false };
+    const sender = {};
+    const setWorkspacePath = vi.fn();
+    const projectWorkbench = service({ setWorkspacePath });
+    const projects = service({
+      create: vi.fn((input) => ({ id: 'project-custom', name: input.name }))
+    });
+    BrowserWindow.fromWebContents.mockReturnValueOnce(questWindow);
+    dialog.showOpenDialog.mockResolvedValueOnce({ canceled: false, filePaths: [workspace] });
+    const { handlers } = register({}, {}, undefined, projectWorkbench, { projects });
+
+    await expect(handlers.get('aibox:createProject')({ sender }, {
+      name: '客户项目', workspaceMode: 'custom'
+    })).resolves.toMatchObject({ id: 'project-custom' });
+    expect(dialog.showOpenDialog).toHaveBeenCalledWith(questWindow, expect.objectContaining({
+      title: '选择项目交付目录',
+      properties: expect.arrayContaining(['openDirectory'])
+    }));
+    expect(setWorkspacePath).toHaveBeenCalledWith('project-custom', workspace);
+  });
+
   it('asks for and persists a project directory before opening it', async () => {
     const workspace = process.cwd();
     const questWindow = { isDestroyed: () => false };
@@ -189,6 +229,92 @@ describe('IPC credential boundary', () => {
     expect(() => handlers.get('aibox:previewProjectArtifact')({}, 'project-1', 'C:\\Windows\\win.ini')).toThrow();
   });
 
+  it('keeps the Hermes mobile listener alive while stopping only the project runtime', async () => {
+    const order: string[] = [];
+    const route = {
+      projectId: 'project-1', pairingId: 'pairing-1',
+      runtimeId: 'hermes-project:project-1:chat', origin: 'https://nexus.test:24443',
+      pairingUrl: 'https://nexus.test:24443/pair', code: '12345678', expiresAt: Date.now() + 60_000,
+      certificateFingerprint: 'sha256/test'
+    };
+    const hermesServices = service({
+      getStatus: vi.fn(() => ({ projectId: 'project-1', state: 'healthy' })),
+      stop: vi.fn(async () => { order.push('runtime'); return { projectId: 'project-1', state: 'stopped' }; })
+    });
+    const hermesMobile = service({
+      createPairing: vi.fn(async () => route),
+      stopProject: vi.fn(async () => { order.push('mobile'); }),
+      getProjectStatus: vi.fn(() => ({
+        projectId: 'project-1', configured: null, running: false, activeRoutes: [], lastError: null
+      }))
+    });
+    const { handlers } = register({}, {}, undefined, undefined, { hermesServices, hermesMobile });
+
+    await expect(handlers.get('aibox:createHermesMobilePairing')({}, 'project-1'))
+      .resolves.toEqual(route);
+    expect(hermesMobile.createPairing).toHaveBeenCalledWith('project-1');
+    expect(() => handlers.get('aibox:createHermesMobilePairing')({}, 'project-1', 'viewer'))
+      .toThrow();
+
+    expect(handlers.get('aibox:getHermesMobileAccessStatus')({}, 'project-1'))
+      .toMatchObject({ projectId: 'project-1', running: false });
+    await handlers.get('aibox:stopHermesMobileAccess')({}, 'project-1');
+    expect(hermesMobile.stopProject).toHaveBeenCalledWith('project-1');
+    order.length = 0;
+
+    await handlers.get('aibox:stopHermesProject')({}, 'project-1');
+    expect(order).toEqual(['runtime']);
+    expect(hermesMobile.stopProject).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects employee conversations outside a restricted project before creating a broken Tab', () => {
+    const projectWorkbench = service({
+      get: vi.fn(() => ({ project: { id: 'project-1', status: 'active' } })),
+      getWorkerSelection: vi.fn(() => ({ mode: 'restricted', workerAgentIds: ['agent-allowed'] }))
+    });
+    const hermesGovernance = service({
+      createConversation: vi.fn((_projectId, input) => ({
+        conversationId: 'hermes-conversation-new', employee: { id: input.employeeId }
+      }))
+    });
+    const { handlers } = register({}, {}, undefined, projectWorkbench, { hermesGovernance });
+    const create = handlers.get('aibox:createHermesProjectConversation');
+
+    expect(create({}, 'project-1', 'agent-allowed')).toEqual(expect.objectContaining({
+      employee: { id: 'agent-allowed' }
+    }));
+    expect(() => create({}, 'project-1', 'agent-blocked'))
+      .toThrow('不在该项目的固定员工池中');
+    expect(hermesGovernance.createConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not tear down mobile access during restart, emergency stop, or Quest setting changes', async () => {
+    const order: string[] = [];
+    const projectWorkbench = service({
+      getSettings: vi.fn(() => ({
+        model: 'model-a', workerAgentIds: [], pluginIds: [], mode: 'quest'
+      })),
+      saveSettings: vi.fn((_id, patch) => ({
+        model: patch.model ?? 'model-a', workerAgentIds: [], pluginIds: [], mode: 'quest'
+      }))
+    });
+    const hermesServices = service({
+      getStatus: vi.fn(() => ({ projectId: 'project-1', state: 'healthy' })),
+      stop: vi.fn(async () => { order.push('stop'); return { projectId: 'project-1', state: 'stopped' }; }),
+      restart: vi.fn(async () => { order.push('restart'); return { projectId: 'project-1', state: 'healthy' }; }),
+      emergencyStop: vi.fn(async () => { order.push('emergency'); return { projectId: 'project-1', state: 'stopped' }; })
+    });
+    const hermesMobile = service({ stopProject: vi.fn(async () => { order.push('mobile'); }) });
+    const { handlers } = register({}, {}, undefined, projectWorkbench, { hermesServices, hermesMobile });
+
+    await handlers.get('aibox:restartHermesProject')({}, 'project-1');
+    await handlers.get('aibox:emergencyStopHermesProject')({}, 'project-1');
+    await handlers.get('aibox:saveQuestSettings')({}, 'project-1', { model: 'model-b' });
+
+    expect(order).toEqual(['restart', 'emergency', 'stop']);
+    expect(hermesMobile.stopProject).not.toHaveBeenCalled();
+  });
+
   it('toggles fullscreen on the standalone Quest sender window', () => {
     let fullscreen = false;
     const questWindow = {
@@ -208,7 +334,14 @@ describe('IPC credential boundary', () => {
     expect(handlers.get('aibox:isFullscreen')(event)).toBe(true);
   });
 
-  it('keeps embedded DSH URLs in Main and validates project, sender, and native bounds', async () => {
+  it('does not register the retired embedded DSH Workbench surface', async () => {
+    const retired = register().handlers;
+    for (const channel of [
+      'aibox:openEmbeddedDshWorkbench', 'aibox:setEmbeddedDshWorkbenchBounds',
+      'aibox:setEmbeddedDshWorkbenchVisible', 'aibox:setEmbeddedDshWorkbenchTheme',
+      'aibox:closeEmbeddedDshWorkbench', 'aibox:getEmbeddedDshWorkbenchStatus'
+    ]) expect(retired.has(channel)).toBe(false);
+    return;
     const mainFrame = {};
     const host = {
       isDestroyed: () => false,
@@ -216,7 +349,7 @@ describe('IPC credential boundary', () => {
       getContentSize: () => [1400, 900]
     };
     const agent = {
-      id: 'agent-dsh', archived: false, engineId: DSH_MANAGED_ENGINE_ID,
+      id: 'agent-retired', archived: false, engineId: RETIRED_ENGINE_ID,
       workspace: process.cwd()
     };
     const orchestrator = service({
@@ -228,7 +361,8 @@ describe('IPC credential boundary', () => {
       getExplicitWorkspacePath: vi.fn(() => process.cwd()),
       get: vi.fn(() => ({
         project: { id: 'project-1' },
-        rootSession: { sessionId: 'session-root', agentId: agent.id }
+        rootSession: { sessionId: 'session-root', agentId: agent.id },
+        settings: { orchestrator: 'dsh', workerAgentIds: [agent.id] }
       }))
     });
     const embeddedStatus = {
@@ -287,6 +421,13 @@ describe('IPC credential boundary', () => {
     await handlers.get('aibox:closeEmbeddedDshWorkbench')(event);
     expect(dsh.closeEmbeddedWorkbench).toHaveBeenCalledOnce();
 
+    expect(handlers.get('aibox:setEmbeddedDshWorkbenchBounds')(event, {
+      x: 100, y: 100, width: 1400, height: 900
+    })).toBe(embeddedStatus);
+    expect(dsh.setEmbeddedWorkbenchBounds).toHaveBeenLastCalledWith({
+      x: 100, y: 100, width: 1300, height: 800
+    });
+
     await expect(handlers.get('aibox:openEmbeddedDshWorkbench')(
       { sender: {}, senderFrame: {} }, input
     )).rejects.toThrow('可信的主应用或 Quest 窗口');
@@ -298,7 +439,9 @@ describe('IPC credential boundary', () => {
     })).rejects.toThrow('不属于当前项目');
   });
 
-  it('prevents a late project binding from overwriting a newer embedded Quest request', async () => {
+  it('has no DSH project-binding race because DSH is an employee CLI only', async () => {
+    expect(register().handlers.has('aibox:openEmbeddedDshWorkbench')).toBe(false);
+    return;
     const mainFrame = {};
     const host = {
       isDestroyed: () => false,
@@ -306,7 +449,7 @@ describe('IPC credential boundary', () => {
       getContentSize: () => [1400, 900]
     };
     const agent = {
-      id: 'agent-dsh', archived: false, engineId: DSH_MANAGED_ENGINE_ID,
+      id: 'agent-retired', archived: false, engineId: RETIRED_ENGINE_ID,
       workspace: process.cwd()
     };
     const orchestrator = service({
@@ -318,7 +461,8 @@ describe('IPC credential boundary', () => {
       getExplicitWorkspacePath: vi.fn(() => process.cwd()),
       get: vi.fn(() => ({
         project: { id: 'project-1' },
-        rootSession: { sessionId: 'session-root', agentId: agent.id }
+        rootSession: { sessionId: 'session-root', agentId: agent.id },
+        settings: { orchestrator: 'dsh', workerAgentIds: [agent.id] }
       }))
     });
     const embeddedStatus = {
@@ -464,7 +608,11 @@ describe('IPC credential boundary', () => {
     expect(openMainSurface).toHaveBeenCalledOnce();
   });
 
-  it('opens a project-scoped Quest shell and gives its trusted window exclusive native View ownership', async () => {
+  it('does not let a Quest shell acquire a DSH native View', async () => {
+    const retired = register().handlers;
+    expect(retired.has('aibox:openEmbeddedDshWorkbench')).toBe(false);
+    expect(retired.has('aibox:openDshWorkbench')).toBe(false);
+    return;
     const mainFrame = {};
     const mainContents = { mainFrame, isDestroyed: () => false, send: vi.fn() };
     const mainHost = {
@@ -483,7 +631,7 @@ describe('IPC credential boundary', () => {
       getContentSize: () => [1440, 900]
     };
     const agent = {
-      id: 'agent-dsh', archived: false, engineId: DSH_MANAGED_ENGINE_ID,
+      id: 'agent-retired', archived: false, engineId: RETIRED_ENGINE_ID,
       workspace: process.cwd()
     };
     const orchestrator = service({
@@ -494,7 +642,7 @@ describe('IPC credential boundary', () => {
     const projectView = {
       project: { id: 'project-1', status: 'active' },
       rootSession: null,
-      settings: { workerAgentIds: [agent.id] }
+      settings: { orchestrator: 'dsh', workerAgentIds: [agent.id] }
     };
     const projectWorkbench = service({
       getExplicitWorkspacePath: vi.fn(() => process.cwd()),
@@ -570,7 +718,7 @@ describe('IPC credential boundary', () => {
       { profileId: 'opc-nexus-managed-web-v1-project-test', workspace: process.cwd() }
     );
     expect(() => handlers.get('aibox:setEmbeddedDshWorkbenchBounds')(mainEvent, mainInput.bounds))
-      .toThrow('另一个 Quest 窗口');
+      .toThrow('由另一个窗口控制');
 
     questDestroyed = true;
     await expect(handlers.get('aibox:openEmbeddedDshWorkbench')(mainEvent, mainInput))
@@ -640,127 +788,31 @@ describe('IPC credential boundary', () => {
     expect(orchestrator.createTask).not.toHaveBeenCalled();
   });
 
-  it('preflights complex chat into planning and blocks direct Task creation', async () => {
-    const planningSession = { id: 'planning-session-1' };
-    const createSession = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'createSession')
-      .mockReturnValue(planningSession as never);
-    try {
-      const { handlers, audit, desktopControlPlane } = register();
-      const preflight = handlers.get('aibox:preflightChatMessage');
-      const chat = handlers.get('aibox:chatWithAgent');
-      const complex = '请让多个团队分阶段完成系统迁移，先给计划，等我确认后再执行。';
+  it('blocks every legacy direct chat and exposes no Secretary planning IPC surface', async () => {
+    const { handlers, audit, desktopControlPlane } = register();
+    const chat = handlers.get('aibox:chatWithAgent');
+    const complex = '请让多个团队分阶段完成系统迁移，先给计划，等我确认后再执行。';
 
-      expect(preflight({}, '解释一下 TypeScript 的 unknown 类型')).toEqual({
-        outcome: 'DIRECT_DISPATCH', planningSession: null
-      });
-      expect(preflight({}, complex)).toEqual({
-        outcome: 'PLANNING_REQUIRED', planningSession
-      });
-      expect(createSession).toHaveBeenCalledWith(expect.objectContaining({
-        request: complex,
-        signals: expect.objectContaining({
-          hasCrossTeamDependencies: true,
-          phasedExecution: true,
-          confirmBeforeExecution: true
-        })
-      }));
+    for (const channel of [
+      'aibox:listPlanningSessions', 'aibox:getPlanningSession', 'aibox:createPlanningSession',
+      'aibox:answerPlanningQuestions', 'aibox:proposePlanningPlan', 'aibox:approvePlanningPlan',
+      'aibox:rejectPlanningPlan', 'aibox:dispatchPlanningPlan', 'aibox:preflightChatMessage'
+    ]) expect(handlers.has(channel)).toBe(false);
 
-      await expect(chat({}, 'agent-1', complex)).rejects.toThrow('QUEST_REQUIRED');
-      expect(desktopControlPlane.dispatch).not.toHaveBeenCalled();
-      expect(audit).toHaveBeenCalledWith(expect.objectContaining({
-        action: 'quest.chat.blocked', result: 'quest-required'
-      }));
-    } finally {
-      createSession.mockRestore();
-    }
+    await expect(chat({}, 'agent-1', complex)).rejects.toThrow('HERMES_PROJECT_REQUIRED');
+    expect(desktopControlPlane.dispatch).not.toHaveBeenCalled();
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'hermes.entry.required', result: 'project-workbench-required'
+    }));
   });
 
-  it('accepts bounded planning text and creates the first proposal through the public IPC contract', () => {
-    const created = { id: 'planning-1', revision: 1 };
-    const answered = { id: 'planning-1', revision: 2 };
-    const proposed = { id: 'planning-1', revision: 3, status: 'PROPOSED' };
-    const createSession = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'createSession').mockReturnValue(created as never);
-    const answerQuestions = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'answerQuestions').mockReturnValue(answered as never);
-    const proposePlan = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'proposePlan').mockReturnValue(proposed as never);
-    try {
-      const { handlers } = register();
-      const planningInput = {
-        request: '为新产品制定跨部门交付计划',
-        signals: {
-          departmentIds: ['product', 'engineering'], hasCrossTeamDependencies: true,
-          ambiguousObjective: false, ambiguousScope: true, ambiguousAcceptance: true,
-          estimatedDurationMinutes: 240, estimatedCost: 0, estimatedTokenCount: 20_000,
-          requiresNewTeam: false, irreversibleOperations: ['write_files'],
-          compareAlternatives: false, phasedExecution: true, confirmBeforeExecution: true,
-          estimatedTaskCount: 4
-        }
-      };
-      expect(handlers.get('aibox:createPlanningSession')({}, planningInput)).toBe(created);
-      expect(createSession).toHaveBeenCalledWith(planningInput);
-
-      const answerInput = {
-        sessionId: 'planning-1', expectedRevision: 1, questionSetVersion: 1,
-        answers: [{ questionId: 'scope', selectedOptionIds: ['mvp'], text: '只在项目目录内产出，验收时提供启动命令。' }]
-      };
-      expect(handlers.get('aibox:answerPlanningQuestions')({}, answerInput)).toBe(answered);
-      expect(answerQuestions).toHaveBeenCalledWith(answerInput);
-
-      const proposalInput = { sessionId: 'planning-1', expectedRevision: 2 };
-      expect(handlers.get('aibox:proposePlanningPlan')({}, proposalInput)).toBe(proposed);
-      expect(proposePlan).toHaveBeenCalledWith(proposalInput);
-      expect(() => handlers.get('aibox:proposePlanningPlan')({}, {
-        ...proposalInput, version: 1, hash: 'a'.repeat(64)
-      })).toThrow(/未知字段/);
-    } finally {
-      createSession.mockRestore();
-      answerQuestions.mockRestore();
-      proposePlan.mockRestore();
-    }
-  });
-
-  it('enforces the 4000-character planning answer boundary without rejecting short text', () => {
-    const answerQuestions = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'answerQuestions')
-      .mockReturnValue({ id: 'planning-1' } as never);
-    try {
-      const { handlers } = register();
-      const base = {
-        sessionId: 'planning-1', expectedRevision: 1, questionSetVersion: 1,
-        answers: [{ questionId: 'scope', selectedOptionIds: [], text: '' }]
-      };
-      expect(() => handlers.get('aibox:answerPlanningQuestions')({}, base)).not.toThrow();
-      expect(() => handlers.get('aibox:answerPlanningQuestions')({}, {
-        ...base, answers: [{ ...base.answers[0], text: '界'.repeat(4_000) }]
-      })).not.toThrow();
-      expect(() => handlers.get('aibox:answerPlanningQuestions')({}, {
-        ...base, answers: [{ ...base.answers[0], text: '界'.repeat(4_001) }]
-      })).toThrow(/0-4000/);
-    } finally {
-      answerQuestions.mockRestore();
-    }
-  });
-
-  it('rejects payloads that omit a declared field instead of forwarding a malformed shape', () => {
-    const proposePlan = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'proposePlan')
-      .mockReturnValue({ id: 'planning-1' } as never);
-    const approvePlan = vi.spyOn(SecretaryPlanningControlPlane.prototype, 'approvePlan')
-      .mockReturnValue({ id: 'planning-1' } as never);
-    try {
-      const { handlers } = register();
-      expect(() => handlers.get('aibox:proposePlanningPlan')({}, { sessionId: 'planning-1' })).toThrow(/缺少必需字段/);
-      expect(() => handlers.get('aibox:proposePlanningPlan')({}, { expectedRevision: 1 })).toThrow(/缺少必需字段/);
-      expect(() => handlers.get('aibox:approvePlanningPlan')({}, {
-        sessionId: 'planning-1', expectedRevision: 1, version: 1
-      })).toThrow(/缺少必需字段/);
-      expect(proposePlan).not.toHaveBeenCalled();
-      expect(approvePlan).not.toHaveBeenCalled();
-    } finally {
-      proposePlan.mockRestore();
-      approvePlan.mockRestore();
-    }
-  });
-
-  it('rejects DSH Quest payloads that omit an identity field', () => {
+  it('does not register DSH Quest owner channels', () => {
     const { handlers } = register();
+    for (const channel of [
+      'aibox:answerDshQuestQuestions', 'aibox:approveDshQuestPlan',
+      'aibox:rejectDshQuestPlan', 'aibox:dispatchDshQuestPlan'
+    ]) expect(handlers.has(channel)).toBe(false);
+    return;
     // The DSH Quest path guards required fields through parseDshQuestIdentity's
     // own hasOwnProperty loop rather than assertKeys' required list, so it
     // reports "missing <key>". Both mechanisms must keep failing closed: an
@@ -775,7 +827,13 @@ describe('IPC credential boundary', () => {
     return expect(handlers.get('aibox:dispatchDshQuestPlan')({}, incomplete)).rejects.toThrow(/missing principalId/);
   });
 
-  it('routes DSH-bound Quest owner decisions through governance and enforces project identity', async () => {
+  it('routes no owner decision through retired DSH governance', async () => {
+    const retiredHandlers = register().handlers;
+    expect(retiredHandlers.has('aibox:answerDshQuestQuestions')).toBe(false);
+    expect(retiredHandlers.has('aibox:approveDshQuestPlan')).toBe(false);
+    expect(retiredHandlers.has('aibox:rejectDshQuestPlan')).toBe(false);
+    expect(retiredHandlers.has('aibox:dispatchDshQuestPlan')).toBe(false);
+    return;
     const view = { binding: { planningSessionId: 'quest-1', projectId: 'project-1', dshSessionId: 'dsh-root-1', principalId: 'principal-1' } };
     const binding = {
       planningSessionId: 'quest-1', projectId: 'project-1', dshSessionId: 'dsh-root-1',
@@ -794,20 +852,20 @@ describe('IPC credential boundary', () => {
       principalId: 'principal-1', expectedRevision: 1
     };
     const hash = 'a'.repeat(64);
-    expect(handlers.get('aibox:answerPlanningQuestions')({}, {
+    expect(handlers.get('aibox:answerDshQuestQuestions')({}, {
       ...identity, dshQuestionSetId: 'questions-1', dshVersion: 1,
       answers: [{ questionId: 'scope', selectedOptionIds: ['all'], text: null }]
     })).toBe(view);
     expect(governance.answerQuestions).toHaveBeenCalledWith(expect.objectContaining({
       planningSessionId: 'quest-1', principalId: 'principal-1', dshQuestionSetId: 'questions-1'
     }));
-    expect(handlers.get('aibox:approvePlanningPlan')({}, {
+    expect(handlers.get('aibox:approveDshQuestPlan')({}, {
       ...identity, dshPlanId: 'plan-1', dshVersion: 1, hash
     })).toBe(view);
     expect(handlers.get('aibox:rejectDshQuestPlan')({}, {
       ...identity, dshPlanId: 'plan-1', dshVersion: 1, hash
     })).toBe(view);
-    await expect(handlers.get('aibox:dispatchPlanningPlan')({}, {
+    await expect(handlers.get('aibox:dispatchDshQuestPlan')({}, {
       ...identity, dshPlanId: 'plan-1', dshVersion: 1, hash
     })).resolves.toBe(view);
     expect(governance.approvePlan).toHaveBeenCalledTimes(1);
@@ -825,11 +883,7 @@ describe('IPC credential boundary', () => {
     expect(() => handlers.get('aibox:approveDshQuestPlan')({}, {
       ...identity, projectId: 'project-other', dshPlanId: 'plan-1', dshVersion: 1, hash
     })).toThrowError(expect.objectContaining({ code: 'PROJECT_BOUNDARY' }));
-    // An old Secretary-shaped payload cannot target a DSH binding and silently
-    // fall through to the compatibility controller.
-    expect(() => handlers.get('aibox:answerPlanningQuestions')({}, {
-      sessionId: 'quest-1', expectedRevision: 1, questionSetVersion: 1, answers: []
-    })).toThrow();
+    expect(handlers.has('aibox:answerPlanningQuestions')).toBe(false);
   });
 
   it('routes confirmed voice tasks through canonical ingress with a stable message key', async () => {
@@ -878,28 +932,6 @@ describe('IPC credential boundary', () => {
       action: 'bridge.key.copy', target: BRIDGE_KEY_SECRET_REF, result: 'clipboard'
     }));
 
-    expect(handlers.get('aibox:copyWebToken')()).toEqual({ ok: true });
-    expect(clipboard.writeText).toHaveBeenCalledWith('web-private-token');
-    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
-      action: 'webserver.token.copy', target: WEB_TOKEN_SECRET_REF, result: 'clipboard'
-    }));
-  });
-
-  it('waits for WebServer restart and propagates startup failure after token rotation', async () => {
-    let releaseStart!: () => void;
-    const deferred = new Promise<void>((resolve) => { releaseStart = resolve; });
-    const start = vi.fn(() => deferred);
-    const getStatus = vi.fn(() => ({ port: 28889, tokenConfigured: true, weakToken: false }));
-    const { handlers } = register({ start, getStatus });
-
-    const pending = handlers.get('aibox:regenerateWebToken')();
-    await Promise.resolve();
-    expect(getStatus).not.toHaveBeenCalled();
-    releaseStart();
-    await expect(pending).resolves.toEqual({ port: 28889, tokenConfigured: true, weakToken: false });
-
-    start.mockRejectedValueOnce(new Error('listen failed'));
-    await expect(handlers.get('aibox:regenerateWebToken')()).rejects.toThrow('listen failed');
   });
 
   it('waits for API Bridge enable and propagates startup failure', async () => {

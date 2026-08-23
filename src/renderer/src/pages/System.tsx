@@ -52,7 +52,7 @@ export function System() {
   const diskPct = last && last.diskTotal > 0 ? Math.round(((last.diskTotal - last.diskFree) / last.diskTotal) * 100) : null;
 
   const healthItems = [
-    { key: 'runtime', label: 'Nexus Runtime', icon: <IconLayers size={18} /> },
+    { key: 'runtime', label: 'Quest / Hermes Runtime', icon: <IconLayers size={18} /> },
     { key: 'gateway', label: 'Messaging Gateway', icon: <IconWifi size={18} /> },
     { key: 'database', label: '本地数据库', icon: <IconDb size={18} /> }
   ] as const;
@@ -74,7 +74,7 @@ export function System() {
             <div style={{ flex: 1 }}>
               <div style={{ color: 'var(--text-2)', fontSize: 12.5, marginBottom: 8 }}>{last?.cpuCores ?? 0} 逻辑核心 · 最近 10 分钟</div>
               <Sparkline data={resources.history.map((h) => h.cpu)} color="#4d6bfe" height={80} />
-              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 8 }}>持续 5 分钟 ≥85% 告警；≥95% 达 10 分钟并发降为 1</div>
+              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 8 }}>持续 5 分钟达到设置阈值后告警</div>
             </div>
           </div>
         </div>
@@ -90,7 +90,7 @@ export function System() {
                 {last ? `${formatBytes(last.memoryUsed)} / ${formatBytes(last.memoryTotal)}` : ''}
               </div>
               <Sparkline data={resources.history.map((h) => h.memoryPercent)} color="#22c1a3" height={80} />
-              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 8 }}>≥85% 告警；连续 30 秒 ≥95% 停止派发新任务</div>
+              <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginTop: 8 }}>持续 5 分钟达到阈值后告警；≥95% 立即暂停新任务，恢复后自动继续</div>
             </div>
           </div>
         </div>

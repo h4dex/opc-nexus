@@ -230,6 +230,39 @@ describe('runCli：不抛异常的一次性执行', () => {
     }
   }, 15_000);
 
+  it.runIf(isWin)('bypasses the npm PowerShell input pipeline for a verified Node CLI target', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'opc-cli-npm-shim-'));
+    const cmdPath = join(dir, 'probe.cmd');
+    const ps1Path = join(dir, 'probe.ps1');
+    const scriptPath = join(dir, 'node_modules', 'probe-cli', 'bin', 'probe.js');
+    try {
+      const { mkdirSync } = await import('node:fs');
+      mkdirSync(join(dir, 'node_modules', 'probe-cli', 'bin'), { recursive: true });
+      writeFileSync(cmdPath, '@echo off\r\n', 'utf8');
+      writeFileSync(ps1Path, [
+        '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
+        '$exe=".exe"',
+        'if ($MyInvocation.ExpectingInput) {',
+        '  $input | & "node$exe" "$basedir/node_modules/probe-cli/bin/probe.js" $args',
+        '} else {',
+        '  & "node$exe" "$basedir/node_modules/probe-cli/bin/probe.js" $args',
+        '}',
+        'exit $LASTEXITCODE'
+      ].join('\r\n'), 'utf8');
+      writeFileSync(scriptPath, 'process.stdout.write(JSON.stringify(process.argv.slice(2)))\r\n', 'utf8');
+
+      const resolved = resolveLaunch(cmdPath, ['exec', 'hello world']);
+      expect(resolved.bin.toLowerCase()).toBe('node.exe');
+      expect(resolved.args).toEqual([scriptPath, 'exec', 'hello world']);
+
+      const result = await runCli(cmdPath, ['exec', 'hello world'], { timeoutMs: 10_000 });
+      expect(result).toMatchObject({ ok: true, code: 0 });
+      expect(JSON.parse(result.stdout)).toEqual(['exec', 'hello world']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('preserves an explicit piped stdin for interactive protocols', async () => {
     const child = spawnCli(process.execPath, [
       '-e',

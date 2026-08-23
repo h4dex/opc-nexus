@@ -8,8 +8,8 @@ import { GlobalSearch } from './components/GlobalSearch';
 import { VoicePanel } from './components/VoicePanel';
 import { todayText } from './components/common';
 import {
-  IconAlert, IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconLayers, IconMonitor, IconMoon, IconPlug,
-  IconSettings, IconSun, IconTask, IconPlay, IconUser, IconFolder, IconBook, IconPhone,
+  IconAlert, IconBook, IconChip, IconClock, IconCoffee, IconFlow, IconHome, IconLayers, IconMonitor, IconMoon, IconPlug,
+  IconSettings, IconSun, IconTask, IconPlay, IconUser, IconFolder, IconPhone,
   IconSearch, IconMic, IconFullscreen, IconMessage
 } from './components/icons';
 
@@ -23,7 +23,6 @@ const Agents = lazy(() => import('./pages/Agents').then((module) => ({ default: 
 const Automation = lazy(() => import('./pages/Automation').then((module) => ({ default: module.Automation })));
 const Tasks = lazy(() => import('./pages/Tasks').then((module) => ({ default: module.Tasks })));
 const Console = lazy(() => import('./pages/Console').then((module) => ({ default: module.Console })));
-const Chat = lazy(() => import('./pages/Chat').then((module) => ({ default: module.Chat })));
 const Market = lazy(() => import('./pages/Market').then((module) => ({ default: module.Market })));
 const Teams = lazy(() => import('./pages/Teams').then((module) => ({ default: module.Teams })));
 const Collab = lazy(() => import('./pages/Collab').then((module) => ({ default: module.Collab })));
@@ -37,7 +36,6 @@ const Plugins = lazy(() => import('./pages/Plugins').then((module) => ({ default
 const System = lazy(() => import('./pages/System').then((module) => ({ default: module.System })));
 const Settings = lazy(() => import('./pages/Settings').then((module) => ({ default: module.Settings })));
 const Mobile = lazy(() => import('./pages/Mobile').then((module) => ({ default: module.Mobile })));
-const SecretaryPlanning = lazy(() => import('./pages/SecretaryPlanning').then((module) => ({ default: module.SecretaryPlanning })));
 
 interface QuestLaunchSurface {
   projectId: string | null;
@@ -80,7 +78,7 @@ const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: 
   ]},
   { group: '系统', items: [
     { key: 'console', label: '执行监控', icon: <IconPlay size={17} /> },
-    { key: 'mobile', label: '手机控制台', icon: <IconPhone size={17} /> },
+    { key: 'mobile', label: 'Android 执行设备', icon: <IconPhone size={17} /> },
     { key: 'usage', label: '用量统计', icon: <IconMonitor size={17} /> },
     { key: 'system', label: '系统状态', icon: <IconMonitor size={17} /> },
     { key: 'settings', label: '设置', icon: <IconSettings size={17} /> },
@@ -88,9 +86,17 @@ const NAV_GROUPS: { group: string; items: { key: RouteKey; label: string; icon: 
 ];
 
 const ALL_NAV = NAV_GROUPS.flatMap((g) => g.items);
+const ROUTE_LABELS: Partial<Record<RouteKey, string>> = {
+  dashboard: '经营概览', quest: 'Quest', projects: '项目中心', office: '办公室', inbox: '待我处理',
+  deliverables: '成果库', knowledge: '项目知识库', agents: '数字员工', tasks: '任务中心',
+  schedules: '经营自动化', workflows: '工作流', console: '执行监控', mobile: 'Android 执行设备',
+  teams: '专家团', collab: '多机协同', market: '员工市场',
+  engines: '引擎中心', channels: '连接中心', mcp: 'MCP', skills: '技能', plugins: '插件中心',
+  usage: '用量统计', system: '系统状态', settings: '设置'
+};
 
-/** 页面按路由挂载；长任务状态由主进程持久化，避免隐藏页继续占用内存和轮询。 */
-const KEEP_ALIVE: RouteKey[] = [];
+/** Quest owns browser-like conversation tabs and unsent drafts, so navigation hides it without destroying its WebContentsView. */
+const KEEP_ALIVE: RouteKey[] = ['quest'];
 
 export function App() {
   const {
@@ -126,28 +132,23 @@ export function App() {
   // 行动中心聚合审批、失败、成果验收和经营风险。
   const inboxCount = actionCenter?.total ?? 0;
 
-  const openQuestShortcut = async () => {
+  const openQuestShortcut = () => {
     const project = [...(snapshot?.projects ?? [])]
       .filter((item) => item.status !== 'archived')
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     if (!project) {
-      setRoute('projects');
+      openQuest(null);
       return;
     }
-    try {
-      await window.aibox.openQuestWindow({ projectId: project.id });
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : '无法打开 Quest 窗口');
-    }
+    openQuest(project.id);
   };
 
   /** 页面渲染器：保活页面用 display 切换，其余条件渲染 */
   const renderPage = (key: RouteKey) => {
     switch (key) {
       case 'dashboard': return <Dashboard />;
-      case 'secretary': return <SecretaryPlanning />;
       case 'inbox': return <Inbox />;
-      case 'quest': return <Quest />;
+      case 'quest': return <Quest active={route === 'quest'} />;
       case 'projects': return <Projects />;
       case 'office': return <Office />;
       case 'agents': return <Agents />;
@@ -158,7 +159,6 @@ export function App() {
       case 'workflows': return <Workflows />;
       case 'console': return <Console />;
       case 'mobile': return <Mobile />;
-      case 'chat': return <Chat />;
       case 'market': return <Market />;
       case 'teams': return <Teams />;
       case 'collab': return <Collab />;
@@ -192,8 +192,8 @@ export function App() {
         <div className="brand">
           <div className="brand-logo">AI</div>
           <div>
-            <div className="brand-name">DSH / Cordis</div>
-            <div className="brand-sub">OPC 工作台 v{appVersion}</div>
+            <div className="brand-name">OPC-Nexus</div>
+            <div className="brand-sub">AI 公司工作台 v{appVersion}</div>
           </div>
         </div>
         <div style={{ flex: 1, overflowY: 'auto' }}>
@@ -203,9 +203,9 @@ export function App() {
               {g.items.map((n) => (
                 <button
                   key={n.key}
-                  className={`nav-item ${n.key !== 'quest' && route === n.key ? 'active' : ''}`}
-                  onClick={() => { if (n.key === 'quest') void openQuestShortcut(); else setRoute(n.key); }}
-                  title={n.key === 'quest' ? '在独立窗口打开最近项目' : undefined}
+                  className={`nav-item ${route === n.key ? 'active' : ''}`}
+                  onClick={() => { if (n.key === 'quest') openQuestShortcut(); else setRoute(n.key); }}
+                  title={n.key === 'quest' ? '打开最近项目的 Quest' : undefined}
                 >
                   {n.icon}{n.label}
                   {n.key === 'tasks' && todos > 0 && <span className="badge">{todos}</span>}
@@ -224,8 +224,8 @@ export function App() {
 
       <div className="main-area">
         <header className="topbar">
-          <span className="topbar-title">{ALL_NAV.find((n) => n.key === route)?.label ?? (route === 'chat' ? 'Local CLI 兼容对话' : route === 'secretary' ? '兼容规划' : '')}</span>
-          <span className="status-pill"><span className={`dot ${online ? 'green' : 'red'}`} />{online ? '在线' : '离线'}</span>
+          <span className="topbar-title">{ROUTE_LABELS[route] ?? ALL_NAV.find((n) => n.key === route)?.label ?? ''}</span>
+          <span className="status-pill"><span className={`dot ${online ? 'green' : 'red'}`} />{online ? '网络已连接' : '网络离线'}</span>
           <span className="status-pill">{deviceName}</span>
           <div className="topbar-right">
             <button className="icon-btn" onClick={() => setSearchOpen(true)} aria-label="搜索" title="搜索 (Ctrl+K)">
@@ -251,7 +251,9 @@ export function App() {
           {/* 保活页面：display 切换保留状态 */}
           {KEEP_ALIVE.map((key) => (
             <div key={key} style={{ display: route === key ? 'contents' : 'none', height: '100%' }}>
-              {renderPage(key)}
+              <Suspense fallback={<div className="page-loading">正在加载...</div>}>
+                {renderPage(key)}
+              </Suspense>
             </div>
           ))}
           {/* 普通页面：条件渲染 */}

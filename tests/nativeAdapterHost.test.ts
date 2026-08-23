@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { NativeAdapterHost } from '../src/main/services/nativeAdapterHost.js';
-import { DshPolicyBroker, type DshPolicyAuditEvent } from '../src/main/services/dshPolicyBroker.js';
-import { resolveBuiltinDshHostPolicy } from '../src/main/services/dshPluginPolicy.js';
+import { HostPolicyBroker, type HostPolicyAuditEvent } from '../src/main/services/hostPolicyBroker.js';
+import { resolveBuiltinHostPolicy } from '../src/main/services/hostPluginPolicy.js';
 import type { EnvironmentComponentView, NativeAdapterMode } from '../src/shared/types.js';
 
-function policy(audits: DshPolicyAuditEvent[] = []) {
-  return new DshPolicyBroker({
-    resolve: resolveBuiltinDshHostPolicy,
+function policy(audits: HostPolicyAuditEvent[] = []) {
+  return new HostPolicyBroker({
+    resolve: resolveBuiltinHostPolicy,
     audit: (event) => audits.push(event)
   }).scopeRuntime({ organizationId: 'org-local', runtimeId: 'native-host', agentId: 'agent-1' });
 }
@@ -31,7 +31,7 @@ function diagnostic(mode: NativeAdapterMode, path: string | null = null): Enviro
 describe('NativeAdapterHost', () => {
   it('keeps DLL/SO paths inside an injected utility-process transport', async () => {
     const invoke = vi.fn(async (request: { nativePath?: string; input: unknown }) => ({ ok: true, input: request.input }));
-    const audits: DshPolicyAuditEvent[] = [];
+    const audits: HostPolicyAuditEvent[] = [];
     const host = new NativeAdapterHost(policy(audits));
     host.register({
       id: 'media-accelerator',
@@ -100,7 +100,7 @@ describe('NativeAdapterHost', () => {
     await expect(noPolicy.invoke('media-accelerator', 'inspect', {}))
       .rejects.toMatchObject({ code: 'POLICY_DENIED' });
 
-    const deniedPolicy = new DshPolicyBroker({
+    const deniedPolicy = new HostPolicyBroker({
       resolve: async () => ({ effect: 'deny', reasonCode: 'profile_denied' })
     }).scopeRuntime({ organizationId: 'org-local', runtimeId: 'native-host', agentId: 'agent-1' });
     const denied = new NativeAdapterHost(deniedPolicy);

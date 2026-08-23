@@ -21,8 +21,8 @@
  * @author liyingjie <y@senke.com>
  */
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { delimiter, extname, isAbsolute, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { appendProcessOutput, createProcessOutputBuffer, finishProcessOutput } from './textEncoding.js';
 
 const isWin = process.platform === 'win32';
@@ -68,6 +68,55 @@ function powerShellLaunch(scriptPath: string, args: string[]): { bin: string; ar
   };
 }
 
+function insideDirectory(base: string, target: string): boolean {
+  const rel = relative(base, target);
+  return rel.length > 0 && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+/** Resolve the fixed target from an npm-generated PowerShell shim.
+ *
+ * npm shims pipe `$input` into the real CLI whenever PowerShell sees redirected
+ * stdin. A desktop child process has redirected stdin even when no payload is
+ * intended, so Codex `exec` waits forever for "additional input". Standard
+ * npm shims contain only a basedir-scoped executable or a Node script; launch
+ * that verified target directly and leave custom PowerShell scripts untouched.
+ */
+function directNpmShimLaunch(scriptPath: string, args: string[]): { bin: string; args: string[] } | null {
+  let source = '';
+  try {
+    source = readFileSync(scriptPath, 'utf8');
+  } catch {
+    return null;
+  }
+  if (source.length > 64 * 1024
+    || !source.includes('$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent')
+    || !source.includes('$MyInvocation.ExpectingInput')) return null;
+
+  const base = dirname(resolve(scriptPath));
+  const lines = source.split(/\r?\n/).filter((line) => !line.includes('$input |'));
+  for (const line of lines) {
+    const match = line.match(/^\s*&\s+"([^"]+)"(?:\s+"([^"]+)")?\s+\$args\s*$/);
+    if (!match) continue;
+    const command = match[1];
+    const target = match[2];
+
+    if ((command === '$basedir/node$exe' || command === 'node$exe') && target?.startsWith('$basedir/')) {
+      const script = resolve(base, target.slice('$basedir/'.length));
+      if (!insideDirectory(base, script) || !existsSync(script)) continue;
+      const bundledNode = join(base, 'node.exe');
+      return { bin: existsSync(bundledNode) ? bundledNode : 'node.exe', args: [script, ...args] };
+    }
+
+    if (command.startsWith('$basedir/')) {
+      const executable = resolve(base, command.slice('$basedir/'.length));
+      if (!insideDirectory(base, executable) || !existsSync(executable)
+        || !['.exe', '.com'].includes(extname(executable).toLowerCase())) continue;
+      return { bin: executable, args };
+    }
+  }
+  return null;
+}
+
 /**
  * 把「命令 + 参数」翻译成当前平台真正可 spawn 的形式。
  * Windows npm shim 通过 PowerShell `-File` 执行，参数保持独立 argv，绝不进入
@@ -79,10 +128,10 @@ export function resolveLaunch(binPath: string, args: string[], env: NodeJS.Proce
     return { bin: `${commandNameOf(binPath)}.exe`, args };
   }
   const ext = extname(binPath).toLowerCase();
-  if (ext === '.ps1') return powerShellLaunch(binPath, args);
+  if (ext === '.ps1') return directNpmShimLaunch(binPath, args) ?? powerShellLaunch(binPath, args);
   if (ext === '.cmd' || ext === '.bat' || ext === '') {
     const shim = companionPowerShellShim(binPath, env);
-    if (shim) return powerShellLaunch(shim, args);
+    if (shim) return directNpmShimLaunch(shim, args) ?? powerShellLaunch(shim, args);
     const executable = ext === '' ? `${binPath}.exe` : '';
     if (executable && (!/[\\/]/.test(binPath) || existsSync(executable))) {
       return { bin: executable, args };
@@ -118,7 +167,7 @@ export function spawnCli(binPath: string, args: string[], opts: SpawnOptions = {
  * Windows 的 npm/.cmd 入口会形成 cmd.exe -> CLI -> runtime 的进程树，单独
  * child.kill() 只会结束最外层 cmd.exe，实际 CLI 会继续占用设备锁和应用退出流程。
  */
-async function terminateCliProcess(child: ChildProcess): Promise<void> {
+export async function terminateCliProcess(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
 
   if (!isWin || !child.pid) {

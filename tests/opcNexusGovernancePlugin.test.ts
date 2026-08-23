@@ -3,12 +3,11 @@ import { validatePluginManifest } from '../src/main/services/pluginHost.js';
 import { OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST } from '../src/main/services/opcNexusGovernancePlugin.js';
 
 describe('opc-nexus-governance plugin identity', () => {
-  it('is a valid DSH host declaration owned by governance', () => {
+  it('is a valid host declaration owned by governance', () => {
     const manifest = validatePluginManifest(OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST);
     expect(manifest.id).toBe('opc-nexus-governance');
     expect(manifest.owner).toBe('nexus-governance');
     expect(manifest.capabilities.map((capability) => capability.id)).toEqual([
-      'dsh-quest-governance',
       'project-workbench',
       'worker-directory',
       'policy-evaluate',
@@ -18,7 +17,7 @@ describe('opc-nexus-governance plugin identity', () => {
       'memory-archive',
       'runtime-environment',
       'channel-projection',
-      'lan-mobile-gateway',
+      'hermes-mobile-gateway',
       'acp-worker-boundary',
       'a2a-worker-boundary'
     ]);

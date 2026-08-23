@@ -80,3 +80,24 @@ describe('MarkdownView typed artifacts', () => {
     expect(parseMarkdownMermaidArtifact('x'.repeat(32 * 1024 + 1))).toBeNull();
   });
 });
+
+describe('Nexus Markdown presentation', () => {
+  const styles = readFileSync(join(process.cwd(), 'vendor', 'hermes-agent', 'web', 'src', 'index.css'), 'utf8');
+
+  it('keeps rich replies and media inside the conversation width', () => {
+    expect(styles).toContain('.nexus-markdown :where(img, video)');
+    expect(styles).toContain('max-width: 100%');
+    expect(styles).toContain('.nexus-markdown table');
+    expect(styles).toContain('overflow-x: auto');
+    expect(styles).toContain('.nexus-mermaid svg');
+  });
+
+  it('allows only Main-owned artifact protocols in the embedded Hermes renderer', () => {
+    const markdown = readFileSync(join(process.cwd(), 'vendor', 'hermes-agent', 'web', 'src', 'components', 'Markdown.tsx'), 'utf8');
+    const proxy = readFileSync(join(process.cwd(), 'src', 'main', 'services', 'hermesProxy.ts'), 'utf8');
+    expect(markdown).toContain('aibox-(?:artifact|mobile):');
+    expect(markdown).not.toContain('file:');
+    expect(proxy).toContain("img-src 'self' blob: data: https: aibox-artifact: aibox-mobile:");
+    expect(proxy).toContain("media-src 'self' blob: data: https: aibox-artifact: aibox-mobile:");
+  });
+});

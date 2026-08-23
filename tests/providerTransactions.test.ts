@@ -176,6 +176,20 @@ describe('Provider transactions with real sql.js', () => {
     expect(db.rows('SELECT id FROM providers WHERE is_default = 1')).toEqual([{ id: first.id }]);
   });
 
+  it('uses /v1 as the runtime API root when the configured Base URL is only an origin', () => {
+    const root = providers.create({
+      name: 'Root URL', baseUrl: 'https://gateway.test', model: 'root-model', apiKey: 'root-key'
+    });
+
+    expect(root.baseUrl).toBe('https://gateway.test');
+    expect(providers.resolveForAgent(root.id, null)).toEqual({
+      baseUrl: 'https://gateway.test/v1', model: 'root-model', key: 'root-key'
+    });
+
+    providers.update(root.id, { baseUrl: 'https://gateway.test/openai/v2' });
+    expect(providers.resolveForAgent(root.id, null)?.baseUrl).toBe('https://gateway.test/openai/v2');
+  });
+
   it('adding an unrelated non-default Provider does not invalidate active runtimes', () => {
     providers.create({
       name: 'Default', baseUrl: 'https://default.test/v1', model: 'default-model', apiKey: 'default-key'

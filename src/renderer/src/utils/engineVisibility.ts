@@ -1,8 +1,11 @@
-import { LEGACY_DSH_ENGINE_ID } from '@shared/types';
+import { isQuestVisibleEngine } from '@shared/engineVisibility';
 
 type EngineIdentity = { id: string };
 
-/** Compatibility runtimes remain in snapshots so historical records still resolve. */
+/**
+ * Retired runtime identities can remain on historical records, but they are
+ * never product-level choices or current execution adapters.
+ */
 export function isUserVisibleEngine(engine: EngineIdentity): boolean {
-  return engine.id !== LEGACY_DSH_ENGINE_ID;
+  return isQuestVisibleEngine(engine);
 }

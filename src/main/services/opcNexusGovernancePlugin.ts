@@ -1,14 +1,13 @@
 import type { PluginManifest } from './pluginHost.js';
 
 /**
- * Declarative identity of this application when mounted in DSH/Cordis.
+ * Declarative identity of this application's host governance boundary.
  *
  * The manifest advertises host-side governance capabilities only. It has no
- * planner, session owner, or arbitrary command handler; DSH/Cordis remains
- * the single AI/orchestration owner.
+ * planner, session owner, or arbitrary command handler; Hermes remains the
+ * single AI/orchestration owner.
  */
 export const OPC_NEXUS_GOVERNANCE_PLUGIN_ID = 'opc-nexus-governance' as const;
-export const DSH_QUEST_GOVERNANCE_CAPABILITY_ID = 'dsh-quest-governance' as const;
 
 export const OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST: PluginManifest = {
   schemaVersion: 1,
@@ -16,27 +15,14 @@ export const OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST: PluginManifest = {
   name: 'OPC Nexus Governance',
   version: '2.0.0',
   owner: 'nexus-governance',
-  executionAdapter: 'dsh-managed',
   hostApiVersion: '^1.0.0',
-  description: 'Host governance, project projection and worker boundaries for the DSH/Cordis product core.',
+  description: 'Host governance, project projection and worker boundaries for the Hermes product core.',
   capabilities: [
-    {
-      id: DSH_QUEST_GOVERNANCE_CAPABILITY_ID,
-      kind: 'artifact',
-      version: '1.0.0',
-      owner: 'nexus-governance',
-      executionAdapter: 'dsh-managed',
-      artifactKind: 'dsh-quest-governance',
-      mediaTypes: ['application/json'],
-      permissions: ['artifact.read', 'artifact.write'],
-      description: 'Typed admission for Cordis-owned QuestionSets and Plans; owner decisions are intentionally excluded.'
-    },
     {
       id: 'project-workbench',
       kind: 'artifact',
       version: '1.0.0',
       owner: 'nexus-governance',
-      executionAdapter: 'dsh-managed',
       artifactKind: 'project-workbench',
       mediaTypes: ['application/json', 'text/markdown'],
       permissions: ['artifact.read', 'artifact.write']
@@ -56,7 +42,6 @@ export const OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST: PluginManifest = {
       kind: 'tool',
       version: '1.0.0',
       owner: 'nexus-governance',
-      executionAdapter: 'dsh-managed',
       toolName: 'governance.policy.evaluate',
       risk: 'safe',
       permissions: ['tool.execute']
@@ -79,7 +64,7 @@ export const OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST: PluginManifest = {
       toolName: 'governance.provider.issue-lease',
       risk: 'write',
       permissions: ['tool.execute', 'engine.use', 'network.request'],
-      description: 'Issues bounded provider leases without returning credentials to DSH or Renderer.'
+      description: 'Issues bounded provider leases without returning credentials to Hermes or Renderer.'
     },
     {
       id: 'artifact-admission',
@@ -96,7 +81,6 @@ export const OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST: PluginManifest = {
       kind: 'artifact',
       version: '1.0.0',
       owner: 'nexus-governance',
-      executionAdapter: 'dsh-managed',
       artifactKind: 'memory-archive',
       mediaTypes: ['application/json', 'text/markdown'],
       permissions: ['artifact.read', 'artifact.write']
@@ -116,21 +100,19 @@ export const OPC_NEXUS_GOVERNANCE_PLUGIN_MANIFEST: PluginManifest = {
       kind: 'channel',
       version: '1.0.0',
       owner: 'nexus-governance',
-      executionAdapter: 'dsh-managed',
       channelType: 'governed-channel',
       direction: 'bidirectional',
       permissions: ['channel.receive', 'channel.send']
     },
     {
-      id: 'lan-mobile-gateway',
+      id: 'hermes-mobile-gateway',
       kind: 'channel',
       version: '1.0.0',
       owner: 'nexus-governance',
-      executionAdapter: 'dsh-managed',
-      channelType: 'dsh-lan-mobile',
+      channelType: 'hermes-mobile-gateway',
       direction: 'bidirectional',
       permissions: ['channel.receive', 'channel.send'],
-      description: 'Authenticated desktop, LAN and mobile projection for DSH/Cordis.'
+      description: 'Authenticated project-scoped Hermes conversation access for desktop and mobile.'
     },
     {
       id: 'acp-worker-boundary',
