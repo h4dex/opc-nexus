@@ -26,6 +26,7 @@ export const WEIXIN_SESSION_REF = 'secret:channel:weixin:ilink';
 export const WEIXIN_POLL_STATE_REF = 'secret:channel:weixin:ilink:poll';
 export const WEIXIN_PENDING_SESSION_REF = 'secret:channel:weixin:ilink:pending';
 export const WEIXIN_OUTBOX_REF = 'secret:channel:weixin:ilink:outbox';
+export const WEIXIN_LAST_ERROR_REF = 'channel:weixin:ilink:last-error';
 
 const CHANNEL_ID = 'ch-weixin';
 const MAX_REPLY_CHARS = 4000;
@@ -43,6 +44,12 @@ interface ILinkCredentials {
   accountId: string;
   ownerUserId: string;
   baseUrl: string;
+}
+
+interface WeixinLoginDiagnostic {
+  message: string;
+  phase: WeixinLoginState['phase'];
+  updatedAt: number;
 }
 
 interface PollState {
@@ -102,8 +109,12 @@ function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function errorText(error: unknown, secrets: readonly string[] = []): string {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const secret of secrets) {
+    if (secret) message = message.replaceAll(secret, '[REDACTED]');
+  }
+  return message;
 }
 
 export class WeixinChannel {
@@ -151,6 +162,17 @@ export class WeixinChannel {
     this.now = options.now ?? Date.now;
     this.ingressService = options.ingressService;
     this.taskPlanner = options.taskPlanner;
+    const diagnostic = this.db.getSetting<WeixinLoginDiagnostic | null>(WEIXIN_LAST_ERROR_REF, null);
+    if (this.hasPendingCredentials()) {
+      this.loginState = {
+        phase: 'IDLE',
+        qrDataUrl: null,
+        message: diagnostic?.message
+          ? `上次微信授权已确认但未完成：${diagnostic.message}。重新生成二维码即可恢复。`
+          : '检测到上次已确认的微信授权，重新生成二维码即可恢复。',
+        updatedAt: diagnostic?.updatedAt ?? this.now()
+      };
+    }
   }
 
   isActive(): boolean {
@@ -201,7 +223,9 @@ export class WeixinChannel {
       this.updateLoginState('WAITING_SCAN', dataUrl, '请用手机微信扫描二维码并确认连接');
       void this.runLoginLoop(gen, attempt, client, qr.qrcode, existing, retainExistingPollState, 0, this.now() + QR_LOGIN_TIMEOUT_MS, abort.signal);
     } catch (error) {
-      if (gen === this.generation && attempt === this.loginAttempt && !abort.signal.aborted) this.failLogin(error);
+      if (gen === this.generation && attempt === this.loginAttempt && !abort.signal.aborted) {
+        this.failLogin(error, existing ? [existing.token] : []);
+      }
     }
     return this.getLoginState();
   }
@@ -230,7 +254,9 @@ export class WeixinChannel {
     } else if (restore?.active) {
       this.updateLoginState('IDLE', null, '已取消扫码连接，原微信会话当前不可用');
     } else {
-      this.updateLoginState('IDLE', null, '已取消扫码连接');
+      this.updateLoginState('IDLE', null, this.hasPendingCredentials()
+        ? '已暂停验证；微信授权已加密保存在本机，重新生成二维码即可恢复'
+        : '已取消扫码连接');
       this.setStatus(this.readCredentials() ? 'DISABLED' : 'UNCONFIGURED');
     }
   }
@@ -263,7 +289,7 @@ export class WeixinChannel {
       }
       try { await client.notifyStart(abort.signal); } catch { /* 在线通知为 best-effort */ }
       if (abort.signal.aborted || gen !== this.generation || !this.active) return { ok: false, message: '微信 iLink 连接已取消' };
-      const response = await client.getUpdates(pollState.cursor, 5_000, abort.signal, { timeoutAsEmpty: false });
+      const response = await client.getUpdates(pollState.cursor, 5_000, abort.signal);
       if (abort.signal.aborted || gen !== this.generation || !this.active) return { ok: false, message: '微信 iLink 连接已取消' };
       const acceptance = await this.acceptUpdateResponse(gen, credentials, client, pollState, response, abort.signal);
       if (acceptance !== 'accepted') {
@@ -292,7 +318,7 @@ export class WeixinChannel {
         return { ok: false, message: '微信授权已过期，请重新扫码连接' };
       }
       this.setStatus('ERROR');
-      const message = errorText(error);
+      const message = errorText(error, [credentials.token]);
       this.updateLoginState('ERROR', null, message);
       return { ok: false, message: `连接失败：${message}` };
     }
@@ -303,11 +329,12 @@ export class WeixinChannel {
     this.active = false;
     const client = this.activeClient;
     this.stopWorkers();
-    this.db.raw.prepare('DELETE FROM settings WHERE key IN (?, ?, ?, ?)').run(
+    this.db.raw.prepare('DELETE FROM settings WHERE key IN (?, ?, ?, ?, ?)').run(
       WEIXIN_SESSION_REF,
       WEIXIN_POLL_STATE_REF,
       WEIXIN_PENDING_SESSION_REF,
-      WEIXIN_OUTBOX_REF
+      WEIXIN_OUTBOX_REF,
+      WEIXIN_LAST_ERROR_REF
     );
     this.db.flush();
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'channel.weixin.ilink.logout', target: CHANNEL_ID, result: 'ok' });
@@ -427,7 +454,7 @@ export class WeixinChannel {
         }
       } catch (error) {
         if (signal.aborted || gen !== this.generation || attempt !== this.loginAttempt) return;
-        this.failLogin(error);
+        this.failLogin(error, existing ? [existing.token] : []);
         return;
       }
       try { await this.sleep(1000, signal); } catch { return; }
@@ -451,7 +478,7 @@ export class WeixinChannel {
 
     try {
       try { await client.notifyStart(signal); } catch { /* 在线通知为 best-effort */ }
-      const response = await client.getUpdates(pollState.cursor, 5_000, signal, { timeoutAsEmpty: false });
+      const response = await client.getUpdates(pollState.cursor, 5_000, signal);
       if (signal.aborted || gen !== this.generation || attempt !== this.loginAttempt) return;
       const code = responseErrorCode(response);
       if (code != null && code !== -14) {
@@ -462,6 +489,7 @@ export class WeixinChannel {
         this.pendingActivation?.();
         this.saveCredentials(credentials);
         this.deletePendingCredentials();
+        this.clearLoginDiagnostic();
         this.savePollState(pollState, false);
         this.db.raw.prepare("UPDATE channels SET account_name = ? WHERE id = 'ch-weixin'").run('微信 iLink Bot');
         this.db.audit({ id: randomUUID(), actor: 'admin', action: 'channel.weixin.ilink.login', target: credentials.accountId, result: 'ok' });
@@ -498,12 +526,12 @@ export class WeixinChannel {
         this.stopMonitor();
         this.loginRestore = null;
       }
-      this.failLogin(error);
+      this.failLogin(error, [credentials.token]);
     }
   }
 
-  private failLogin(error: unknown) {
-    const message = errorText(error);
+  private failLogin(error: unknown, secrets: readonly string[] = []) {
+    const message = errorText(error, secrets);
     const auth = error instanceof ILinkHttpError && [401, 403].includes(error.status);
     this.loginAbort = null;
     this.loginAttemptActive = false;
@@ -514,6 +542,15 @@ export class WeixinChannel {
       this.setStatus(auth ? 'AUTH_EXPIRED' : 'ERROR');
     }
     this.updateLoginState('ERROR', null, message);
+    this.db.setSetting(WEIXIN_LAST_ERROR_REF, {
+      message: message.slice(0, 500),
+      phase: 'ERROR',
+      updatedAt: this.now()
+    });
+    this.db.audit({
+      id: randomUUID(), actor: 'system', action: 'channel.weixin.ilink.login',
+      target: CHANNEL_ID, result: auth ? 'failed:auth' : 'failed:activation'
+    });
     notify(this.db, '微信 iLink 连接失败', message);
   }
 
@@ -652,7 +689,7 @@ export class WeixinChannel {
     if (!contextToken) return null;
 
     const text = extractIlinkText(message);
-    const send = (content: string) => this.enqueueReply({
+    const send = (content: string, taskId?: string) => this.enqueueReply({
       generation: gen,
       accountId: credentials.accountId,
       to: from,
@@ -871,14 +908,29 @@ export class WeixinChannel {
 
   private savePendingCredentials(credentials: ILinkCredentials) {
     this.encryptSetting(WEIXIN_PENDING_SESSION_REF, credentials);
+    this.db.audit({
+      id: randomUUID(),
+      actor: 'system',
+      action: 'channel.weixin.ilink.pending.store',
+      target: credentials.accountId,
+      result: 'encrypted'
+    });
   }
 
   private readPendingCredentials(): ILinkCredentials | null {
     return this.readEncryptedCredentials(WEIXIN_PENDING_SESSION_REF);
   }
 
+  private hasPendingCredentials(): boolean {
+    return Boolean(this.db.getSetting<string | null>(WEIXIN_PENDING_SESSION_REF, null));
+  }
+
   private deletePendingCredentials() {
     this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(WEIXIN_PENDING_SESSION_REF);
+  }
+
+  private clearLoginDiagnostic() {
+    this.db.raw.prepare('DELETE FROM settings WHERE key = ?').run(WEIXIN_LAST_ERROR_REF);
   }
 
   private readCredentials(): ILinkCredentials | null {

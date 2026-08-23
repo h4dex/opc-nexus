@@ -165,14 +165,17 @@ describe('MCP scope and browser credential guards', () => {
 });
 
 describe('MCP seed capabilities', () => {
-  it('marks only the Puppeteer seed as a browser capability', () => {
-    const inserted: { name: string; args: string; capability: string }[] = [];
+  it('does not create enabled placeholder MCP servers on a new install', () => {
+    const inserted: unknown[][] = [];
+    const removed: unknown[][] = [];
     const db = {
       raw: {
         prepare: (sql: string) => ({
           get: () => ({ c: 0 }),
-          run: (_id: string, name: string, _command: string, args: string, _env: string, _scope: string, capability: string) => {
-            if (/INSERT INTO mcp_servers/.test(sql)) inserted.push({ name, args, capability });
+          run: (...args: unknown[]) => {
+            if (/INSERT INTO mcp_servers/.test(sql)) inserted.push(args);
+            if (/DELETE FROM mcp_servers/.test(sql)) removed.push(args);
+            return { changes: 0 };
           }
         })
       },
@@ -180,8 +183,7 @@ describe('MCP seed capabilities', () => {
     };
 
     seedMcpServers(db as never);
-    expect(inserted.filter((item) => item.capability === 'browser')).toEqual([
-      expect.objectContaining({ name: '浏览器自动化', args: expect.stringContaining('server-puppeteer') })
-    ]);
+    expect(inserted).toEqual([]);
+    expect(removed.length).toBeGreaterThan(0);
   });
 });

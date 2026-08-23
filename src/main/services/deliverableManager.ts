@@ -1,4 +1,10 @@
-/** 成果领域服务：同步任务/专家团终稿，并维护版本、验收与项目成果包。 */
+/**
+ * 成果领域服务：同步任务/专家团终稿，并维护版本、验收与项目成果包。
+ *
+ * **B.7 — 兼容投影层，不再作为交付权威。** v2.0.0 起，真实产物由
+ * `ProjectArtifactManifestService` 验证并持久化为 `task_events` 中的
+ * `artifact_manifest`；本服务维持文本包装与已有验收流程向后兼容。
+ */
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput,

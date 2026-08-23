@@ -45,6 +45,7 @@ describe('HermesRuntimeProfileService', () => {
 
     expect(config).toContain('"provider": "opcnexus"');
     expect(config).toContain('https://api.deepseek.com/v1');
+    expect(config).toContain('"max_tokens": 16384');
     expect(config).not.toContain('secret-key');
     expect(prepared.env).toMatchObject({
       HERMES_HOME: prepared.home,

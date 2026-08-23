@@ -102,6 +102,16 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:createFollowUpTask` | `parentTaskId, title` | `Task` | 追问/续跑 |
 | `aibox:getTaskEvents` | `taskId: string` | `TaskEvent[]` | 事件时间线 |
 | `aibox:getTaskResult` | `taskId: string` | `string \| null` | 执行产物 |
+| `aibox:getTaskManifest` | `taskId: string` | `ProjectArtifactManifest \| null` | 读取真实交付清单 |
+| `aibox:openTaskDeliveryFolder` | `taskId: string` | `{ ok, message }` | 打开交付目录 |
+| `aibox:openArtifactPreview` | `taskId, relativePath` | `{ ok, message }` | 预览清单内文件 |
+| `aibox:copyArtifactCommand` | `taskId: string` | `{ ok, message }` | 复制经校验的启动命令 |
+| `aibox:runArtifactCommand` | `taskId: string` | `ProjectArtifactRuntimeOperationResult` | 启动真实本地预览并生成运行证据与截图 |
+| `aibox:getArtifactRuntimeStatus` | `taskId: string` | `ProjectArtifactRuntimeEvidence \| null` | 查询预览进程、URL 和错误 |
+| `aibox:stopArtifactRuntime` | `taskId: string` | `ProjectArtifactRuntimeOperationResult` | 停止预览进程树 |
+| `aibox:openArtifactRuntimeUrl` | `taskId: string` | `{ ok, message }` | 打开已验证的 loopback 预览地址 |
+
+`createTask` 等直接执行接口只供 Hermes/Nexus 治理桥和内部恢复路径使用。老板侧新任务统一从项目 Quest/Hermes Workbench 进入，Renderer 不提供绕过调度与治理的直接派单入口。
 
 ---
 
@@ -284,9 +294,9 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:getWeixinLoginState` | 无 | `WeixinLoginState` | 查询扫码/配对状态（不返回 Token） |
 | `aibox:submitWeixinVerifyCode` | `code` | `WeixinLoginState` | 提交手机显示的数字配对码 |
 | `aibox:cancelWeixinLogin` | 无 | `void` | 取消尚未提交的扫码会话；`VERIFYING` 阶段会中止远端探测，凭据事务一旦提交则需通过“停用”撤销 |
-| `aibox:setupChannel` | `id, accountName` | `void` | 通用设置 |
 | `aibox:disconnectChannel` | `id: string` | `void` | 断开 |
 | `aibox:bindChannel` | `channelId, agentId` | `void` | 绑定 |
+| `aibox:bindChannelProject` | `channelId, projectId` | `void` | 将真实渠道绑定到授权项目 Hermes 会话 |
 | `aibox:unbindChannel` | `channelId, agentId` | `void` | 解绑 |
 
 `WeixinLoginState.phase` 中，`VERIFY_REQUIRED` 表示等待用户输入手机显示的数字配对码；提交配对码后状态回到 `SCANNED`，由主进程继续二维码状态轮询。`VERIFYING` 表示微信已确认授权，主进程正在通过 `notifyStart` / `getUpdates` 验证新 iLink 会话；此时关闭弹窗会中止尚未完成的探测。探测通过后，凭据与员工绑定在同一事务内提交，随后进入 `CONNECTED`。
@@ -323,12 +333,28 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 
 ---
 
-## Hermes 同步
+## Hermes 项目运行时
 
 | Channel | 参数 | 返回值 | 说明 |
 |---------|------|--------|------|
-| `aibox:importFromHermes` | 无 | `{ ok, message }` | 导入 |
-| `aibox:exportToHermes` | 无 | `{ ok, message }` | 导出 |
+| `aibox:getHermesRuntimeStatus` | `projectId` | `HermesRuntimeStatus` | 查询项目服务真实状态，不返回上游 Token |
+| `aibox:listHermesProjectBindings` | 无 | `HermesProjectBinding[]` | 列出项目隔离的 Hermes Home 绑定 |
+| `aibox:startHermesProject` | `projectId` | `HermesRuntimeStatus` | 校验项目目录后启动服务 |
+| `aibox:stopHermesProject` | `projectId` | `HermesRuntimeStatus` | 停止项目服务和手机路由 |
+| `aibox:restartHermesProject` | `projectId` | `HermesRuntimeStatus` | 重启项目服务 |
+| `aibox:emergencyStopHermesProject` | `projectId` | `HermesRuntimeStatus` | 紧急停止项目服务 |
+| `aibox:openHermesWorkbench` | `projectId` | `HermesWorkbenchStatus` | 通过 Main Proxy 打开项目 Workbench |
+| `aibox:closeHermesWorkbench` | 无 | `HermesWorkbenchStatus` | 关闭 Workbench |
+| `aibox:getHermesWorkbenchStatus` | 无 | `HermesWorkbenchStatus` | 查询 Workbench 状态 |
+| `aibox:getHermesMemoryIndex` | `projectId` | `MemoryIndexEntry[]` | 读取记忆文件索引，不复制正文到 SQLite |
+| `aibox:listHermesClarifications` | `projectId, conversationId?` | `HermesClarifyRequest[]` | 列出持久化待回答问题 |
+| `aibox:answerHermesClarification` | `input` | `HermesClarifyRequest` | 以项目 Principal 回答并恢复 Hermes 会话 |
+| `aibox:listHermesPlanProjections` | `projectId` | `HermesPlanProjection[]` | 读取宿主治理的 Hermes 计划投影 |
+| `aibox:approveHermesPlan` | `projectId, draftId` | `HermesPlanProjection` | 批准指定版本和哈希 |
+| `aibox:dispatchHermesPlan` | `projectId, draftId` | `HermesPlanProjection` | 通过宿主策略校验并派工 |
+| `aibox:createHermesMobilePairing` | `projectId, role` | `HermesMobileRoute` | 创建项目级 viewer/operator 配对 |
+
+Workbench 只接触 Main 代理签发的短期租约；Hermes 上游服务 Token 不进入 URL、localStorage 或普通 Renderer 状态。`importFromHermes` / `exportToHermes` 仅是旧 MCP 配置兼容工具，不属于项目记忆或核心执行路径。
 
 ---
 
@@ -342,9 +368,6 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:setAppConfig` | `patch` | `AppConfig` | 保存配置 |
 | `aibox:integrityCheck` | 无 | `{ ok, message }` | 完整性检查 |
 | `aibox:manualCleanup` | 无 | `{ ok, message }` | 数据清理 |
-| `aibox:getWebAdminStatus` | 无 | `WebAdminStatus` | Web 管理状态（不含 Token） |
-| `aibox:regenerateWebToken` | 无 | `WebAdminStatus` | 重新生成 Token（不回传明文） |
-| `aibox:copyWebToken` | 无 | `{ ok: true }` | 由 Main 进程复制 Token 到剪贴板 |
 | `aibox:pickDirectory` | 无 | `string \| null` | 选择目录 |
 | `aibox:toggleFullscreen` | 无 | `boolean` | 全屏切换 |
 | `aibox:isFullscreen` | 无 | `boolean` | 全屏状态 |
@@ -352,7 +375,7 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:openTaskWorkspace` | `taskId` | `{ ok, message }` | 打开产物目录 |
 | `aibox:openAgentWorkspace` | `agentId` | `{ ok, message }` | 打开工作目录 |
 
-`RendererSettingKey` 仅允许 `theme`、`thresholds`、`notifications`、`demoAutoTasks`。内部设置、健康状态和 `secret:*` 条目均不可通过 Renderer 或 Web 设置接口访问。
+`RendererSettingKey` 仅允许 `theme`、`thresholds`、`notifications`和记忆提案偏好。内部设置、健康状态和 `secret:*` 条目均不可通过 Renderer 或 Web 设置接口访问。
 
 ---
 
@@ -363,7 +386,7 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:mobile:getStatus` | 无 | `MobileGatewayStatus` | 获取 Gateway 状态 |
 | `aibox:mobile:listLanAddresses` | 无 | `string[]` | 获取可绑定的局域网 IPv4 |
 | `aibox:mobile:startGateway` / `stopGateway` | `host, port?` / 无 | 状态 / `void` | 启停 WSS Gateway |
-| `aibox:mobile:createPairing` / `resetCertificate` | 无 | `MobilePairingOffer` / `void` | 创建二维码配对或重置 TLS 身份 |
+| `aibox:androidBridge:createPairing` / `aibox:mobile:resetCertificate` | 无 | `MobilePairingOffer` / `void` | 创建 Android Bridge 执行设备二维码配对或重置 TLS 身份；Hermes 手机对话请使用 `aibox:createHermesMobilePairing` |
 | `aibox:mobile:getToolCatalog` | 无 | `MobileToolCatalog` | 获取 42 个 Android 工具及 Schema |
 | `aibox:mobile:listDevices` | 无 | `MobileDevice[]` | 列出已配对设备 |
 | `aibox:mobile:bindAgent` / `unbindAgent` | 绑定输入 / `agentId` | 配置 / `void` | 绑定或解绑 Android 操作员 Agent |

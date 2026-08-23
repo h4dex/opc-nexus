@@ -3,7 +3,6 @@
  * 真实执行路径：
  *  - Nexus 内置引擎 → OpenAI 兼容 API 流式调用（参考 Cherry Studio 供应商直连模式）
  *  - Codex CLI / Claude Code → child_process headless 拉起（shell:false）
- *  - simulated → 演示回退（引擎未就绪时保持界面鲜活，UI 明确标注"演示模式"）
  */
 import type { ChildProcess } from 'node:child_process';
 import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
@@ -11,7 +10,7 @@ import type { Agent, ExecutorKind, Task } from '../../../shared/types.js';
 /**
  * Immutable executor selection for one dispatch attempt. The requested engine
  * can differ from the resolved engine when the configured fallback is used.
- * Simulated/unavailable dispatches have no real resolved engine.
+ * Unavailable dispatches have no real resolved engine.
  */
 export interface ExecutionBinding {
   requestedEngineId: string;
@@ -51,11 +50,18 @@ export interface ExecutorCallbacks {
   onError(taskId: string, message: string): void;
 }
 
+/** Result of an asynchronous cancellation request. */
+export interface ExecutorAbortResult {
+  status: 'CONFIRMED' | 'COMPLETED' | 'FAILED' | 'UNCONFIRMED';
+  reason?: string;
+  result?: string;
+}
+
 export interface ExecutorAdapter {
   readonly kind: ExecutorKind;
-  /** 引擎是否就绪（未就绪时 registry 回退到 simulated） */
+  /** 引擎是否就绪。 */
   isReady(): boolean;
   start(task: Task, agent: Agent, cb: ExecutorCallbacks): void;
   /** 取消执行：中止网络请求或终止子进程 */
-  abort(taskId: string): void;
+  abort(taskId: string): void | Promise<ExecutorAbortResult>;
 }

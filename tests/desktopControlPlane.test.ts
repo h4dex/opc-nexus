@@ -33,8 +33,13 @@ function testDatabase(): { db: Database; inner: InstanceType<Awaited<ReturnType<
       organization_id TEXT NOT NULL REFERENCES organizations(id),
       archived INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE projects(
+      id TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL REFERENCES organizations(id)
+    );
     CREATE TABLE conversations(
       id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
+      project_id TEXT REFERENCES projects(id),
       organization_id TEXT REFERENCES organizations(id), principal_id TEXT REFERENCES principals(id),
       channel_id TEXT, channel_identity_id TEXT, external_conversation_key TEXT,
       title TEXT NOT NULL, last_message_at INTEGER NOT NULL, message_count INTEGER NOT NULL,
@@ -61,6 +66,9 @@ function testDatabase(): { db: Database; inner: InstanceType<Awaited<ReturnType<
     INSERT INTO agents VALUES('agent-2', 'org-local', 0);
     INSERT INTO agents VALUES('agent-foreign', 'org-other', 0);
     INSERT INTO agents VALUES('agent-archived', 'org-local', 1);
+    INSERT INTO projects VALUES('project-1', 'org-local');
+    INSERT INTO projects VALUES('project-2', 'org-local');
+    INSERT INTO projects VALUES('project-foreign', 'org-other');
   `);
   const db = Reflect.construct(Database as unknown as new () => Database, []);
   db.inner = inner;
@@ -115,6 +123,28 @@ describe('DesktopIngressService', () => {
     expect(scalar(inner, "SELECT task_id FROM messages WHERE direction = 'inbound'")).toBe('task-1');
     expect(scalar(inner, "SELECT COUNT(*) FROM messages WHERE direction = 'outbound'")).toBe(1);
     expect(scalar(inner, "SELECT content FROM messages WHERE direction = 'outbound'")).toBe('报告完成');
+  });
+
+  it('keeps a conversation bound to one project and inherits it on later turns', () => {
+    const { db, inner } = testDatabase();
+    const ingress = new DesktopIngressService(db);
+    const first = ingress.ingest({
+      agentId: 'agent-1', message: '启动项目 Quest', messageKey: 'project-msg-1', projectId: 'project-1'
+    });
+    const continued = ingress.ingest({
+      agentId: 'agent-1', message: '继续上一轮', messageKey: 'project-msg-2', conversationId: first.conversationId
+    });
+
+    expect(first.projectId).toBe('project-1');
+    expect(continued.projectId).toBe('project-1');
+    expect(scalar(inner, `SELECT project_id FROM conversations WHERE id = '${first.conversationId}'`)).toBe('project-1');
+    expect(() => ingress.ingest({
+      agentId: 'agent-1', message: '跨项目续接', messageKey: 'project-msg-3',
+      conversationId: first.conversationId, projectId: 'project-2'
+    })).toThrow('会话不属于所选项目');
+    expect(() => ingress.ingest({
+      agentId: 'agent-1', message: '外部项目', messageKey: 'project-msg-4', projectId: 'project-foreign'
+    })).toThrow('project does not belong to the local organization');
   });
 
   it('rejects foreign or archived agents before creating a local conversation', () => {
@@ -183,13 +213,13 @@ describe('DesktopControlPlane', () => {
     const control = new DesktopControlPlane(db, ingress, { dispatchCanonical } as never);
 
     const result = await control.dispatch({
-      preferredAgentId: 'agent-1', message: '安排财务员工分析现金流', messageKey: 'desktop-control-1'
+      preferredAgentId: 'agent-1', message: '安排财务员工分析现金流', messageKey: 'desktop-control-1', projectId: 'project-1'
     });
 
     expect(result).toMatchObject({ task: { id: 'task-control' } });
     expect(dispatchCanonical).toHaveBeenCalledWith(expect.objectContaining({
       source: 'desktop', channelId: null, organizationId: 'org-local',
-      principalId: 'principal-local-admin', preferredAgentId: 'agent-1'
+      principalId: 'principal-local-admin', preferredAgentId: 'agent-1', projectId: 'project-1'
     }));
     expect(scalar(inner, "SELECT task_id FROM messages WHERE direction = 'inbound'")).toBe('task-control');
   });
@@ -211,5 +241,20 @@ describe('DesktopControlPlane', () => {
     });
 
     expect(dispatchCanonical).toHaveBeenCalledWith(expect.objectContaining({ source: 'voice', channelId: null }));
+  });
+
+  it('rolls back an unlinked inbound message and empty conversation when dispatch is rejected', async () => {
+    const { db, inner } = testDatabase();
+    const ingress = new DesktopIngressService(db);
+    const control = new DesktopControlPlane(db, ingress, {
+      dispatchCanonical: vi.fn(async () => { throw new Error('尚未连接可执行模型'); })
+    } as never);
+
+    await expect(control.dispatch({
+      preferredAgentId: 'agent-1', message: '生成交付报告', messageKey: 'desktop-control-failed'
+    })).rejects.toThrow('尚未连接可执行模型');
+
+    expect(scalar(inner, "SELECT COUNT(*) FROM messages WHERE external_message_key = 'desktop-control-failed'")).toBe(0);
+    expect(scalar(inner, 'SELECT COUNT(*) FROM conversations')).toBe(0);
   });
 });

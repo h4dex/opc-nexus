@@ -8,6 +8,7 @@ import { ProviderManager, type ResolvedProvider } from './providerManager.js';
 import { resolveEngineProvider } from './engineEnv.js';
 
 export const HERMES_AGENT_ENGINE_ID = 'eng-hermes-cli';
+const HERMES_MAX_OUTPUT_TOKENS = 16_384;
 
 export interface PreparedHermesRuntime {
   home: string;
@@ -22,6 +23,7 @@ interface HermesProfileIdentity {
   soulMd: string;
   agentsMd: string;
   userMd: string;
+  memoryMode?: Agent['memoryMode'];
 }
 
 function defaultManagedRoot(): string {
@@ -91,7 +93,8 @@ export class HermesRuntimeProfileService {
     const config = {
       model: {
         default: provider.model,
-        provider: 'opcnexus'
+        provider: 'opcnexus',
+        max_tokens: HERMES_MAX_OUTPUT_TOKENS
       },
       providers: {
         opcnexus: {
@@ -99,8 +102,12 @@ export class HermesRuntimeProfileService {
           api: provider.baseUrl,
           key_env: 'OPENAI_API_KEY',
           default_model: provider.model,
-          transport: 'chat_completions'
+          transport: 'chat_completions',
+          max_tokens: HERMES_MAX_OUTPUT_TOKENS
         }
+      },
+      memory: {
+        memory_enabled: identity.memoryMode === 'long_term'
       }
     };
 

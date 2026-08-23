@@ -1,0 +1,15 @@
+extends: ./electron-builder.yml
+
+directories:
+  output: release-preview
+
+# Manual desktop previews reuse the production file/resource manifest but do
+# not require Android SDK or installer-signing release gates.
+beforePack: null
+afterPack: null
+
+win:
+  signAndEditExecutable: false
+  target:
+    - target: dir
+      arch: [x64]

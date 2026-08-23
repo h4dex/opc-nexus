@@ -9,7 +9,7 @@
  * - 频率约束（官方）：单会话 30 条/分钟；本端仅回执 + 终态两条，天然满足
  */
 import { randomUUID, createDecipheriv } from 'node:crypto';
-import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { app, safeStorage } from 'electron';
@@ -17,6 +17,7 @@ import type { Database } from '../database.js';
 import type { Orchestrator } from '../orchestrator.js';
 import { notify } from '../notifier.js';
 import { dispatchChannelTask, createWs, type ChannelTaskPlanner, type WsLike } from './common.js';
+import { readTaskArtifactManifest, resolveManifestPath } from '../projectArtifactManifest.js';
 
 export const WECOM_BOTID_SETTING = 'channel:wecom:botId';
 export const WECOM_SECRET_REF = 'secret:channel:wecom';
@@ -26,6 +27,8 @@ const CHANNEL_ID = 'ch-wecom';
 const PING_MS = 30_000;
 const SUBSCRIBE_TIMEOUT_MS = 10_000;
 const MAX_REPLY_CHARS = 2000;
+/** B.6 — 单条终态消息最多附带的产物数，避免刷屏 */
+const MAX_CHANNEL_ATTACHMENTS = 5;
 
 /** 长连接帧（下行回调 / 上行命令响应共用外层结构） */
 interface WecomFrame {
@@ -333,9 +336,9 @@ export class WecomChannel {
       sourceKey: body.msgid?.trim() || reqId?.trim(),
       metadata: { chatType: body.chattype ?? null, messageType: body.msgtype ?? null },
       ack: (message) => this.respondStream(ws, reqId, message),
-      final: (message) => {
+      final: (message, taskId) => {
         if (gen !== this.generation || !pushChatId) return;
-        this.sendFinalResult(pushChatId, pushChatType, message);
+        this.sendFinalResult(pushChatId, pushChatType, message, taskId);
       }
     });
   }
@@ -497,28 +500,42 @@ export class WecomChannel {
     }
   }
 
-  /** 智能发送终态结果：检测产物中的文件路径，图片/文件异步上传发送，文本走 markdown */
-  private sendFinalResult(chatId: string, chatType: number, message: string) {
-    const imgExts = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
-    const filePathRegex = /(?:[A-Za-z]:[\\/]|\/{1,2}|~[\/])[\w\-.\\/ ]+\.\w{1,6}/g;
-    const paths = message.match(filePathRegex) ?? [];
-    const mediaPaths = paths.filter((p) => {
-      try { return readFileSync(p.trim()).length > 0; } catch { return false; }
-    });
+  /**
+   * B.6 — 只附带 manifest 已验证过的产物：路径来自 manifest，边界由
+   * `resolveManifestPath` 收口，磁盘不存在的条目直接跳过。限制前 5 个避免刷屏。
+   */
+  private manifestAttachments(taskId: string): Array<{ absolutePath: string; relativePath: string }> {
+    const manifest = readTaskArtifactManifest(this.db, taskId);
+    if (!manifest) return [];
+    const project = this.db.raw
+      .prepare('SELECT workspace FROM projects WHERE id = ? LIMIT 1')
+      .get(manifest.projectId) as { workspace?: unknown } | undefined;
+    const root = typeof project?.workspace === 'string' ? project.workspace : '';
+    if (!root) return [];
 
-    let textPart = message;
-    const mediaSends: Promise<boolean>[] = [];
-    for (const p of mediaPaths) {
-      const trimmed = p.trim();
-      if (imgExts.test(trimmed)) {
-        mediaSends.push(this.sendImage(chatId, chatType, trimmed));
-      } else {
-        mediaSends.push(this.sendFile(chatId, chatType, trimmed));
-      }
-      textPart = textPart.replace(p, '').trim();
+    const files: Array<{ absolutePath: string; relativePath: string }> = [];
+    for (const entry of manifest.entries) {
+      if (files.length >= MAX_CHANNEL_ATTACHMENTS) break;
+      if (!entry.previewable) continue;
+      const absolutePath = resolveManifestPath(root, entry.relativePath);
+      if (!absolutePath || !existsSync(absolutePath)) continue;
+      files.push({ absolutePath, relativePath: entry.relativePath });
     }
-    // 剩余文本走 markdown（不等待媒体上传完成，文本先发）
-    if (textPart) this.sendMarkdown(chatId, chatType, textPart);
+    return files;
+  }
+
+  /** B.6: 发送终态结果，附加 manifest 中的真实项目产物。 */
+  private sendFinalResult(chatId: string, chatType: number, message: string, taskId?: string) {
+    const imgExts = /\.(png|jpe?g|gif|webp|bmp)$/i;
+
+    const artifactFiles = taskId ? this.manifestAttachments(taskId) : [];
+
+    const mediaSends = artifactFiles.map((file) => imgExts.test(file.relativePath)
+      ? this.sendImage(chatId, chatType, file.absolutePath)
+      : this.sendFile(chatId, chatType, file.absolutePath, file.relativePath));
+
+    // 文本走 markdown（不等待媒体上传完成，文本先发）
+    if (message) this.sendMarkdown(chatId, chatType, message);
     // 媒体异步发送，失败静默
     void Promise.allSettled(mediaSends);
   }

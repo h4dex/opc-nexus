@@ -112,6 +112,8 @@ export class ResourceMonitor {
     diskTotal: 0
   };
   private listeners = new Set<(s: ResourceSample) => void>();
+  private guardListeners = new Set<(current: string | null, previous: string | null) => void>();
+  private lastGuardReason: string | null = null;
   private health: ServiceHealth = { runtime: 'healthy', gateway: 'healthy', database: 'healthy' };
   /** 阈值提供方（读 settings，由 main 注入） */
   private thresholds: () => Thresholds = () => ({ cpu: 85, mem: 85, gpuTemp: 85 });
@@ -215,6 +217,12 @@ export class ResourceMonitor {
     return () => this.listeners.delete(fn);
   }
 
+  /** Emits only when the dispatch guard enters, changes, or leaves a blocked state. */
+  onGuardChange(fn: (current: string | null, previous: string | null) => void): () => void {
+    this.guardListeners.add(fn);
+    return () => this.guardListeners.delete(fn);
+  }
+
   getHistory(): ResourceSample[] {
     return this.history;
   }
@@ -243,6 +251,18 @@ export class ResourceMonitor {
   private emit(s: ResourceSample) {
     this.history.push(s);
     if (this.history.length > HISTORY_LIMIT) this.history.splice(0, this.history.length - HISTORY_LIMIT);
+    const guardReason = this.getGuardReason();
+    if (guardReason !== this.lastGuardReason) {
+      const previous = this.lastGuardReason;
+      this.lastGuardReason = guardReason;
+      for (const fn of this.guardListeners) {
+        try {
+          fn(guardReason, previous);
+        } catch {
+          /* listener failures must not stop resource sampling */
+        }
+      }
+    }
     this.checkThresholds(s);
     for (const fn of this.listeners) {
       try {

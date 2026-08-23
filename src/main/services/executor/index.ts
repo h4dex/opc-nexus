@@ -2,9 +2,9 @@
  * 执行器注册表：主辅引擎策略（P1）。
  * 解析顺序：主引擎（agent.engineId）就绪 → 用主引擎；
  * 否则辅助引擎（user/config.yaml engine.fallbackEngineId，默认 eng-opencode）就绪 → 回退辅助引擎；
- * 两者均不可用时按执行模式分流：production = 返回 null（任务如实 FAILED，绝不伪装完成）；
- * demo = SimulatedExecutor（UI 标注演示模式）。
- * Hermes 与 Pi 使用专属执行器；Codex、Claude Code、OpenCode 使用对应 CLI 适配器；DSH 与自定义引擎走 ACP。
+ * 两者均不可用时返回 null（任务如实 FAILED，绝不伪装完成）。
+ * Hermes 与 Pi 使用专属执行器；Codex、Claude Code、OpenCode 使用对应 CLI 适配器；
+ * 自定义外部引擎走 ACP。
  *
  * @author liyingjie <y@senke.com>
  */
@@ -16,11 +16,11 @@ import { CliExecutor } from './cliExecutor.js';
 import { HermesAgentExecutor } from './hermesAgentExecutor.js';
 import { PiAgentExecutor } from './piAgentExecutor.js';
 import { AcpExecutor } from './acpExecutor.js';
-import { SimulatedExecutor } from './simulatedExecutor.js';
 import { loadUserConfig } from '../userConfig.js';
 import type { ToolHost } from './tools.js';
 import type { ExecutionBinding, ExecutorAdapter, ExecutorCallbacks } from './types.js';
 import { PiRuntimeProfileService } from '../piRuntimeProfile.js';
+import { MemoryService } from '../memoryService.js';
 import {
   ANDROID_OPERATOR_ENGINE_ID,
   androidOperatorEngineError,
@@ -41,7 +41,6 @@ interface RunningExecutor {
 export class ExecutorRegistry {
   private llm: LlmApiExecutor;
   private acp: AcpExecutor;
-  private sim: SimulatedExecutor;
   /** 真实 Hermes Agent CLI（专属执行器：-z headless + usage-file 会话锚点） */
   private hermes: HermesAgentExecutor;
   private pi: PiAgentExecutor;
@@ -49,15 +48,21 @@ export class ExecutorRegistry {
   private cliByType = new Map<string, CliExecutor>();
   /** taskId → 正在执行它的适配器（用于 abort） */
   private running = new Map<string, RunningExecutor>();
+  private readonly memory: MemoryService;
 
-  constructor(private db: Database, broker: ApprovalBroker, providerMgr?: import('../providerManager.js').ProviderManager) {
+  constructor(
+    private db: Database,
+    broker: ApprovalBroker,
+    providerMgr?: import('../providerManager.js').ProviderManager,
+    claudeGateway?: () => { baseUrl: string; key: string } | null
+  ) {
+    this.memory = new MemoryService(db);
     this.llm = new LlmApiExecutor(db, broker, providerMgr);
     this.acp = new AcpExecutor(db, broker);
-    this.sim = new SimulatedExecutor();
     this.hermes = new HermesAgentExecutor(db);
     this.pi = new PiAgentExecutor(db, new PiRuntimeProfileService(db, providerMgr));
     this.cliByType.set('codex', new CliExecutor('codex-cli', db, 'eng-codex'));
-    this.cliByType.set('claude', new CliExecutor('claude-cli', db, 'eng-claude'));
+    this.cliByType.set('claude', new CliExecutor('claude-cli', db, 'eng-claude', ['-p', '{prompt}'], claudeGateway));
     this.cliByType.set('opencode', new CliExecutor('generic-cli', db, 'eng-opencode', ['run', '{prompt}']));
   }
 
@@ -115,7 +120,7 @@ export class ExecutorRegistry {
     return row?.status ?? 'NOT_INSTALLED';
   }
 
-  /** 主辅解析：主引擎 → 辅助引擎 →（demo 模式）模拟器 / （production 模式）null */
+  /** 主辅解析：主引擎 → 辅助引擎 → null。 */
   private resolve(engineId: string, allowFallback = true): ResolvedExecutor | null {
     const primary = this.adapterFor(engineId);
     if (primary) return { adapter: primary, engineId, usedFallback: false };
@@ -126,17 +131,13 @@ export class ExecutorRegistry {
       const fallback = this.adapterFor(cfg.engine.fallbackEngineId);
       if (fallback) return { adapter: fallback, engineId: cfg.engine.fallbackEngineId, usedFallback: true };
     }
-    return cfg.engine.executionMode === 'production' ? null : { adapter: this.sim, engineId: null, usedFallback: true };
+    return null;
   }
 
-  /** 该引擎当前会使用的执行方式（供 UI 标注 真实/演示；production 无可用引擎显示 unavailable） */
+  /** 该引擎当前会使用的执行方式。 */
   kindFor(engineId: string): ExecutorKind {
     const adapter = this.resolve(engineId);
-    if (!adapter) {
-      const cfg = loadUserConfig();
-      return cfg.engine.executionMode === 'production' ? 'unavailable' : 'simulated';
-    }
-    return adapter.adapter.kind;
+    return adapter?.adapter.kind ?? 'unavailable';
   }
 
   /** 派发任务执行；production 模式无可用引擎 → 直接回报错误（任务 FAILED，不伪装成功） */
@@ -146,6 +147,11 @@ export class ExecutorRegistry {
     cb: ExecutorCallbacks,
     onResolved?: (binding: ExecutionBinding) => void
   ): ExecutorKind {
+    const memoryMode = agent.memoryMode ?? 'short_term';
+    const executionTask: Task = memoryMode === 'none' && task.sessionId !== null
+      ? { ...task, sessionId: null }
+      : task;
+    const executionAgent = this.withDurableMemory(agent, executionTask);
     // P1 修复：编码委派优先 —— task.engineOverride 覆盖 agent.engineId
     const targetEngineId = task.engineOverride || agent.engineId;
     const mobileEngineError = androidOperatorEngineError(agent.kind, targetEngineId);
@@ -181,7 +187,7 @@ export class ExecutorRegistry {
           ? androidOperatorRuntimeUnavailableError()
           : exactEngineBinding
             ? `任务固定的执行引擎不可用：${targetEngineId}（已禁止静默切换到其他引擎）`
-            : '无可用执行引擎（production 模式不允许演示回退）：请检查主引擎与辅助引擎的安装/配置状态');
+            : '无可用执行引擎：请检查主引擎与辅助引擎的安装/配置状态');
       cb.onError(task.id, message);
       return 'unavailable';
     }
@@ -193,24 +199,63 @@ export class ExecutorRegistry {
       this.running.delete(id);
       return true;
     };
-    adapter.start(task, { ...agent, engineId: engineId ?? targetEngineId }, {
+    adapter.start(executionTask, { ...executionAgent, engineId: engineId ?? targetEngineId }, {
       onStage: (id, stage) => cb.onStage(id, stage),
       onProgress: (id, pct) => cb.onProgress(id, pct),
       onOutput: (id, chunk) => cb.onOutput(id, chunk),
-      onSession: (id, sessionId) => cb.onSession?.(id, sessionId),
+      onSession: (id, sessionId) => {
+        if (memoryMode !== 'none') cb.onSession?.(id, sessionId);
+      },
       onReleased: (id) => {
         if (release(id)) cb.onReleased?.(id);
       },
       onDone: (id, result) => {
+        // A paused/retried task can already have a replacement execution with
+        // the same durable task id. Never let the old process settle the new
+        // generation when its terminal callback arrives late.
+        if (this.running.get(id) !== running) return;
         if (adapter.kind !== 'acp') release(id);
         cb.onDone(id, result);
       },
       onError: (id, message) => {
+        if (this.running.get(id) !== running) return;
         if (adapter.kind !== 'acp') release(id);
         cb.onError(id, message);
       }
     });
     return adapter.kind;
+  }
+
+  private withDurableMemory(agent: Agent, task: Task): Agent {
+    if ((agent.memoryMode ?? 'short_term') !== 'long_term') return agent;
+    try {
+      const row = this.db.raw.prepare('SELECT organization_id FROM agents WHERE id = ?').get(agent.id) as
+        | { organization_id?: string }
+        | undefined;
+      if (!row?.organization_id) return agent;
+      const recalled = this.memory.recall({
+        organizationId: row.organization_id,
+        agentId: agent.id,
+        projectId: task.projectId,
+        query: task.content || task.title,
+        limit: 8
+      });
+      if (recalled.length === 0) return agent;
+      const memoryContext = recalled.map((item, index) => `${index + 1}. ${item.content}`).join('\n');
+      return {
+        ...agent,
+        systemPrompt: [
+          agent.systemPrompt,
+          '# 已接受的长期记忆',
+          '以下内容仅作为历史上下文；若与当前任务或项目事实冲突，以当前事实为准。',
+          memoryContext
+        ].filter(Boolean).join('\n\n')
+      };
+    } catch {
+      // A memory index problem must not silently widen scope. Execute without
+      // durable recall; the task itself still follows its configured engine.
+      return agent;
+    }
   }
 
   abort(taskId: string): void {

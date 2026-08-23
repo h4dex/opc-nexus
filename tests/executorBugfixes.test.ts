@@ -131,10 +131,10 @@ describe('[P2] production 无引擎时不再误报演示模式', () => {
     expect(reg.kindFor('eng-codex')).toBe('unavailable');
   });
 
-  it('demo 模式下仍返回 simulated(演示回退仍可用)', () => {
+  it('旧版 demo 配置不再启用模拟回退', () => {
     userCfg.engine.executionMode = 'demo';
     const reg = new ExecutorRegistry(makeDb(dead), mockBroker());
-    expect(reg.kindFor('eng-codex')).toBe('simulated');
+    expect(reg.kindFor('eng-codex')).toBe('unavailable');
   });
 
   it('dispatch 报错且 kind 为 unavailable,任务落 FAILED 而非伪装完成', () => {

@@ -17,7 +17,7 @@ const PERM_META: Record<PermissionMode, { label: string; color: string }> = {
   readonly: { label: '只读', color: 'var(--text-3)' },
   standard: { label: '标准审批', color: 'var(--warning)' },
   trusted: { label: '受信任', color: 'var(--accent)' },
-  autonomous: { label: '完全自主', color: 'var(--success)' }
+  autonomous: { label: '项目自主', color: 'var(--success)' }
 };
 
 function PermBadge({ mode, onChange }: { mode: PermissionMode; onChange: (m: PermissionMode) => void }) {
@@ -192,8 +192,8 @@ export function Dashboard() {
               <div>
                 <div className="t">模型服务状态</div>
                 <div className="v">
-                  <span className={`dot ${resources.health.runtime === 'healthy' ? 'green' : 'red'}`} style={{ marginRight: 6 }} />
-                  {resources.health.runtime === 'healthy' ? '全部正常' : '存在异常'}
+                  <span className={`dot ${snapshot.executorAvailable ? 'green' : 'orange'}`} style={{ marginRight: 6 }} />
+                  {snapshot.executorAvailable ? '可执行' : '待配置'}
                 </div>
               </div>
             </div>

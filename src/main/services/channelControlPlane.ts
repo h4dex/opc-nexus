@@ -26,6 +26,7 @@ export interface CanonicalControlPlaneInput {
   message: string;
   preferredAgentId: string;
   projectId?: string | null;
+  routingMode?: KernelRequest['routingMode'];
 }
 
 type Row = Record<string, unknown>;
@@ -90,7 +91,11 @@ export class ChannelControlPlane {
       inputMessageId: input.ingress.messageId,
       message: input.message,
       preferredAgentId: input.preferredAgentId,
-      projectId: input.projectId
+      projectId: input.projectId,
+      // Legacy channel ingress is only a compatibility path. Hermes owns
+      // project conversations; if this path is used, execute only the
+      // explicitly selected worker and never promote a CLI to a scheduler.
+      routingMode: 'direct-worker'
     });
   }
 
@@ -144,6 +149,7 @@ export class ChannelControlPlane {
       conversationId: input.conversationId,
       inputMessageId: input.inputMessageId,
       message: input.message,
+      routingMode: 'direct-worker',
       preferredAgentId: agentId,
       projectId: input.projectId ?? null,
       workers: [worker],
@@ -172,6 +178,10 @@ export class ChannelControlPlane {
     const preferred = workers.some((worker) => worker.agentId === input.preferredAgentId)
       ? input.preferredAgentId
       : null;
+    // Hermes is the only planner. This legacy dispatch plane may execute an
+    // explicitly selected worker, but it never selects a CLI as an
+    // owner-facing control kernel.
+    const routingMode = 'direct-worker' as const;
     const recallContext = {
       organizationId: input.organizationId,
       principalId: input.principalId,
@@ -198,6 +208,7 @@ export class ChannelControlPlane {
       conversationId: input.conversationId,
       inputMessageId: input.inputMessageId,
       message: input.message,
+      routingMode,
       preferredAgentId: preferred,
       projectId: input.projectId ?? null,
       workers,

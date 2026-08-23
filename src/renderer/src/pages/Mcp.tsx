@@ -70,7 +70,7 @@ export function Mcp() {
         <h2>MCP 管理</h2>
         <span className="desc">{servers.length} 个服务器 · {servers.filter((server) => server.running).length} 个运行中 · {tools.length} 个工具</span>
         <div className="right">
-          <button className="btn small" title={browserAgents.length === 0 ? '目前仅支持 Nexus Agent' : '连接已登录浏览器'} onClick={() => setBrowserOpen(true)} disabled={browserAgents.length === 0}>
+          <button className="btn small" title={browserAgents.length === 0 ? '目前仅支持内置员工执行器' : '连接已登录浏览器'} onClick={() => setBrowserOpen(true)} disabled={browserAgents.length === 0}>
             <IconPlay size={13} />连接浏览器
           </button>
           <button className="btn small primary" onClick={() => setAddOpen(true)}><IconPlus size={13} />添加服务器</button>

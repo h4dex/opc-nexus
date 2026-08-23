@@ -4,14 +4,15 @@ import { useApp } from '../store';
 import { Modal } from '../components/common';
 import { MobileToolPolicy } from './MobileToolPolicy';
 import type {
-  Agent, AgentCapabilities, AgentKind, MobileAgentConfig, MobileDevice, MobileToolCatalog, MobileToolName, PermissionMode
+  Agent, AgentCapabilities, AgentKind, AgentMemoryMode, MobileAgentConfig, MobileDevice, MobileToolCatalog, MobileToolName, PermissionMode
 } from '@shared/types';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
 
 const PERM_OPTIONS: { value: PermissionMode; label: string; desc: string; color: string }[] = [
   { value: 'readonly', label: '只读', desc: '仅允许读取操作，写入/删除一律禁止', color: 'var(--text-3)' },
   { value: 'standard', label: '标准审批', desc: '写入/删除操作需人工审批后执行', color: 'var(--warning)' },
-  { value: 'trusted', label: '受信任', desc: '自动执行所有操作（渠道来源仍需审批）', color: 'var(--accent)' },
-  { value: 'autonomous', label: '完全自主', desc: '无需任何审批，所有操作自动执行', color: 'var(--success)' }
+  { value: 'trusted', label: '受信任（兼容）', desc: '兼容旧配置，仍受项目工作目录边界约束', color: 'var(--accent)' },
+  { value: 'autonomous', label: '项目自主', desc: '项目目录内自动执行；目录外拒绝，不可逆外部动作单独确认', color: 'var(--success)' }
 ];
 
 /** 人设预设模板 */
@@ -32,6 +33,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
   const [systemPrompt, setSystemPrompt] = useState(agent.systemPrompt);
   const [role, setRole] = useState(agent.role);
   const [permMode, setPermMode] = useState<PermissionMode>(agent.permissionMode);
+  const [memoryMode, setMemoryMode] = useState<AgentMemoryMode>(agent.memoryMode ?? 'short_term');
   const [caps, setCaps] = useState<AgentCapabilities>(agent.capabilities ?? { network: false, shell: false, install: false, browser: false, computer: false, mobile: false });
   const [tags, setTags] = useState<string[]>(agent.tags ?? []);
   const [tagInput, setTagInput] = useState('');
@@ -88,7 +90,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
         throw new Error('绑定新设备前必须确认完整手机工具授权');
       }
       const updated = await window.aibox.updateAgentPersona(agent.id, {
-        role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, capabilities: caps,
+        role, systemPrompt, soulMd, agentsMd, userMd, permissionMode: permMode, memoryMode, capabilities: caps,
         tags, modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined,
         engineId: kind === 'android_operator' ? 'eng-hermes-cli' : engineId,
         modelOverride: modelOverride || undefined,
@@ -112,7 +114,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
     }
   };
 
-  // 组合预览：模拟执行器拼装 system prompt 的逻辑
+  // 组合预览：与真实执行器相同的人设指令拼装逻辑
   const composedPreview = [
     soulMd && `# 身份与性格\n${soulMd}`,
     systemPrompt,
@@ -223,7 +225,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
               <button className={`chip ${kind === 'general' ? 'on' : ''}`} onClick={() => chooseKind('general')}>通用数字员工</button>
               <button className={`chip ${kind === 'android_operator' ? 'on' : ''}`} onClick={() => chooseKind('android_operator')}>Android 手机操作员</button>
             </div>
-            {kind === 'android_operator' && <div className="hint">固定 Hermes Agent CLI、并发 1，关闭网络、Shell、安装、浏览器和桌面操控能力。DeepSeek Harness 和其他 Runtime 当前没有 Android 工具桥接。</div>}
+            {kind === 'android_operator' && <div className="hint">固定 Hermes Agent CLI、并发 1，关闭网络、Shell、安装、浏览器和桌面操控能力。其他执行 Runtime 当前没有 Android 工具桥接。</div>}
           </div>
           <div className="field">
             <label>职责描述</label>
@@ -248,6 +250,27 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
             <label>基础 System Prompt（补充指令，与人设文件组合生效）</label>
             <textarea style={{ ...textareaStyle, minHeight: 100 }} value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)}
               placeholder="额外的系统级指令…" />
+          </div>
+
+          <div className="field">
+            <label>记忆策略</label>
+            <div className="automation-segmented" role="group" aria-label="数字员工记忆策略">
+              {([
+                ['long_term', '长期记忆'],
+                ['short_term', '当前会话'],
+                ['none', '无记忆']
+              ] as Array<[AgentMemoryMode, string]>).map(([mode, label]) => (
+                <button key={mode} type="button" className={memoryMode === mode ? 'active' : ''}
+                  aria-pressed={memoryMode === mode} onClick={() => setMemoryMode(mode)}>{label}</button>
+              ))}
+            </div>
+            <div className="hint">
+              {memoryMode === 'long_term'
+                ? '跨会话召回该员工已接受的长期记忆，同时保留当前会话上下文。'
+                : memoryMode === 'none'
+                  ? '每次调用独立执行，不读取历史，也不保存可续接会话。'
+                  : '只延续当前会话，不跨会话读取历史。'}
+            </div>
           </div>
 
           {/* 能力开关 */}
@@ -299,7 +322,7 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
                 </option>
               ))}
             </select>
-            <div className="hint">新设备请先在“手机控制台”启动 Gateway 并扫码配对。</div>
+            <div className="hint">实体 Android Worker 的设备接入由“Android 执行设备”管理；它不属于手机对话。手机对话扫码入口只有 Quest 右上角的 Hermes 连接。</div>
           </div>
           <div className="field">
             <label>Hermes Profile</label>
@@ -378,10 +401,14 @@ export function AgentEditor({ agent, onClose }: { agent: Agent; onClose: () => v
 /** 引擎选择下拉：从 snapshot.engines 中筛选可用引擎 */
 function EngineSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const { snapshot } = useApp();
-  const engines = (snapshot?.engines ?? []).filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status));
+  const engines = (snapshot?.engines ?? []).filter((e) =>
+    isUserVisibleEngine(e) && ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)
+  );
+  const selectedIsMissing = Boolean(value) && !engines.some((engine) => engine.id === value);
   return (
     <select value={value} onChange={(e) => onChange(e.target.value)} style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-1)', fontSize: 13 }}>
-      {engines.map((e) => <option key={e.id} value={e.id}>{e.name}{e.isDefault ? ' (默认)' : ''}{e.status === 'SETUP_REQUIRED' ? ' [演示模式]' : ''}</option>)}
+      {selectedIsMissing && <option value={value} disabled>已移除的旧引擎，请重新选择</option>}
+      {engines.map((e) => <option key={e.id} value={e.id}>{e.name}{e.isDefault ? ' (默认)' : ''}{e.status === 'SETUP_REQUIRED' ? ' [待配置]' : ''}</option>)}
       {engines.length === 0 && <option value="">无可用引擎</option>}
     </select>
   );

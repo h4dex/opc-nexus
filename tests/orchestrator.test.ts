@@ -330,7 +330,7 @@ describe('Orchestrator 状态机', () => {
       });
       orch.setMobileDispatchPolicy({ canDispatch: () => ({ bound: true, ready: true, reason: '' }) });
 
-      expect(() => orch.createTask(agentId, '操作手机')).toThrow('DeepSeek Harness 和其他执行引擎目前没有 Android 工具桥接');
+      expect(() => orch.createTask(agentId, '操作手机')).toThrow('其他执行引擎目前没有 Android 工具桥接');
       expect(executors.dispatch).not.toHaveBeenCalled();
     });
 
@@ -489,6 +489,114 @@ describe('Orchestrator 状态机', () => {
       expect(followUp.parentId).toBe(task.id);
     });
 
+    it('项目任务只有在 Artifact Manifest 校验通过后才能完成', async () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const validateTaskCompletion = vi.fn().mockResolvedValue({
+        ok: true,
+        manifest: {
+          schemaVersion: 1,
+          projectId,
+          sourceTaskId: 'pending',
+          generatedAt: 123,
+          totalBytes: 12,
+          entries: [{
+            relativePath: 'result.md', mediaType: 'text/markdown', size: 12, sha256: 'a'.repeat(64),
+            modifiedAt: 100, sourceTaskId: 'pending', version: 1, validationState: 'verified',
+            previewKind: 'markdown', previewable: true, run: null
+          }],
+          truncated: false,
+          validation: { status: 'verified', reason: null }
+        }
+      });
+      orch.setProjectArtifactCompletionValidator({ validateTaskCompletion });
+      const task = orch.createTask(agentId, '生成项目成果', 'desktop', { projectId });
+      const callbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+
+      callbacks.onDone(task.id, '执行器声称完成');
+
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'RUNNING', stage: '校验项目产物' });
+      await vi.waitFor(() => expect(db.tables.tasks.get(task.id)?.status).toBe('COMPLETED'));
+      expect(validateTaskCompletion).toHaveBeenCalledWith(expect.objectContaining({ taskId: task.id, projectId }));
+      const manifestEvent = [...db.tables.task_events.values()].find((event) =>
+        event.task_id === task.id && event.event_type === 'artifact_manifest'
+      );
+      expect(JSON.parse(String(manifestEvent?.payload))).toMatchObject({
+        manifest: { projectId, entries: [{ relativePath: 'result.md', sha256: 'a'.repeat(64) }] }
+      });
+    });
+
+    it('项目内纯对话任务不强制要求文件产物', async () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const validateTaskCompletion = vi.fn();
+      orch.setProjectArtifactCompletionValidator({ validateTaskCompletion });
+      const task = orch.createTask(agentId, '返回一句路由确认，不创建文件', 'team', {
+        projectId,
+        requiresArtifacts: false
+      });
+      const callbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+
+      callbacks.onDone(task.id, '路由确认完成');
+
+      await vi.waitFor(() => expect(db.tables.tasks.get(task.id)?.status).toBe('COMPLETED'));
+      expect(db.tables.tasks.get(task.id)?.result).toBe('路由确认完成');
+      expect(validateTaskCompletion).not.toHaveBeenCalled();
+      expect([...db.tables.task_events.values()].some((event) =>
+        event.task_id === task.id && event.event_type === 'artifact_manifest'
+      )).toBe(false);
+    });
+
+    it('项目任务没有真实文件时拒绝假完成并阻断依赖任务', async () => {
+      const upstreamAgent = seedAgent(db, { name: '项目执行员工' });
+      const downstreamAgent = seedAgent(db, { name: '项目验收员工' });
+      const projectId = seedProject(db);
+      orch.setProjectArtifactCompletionValidator({
+        validateTaskCompletion: vi.fn().mockResolvedValue({ ok: false, error: '未检测到真实项目产物' })
+      });
+      const upstream = orch.createTask(upstreamAgent, '生成项目成果', 'desktop', { projectId });
+      const downstream = orch.createTask(downstreamAgent, '验收项目成果', 'team', {
+        projectId,
+        dependencyTaskIds: [upstream.id]
+      });
+      const callbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+
+      callbacks.onDone(upstream.id, '只有文本，没有文件');
+
+      await vi.waitFor(() => expect(db.tables.tasks.get(upstream.id)?.status).toBe('FAILED'));
+      expect(db.tables.tasks.get(upstream.id)?.error).toContain('未检测到真实项目产物');
+      expect(db.tables.tasks.get(downstream.id)?.status).toBe('CANCELLED');
+      expect([...db.tables.task_events.values()].some((event) =>
+        event.task_id === upstream.id && event.event_type === 'artifact_validation_failed'
+      )).toBe(true);
+    });
+
+    it('审批恢复重置 started_at 时仍接纳任务创建后写入的真实产物', async () => {
+      const agentId = seedAgent(db);
+      const projectId = seedProject(db);
+      const validateTaskCompletion = vi.fn().mockResolvedValue({
+        ok: true,
+        manifest: {
+          schemaVersion: 1, projectId, sourceTaskId: 'pending', generatedAt: 123,
+          totalBytes: 1, entries: [], truncated: false,
+          validation: { status: 'verified', reason: null }
+        }
+      });
+      orch.setProjectArtifactCompletionValidator({ validateTaskCompletion });
+      const task = orch.createTask(agentId, '审批恢复后的项目成果', 'desktop', { projectId });
+      const row = db.tables.tasks.get(task.id)!;
+      const createdAt = Number(row.created_at);
+      row.started_at = createdAt + 60_000;
+      const callbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+
+      callbacks.onDone(task.id, '执行器完成');
+
+      await vi.waitFor(() => expect(db.tables.tasks.get(task.id)?.status).toBe('COMPLETED'));
+      expect(validateTaskCompletion).toHaveBeenCalledWith(expect.objectContaining({
+        taskId: task.id, projectId, startedAt: createdAt
+      }));
+    });
+
     it('allows parent and project associations inside one organization', () => {
       const agentId = seedAgent(db, { organization_id: 'org-a' });
       const projectId = seedProject(db, { organization_id: 'org-a' });
@@ -577,6 +685,114 @@ describe('Orchestrator 状态机', () => {
       // 第二个任务应排队
       const task2 = orch.createTask(agentId, '任务2');
       expect(task2.status).toBe('QUEUED');
+    });
+
+    it('任务依赖未完成时保持 QUEUED，前置完成后跨员工唤醒', () => {
+      const upstreamAgent = seedAgent(db, { name: '上游员工', organization_id: 'org-local' });
+      const downstreamAgent = seedAgent(db, { name: '下游员工', organization_id: 'org-local' });
+      const upstream = orch.createTask(upstreamAgent, '先行任务');
+      const downstream = orch.createTask(downstreamAgent, '后续任务', 'team', {
+        dependencyTaskIds: [upstream.id]
+      });
+
+      expect(downstream.status).toBe('QUEUED');
+      expect(downstream.stage).toContain('等待前置任务');
+      expect(db.tables.task_dependencies.get(`${downstream.id}:${upstream.id}`)).toBeTruthy();
+      expect(executors.dispatch).toHaveBeenCalledTimes(1);
+
+      const upstreamCallbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+      upstreamCallbacks.onDone(upstream.id, 'upstream result');
+
+      expect(db.tables.tasks.get(upstream.id)?.status).toBe('COMPLETED');
+      expect(db.tables.tasks.get(downstream.id)?.status).toBe('RUNNING');
+      expect(executors.dispatch).toHaveBeenCalledTimes(2);
+    });
+
+    it('前置失败会递归取消下游，且不会启动任何被阻断任务', () => {
+      const upstreamAgent = seedAgent(db, { name: '失败上游' });
+      const downstreamAgent = seedAgent(db, { name: '失败下游' });
+      const leafAgent = seedAgent(db, { name: '失败末端' });
+      const upstream = orch.createTask(upstreamAgent, '会失败的任务');
+      const downstream = orch.createTask(downstreamAgent, '不应执行的任务', 'team', {
+        dependencyTaskIds: [upstream.id]
+      });
+      const leaf = orch.createTask(leafAgent, '不应执行的末端', 'team', {
+        dependencyTaskIds: [downstream.id]
+      });
+      const finished = vi.fn();
+      orch.onTaskFinished(finished);
+
+      const upstreamCallbacks = vi.mocked(executors.dispatch).mock.calls[0][2];
+      upstreamCallbacks.onError(upstream.id, 'upstream failed');
+
+      expect(db.tables.tasks.get(upstream.id)?.status).toBe('FAILED');
+      expect(db.tables.tasks.get(downstream.id)).toMatchObject({ status: 'CANCELLED', stage: '依赖失败' });
+      expect(db.tables.tasks.get(leaf.id)).toMatchObject({ status: 'CANCELLED', stage: '依赖失败' });
+      expect(executors.dispatch).toHaveBeenCalledTimes(1);
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: downstream.id, status: 'CANCELLED' }));
+      expect(finished).toHaveBeenCalledWith(expect.objectContaining({ taskId: leaf.id, status: 'CANCELLED' }));
+    });
+
+    it('前置取消同样递归阻断下游', () => {
+      const upstreamAgent = seedAgent(db, { name: '取消上游' });
+      const downstreamAgent = seedAgent(db, { name: '取消下游' });
+      const upstream = orch.createTask(upstreamAgent, '将被取消');
+      const downstream = orch.createTask(downstreamAgent, '取消后不得执行', 'team', {
+        dependencyTaskIds: [upstream.id]
+      });
+
+      orch.cancelTask(upstream.id, '老板取消上游');
+
+      expect(db.tables.tasks.get(upstream.id)?.status).toBe('CANCELLED');
+      expect(db.tables.tasks.get(downstream.id)).toMatchObject({ status: 'CANCELLED', stage: '依赖失败' });
+      expect(executors.dispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('取消委派树中的 descendant 也会阻断依赖它的后继任务', () => {
+      const rootAgent = seedAgent(db, { name: '委派根员工', concurrency_limit: 2 });
+      const childAgent = seedAgent(db, { name: '委派子员工' });
+      const dependentAgent = seedAgent(db, { name: '委派后继员工' });
+      const root = orch.createTask(rootAgent, '委派根任务');
+      const child = orch.createTask(childAgent, '委派子任务', 'delegated', { parentId: root.id });
+      const dependent = orch.createTask(dependentAgent, '依赖委派子任务', 'team', {
+        dependencyTaskIds: [child.id]
+      });
+
+      expect(dependent.status).toBe('QUEUED');
+      orch.cancelTask(root.id, '老板取消委派树');
+
+      expect(db.tables.tasks.get(root.id)?.status).toBe('CANCELLED');
+      expect(db.tables.tasks.get(child.id)?.status).toBe('CANCELLED');
+      expect(db.tables.tasks.get(dependent.id)).toMatchObject({ status: 'CANCELLED', stage: '依赖失败' });
+    });
+
+    it('依赖阻塞不会卡住同一员工后面的独立任务', () => {
+      const upstreamAgent = seedAgent(db, { name: '队列上游' });
+      const workerAgent = seedAgent(db, { name: '队列员工', concurrency_limit: 1 });
+      const upstream = orch.createTask(upstreamAgent, '尚未完成的上游');
+      const occupying = orch.createTask(workerAgent, '占用执行槽');
+      const blocked = orch.createTask(workerAgent, '等待依赖', 'team', { dependencyTaskIds: [upstream.id] });
+      const independent = orch.createTask(workerAgent, '独立后续');
+
+      expect(blocked.status).toBe('QUEUED');
+      expect(independent.status).toBe('QUEUED');
+      const occupyingCallbacks = vi.mocked(executors.dispatch).mock.calls[1][2];
+      occupyingCallbacks.onDone(occupying.id, 'slot released');
+
+      expect(db.tables.tasks.get(blocked.id)?.status).toBe('QUEUED');
+      expect(db.tables.tasks.get(independent.id)?.status).toBe('RUNNING');
+    });
+
+    it('拒绝跨组织任务依赖并保持数据库无副作用', () => {
+      const localAgent = seedAgent(db, { organization_id: 'org-local' });
+      const foreignAgent = seedAgent(db, { organization_id: 'org-foreign' });
+      const foreignTask = orch.createTask(foreignAgent, '外部任务');
+      const before = db.tables.tasks.size;
+
+      expect(() => orch.createTask(localAgent, '跨组织依赖', 'team', { dependencyTaskIds: [foreignTask.id] }))
+        .toThrow('任务依赖跨组织');
+      expect(db.tables.tasks.size).toBe(before);
+      expect(db.tables.task_dependencies.size).toBe(0);
     });
 
     it('cancelTask → CANCELLED 并触发 FIFO 补位', () => {
@@ -697,6 +913,21 @@ describe('Orchestrator 状态机', () => {
       db.tables.tasks.get(parent.id)!.ended_at = Date.now();
       orch.createTask(agentId, '后续任务', 'desktop', { parentId: parent.id });
       expect(() => orch.deleteTask(parent.id)).toThrow('后续任务');
+    });
+
+    it('有活跃依赖后继时拒绝软删除前置任务', () => {
+      const upstreamAgent = seedAgent(db, { name: '待删除前置' });
+      const downstreamAgent = seedAgent(db, { name: '依赖后继' });
+      const upstream = orch.createTask(upstreamAgent, '前置任务');
+      const downstream = orch.createTask(downstreamAgent, '后继任务', 'team', {
+        dependencyTaskIds: [upstream.id]
+      });
+      db.tables.tasks.get(upstream.id)!.status = 'COMPLETED';
+      db.tables.tasks.get(upstream.id)!.ended_at = Date.now();
+
+      expect(downstream.status).toBe('QUEUED');
+      expect(() => orch.deleteTask(upstream.id)).toThrow('未完成的依赖后续任务');
+      expect(db.tables.tasks.get(upstream.id)?.deleted_at).toBeNull();
     });
 
     it('pauseTask → PAUSED（仅 RUNNING 可暂停）', () => {
@@ -1002,17 +1233,19 @@ describe('Orchestrator 状态机', () => {
     });
 
     it('dispatchGuard 解除后恢复正常派发', () => {
-      orch.setDispatchGuard(() => '资源保护中');
+      let guardReason: string | null = '资源保护中';
+      orch.setDispatchGuard(() => guardReason);
       const agentId = seedAgent(db);
       const task = orch.createTask(agentId, '等待任务');
-      expect(task.status).toBe('QUEUED');
+      expect(task).toMatchObject({ status: 'QUEUED', stage: '资源保护中' });
 
-      // 解除保护
-      orch.setDispatchGuard(() => null);
-      // 取消另一个任务触发 scheduleNext 不太方便，直接创建新任务验证
+      guardReason = null;
+      expect(orch.wakeQueuedAgentQueues('资源保护中')).toBe(1);
+      expect(db.tables.tasks.get(task.id)).toMatchObject({ status: 'RUNNING', stage: '理解需求' });
+      expect(executors.dispatch).toHaveBeenCalledOnce();
+
       const task2 = orch.createTask(agentId, '新任务');
-      // 并发限制 1，第一个还在 QUEUED 不算活跃，所以 task2 应该 RUNNING
-      expect(task2.status).toBe('RUNNING');
+      expect(task2).toMatchObject({ status: 'QUEUED', stage: '排队中' });
     });
   });
 });

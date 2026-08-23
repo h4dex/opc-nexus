@@ -1,7 +1,7 @@
 /**
  * 执行器注册表主辅引擎策略测试(P1)
  * 覆盖:主引擎就绪直用、主引擎不可用回退辅助引擎、
- * production 模式禁用模拟回退(任务 FAILED)、demo 模式保留演示回退
+ * 主辅引擎均不可用时任务如实失败
  */
 // @ts-nocheck
 /* eslint-disable */
@@ -71,13 +71,13 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.kindFor('eng-codex')).toBe('generic-cli');
   });
 
-  it('demo 模式主辅均不可用回退演示执行器', () => {
+  it('主辅均不可用时返回 unavailable', () => {
     const db = makeDb({
       'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' },
       'eng-opencode': { type: 'opencode', status: 'NOT_INSTALLED' }
     });
     const reg = new ExecutorRegistry(db as never, broker as never);
-    expect(reg.kindFor('eng-codex')).toBe('simulated');
+    expect(reg.kindFor('eng-codex')).toBe('unavailable');
   });
 
   it('production 模式主辅均不可用 → dispatch 直接 onError,任务不伪装完成', () => {
@@ -99,13 +99,13 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.isExecuting('t1')).toBe(false);
   });
 
-  it('辅助引擎与主引擎相同时不重复探测(仍走 demo 回退)', () => {
+  it('辅助引擎与主引擎相同时不重复探测', () => {
     userCfg.engine.fallbackEngineId = 'eng-codex';
     const db = makeDb({
       'eng-codex': { type: 'codex', status: 'NOT_INSTALLED' }
     });
     const reg = new ExecutorRegistry(db as never, broker as never);
-    expect(reg.kindFor('eng-codex')).toBe('simulated');
+    expect(reg.kindFor('eng-codex')).toBe('unavailable');
   });
 
   it('Hermes Agent CLI(hermes-cli 类型)健康时按泛化 CLI 执行', () => {
@@ -163,7 +163,7 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     )).toBe('unavailable');
 
     expect(fallback).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith('t-mobile-no-hermes', expect.stringContaining('不会降级到 DeepSeek Harness'));
+    expect(onError).toHaveBeenCalledWith('t-mobile-no-hermes', expect.stringContaining('不会降级到其他执行引擎'));
   });
 
   it('Pi Agent uses its dedicated JSONL executor when healthy', () => {
@@ -364,5 +364,51 @@ describe('ExecutorRegistry 主辅引擎策略', () => {
     expect(reg.activeTaskIdsForAgent('a1')).toEqual([]);
     expect(onReleased).toHaveBeenCalledOnce();
     expect(onReleased).toHaveBeenCalledWith('t-acp-release');
+  });
+
+  it('drops terminal callbacks from an aborted execution after the same task is redispatched', () => {
+    userCfg.engine.executionMode = 'production';
+    userCfg.engine.fallbackEngineId = null;
+    const db = makeDb({
+      'eng-nexus': { type: 'nexus', status: 'HEALTHY' }
+    });
+    const reg = new ExecutorRegistry(db as never, broker as never);
+    vi.spyOn(reg['llm'], 'isReady').mockReturnValue(true);
+    const innerCallbacks: Array<Record<string, (...args: unknown[]) => void>> = [];
+    vi.spyOn(reg['llm'], 'start').mockImplementation((_task, _agent, callbacks) => {
+      innerCallbacks.push(callbacks as unknown as Record<string, (...args: unknown[]) => void>);
+    });
+    vi.spyOn(reg['llm'], 'abort').mockImplementation(() => undefined);
+
+    const firstDone = vi.fn();
+    const firstError = vi.fn();
+    const secondDone = vi.fn();
+    const secondError = vi.fn();
+    const task = { id: 't-resumed', agentId: 'a1', title: '暂停后恢复' } as never;
+    const agent = { id: 'a1', engineId: 'eng-nexus' } as never;
+
+    expect(reg.dispatch(task, agent, {
+      onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(),
+      onDone: firstDone, onError: firstError
+    } as never)).toBe('llm-api');
+    reg.abort('t-resumed');
+    expect(reg.isExecuting('t-resumed')).toBe(false);
+
+    expect(reg.dispatch(task, agent, {
+      onStage: vi.fn(), onProgress: vi.fn(), onOutput: vi.fn(),
+      onDone: secondDone, onError: secondError
+    } as never)).toBe('llm-api');
+    expect(reg.isExecuting('t-resumed')).toBe(true);
+
+    innerCallbacks[0].onError('t-resumed', 'old execution aborted late');
+    innerCallbacks[0].onDone('t-resumed', 'old execution completed late');
+    expect(firstError).not.toHaveBeenCalled();
+    expect(firstDone).not.toHaveBeenCalled();
+    expect(reg.isExecuting('t-resumed')).toBe(true);
+
+    innerCallbacks[1].onDone('t-resumed', 'new execution completed');
+    expect(secondDone).toHaveBeenCalledWith('t-resumed', 'new execution completed');
+    expect(secondError).not.toHaveBeenCalled();
+    expect(reg.isExecuting('t-resumed')).toBe(false);
   });
 });

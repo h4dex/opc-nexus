@@ -19,7 +19,13 @@ vi.mock('electron', async () => await import('./__mocks__/electron.js'));
 
 // CliExecutor ensures the workspace exists before spawning. Keep this unit test
 // independent of host permissions (Linux CI cannot create /ws at filesystem root).
-vi.mock('node:fs', () => ({ mkdirSync: vi.fn() }));
+vi.mock('node:fs', () => ({
+  existsSync: vi.fn(() => false),
+  mkdirSync: vi.fn(),
+  renameSync: vi.fn(),
+  unlinkSync: vi.fn(),
+  writeFileSync: vi.fn()
+}));
 
 // 配置文件 mock：泛化 CLI 的 runArgs 覆写由用例控制
 const appCfg: { engines: Record<string, { runArgs?: string[] }> } = { engines: {} };
@@ -61,11 +67,15 @@ vi.mock('../src/main/services/cliLauncher.js', () => ({
 
 const {
   CliExecutor,
+  buildManagedCodexModelCatalog,
   buildClaudeAuthCheckArgs,
   buildClaudeProbeArgs,
   buildCodexManagedArgs,
   buildOpenCodeManagedArgs,
   claudeProcessEnv,
+  ensureManagedCodexWindowsSandbox,
+  isolatedCodexProcessEnv,
+  managedClaudeProcessEnv,
   managedCodexProcessEnv,
   parseClaudeAuthStatus,
   parseClaudeProbeOutput,
@@ -128,42 +138,50 @@ describe('就绪判定', () => {
 });
 
 describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
-  const sandboxFor = (permissionMode: string, source = 'desktop') => {
+  const profileFor = (permissionMode: string, source = 'desktop') => {
     new CliExecutor('codex-cli', makeDb(), 'eng-codex').start(task({ source }), agent({ permissionMode }), cb());
-    const i = lastSpawn.args.indexOf('--sandbox');
-    return i >= 0 ? lastSpawn.args[i + 1] : null;
+    return lastSpawn.args.find((arg: string) => arg.startsWith('default_permissions=')) ?? null;
   };
 
-  it('readonly → read-only', () => {
-    expect(sandboxFor('readonly')).toBe('read-only');
+  it('readonly → :read-only named profile', () => {
+    expect(profileFor('readonly')).toBe('default_permissions=:read-only');
   });
 
-  it('standard → workspace-write（可写工作区，不可越界）', () => {
-    expect(sandboxFor('standard')).toBe('workspace-write');
+  it('standard → :workspace named profile（可写工作区，不可越界）', () => {
+    expect(profileFor('standard')).toBe('default_permissions=:workspace');
   });
 
-  it('trusted / autonomous → danger-full-access', () => {
-    expect(sandboxFor('trusted')).toBe('danger-full-access');
-    expect(sandboxFor('autonomous')).toBe('danger-full-access');
+  it('trusted / autonomous 仍限定为 :workspace', () => {
+    expect(profileFor('trusted')).toBe('default_permissions=:workspace');
+    expect(profileFor('autonomous')).toBe('default_permissions=:workspace');
   });
 
-  it('渠道来源任务：trusted 降级为 workspace-write（10.5）', () => {
+  it('渠道来源任务：trusted 降级为 :workspace（10.5）', () => {
     // 关键安全边界：聊天里说一句就能全盘写，风险过高
-    expect(sandboxFor('trusted', 'channel')).toBe('workspace-write');
+    expect(profileFor('trusted', 'channel')).toBe('default_permissions=:workspace');
   });
 
-  it('渠道来源任务：autonomous 不降级', () => {
-    expect(sandboxFor('autonomous', 'channel')).toBe('danger-full-access');
+  it('渠道来源任务：autonomous 仍限定为 :workspace', () => {
+    expect(profileFor('autonomous', 'channel')).toBe('default_permissions=:workspace');
   });
 
-  it('专家团任务保留员工权限：standard 仍为 workspace-write', () => {
-    expect(sandboxFor('standard', 'team')).toBe('workspace-write');
+  it('专家团任务保留员工权限：standard 仍为 :workspace', () => {
+    expect(profileFor('standard', 'team')).toBe('default_permissions=:workspace');
   });
 
   it('始终带 --json 与 --skip-git-repo-check（非交互执行前提）', () => {
     new CliExecutor('codex-cli', makeDb(), 'eng-codex').start(task(), agent(), cb());
     expect(lastSpawn.args).toContain('--json');
     expect(lastSpawn.args).toContain('--skip-git-repo-check');
+    expect(lastSpawn.args).toContain('--strict-config');
+    expect(lastSpawn.args).toContain('--ignore-rules');
+    expect(lastSpawn.args).not.toContain('--ignore-user-config');
+    expect(lastSpawn.args).not.toContain('--sandbox');
+    for (const feature of ['plugins', 'remote_plugin', 'plugin_sharing', 'multi_agent', 'multi_agent_v2']) {
+      const index = lastSpawn.args.indexOf(feature);
+      expect(index).toBeGreaterThan(0);
+      expect(lastSpawn.args[index - 1]).toBe('--disable');
+    }
   });
 
   it('无 session 时用 exec，有 session 时 exec resume 续跑', () => {
@@ -174,7 +192,7 @@ describe('Codex 权限映射（映射错会静默放宽沙箱）', () => {
     expect(lastSpawn.args.slice(0, 2)).toEqual(['exec', 'resume']);
     expect(lastSpawn.args).toContain('thread-abc');
     expect(lastSpawn.args).not.toContain('--sandbox');
-    expect(lastSpawn.args).toContain('sandbox_mode="workspace-write"');
+    expect(lastSpawn.args).toContain('default_permissions=:workspace');
   });
 
   it('工作目录传给 spawn 的 cwd，且 shell:false（杜绝命令注入）', () => {
@@ -231,11 +249,12 @@ describe('Claude Code Worker 边界', () => {
     expect(args).not.toContain('--allowedTools');
   });
 
-  it('trusted/autonomous 才允许权限绕过；渠道 trusted 仍降级为 standard；team 不升级', () => {
-    expect(argsFor('trusted')).toContain('--dangerously-skip-permissions');
-    expect(argsFor('autonomous', 'channel')).toContain('--dangerously-skip-permissions');
+  it('trusted/autonomous 也不绕过 Claude 的项目边界；team 与渠道同样不提升', () => {
+    expect(argsFor('trusted')).not.toContain('--dangerously-skip-permissions');
+    expect(argsFor('autonomous', 'channel')).not.toContain('--dangerously-skip-permissions');
     expect(argsFor('trusted', 'channel')).not.toContain('--dangerously-skip-permissions');
     expect(argsFor('standard', 'team')).not.toContain('--dangerously-skip-permissions');
+    expect(argsFor('autonomous')).toContain('acceptEdits');
   });
 
   it('只续接 Claude 命名空间或合法 UUID，不把其他执行器会话传给 --resume', () => {
@@ -264,6 +283,22 @@ describe('Claude Code Worker 边界', () => {
     expect(env.OPENAI_API_KEY).toBeUndefined();
     expect(env.DEEPSEEK_API_KEY).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBe('managed-anthropic-key');
+  });
+
+  it('受管 Claude 使用应用独立配置目录，不读取用户级 Provider 环境', () => {
+    const env = managedClaudeProcessEnv({
+      ANTHROPIC_API_KEY: 'managed-anthropic-key',
+      ANTHROPIC_BASE_URL: 'https://provider.test',
+      ANTHROPIC_AUTH_TOKEN: 'managed-anthropic-key',
+      CLAUDE_CONFIG_DIR: 'C:\\Users\\test\\.claude'
+    }, 'agent:a1');
+
+    expect(env.CLAUDE_CONFIG_DIR).toContain('aibox-data');
+    expect(env.CLAUDE_CONFIG_DIR).toContain('claude');
+    expect(env.CLAUDE_CONFIG_DIR).not.toContain('Users\\test\\.claude');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('managed-anthropic-key');
+    expect(env.ANTHROPIC_API_KEY).toBe('managed-anthropic-key');
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1');
   });
 
   it('探活参数禁用工具和会话落盘，并解析 auth/result JSON', () => {
@@ -440,15 +475,101 @@ describe('中止与清理', () => {
 });
 
 describe('Managed CLI Provider boundaries', () => {
+  it('uses the official App Server handshake to initialize an isolated Windows sandbox', async () => {
+    const requests: Record<string, unknown>[] = [];
+    class ProtocolChild extends EventEmitter {
+      stdout = new EventEmitter();
+      stderr = new EventEmitter();
+      killed = false;
+      stdin = {
+        writable: true,
+        write: (value: string) => {
+          const request = JSON.parse(value.trim()) as Record<string, unknown>;
+          requests.push(request);
+          queueMicrotask(() => {
+            if (request.id === 1) this.line({ id: 1, result: { codexHome: 'C:\\managed', platformFamily: 'windows' } });
+            if (request.id === 2) this.line({ id: 2, result: { status: 'notConfigured' } });
+            if (request.id === 3) {
+              this.line({ id: 3, result: { started: true } });
+              this.line({ method: 'windowsSandbox/setupCompleted', params: { mode: 'unelevated', success: true, error: null } });
+            }
+          });
+          return true;
+        },
+        end: vi.fn()
+      };
+      line(value: unknown) { this.stdout.emit('data', Buffer.from(`${JSON.stringify(value)}\n`)); }
+      kill() { this.killed = true; return true; }
+    }
+    const protocolChild = new ProtocolChild();
+    const spawn = vi.fn(() => protocolChild as never);
+
+    await ensureManagedCodexWindowsSandbox(
+      'codex', { CODEX_HOME: 'C:\\managed' }, 'C:\\project', undefined, 'win32', spawn as never
+    );
+
+    expect(spawn).toHaveBeenCalledWith('codex', expect.arrayContaining([
+      'app-server', '--stdio', '--disable', 'plugins', '--disable', 'multi_agent'
+    ]), expect.objectContaining({ cwd: 'C:\\project', stdio: ['pipe', 'pipe', 'pipe'] }));
+    expect(requests.map((request) => request.method)).toEqual([
+      'initialize', 'initialized', 'windowsSandbox/readiness', 'windowsSandbox/setupStart'
+    ]);
+    expect(requests.at(-1)).toMatchObject({
+      params: { mode: 'unelevated', cwd: 'C:\\project' }
+    });
+    expect(protocolChild.killed).toBe(true);
+  });
+
+  it('does not launch Windows sandbox setup on other platforms and honors early cancellation', async () => {
+    const spawn = vi.fn();
+    await ensureManagedCodexWindowsSandbox(
+      'codex', { CODEX_HOME: '/managed' }, '/project', undefined, 'linux', spawn as never
+    );
+    expect(spawn).not.toHaveBeenCalled();
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(ensureManagedCodexWindowsSandbox(
+      'codex', { CODEX_HOME: 'C:\\managed' }, 'C:\\project', controller.signal, 'win32', spawn as never
+    )).rejects.toMatchObject({ name: 'AbortError' });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it('supplies the complete Codex Responses Provider schema', () => {
-    const args = buildCodexManagedArgs('ping', 'worker-model', { baseUrl: 'https://provider.test/v1/' });
-    expect(args.slice(0, 2)).toEqual(['exec', '--ignore-user-config']);
+    const args = buildCodexManagedArgs(
+      'ping', 'worker-model', { baseUrl: 'https://provider.test/v1/' }, 'C:\\managed\\catalog.json'
+    );
+    expect(args[0]).toBe('exec');
+    expect(args).toContain('--strict-config');
+    expect(args).not.toContain('--ignore-user-config');
+    expect(args).toContain('--ignore-rules');
+    expect(args).toContain('default_permissions=:read-only');
+    expect(args).not.toContain('--sandbox');
+    expect(args).toContain('model_catalog_json="C:\\\\managed\\\\catalog.json"');
+    for (const feature of ['plugins', 'remote_plugin', 'plugin_sharing', 'multi_agent', 'multi_agent_v2']) {
+      const index = args.indexOf(feature);
+      expect(index).toBeGreaterThan(0);
+      expect(args[index - 1]).toBe('--disable');
+    }
     expect(args).toContain('model_provider="opcnexus"');
     expect(args).toContain('model_providers.opcnexus.name="OPC-Nexus"');
     expect(args).toContain('model_providers.opcnexus.base_url="https://provider.test/v1"');
     expect(args).toContain('model_providers.opcnexus.env_key="OPENAI_API_KEY"');
     expect(args).toContain('model_providers.opcnexus.wire_api="responses"');
     expect(args.slice(-3)).toEqual(['--model', 'worker-model', 'ping']);
+  });
+
+  it('declares apply_patch for a managed custom model without enabling a second scheduler', () => {
+    const catalog = buildManagedCodexModelCatalog('worker-model') as {
+      models: Array<Record<string, unknown>>
+    };
+    expect(catalog.models).toHaveLength(1);
+    expect(catalog.models[0]).toMatchObject({
+      slug: 'worker-model',
+      apply_patch_tool_type: 'freeform',
+      tool_mode: 'code_mode_only'
+    });
+    expect(catalog.models[0]).not.toHaveProperty('multi_agent_version');
   });
 
   it('replaces ambient CODEX_HOME with a stable application-owned profile', () => {
@@ -461,6 +582,16 @@ describe('Managed CLI Provider boundaries', () => {
     expect(first.CODEX_HOME).toContain('aibox-data');
     expect(first.CODEX_HOME).toContain('codex');
     expect(other.CODEX_HOME).not.toBe(first.CODEX_HOME);
+  });
+
+  it('removes parent-session permission and identity overrides from Codex workers', () => {
+    expect(isolatedCodexProcessEnv({
+      PATH: 'C:\\tools',
+      CODEX_PERMISSION_PROFILE: ':danger-full-access',
+      CODEX_THREAD_ID: 'parent-thread',
+      CODEX_SESSION_ID: 'parent-session',
+      CODEX_INTERNAL_ORIGINATOR_OVERRIDE: 'Codex Desktop'
+    })).toEqual({ PATH: 'C:\\tools' });
   });
 
   it('forces OpenCode pure mode and the managed model without duplicating explicit flags', () => {

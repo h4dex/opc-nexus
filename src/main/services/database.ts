@@ -22,7 +22,15 @@ const require = createRequire(import.meta.url);
  *  v37：组织化 project/agent/channel 与待审批 memory proposal 持久化。 */
 // v38: durable task schedule proposals reviewed through OPC-Nexus Scheduler.
 // v39: rename the legacy built-in `eng-hermes` runtime identity to Nexus.
-const SCHEMA_VERSION = 39;
+// v40-v41: retired DSH runtime/session projection (removed in v47).
+// v42: durable task prerequisite edges used by Secretary/DAG dispatch.
+// v43: project-scoped canonical conversations for Quest/Hermes continuity.
+// v44: project-autonomous defaults without widening executor workspace boundaries.
+// v45: explicit per-employee memory policy.
+// v46: explicit project task artifact requirement.
+// v47: retire DSH/Harness runtimes and remove their private state tables.
+// Hermes runtime tables are created after this legacy migration transaction.
+const SCHEMA_VERSION = 47;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -56,7 +64,9 @@ CREATE TABLE IF NOT EXISTS agents (
   lifecycle TEXT NOT NULL DEFAULT 'DISABLED',
   engine_id TEXT NOT NULL,
   workspace TEXT NOT NULL DEFAULT '',
-  permission_mode TEXT NOT NULL DEFAULT 'standard',
+  permission_mode TEXT NOT NULL DEFAULT 'autonomous',
+  memory_mode TEXT NOT NULL DEFAULT 'short_term'
+    CHECK(memory_mode IN ('long_term', 'short_term', 'none')),
   concurrency_limit INTEGER NOT NULL DEFAULT 1,
   archived INTEGER NOT NULL DEFAULT 0,
   avatar_color TEXT NOT NULL DEFAULT '#4d6bfe',
@@ -95,10 +105,19 @@ CREATE TABLE IF NOT EXISTS tasks (
   stage TEXT NOT NULL DEFAULT '',
   error TEXT,
   workspace_override TEXT,
+  artifacts_required INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   started_at INTEGER,
   ended_at INTEGER,
   deleted_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  dependency_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(task_id, dependency_task_id),
+  CHECK(task_id <> dependency_task_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_runs (
@@ -233,6 +252,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id),
+  project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
   organization_id TEXT REFERENCES organizations(id),
   principal_id TEXT REFERENCES principals(id),
   channel_id TEXT REFERENCES channels(id),
@@ -749,6 +769,8 @@ CREATE TABLE IF NOT EXISTS mobile_scripts (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_task ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_dependency ON task_dependencies(dependency_task_id);
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(enabled, next_run_at);
@@ -821,6 +843,15 @@ class RawFacade {
 }
 
 export class Database {
+  private readonly auditListeners = new Set<(entry: {
+    id: string;
+    actor: string;
+    action: string;
+    target: string;
+    result: string;
+    source: string;
+    createdAt: number;
+  }) => void>();
   inner!: SqlJsDatabase;
   raw = new RawFacade(this);
   private file = '';
@@ -2016,8 +2047,9 @@ export class Database {
             content TEXT NOT NULL DEFAULT '',
             task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}',
-            created_at INTEGER NOT NULL
-          );
+  created_at INTEGER NOT NULL
+);
+
           INSERT INTO messages_v36(
             id, organization_id, principal_id, conversation_id, channel_id,
             channel_identity_id, external_message_key, dedupe_key, direction,
@@ -2223,12 +2255,12 @@ export class Database {
             data_boundary, config_json
           )
           SELECT
-            'eng-nexus', 'nexus', 'Nexus Agent', version, path, status,
+            'eng-nexus', 'nexus', 'OPC-Nexus Worker', version, path, status,
             auth_status, is_default, data_boundary, config_json
           FROM engines WHERE id = 'eng-hermes';
 
           UPDATE engines
-          SET type = 'nexus', name = 'Nexus Agent',
+          SET type = 'nexus', name = 'OPC-Nexus Worker',
               version = COALESCE(version, (
                 SELECT version FROM engines legacy WHERE legacy.id = 'eng-hermes'
               )),
@@ -2305,7 +2337,9 @@ export class Database {
         this.inner.exec(`
           UPDATE agents
           SET engine_id = 'eng-hermes-cli'
-          WHERE agent_kind = 'android_operator' AND engine_id <> 'eng-hermes-cli'
+          WHERE agent_kind = 'android_operator'
+            AND engine_id <> 'eng-hermes-cli'
+            AND engine_id NOT IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed')
         `);
         migrateReference('tasks', 'engine_override');
         migrateReference('agent_runs', 'requested_engine_id');
@@ -2323,14 +2357,18 @@ export class Database {
           SET engine_override = NULL
           WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED')
             AND agent_id IN (
-              SELECT id FROM agents WHERE agent_kind = 'android_operator'
+              SELECT id FROM agents
+              WHERE agent_kind = 'android_operator'
+                AND engine_id NOT IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed')
             )
         `);
         {
           const plans = this.migrationRows(`
             SELECT id, plan_json FROM dispatch_plans
             WHERE worker_agent_id IN (
-              SELECT id FROM agents WHERE agent_kind = 'android_operator'
+              SELECT id FROM agents
+              WHERE agent_kind = 'android_operator'
+                AND engine_id NOT IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed')
             ) AND (
               status = 'planned'
               OR (status = 'committed' AND (
@@ -2410,6 +2448,141 @@ export class Database {
         }
 
         this.inner.exec("DELETE FROM engines WHERE id = 'eng-hermes'");
+      }
+      if (prev < 42) {
+        // Task prerequisite edges are additive. Recreate the table/indexes
+        // explicitly for databases that were stamped before v42 or whose
+        // prior migration was interrupted after DDL had started.
+        this.inner.exec(`
+          CREATE TABLE IF NOT EXISTS task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            dependency_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(task_id, dependency_task_id),
+            CHECK(task_id <> dependency_task_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_task_dependencies_task
+            ON task_dependencies(task_id);
+          CREATE INDEX IF NOT EXISTS idx_task_dependencies_dependency
+            ON task_dependencies(dependency_task_id);
+        `);
+      }
+      if (prev < 43) {
+        // Conversations are project-scoped in v2. Existing conversations are
+        // backfilled only when all linked tasks agree on one project; mixed or
+        // unscoped history stays null instead of guessing across boundaries.
+        addCol('conversations', 'project_id', 'TEXT REFERENCES projects(id) ON DELETE SET NULL');
+        this.inner.exec(`
+          UPDATE conversations
+          SET project_id = (
+            SELECT MIN(t.project_id)
+            FROM tasks t
+            WHERE t.conversation_id = conversations.id AND t.project_id IS NOT NULL
+          )
+          WHERE project_id IS NULL
+            AND 1 = (
+              SELECT COUNT(DISTINCT t.project_id)
+              FROM tasks t
+              WHERE t.conversation_id = conversations.id AND t.project_id IS NOT NULL
+            );
+          CREATE INDEX IF NOT EXISTS idx_conversations_project
+            ON conversations(project_id, updated_at DESC);
+        `);
+      }
+      if (prev < 44) {
+        // v2 execution policy: existing default/standard employees become
+        // project-autonomous. Explicit readonly and other user choices remain
+        // untouched, and every executor still owns its workspace boundary.
+        // Some supported stamped snapshots predate the additive column even
+        // though their version is newer; normalize that shape first.
+        addCol('agents', 'permission_mode', "TEXT NOT NULL DEFAULT 'autonomous'");
+        this.inner.exec(`
+          UPDATE agents
+          SET permission_mode = 'autonomous'
+          WHERE permission_mode = 'standard';
+        `);
+      }
+      if (prev < 45) {
+        addCol('agents', 'memory_mode', "TEXT NOT NULL DEFAULT 'short_term'");
+        this.inner.exec(`
+          UPDATE agents SET memory_mode = 'short_term'
+          WHERE memory_mode IS NULL OR memory_mode NOT IN ('long_term', 'short_term', 'none');
+        `);
+      }
+      if (prev < 46) {
+        addCol('tasks', 'artifacts_required', 'INTEGER NOT NULL DEFAULT 0');
+        this.inner.exec(`
+          UPDATE tasks SET artifacts_required = CASE WHEN project_id IS NOT NULL THEN 1 ELSE 0 END
+          WHERE artifacts_required IS NULL OR artifacts_required = 0;
+        `);
+      }
+      if (prev < 47) {
+        // Some supported pre-v39 snapshots omit this additive lifecycle
+        // column. Add it before marking employees that used a retired engine.
+        addCol('agents', 'lifecycle', "TEXT NOT NULL DEFAULT 'DISABLED'");
+        addCol('agents', 'updated_at', 'INTEGER NOT NULL DEFAULT 0');
+        addCol('agents', 'archived', 'INTEGER NOT NULL DEFAULT 0');
+        const retiredAt = Date.now();
+        const retiredError = '旧执行引擎已移除；请为数字员工选择可用引擎后重新派发';
+        this.raw.prepare(`
+          UPDATE tasks
+          SET status = 'INTERRUPTED', ended_at = COALESCE(ended_at, ?), error = ?
+          WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_APPROVAL', 'PAUSED')
+            AND (
+              engine_override IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed')
+              OR agent_id IN (
+                SELECT id FROM agents
+                WHERE engine_id IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed')
+              )
+            )
+        `).run(retiredAt, retiredError);
+        this.raw.prepare(`
+          UPDATE agent_runs
+          SET status = 'INTERRUPTED', ended_at = COALESCE(ended_at, ?)
+          WHERE ended_at IS NULL AND task_id IN (
+            SELECT id FROM tasks WHERE status = 'INTERRUPTED' AND error = ?
+          )
+        `).run(retiredAt, retiredError);
+        this.inner.exec(`
+          UPDATE agents
+          SET lifecycle = 'ERROR', updated_at = ${retiredAt}
+          WHERE archived = 0
+            AND engine_id IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed');
+
+          UPDATE dispatch_plans
+          SET status = 'failed', error = 'retired_execution_engine'
+          WHERE status = 'planned'
+            AND worker_engine_id IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed');
+
+          DELETE FROM settings
+          WHERE key LIKE 'dsh:%'
+             OR key LIKE 'secret:dsh:%'
+             OR key LIKE 'feature:dsh%'
+             OR key IN (
+               'engine:health:eng-deepseek-harness',
+               'engine:health:eng-deepseek-harness-managed',
+               'secret:engine:eng-deepseek-harness:env',
+               'secret:engine:eng-deepseek-harness-managed:env',
+               'provider:verification:deepseek-harness'
+             );
+
+          DROP INDEX IF EXISTS idx_dsh_receipts_session;
+          DROP INDEX IF EXISTS idx_dsh_events_run;
+          DROP INDEX IF EXISTS idx_dsh_runs_task;
+          DROP INDEX IF EXISTS idx_dsh_runs_session;
+          DROP INDEX IF EXISTS idx_dsh_sessions_conversation;
+          DROP INDEX IF EXISTS idx_dsh_sessions_agent;
+          DROP INDEX IF EXISTS idx_dsh_runtime_agent;
+          DROP TABLE IF EXISTS dsh_command_receipts;
+          DROP TABLE IF EXISTS dsh_control_leases;
+          DROP TABLE IF EXISTS dsh_events;
+          DROP TABLE IF EXISTS dsh_runs;
+          DROP TABLE IF EXISTS dsh_sessions;
+          DROP TABLE IF EXISTS dsh_runtime_instances;
+          DROP TABLE IF EXISTS dsh_profiles;
+          DELETE FROM engines
+          WHERE id IN ('eng-deepseek-harness', 'eng-deepseek-harness-managed');
+        `);
       }
       this.inner.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_input_message_exactly_once
         ON tasks(input_message_id) WHERE input_message_id IS NOT NULL`);
@@ -2504,22 +2677,41 @@ export class Database {
   }
 
   /** 任务状态更新 + 事件写入在同一事务内完成（13.2） */
-  transaction(fn: () => void) {
+  transaction<T>(fn: () => T): T {
     this.inner.exec('BEGIN');
     try {
-      fn();
+      const result = fn();
       this.inner.exec('COMMIT');
+      this.scheduleSave();
+      return result;
     } catch (err) {
       this.inner.exec('ROLLBACK');
       throw err;
     }
-    this.scheduleSave();
   }
 
   audit(entry: { id: string; actor: string; action: string; target: string; result: string; source?: string }) {
+    const createdAt = Date.now();
+    const normalized = { ...entry, source: entry.source ?? 'desktop', createdAt };
     this.raw
       .prepare('INSERT INTO audit_logs(id, actor, action, target, result, source, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
-      .run(entry.id, entry.actor, entry.action, entry.target, entry.result, entry.source ?? 'desktop', Date.now());
+      .run(entry.id, entry.actor, entry.action, entry.target, entry.result, normalized.source, createdAt);
+    for (const listener of this.auditListeners) {
+      try { listener(normalized); } catch { /* Audit persistence must not depend on diagnostics. */ }
+    }
+  }
+
+  onAudit(listener: (entry: {
+    id: string;
+    actor: string;
+    action: string;
+    target: string;
+    result: string;
+    source: string;
+    createdAt: number;
+  }) => void): () => void {
+    this.auditListeners.add(listener);
+    return () => this.auditListeners.delete(listener);
   }
 
   /** 数据保留策略（设置页承诺）：任务日志 90 天 / 资源明细 7 天 / 审计 1 年；启动及每 24h 执行 */

@@ -7,6 +7,7 @@ import { toast } from '../components/Toast';
 import { TEAM_TEMPLATES, type TeamTemplate, type TeamTemplateAgent } from '../data/teamTemplates';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
 import { NEXUS_ENGINE_ID, type TeamCollaborationOverview, type TeamRun, type TeamRunSubtask } from '../../../shared/types';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
 
 interface TeamData {
   id: string; name: string; coordinatorId: string; memberIds: string[]; mode: string; workspace: string; createdAt: number;
@@ -92,7 +93,9 @@ export function Teams() {
     setDeployMsg('');
     try {
       const existingNames = new Set(snapshot?.agentCards.map((c) => c.agent.name) ?? []);
-      const engineId = snapshot?.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? NEXUS_ENGINE_ID;
+      const engineId = snapshot?.engines.find((e) =>
+        isUserVisibleEngine(e) && ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)
+      )?.id ?? NEXUS_ENGINE_ID;
       const allAgents = [coordinator, ...members];
       const nameToId = new Map<string, string>();
 
@@ -103,7 +106,7 @@ export function Teams() {
         } else {
           const created = await window.aibox.createAgent({
             name: ag.name, role: ag.role, systemPrompt: '', soulMd: ag.soulMd, agentsMd: ag.agentsMd, userMd: '',
-            engineId, workspace: '', permissionMode: ag.permissionMode, concurrencyLimit: 1, channelIds: []
+            engineId, workspace: '', permissionMode: 'autonomous', concurrencyLimit: 1, channelIds: []
           });
           nameToId.set(ag.name, created.id);
         }
@@ -658,7 +661,9 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
     try {
       // 从员工市场实例化专家：已存在同名员工则复用，否则创建
       const existingNames = new Set(snapshot.agentCards.map((c) => c.agent.name));
-      const engineId = snapshot.engines.find((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status))?.id ?? NEXUS_ENGINE_ID;
+      const engineId = snapshot.engines.find((e) =>
+        isUserVisibleEngine(e) && ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)
+      )?.id ?? NEXUS_ENGINE_ID;
       const allRoles = [coordRole, ...memberRoles.filter((r) => r.id !== coordRole.id)];
       const nameToId = new Map<string, string>();
 
@@ -669,7 +674,7 @@ function CreateTeamModal({ onClose, onCreated }: { onClose: () => void; onCreate
         } else {
           const created = await window.aibox.createAgent({
             name: role.name, role: role.role, systemPrompt: '', soulMd: role.soulMd, agentsMd: role.agentsMd, userMd: '',
-            engineId, workspace: '', permissionMode: role.permissionMode, concurrencyLimit: 1, channelIds: []
+            engineId, workspace: '', permissionMode: 'autonomous', concurrencyLimit: 1, channelIds: []
           });
           nameToId.set(role.name, created.id);
         }

@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconAlert, IconChip, IconRefresh, IconPlus } from '../components/icons';
 import type { Engine, EngineProviderMode, EngineRuntimeConfig, ProviderProtocol } from '@shared/types';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
+import { engineDisplayName } from '@shared/engineVisibility';
 
 interface ProviderOption {
   id: string;
@@ -22,7 +24,7 @@ function supportsNativeProviderAuth(engine: Engine): boolean {
   return engine.id === 'eng-codex'
     || engine.id === 'eng-claude'
     || engine.id === 'eng-opencode'
-    || (engine.type === 'external' && engine.id !== 'eng-deepseek-harness');
+    || engine.type === 'external';
 }
 
 function inferredProviderMode(engine: Engine, config: EngineRuntimeConfig | null): EngineProviderMode {
@@ -41,6 +43,12 @@ const STATUS_META: Record<Engine['status'], { label: string; tag: string }> = {
   DEGRADED: { label: '降级', tag: 'orange' },
   ERROR: { label: '异常', tag: 'red' }
 };
+
+function engineRoleLabel(engine: Engine): string {
+  if (engine.id === 'eng-nexus') return '内置 Worker · 仅执行，不负责 Quest 调度';
+  if (engine.id === 'eng-hermes-cli') return 'Hermes CLI Worker · 仅执行';
+  return engine.type === 'external' ? '外部员工执行器' : '员工执行器';
+}
 
 /**
  * 四级探活信号（发布要求）：把「健康」拆成可解释的独立维度逐条展示。
@@ -96,6 +104,7 @@ export function Engines() {
   const [showRegister, setShowRegister] = useState(false);
   if (!snapshot) return null;
   const { engines, executorAvailable } = snapshot;
+  const visibleEngines = engines.filter(isUserVisibleEngine);
 
   const redetect = async () => {
     setDetecting(true);
@@ -141,18 +150,28 @@ export function Engines() {
         </div>
       </div>
 
+      <div className="card" style={{ marginBottom: 16, display: 'flex', gap: 12, alignItems: 'flex-start', borderColor: 'var(--accent)' }}>
+        <IconChip size={18} style={{ color: 'var(--accent)', flexShrink: 0, marginTop: 2 }} />
+        <div style={{ fontSize: 12.5, lineHeight: 1.7 }}>
+          <strong style={{ display: 'block', color: 'var(--text-1)' }}>Quest 当前调度器：Hermes Agent</strong>
+          <span style={{ color: 'var(--text-2)' }}>
+            本页管理的是数字员工的执行引擎，不是 Quest 调度器开关。OPC-Nexus Worker 仍可作为独立员工执行器使用；旧版 DSH/eng-hermes 路由已在启动时清理。Hermes CLI Worker 的健康状态也只代表它能否执行员工任务。
+          </span>
+        </div>
+      </div>
+
       {!executorAvailable && (
         <div className="card" style={{ marginBottom: 16, display: 'flex', gap: 10, alignItems: 'center', color: 'var(--warning)', background: 'var(--warning-soft)' }}>
           <IconAlert size={18} />
           <div style={{ fontSize: 12.5, lineHeight: 1.8 }}>
-            <b>未检测到可用执行引擎，系统当前以演示模式运行。</b>
+            <b>未检测到可用执行引擎，任务暂时无法执行。</b>
             请安装下方任一 CLI 引擎，或在设置页完成模型供应商配置。
           </div>
         </div>
       )}
 
       <div className="agent-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))' }}>
-        {engines.map((e) => {
+        {visibleEngines.map((e) => {
           const meta = STATUS_META[e.status];
           const msg = installMsg[e.id];
           return (
@@ -163,11 +182,11 @@ export function Engines() {
                 </div>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 650, fontSize: 14.5, display: 'flex', gap: 8, alignItems: 'center' }}>
-                    {e.name}
+                    {engineDisplayName(e.id, e.name)}
                     {e.isDefault && <span className="tag blue">默认</span>}
                   </div>
                   <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 2 }}>
-                    {e.version ? `v${e.version}` : '—'} · 运行实例 {e.runningInstances}
+                    {engineRoleLabel(e)} · {e.version ? `v${e.version}` : '—'} · 运行实例 {e.runningInstances}
                   </div>
                 </div>
                 <span className={`tag ${meta.tag}`}>{meta.label}</span>
@@ -242,7 +261,7 @@ export function Engines() {
       {showRegister && <RegisterEngineModal onClose={() => setShowRegister(false)} />}
 
       {/* 引擎路由规则 */}
-      <RoutingRules engines={engines} />
+      <RoutingRules engines={visibleEngines} />
     </>
   );
 }

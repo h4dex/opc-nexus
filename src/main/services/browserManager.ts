@@ -6,8 +6,7 @@
  * - 空闲超时自动关闭（5 分钟无操作释放资源）
  */
 import { join } from 'node:path';
-import { app } from 'electron';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 
 /** 延迟加载 playwright-core（避免未安装时阻塞启动） */
 let pw: typeof import('playwright-core') | null = null;
@@ -33,6 +32,36 @@ interface PendingBrowserSession {
 }
 
 const IDLE_TIMEOUT_MS = 5 * 60_000; // 5 分钟空闲自动关闭
+
+export function resolveBrowserExecutable(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  pathExists: (path: string) => boolean = existsSync
+): string | null {
+  const candidates = platform === 'win32'
+    ? [
+        env.PROGRAMFILES && join(env.PROGRAMFILES, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        env['PROGRAMFILES(X86)'] && join(env['PROGRAMFILES(X86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        env.LOCALAPPDATA && join(env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        env.PROGRAMFILES && join(env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        env['PROGRAMFILES(X86)'] && join(env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        env.LOCALAPPDATA && join(env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe')
+      ]
+    : platform === 'darwin'
+      ? [
+          '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+          '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+        ]
+      : [
+          '/usr/bin/microsoft-edge',
+          '/usr/bin/microsoft-edge-stable',
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser'
+        ];
+  return candidates.find((candidate): candidate is string => Boolean(candidate && pathExists(candidate))) ?? null;
+}
 
 export class BrowserManager {
   /** agentId → 浏览器会话 */
@@ -166,9 +195,11 @@ export class BrowserManager {
     let launchPromise!: Promise<import('playwright-core').Browser>;
     launchPromise = (async () => {
       const playwright = await this.loadPlaywright();
+      const executablePath = resolveBrowserExecutable();
       const browser = await playwright.chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
+        args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+        ...(executablePath ? { executablePath } : {})
       });
       if (this.disposed) {
         try { await browser.close(); } catch { /* ignore cleanup errors */ }
@@ -273,9 +304,10 @@ export class BrowserManager {
     return `已在 ${selector} 输入文本（${text.length} 字符）`;
   }
 
-  async screenshot(agentId: string, selector?: string): Promise<{ path: string; base64: string }> {
+  async screenshot(agentId: string, selector?: string, outputDir?: string): Promise<{ path: string; base64: string }> {
     const { page } = await this.getSession(agentId);
-    const screenshotDir = join(app.getPath('userData'), 'aibox-data', 'screenshots');
+    if (!outputDir) throw new Error('浏览器截图需要项目产物目录');
+    const screenshotDir = outputDir;
     mkdirSync(screenshotDir, { recursive: true });
     const filePath = join(screenshotDir, `agent_${agentId}_${Date.now()}.png`);
     const opts = selector

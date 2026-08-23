@@ -19,22 +19,12 @@ import {
   redactSensitiveText,
   resolveEngineEnv
 } from '../engineEnv.js';
-import {
-  DEEPSEEK_HARNESS_ENGINE_ID,
-  cleanupHarnessEnv,
-  deepseekHarnessCommand,
-  deepseekHarnessEnv,
-  deepseekHarnessProviderReady,
-  deepseekHarnessProcessEnv
-} from '../deepseekHarnessRuntime.js';
-import { harnessProviderVerificationIsCurrent } from '../harnessProviderVerification.js';
 import { killQuietly, type ExecutorAdapter, type ExecutorCallbacks } from './types.js';
 import { appendBoundedText, appendProcessOutput, boundedText, createProcessOutputBuffer, createUtf8StreamDecoder, finishProcessOutput } from '../textEncoding.js';
 
 const TIMEOUT_MS = 15 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
 const ACP_EXIT_GRACE_MS = 1_000;
-const DEEPSEEK_HARNESS_EXIT_GRACE_MS = 5_000;
 
 // Keep protocol input bounded even when a sidecar never emits a newline.
 export const MAX_ACP_FRAME_BYTES = 1024 * 1024;
@@ -54,11 +44,6 @@ const ACP_INBOUND_REQUEST_LIMIT_CODE = -32000;
 const ACP_INBOUND_REQUEST_LIMIT_ERROR = 'ACP inbound request concurrency limit exceeded';
 const ACP_INBOUND_REQUEST_TOTAL_LIMIT_ERROR = `ACP client request event limit exceeded (${MAX_ACP_INBOUND_REQUESTS_PER_TASK_TOTAL})`;
 const ACP_PERMISSION_BUSY_ERROR = 'Permission request already pending';
-
-/** Redact provider credentials from text emitted by the managed Harness. */
-export function redactManagedHarnessText(text: string, env: Record<string, string>): string {
-  return redactSensitiveText(text, env);
-}
 
 function frameExceedsLimit(buffer: string): boolean {
   return Buffer.byteLength(buffer, 'utf8') > MAX_ACP_FRAME_BYTES;
@@ -95,14 +80,8 @@ interface RunningAcp {
   cancel: (() => void) | null;
 }
 
-function stopProbeChild(child: ChildProcess, managedHarness: boolean): void {
-  if (!managedHarness) {
-    killQuietly(child);
-    return;
-  }
-  try { child.stdin?.end(); } catch { /* Process already closed. */ }
-  const timer = setTimeout(() => killQuietly(child), DEEPSEEK_HARNESS_EXIT_GRACE_MS);
-  timer.unref?.();
+function stopProbeChild(child: ChildProcess): void {
+  killQuietly(child);
 }
 
 export interface AcpTaskProbeResult {
@@ -129,8 +108,6 @@ export function acpCommandFor(dbOrEngineId: Database | string, maybeEngineId?: s
   const db = typeof dbOrEngineId === 'string' ? null : dbOrEngineId;
   const engineId = typeof dbOrEngineId === 'string' ? dbOrEngineId : maybeEngineId;
   if (!engineId) return null;
-  if (engineId === DEEPSEEK_HARNESS_ENGINE_ID) return deepseekHarnessCommand();
-
   if (db) {
     const row = db.raw.prepare('SELECT config_json, path FROM engines WHERE id = ?').get(engineId) as
       | { config_json?: string | null; path?: string | null }
@@ -170,8 +147,7 @@ export class AcpExecutor implements ExecutorAdapter {
   engineReady(engineId: string): boolean {
     if (!acpCommandFor(this.db, engineId)) return false;
     const row = this.db.raw.prepare('SELECT status FROM engines WHERE id = ?').get(engineId) as { status: string } | undefined;
-    return row?.status === 'HEALTHY'
-      && (engineId !== DEEPSEEK_HARNESS_ENGINE_ID || harnessProviderVerificationIsCurrent(this.db));
+    return row?.status === 'HEALTHY';
   }
 
   /** ExecutorAdapter 接口：ACP 就绪与否按引擎粒度判断（registry 调 engineReady） */
@@ -189,11 +165,11 @@ export class AcpExecutor implements ExecutorAdapter {
       failBeforeStart(`引擎 ${agent.engineId} 未配置 acpCommand（配置文件 aibox.config.json）`);
       return;
     }
-    if (agent.engineId === DEEPSEEK_HARNESS_ENGINE_ID && !deepseekHarnessProviderReady(this.db, agent)) {
-      failBeforeStart('DeepSeek Harness 供应商未配置或 API Key 无效，请在设置中完成配置');
+    const workspace = task.projectId ? task.workspaceOverride?.trim() : task.workspaceOverride || agent.workspace;
+    if (!workspace) {
+      failBeforeStart('项目任务没有绑定工作目录，已拒绝启动 ACP');
       return;
     }
-    const workspace = task.workspaceOverride || agent.workspace;
     try {
       mkdirSync(workspace, { recursive: true });
     } catch (err) {
@@ -203,27 +179,17 @@ export class AcpExecutor implements ExecutorAdapter {
 
     let child: ChildProcess;
     let runtimeEnv: Record<string, string> = {};
-    let managedEnv: Record<string, string> | null = null;
     try {
-      const engineEnv = resolveEngineEnv(this.db, agent.engineId, agent);
-      managedEnv = agent.engineId === DEEPSEEK_HARNESS_ENGINE_ID
-        ? deepseekHarnessEnv(this.db, agent)
-        : null;
-      runtimeEnv = managedEnv ?? engineEnv;
+      runtimeEnv = resolveEngineEnv(this.db, agent.engineId, agent);
       child = spawn(command[0], command.slice(1), {
         cwd: workspace,
         shell: false,
         windowsHide: true,
-        env: agent.engineId === DEEPSEEK_HARNESS_ENGINE_ID
-          ? deepseekHarnessProcessEnv(runtimeEnv)
-          : childProcessEnv(runtimeEnv)
+        env: childProcessEnv(runtimeEnv)
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       const safeDetail = redactSensitiveText(detail, runtimeEnv);
-      if (managedEnv) {
-        try { cleanupHarnessEnv(managedEnv, true); } catch { /* Preserve the launch error. */ }
-      }
       failBeforeStart(`无法启动 ACP 引擎：${safeDetail}`);
       return;
     }
@@ -246,12 +212,6 @@ export class AcpExecutor implements ExecutorAdapter {
     let childClosed = false;
     let released = false;
     let exitTimer: NodeJS.Timeout | null = null;
-    let terminalCallback: (() => void) | null = null;
-    const deliverTerminal = () => {
-      const callback = terminalCallback;
-      terminalCallback = null;
-      callback?.();
-    };
     const release = () => {
       if (released) return;
       released = true;
@@ -302,10 +262,7 @@ export class AcpExecutor implements ExecutorAdapter {
       }
       try { child.stdin?.end(); } catch { /* Process already closed. */ }
       if (!childClosed && !exitTimer) {
-        const graceMs = agent.engineId === DEEPSEEK_HARNESS_ENGINE_ID
-          ? DEEPSEEK_HARNESS_EXIT_GRACE_MS
-          : ACP_EXIT_GRACE_MS;
-        exitTimer = setTimeout(() => killQuietly(child), graceMs);
+        exitTimer = setTimeout(() => killQuietly(child), ACP_EXIT_GRACE_MS);
         exitTimer.unref?.();
       }
     };
@@ -332,8 +289,7 @@ export class AcpExecutor implements ExecutorAdapter {
         if (safeError) cb.onError(task.id, safeError);
         else if (safeResult !== undefined) cb.onDone(task.id, safeResult);
       };
-      if (managedEnv) terminalCallback = notify;
-      else notify();
+      notify();
     };
     run.cancel = () => {
       if (finished) return;
@@ -397,13 +353,11 @@ export class AcpExecutor implements ExecutorAdapter {
         const content = update.content as { type?: string; text?: string } | undefined;
         if (content?.text) pushText(content.text);
       } else if (kind === 'tool_call' || kind === 'tool_call_update') {
-        const title = managedEnv
-          ? 'DeepSeek Harness tool'
-          : boundedExternalText(
-            redactSensitiveText(typeof update.title === 'string' ? update.title : 'tool', runtimeEnv),
-            MAX_ACP_TOOL_TITLE_CHARS,
-            'tool'
-          );
+        const title = boundedExternalText(
+          redactSensitiveText(typeof update.title === 'string' ? update.title : 'tool', runtimeEnv),
+          MAX_ACP_TOOL_TITLE_CHARS,
+          'tool'
+        );
         if (kind === 'tool_call') {
           recordEvent('tool_call', { name: title, args: {} });
           cb.onStage(task.id, '调用工具');
@@ -427,13 +381,11 @@ export class AcpExecutor implements ExecutorAdapter {
         const params = msg.params ?? {};
         const options = (params.options as { optionId: string; kind: string }[] | undefined) ?? [];
         const toolCall = params.toolCall as { title?: string } | undefined;
-        const toolTitle = managedEnv
-          ? 'DeepSeek Harness tool'
-          : boundedExternalText(
-            redactSensitiveText(toolCall?.title ?? '执行工具操作', runtimeEnv),
-            MAX_ACP_TOOL_TITLE_CHARS,
-            '执行工具操作'
-          );
+        const toolTitle = boundedExternalText(
+          redactSensitiveText(toolCall?.title ?? '执行工具操作', runtimeEnv),
+          MAX_ACP_TOOL_TITLE_CHARS,
+          '执行工具操作'
+        );
         const allow = options.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always');
         const reject = options.find((o) => o.kind === 'reject_once' || o.kind === 'reject_always');
         const pick = (opt?: { optionId: string }) =>
@@ -443,7 +395,13 @@ export class AcpExecutor implements ExecutorAdapter {
         // source=team 是来源标签，不授予额外权限；嵌套任务继承员工策略。
         const effectiveMode = agent.permissionMode;
         if (effectiveMode === 'readonly') return pick(reject);
-        if (effectiveMode === 'autonomous' || (effectiveMode === 'trusted' && task.source !== 'channel')) return pick(allow);
+        if (effectiveMode === 'autonomous') {
+          // An arbitrary ACP process only receives cwd, not an OS sandbox.
+          // Unknown peers fail closed instead of turning autonomous mode into
+          // host-wide access.
+          return pick(reject);
+        }
+        if (effectiveMode === 'trusted' && task.source !== 'channel') return pick(allow);
         const approved = await this.broker.request({
           taskId: task.id,
           agentId: agent.id,
@@ -566,13 +524,6 @@ export class AcpExecutor implements ExecutorAdapter {
       } else {
         rejectPending(new Error(`ACP 进程已退出（代码 ${code ?? 'null'}）`));
       }
-      if (managedEnv) {
-        try { cleanupHarnessEnv(managedEnv, true); } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
-          console.error(`[DeepSeek Harness] runtime cleanup failed: ${redactManagedHarnessText(detail, managedEnv)}`);
-        }
-      }
-      deliverTerminal();
       release();
     });
 
@@ -637,7 +588,6 @@ export class AcpExecutor implements ExecutorAdapter {
 
 /** 检测握手：spawn + initialize 成功即认为引擎可用（EngineManager.detect 调用，10s 超时） */
 export interface AcpProbeOptions {
-  managedHarness?: boolean;
   /** Optional read-only prompt used by control-plane advisors. */
   prompt?: string;
   maxOutputChars?: number;
@@ -649,48 +599,30 @@ export function probeAcpEngine(
   options: AcpProbeOptions = {}
 ): Promise<{ ok: boolean; message: string }> {
   return new Promise((resolve) => {
-    const managedHarness = options.managedHarness === true;
     let child: ChildProcess;
     try {
       child = spawn(command[0], command.slice(1), {
         shell: false,
         windowsHide: true,
-        env: managedHarness
-          ? deepseekHarnessProcessEnv(env)
-          : childProcessEnv(env)
+        env: childProcessEnv(env)
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      if (managedHarness) {
-        try { cleanupHarnessEnv(env); } catch { /* Preserve the launch error. */ }
-      }
       return resolve({
         ok: false,
         message: boundedErrorText(redactSensitiveText(detail, env))
       });
     }
     let settled = false;
-    let childClosed = false;
-    let outcome: { ok: boolean; message: string } | null = null;
-    const cleanup = () => {
-      if (!managedHarness) return;
-      try { cleanupHarnessEnv(env); } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        console.error(`[DeepSeek Harness] probe cleanup failed: ${redactManagedHarnessText(detail, env)}`);
-      }
-    };
     const done = (ok: boolean, message: string) => {
       if (settled) return;
       settled = true;
-      outcome = {
+      const outcome = {
         ok,
         message: boundedErrorText(redactSensitiveText(message, env))
       };
-      stopProbeChild(child, managedHarness);
-      if (!managedHarness || childClosed) {
-        cleanup();
-        resolve(outcome);
-      }
+      stopProbeChild(child);
+      resolve(outcome);
     };
     const timer = setTimeout(() => done(false, '握手超时（10s）'), 10_000);
     let buf = '';
@@ -741,14 +673,9 @@ export function probeAcpEngine(
       done(false, err.message);
     });
     child.on('close', () => {
-      childClosed = true;
       clearTimeout(timer);
       buf += stdoutDecoder.end();
       done(false, frameExceedsLimit(buf) ? ACP_FRAME_LIMIT_ERROR : '进程提前退出');
-      if (managedHarness && outcome) {
-        cleanup();
-        resolve(outcome);
-      }
     });
     child.stdin?.write(
       JSON.stringify({
@@ -773,8 +700,7 @@ export function probeAcpTask(
   options: AcpProbeOptions = {}
 ): Promise<AcpTaskProbeResult> {
   return new Promise((resolve) => {
-    const managedHarness = options.managedHarness === true;
-    const prompt = options.prompt?.trim() || 'Reply with exactly OPC_HARNESS_OK. Do not call tools.';
+    const prompt = options.prompt?.trim() || 'Reply with exactly OPC_ACP_OK. Do not call tools.';
     const maxOutputChars = Math.max(100, Math.min(options.maxOutputChars ?? 4_000, 16_000));
     let child: ChildProcess;
     try {
@@ -782,15 +708,10 @@ export function probeAcpTask(
         cwd,
         shell: false,
         windowsHide: true,
-        env: managedHarness
-          ? deepseekHarnessProcessEnv(env)
-          : childProcessEnv(env)
+        env: childProcessEnv(env)
       });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      if (managedHarness) {
-        try { cleanupHarnessEnv(env); } catch { /* Preserve the launch error. */ }
-      }
       return resolve({
         ok: false,
         message: boundedErrorText(redactSensitiveText(detail, env)),
@@ -801,7 +722,6 @@ export function probeAcpTask(
     }
 
     let settled = false;
-    let childClosed = false;
     let initialized = false;
     let sessionCreated = false;
     let sessionId = '';
@@ -810,7 +730,6 @@ export function probeAcpTask(
     let buf = '';
     let updateEventCount = 0;
     let toolEventCount = 0;
-    let outcome: AcpTaskProbeResult | null = null;
     const stdoutDecoder = createUtf8StreamDecoder();
     const outputParts: string[] = [];
     const outputState = { length: 0, truncated: false };
@@ -826,15 +745,15 @@ export function probeAcpTask(
       const rawOutput = boundedText(outputParts, outputState).trim();
       const output = redactSensitiveText(rawOutput, env);
       if (!ok && sessionId) send({ method: 'session/cancel', params: { sessionId } });
-      stopProbeChild(child, managedHarness);
-      outcome = {
+      stopProbeChild(child);
+      const outcome = {
         ok,
         message: boundedErrorText(redactSensitiveText(message, env)),
         initialized,
         sessionCreated,
         output
       };
-      if (!managedHarness || childClosed) resolve(outcome);
+      resolve(outcome);
     };
     const failFromRpc = (stage: string, msg: JsonRpcMessage) => {
       const detail = redactSensitiveText(msg.error?.message || stderr.trim() || '未知错误', env);
@@ -948,19 +867,11 @@ export function probeAcpTask(
     });
     child.on('error', (err) => done(false, err.message));
     child.on('close', (code) => {
-      childClosed = true;
       buf += stdoutDecoder.end();
       const detail = redactSensitiveText(stderr.trim(), env);
       done(false, frameExceedsLimit(buf)
         ? ACP_FRAME_LIMIT_ERROR
         : `ACP 进程提前退出（代码 ${code ?? 'null'}）${detail ? `：${detail.slice(0, 500)}` : ''}`);
-      if (managedHarness) {
-        try { cleanupHarnessEnv(env); } catch (err) {
-          const cleanupDetail = err instanceof Error ? err.message : String(err);
-          console.error(`[DeepSeek Harness] task probe cleanup failed: ${redactManagedHarnessText(cleanupDetail, env)}`);
-        }
-        if (outcome) resolve(outcome);
-      }
     });
 
     send({

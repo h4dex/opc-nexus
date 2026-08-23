@@ -3,7 +3,14 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../store';
 import { IconMoon, IconSun } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { ApiBridgeStatus, SystemInfo, VoiceConfig, VoiceConfigInput, WebAdminStatus } from '@shared/types';
+import type {
+  ApiBridgeStatus,
+  DebugLogStatus,
+  VisionModelBindingView,
+  SystemInfo,
+  VoiceConfig,
+  VoiceConfigInput
+} from '@shared/types';
 
 export function Settings() {
   const { theme, setTheme } = useApp();
@@ -12,7 +19,6 @@ export function Settings() {
   const [memAlert, setMemAlert] = useState(85);
   const [gpuTempAlert, setGpuTempAlert] = useState(85);
   const [notifications, setNotifications] = useState(true);
-  const [demoAutoTasks, setDemoAutoTasks] = useState(false);
 
   useEffect(() => {
     void window.aibox.getSystemInfo().then(setInfo);
@@ -26,7 +32,6 @@ export function Settings() {
     });
     void window.aibox.getSetting('notifications').then((v) => setNotifications(v !== false));
     // 默认关闭：生产环境绝不自动造任务（与主进程 orchestrator 默认值保持一致）
-    void window.aibox.getSetting('demoAutoTasks').then((v) => setDemoAutoTasks(v === true));
   }, []);
 
   const saveThresholds = () => {
@@ -42,10 +47,11 @@ export function Settings() {
 
       <div className="dash-grid">
         <ProviderCard />
+        <VisionCard />
         <VoiceCard />
         <RegistryCard />
         <BridgeCard />
-        <WebServerCard />
+        <DebugLogCard />
 
         <div className="card">
           <div className="card-title">外观</div>
@@ -61,19 +67,13 @@ export function Settings() {
         </div>
 
         <div className="card">
-          <div className="card-title">通知与演示</div>
+          <div className="card-title">通知</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer' }}>
               <input type="checkbox" checked={notifications}
                 onChange={(e) => { setNotifications(e.target.checked); void window.aibox.setSetting('notifications', e.target.checked); }} />
               系统通知（审批到达 / 任务失败 / 引擎待登录 / 资源告警）
             </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, cursor: 'pointer' }}>
-              <input type="checkbox" checked={demoAutoTasks}
-                onChange={(e) => { setDemoAutoTasks(e.target.checked); void window.aibox.setSetting('demoAutoTasks', e.target.checked); }} />
-              演示自动派单（自动创建虚构任务维持水位；生产环境务必保持关闭）
-            </label>
-            <DemoDataPurge />
           </div>
         </div>
 
@@ -119,7 +119,7 @@ export function Settings() {
           <table className="table">
             <tbody>
               <tr><td style={{ color: 'var(--text-2)', width: 120 }}>产品</td><td>数字员工 AI Box 控制中心</td></tr>
-              <tr><td style={{ color: 'var(--text-2)' }}>版本</td><td>v{info?.appVersion ?? '1.0.0'}</td></tr>
+              <tr><td style={{ color: 'var(--text-2)' }}>版本</td><td>v{info?.appVersion ?? '2.0.0'}</td></tr>
               <tr><td style={{ color: 'var(--text-2)' }}>平台</td><td>{info?.platform === 'win32' ? 'Windows' : info?.platform === 'linux' ? 'Ubuntu / Linux' : info?.platform} ({info?.osVersion})</td></tr>
               <tr><td style={{ color: 'var(--text-2)' }}>设备</td><td>{info?.hostname ?? '—'}</td></tr>
               <tr><td style={{ color: 'var(--text-2)' }}>数据目录</td><td style={{ fontSize: 12 }}>用户数据目录 / aibox-data（继承 OS 用户 ACL）</td></tr>
@@ -131,55 +131,63 @@ export function Settings() {
   );
 }
 
-/**
- * 演示数据清理（H-3）：演示种子与真实数据同表，此处展示残留量并提供一键清空。
- * 只删 is_demo = 1 的行，用户自己创建的员工/任务/项目不受影响。
- */
-function DemoDataPurge() {
-  const [stats, setStats] = useState<{ agents: number; tasks: number; projects: number } | null>(null);
+function DebugLogCard() {
+  const [status, setStatus] = useState<DebugLogStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [confirming, setConfirming] = useState(false);
 
-  useEffect(() => { void window.aibox.getDemoDataStats().then(setStats); }, []);
+  const load = async () => {
+    try { setStatus(await window.aibox.getDebugLogStatus()); }
+    catch (error) { toast.err(error instanceof Error ? error.message : '无法读取调试日志状态'); }
+  };
 
-  const total = stats ? stats.agents + stats.tasks + stats.projects : 0;
-  if (!stats || total === 0) return null;
+  useEffect(() => { void load(); }, []);
 
-  const purge = async () => {
+  const toggle = async (enabled: boolean) => {
     setBusy(true);
     try {
-      const removed = await window.aibox.purgeDemoData();
-      toast.ok(`已清空演示数据：${removed.agents} 名员工 / ${removed.tasks} 条任务 / ${removed.projects} 个项目`);
-      setStats(await window.aibox.getDemoDataStats());
-      setConfirming(false);
-    } finally { setBusy(false); }
+      setStatus(await window.aibox.setDebugMode(enabled));
+      toast.ok(enabled ? '调试模式已开启' : '调试模式已关闭');
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : '调试模式更新失败');
+      await load();
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
-    <div style={{ borderTop: '1px solid var(--border)', paddingTop: 10, marginTop: 2 }}>
-      <div style={{ fontSize: 12.5, color: 'var(--warning)', lineHeight: 1.7 }}>
-        当前库中有演示数据：<b>{stats.agents}</b> 名员工 · <b>{stats.tasks}</b> 条任务 · <b>{stats.projects}</b> 个项目
-        <div style={{ color: 'var(--text-3)', fontSize: 11.5 }}>
-          演示数据已从首页统计中排除，但仍显示在列表页。清空后不可恢复（仅删除演示数据，真实数据保留）。
-        </div>
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-title">调试日志<span className="sub">仅在开启时写入，敏感凭据自动脱敏</span></div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: busy ? 'wait' : 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={status?.enabled ?? false}
+            disabled={busy || !status}
+            onChange={(event) => void toggle(event.target.checked)}
+          />
+          启用调试模式
+        </label>
+        <span className={`tag ${status?.enabled ? 'green' : 'gray'}`}>{status?.enabled ? '正在记录' : '已关闭'}</span>
+        <button className="btn small" type="button" disabled={!status} onClick={() => {
+          void window.aibox.openDebugLogDirectory().catch((error) => {
+            toast.err(error instanceof Error ? error.message : '无法打开日志目录');
+          });
+        }}>打开日志目录</button>
       </div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
-        {!confirming && <button className="btn small danger" onClick={() => setConfirming(true)}>清空演示数据</button>}
-        {confirming && (
-          <>
-            <span style={{ fontSize: 12.5 }}>确认删除全部演示数据？</span>
-            <button className="btn small danger" disabled={busy} onClick={() => void purge()}>{busy ? '清理中…' : '确认删除'}</button>
-            <button className="btn small" disabled={busy} onClick={() => setConfirming(false)}>取消</button>
-          </>
-        )}
+      <div style={{ marginTop: 10, fontSize: 11.5, color: 'var(--text-2)', lineHeight: 1.8, wordBreak: 'break-all' }}>
+        <div>目录：<code>{status?.logDirectory ?? '读取中'}</code></div>
+        <div>当前文件：<code>{status?.currentFile ?? '尚未写入'}</code></div>
+        <div>轮转：单文件最多 {status ? Math.round(status.maxFileBytes / 1024 / 1024) : 5} MB，当前保留 {status?.retainedFiles ?? 0} 个文件</div>
+        {status?.lastError && <div style={{ color: 'var(--danger)' }}>写入错误：{status.lastError}</div>}
       </div>
     </div>
   );
 }
 
 /**
- * 语音任务下达配置：阿里云 NLS 凭据 + 双路策略。
- * 凭据经 IPC 交给主进程走 safeStorage 加密，此处只显示「是否已配置」，不回显明文。
+ * 语音任务下达配置：阿里云 NLS 凭据。
+ * 凭据经 IPC 交给主进程走 safeStorage 加密，此处只显示是否已配置，不回显明文。
  */
 function VoiceCard() {
   const [cfg, setCfg] = useState<VoiceConfig | null>(null);
@@ -210,7 +218,7 @@ function VoiceCard() {
       const r = await window.aibox.testVoice();
       setTestMsg({
         ok: r.ok,
-        text: r.ok ? `可用（${r.provider === 'cloud' ? '云端' : '本地'}，${r.latencyMs}ms）` : r.error ?? '不可用'
+        text: r.ok ? `可用（阿里云 NLS，${r.latencyMs}ms）` : r.error ?? '不可用'
       });
     } finally { setTesting(false); }
   };
@@ -233,23 +241,12 @@ function VoiceCard() {
       </label>
 
       <label style={labelStyle}>识别通道</label>
-      <select
-        value={cfg.provider}
-        onChange={(e) => void save({ provider: e.target.value as VoiceConfig['provider'] })}
-        style={{ ...inputStyle, marginBottom: 12 }}
-      >
-        <option value="auto">自动（云端凭据齐备走云端，否则用本地模型）</option>
-        <option value="cloud">仅云端（阿里云 NLS 实时识别）</option>
-        <option value="local">仅本地（离线，数据不出本机）</option>
-      </select>
+      <div style={{ ...inputStyle, marginBottom: 12 }}>阿里云 NLS 实时识别</div>
 
       <div style={{ fontSize: 12, color: 'var(--text-2)', background: 'var(--input-bg)', borderRadius: 8, padding: '8px 12px', marginBottom: 12, lineHeight: 1.8 }}>
         云端凭据：AppKey {cfg.appKey ? '已填' : <span style={{ color: 'var(--danger)' }}>未填</span>} ·
         AccessKeyId {cfg.hasAccessKeyId ? '已配置' : <span style={{ color: 'var(--danger)' }}>未配置</span>} ·
         AccessKeySecret {cfg.hasAccessKeySecret ? '已配置' : <span style={{ color: 'var(--danger)' }}>未配置</span>}
-        <div style={{ color: 'var(--text-3)', fontSize: 11.5 }}>
-          本地模型：{cfg.localModelReady ? '已就绪' : '未安装（本地离线识别尚未实现，当前请使用云端）'}
-        </div>
       </div>
 
       <label style={labelStyle}>AppKey（阿里云智能语音交互项目 AppKey）</label>
@@ -546,60 +543,74 @@ function BridgeCard() {
   );
 }
 
-/** 局域网 Web 管理面板卡片：访问 Token 管理（安全加固） */
-function WebServerCard() {
-  const [status, setStatus] = useState<WebAdminStatus | null>(null);
-  const [copied, setCopied] = useState(false);
+/** OCR 文字识别服务卡片（PaddleOCR WASM） */
+/** Configure the shared visual model without exposing provider secrets. */
+function VisionCard() {
+  const [providers, setProviders] = useState<{ id: string; name: string; model: string; hasKey: boolean }[]>([]);
+  const [binding, setBinding] = useState<VisionModelBindingView | null>(null);
+  const [providerId, setProviderId] = useState('');
+  const [model, setModel] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState('');
 
-  useEffect(() => {
-    void window.aibox.getWebAdminStatus().then(setStatus);
-  }, []);
-
-  const regen = async () => {
-    try {
-      setStatus(await window.aibox.regenerateWebToken());
-      toast.ok('已重新生成访问 Token，旧会话已失效');
-    } catch (error) {
-      toast.err(error instanceof Error ? error.message : '重新生成访问 Token 失败');
+  const load = async () => {
+    const [nextProviders, nextBinding] = await Promise.all([window.aibox.listProviders(), window.aibox.getVisionBinding()]);
+    setProviders(nextProviders);
+    setBinding(nextBinding);
+    if (nextBinding) {
+      setProviderId(nextBinding.providerId);
+      setModel(nextBinding.model);
+    } else if (!providerId && nextProviders[0]) {
+      setProviderId(nextProviders[0].id);
+      setModel(nextProviders[0].model);
     }
   };
+  useEffect(() => { void load().catch(() => undefined); }, []);
 
-  const copy = async () => {
-    if (!status?.tokenConfigured) return;
+  const configure = async () => {
+    if (!providerId || !model.trim()) return;
+    setBusy(true);
     try {
-      await window.aibox.copyWebToken();
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      setBinding(await window.aibox.configureVisionBinding({ providerId, model: model.trim(), enabled: true }));
+      toast.ok('视觉模型已配置');
     } catch (error) {
-      toast.err(error instanceof Error ? error.message : '复制访问 Token 失败');
-    }
+      toast.err(error instanceof Error ? error.message : String(error));
+    } finally { setBusy(false); }
+  };
+
+  const sample = async () => {
+    setBusy(true);
+    try {
+      const ref = await window.aibox.pickVisionAttachment();
+      if (!ref) return;
+      const answer = await window.aibox.describeVision({ attachmentRef: ref, prompt: '请简要描述图片内容，并列出需要注意的文字或视觉信息。' });
+      setResult(answer.text);
+    } catch (error) {
+      toast.err(error instanceof Error ? error.message : String(error));
+    } finally { setBusy(false); }
   };
 
   return (
     <div className="card" style={{ gridColumn: '1 / -1' }}>
-      <div className="card-title">局域网 Web 管理面板<span className="sub">工控机无人值守远程管理 · 端口 {status?.port ?? 28889}</span></div>
-      {status?.weakToken && (
-        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 8, background: 'var(--danger-soft, rgba(248,113,113,.1))', color: 'var(--danger)', fontSize: 12.5 }}>
-          ⚠️ 当前仍在使用默认弱口令「aibox-admin」，局域网内任何人可完全控制本系统！请立即重新生成。
-        </div>
-      )}
-      <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--input-bg)', marginBottom: 12 }}>
-        <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>访问 Token（Bearer）</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <code style={{ fontSize: 12, color: 'var(--text-1)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{status?.tokenConfigured ? '已安全存储' : '（未生成）'}</code>
-          <button className="btn small" onClick={copy} disabled={!status?.tokenConfigured}>{copied ? '✓ 已复制' : '复制'}</button>
-          <button className="btn small primary" onClick={() => void regen()}>重新生成</button>
-        </div>
+      <div className="card-title">视觉模型<span className="sub">图片理解由主进程代理，凭据不会进入界面</span></div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 1fr) minmax(180px, 1fr)', gap: 10 }}>
+        <div className="field"><label>Provider</label><select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
+          <option value="">选择已配置 Provider</option>
+          {providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}{provider.hasKey ? '' : '（缺少 Key）'}</option>)}
+        </select></div>
+        <div className="field"><label>视觉模型</label><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="例如 gpt-4o-mini 或 qwen-vl" /></div>
       </div>
-      <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 8 }}>
-        <b>访问地址：</b><code style={{ fontSize: 11.5 }}>http://&lt;本机局域网IP&gt;:{status?.port ?? 28889}</code>，请求头携带 <code style={{ fontSize: 11.5 }}>Authorization: Bearer &lt;Token&gt;</code>。<br />
-        首次启动已自动生成强随机 Token；重新生成会使所有已登录会话失效。
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+        <button className="btn primary" disabled={busy || !providerId || !model.trim()} onClick={() => void configure()}>保存视觉配置</button>
+        <button className="btn" disabled={busy || !binding} onClick={() => void sample()}>选择图片测试</button>
+        {binding && <span style={{ fontSize: 12, color: binding.enabled ? 'var(--success)' : 'var(--warning)' }}>{binding.enabled ? '已启用' : '已停用'} · {binding.model}</span>}
       </div>
+      {result && <div style={{ marginTop: 10, padding: '9px 12px', background: 'var(--input-bg)', borderRadius: 6, fontSize: 12.5, whiteSpace: 'pre-wrap' }}>{result}</div>}
+      <div style={{ marginTop: 8, fontSize: 11.5, color: 'var(--text-3)', lineHeight: 1.6 }}>支持 PNG、JPEG、WebP、GIF。精确文字抄录仍使用本地 OCR；图片外发前请确认 Provider 的数据策略。</div>
     </div>
   );
 }
 
-/** OCR 文字识别服务卡片（PaddleOCR WASM） */
 function OcrCard() {
   const [status, setStatus] = useState<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string } | null>(null);
   const [downloading, setDownloading] = useState(false);

@@ -3,10 +3,10 @@
  * - 打包环境：<exe 所在目录>/user/config.yaml；开发环境：<项目根>/user/config.yaml；
  *   目录不可写时回退 userData/user/config.yaml（Program Files 安装场景）
  * - 内容：企微机器人凭据（启动时导入 safeStorage，见 index.ts）、企微 webhook 通知地址、
- *   引擎策略（辅助引擎/执行模式）、任务看门狗参数
+ *   引擎策略（辅助引擎）、任务看门狗参数
  * - 解析：内置 YAML 子集解析器（两级映射 + 标量 + 注释），零新增依赖
  * - 安全：文件含凭据，模板头部注明勿入仓库；Secret 导入系统密钥库后运行期不再读明文
- * - executionMode 默认 production：引擎不可用时任务转 FAILED，绝不用模拟结果冒充完成
+ * - 引擎不可用时任务转 FAILED，不存在模拟完成模式
  *
  * @author liyingjie <y@senke.com>
  */
@@ -14,6 +14,7 @@ import { app } from 'electron';
 import { dirname, join } from 'node:path';
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { LEGACY_NEXUS_ENGINE_ID, NEXUS_ENGINE_ID } from '../../shared/types.js';
+import { isRetiredExecutionEngine } from '../../shared/engineVisibility.js';
 
 export interface UserConfig {
   wecom: {
@@ -27,8 +28,6 @@ export interface UserConfig {
   engine: {
     /** 辅助引擎：主引擎不可用时的回退引擎 ID */
     fallbackEngineId: string;
-    /** production（默认）= 引擎不可用任务直接失败；demo = 回退演示模式（生成虚构产物，仅演示用） */
-    executionMode: 'production' | 'demo';
   };
   task: {
     /** 单任务最长运行分钟数（看门狗；0 = 不限制） */
@@ -50,7 +49,7 @@ export interface UserConfig {
 
 export const USER_CONFIG_DEFAULTS: UserConfig = {
   wecom: { botId: '', secret: '', webhookUrl: '' },
-  engine: { fallbackEngineId: 'eng-opencode', executionMode: 'production' },
+  engine: { fallbackEngineId: 'eng-opencode' },
   task: { maxRunMinutes: 30 },
   provider: { apiKey: '', baseUrl: '', model: '' }
 };
@@ -70,7 +69,6 @@ wecom:
 # 引擎策略
 engine:
   fallbackEngineId: "eng-opencode"   # 辅助引擎：主引擎不可用时回退（eng-opencode / eng-codex / eng-hermes-cli / eng-nexus）
-  executionMode: "production"        # production(默认) = 引擎不可用任务直接失败；demo = 回退演示模式(仅演示用，会生成虚构产物)
 
 # 任务保护（防长任务卡死 / 死循环）
 task:
@@ -174,7 +172,6 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
   const engine = (parsed.engine ?? {}) as Record<string, unknown>;
   const task = (parsed.task ?? {}) as Record<string, unknown>;
   const provider = (parsed.provider ?? {}) as Record<string, unknown>;
-  const mode = str(engine.executionMode, d.engine.executionMode);
   const configuredFallback = str(engine.fallbackEngineId, d.engine.fallbackEngineId);
   const maxRun = typeof task.maxRunMinutes === 'number' && task.maxRunMinutes >= 0 ? task.maxRunMinutes : d.task.maxRunMinutes;
   return {
@@ -184,8 +181,14 @@ export function mergeUserConfig(parsed: Record<string, unknown>): UserConfig {
       webhookUrl: sanitizeWebhookUrl(str(wecom.webhookUrl, ''))
     },
     engine: {
-      fallbackEngineId: configuredFallback === LEGACY_NEXUS_ENGINE_ID ? NEXUS_ENGINE_ID : configuredFallback,
-      executionMode: mode === 'production' ? 'production' : 'demo'
+      // Retired DSH runtimes and the pre-v39 Hermes identity must never remain
+      // as a fallback target after an upgrade. Use the documented OpenCode
+      // fallback instead of preserving a dead adapter ID.
+      fallbackEngineId: configuredFallback === LEGACY_NEXUS_ENGINE_ID
+        ? NEXUS_ENGINE_ID
+        : isRetiredExecutionEngine({ id: configuredFallback })
+          ? d.engine.fallbackEngineId
+          : configuredFallback
     },
     task: { maxRunMinutes: maxRun },
     provider: {

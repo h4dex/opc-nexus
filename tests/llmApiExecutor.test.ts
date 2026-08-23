@@ -297,6 +297,64 @@ describe('工具循环', () => {
     expect(types).toContain('tool_result');
   });
 
+  it('多轮工具历史被上游 400 拒绝时保留真实结果并用同一模型兼容重试', async () => {
+    const responses = [
+      { ok: true, status: 200, body: sseStream(toolFrames('list_dir', '{"path":"."}')), text: async () => '' },
+      { ok: true, status: 200, body: sseStream(toolFrames('list_dir', '{"path":"deliverables"}')), text: async () => '' },
+      { ok: false, status: 400, body: null, text: async () => '{"error":"invalid_request"}' },
+      { ok: true, status: 200, body: sseStream(textFrames('兼容完成')), text: async () => '' }
+    ];
+    const f = vi.fn(async () => responses.shift() as never);
+    globalThis.fetch = f as never;
+    const db = makeDb();
+    const c = cb();
+
+    new LlmApiExecutor(db, broker()).start(task(), agent(), c);
+    await settle();
+
+    expect(f).toHaveBeenCalledTimes(4);
+    const rejectedPayload = JSON.parse(f.mock.calls[2][1].body);
+    const compatibilityPayload = JSON.parse(f.mock.calls[3][1].body);
+    expect(rejectedPayload.messages.some((message: { role: string }) => message.role === 'tool')).toBe(true);
+    expect(compatibilityPayload.model).toBe(rejectedPayload.model);
+    expect(compatibilityPayload.messages.some((message: { role: string }) => message.role === 'tool')).toBe(false);
+    expect(compatibilityPayload.messages.some((message: { tool_calls?: unknown }) => message.tool_calls)).toBe(false);
+    expect(JSON.stringify(compatibilityPayload.messages)).toContain('工具 list_dir 的真实返回');
+    expect(db.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'provider.tool-history.compact', target: 't1' }));
+    expect(c.onDone).toHaveBeenCalledWith('t1', '兼容完成');
+    expect(c.onError).not.toHaveBeenCalled();
+  });
+
+  it('多轮工具兼容重试仍返回 400 时明确提示模型不兼容且不伪装完成', async () => {
+    const responses = [
+      { ok: true, status: 200, body: sseStream(toolFrames('list_dir', '{"path":"."}')), text: async () => '' },
+      { ok: false, status: 400, body: null, text: async () => '{"error":"invalid_request"}' },
+      { ok: false, status: 400, body: null, text: async () => '{"error":"invalid_request"}' }
+    ];
+    globalThis.fetch = vi.fn(async () => responses.shift() as never) as never;
+    const c = cb();
+
+    new LlmApiExecutor(makeDb(), broker()).start(task(), agent(), c);
+    await settle();
+
+    expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('不兼容多轮工具调用'));
+    expect(c.onDone).not.toHaveBeenCalled();
+  });
+
+  it('供应商提前关闭流且没有终态时失败，不把半截响应当成完成', async () => {
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: sseStream([dataFrame({ choices: [{ delta: { content: '半截' } }] })]),
+      text: async () => ''
+    })) as never;
+    const c = cb();
+    new LlmApiExecutor(makeDb(), broker()).start(task(), agent(), c);
+    await settle();
+    expect(c.onError).toHaveBeenCalledWith('t1', expect.stringContaining('未收到完成标记'));
+    expect(c.onDone).not.toHaveBeenCalled();
+  });
+
   it('未知工具不崩溃,把错误作为工具结果回灌模型', async () => {
     const f = mockFetchSequence(toolFrames('no_such_tool', '{}'), textFrames('已换方案'));
     const c = cb();
@@ -385,6 +443,26 @@ describe('审批门禁（四级权限语义）', () => {
     expect(b.request).not.toHaveBeenCalled();
   });
 
+  it('autonomous:项目内删除自动执行,不会产生步骤审批', async () => {
+    mockFetchSequence(toolFrames('delete_path', '{"path":"a.txt"}'), textFrames('已处理'));
+    const b = broker(true);
+    new LlmApiExecutor(makeDb(), b).start(task(), agent({ permissionMode: 'autonomous' }), cb());
+    await settle();
+    expect(b.request).not.toHaveBeenCalled();
+  });
+
+  it('autonomous:未受沙箱保护的 Shell 仍作为项目边界例外确认', async () => {
+    mockFetchSequence(toolFrames('run_command', '{"command":"echo ok"}'), textFrames('已跳过'));
+    const b = broker(false);
+    new LlmApiExecutor(makeDb(), b).start(
+      task(),
+      agent({ permissionMode: 'autonomous', capabilities: { network: false, shell: true, install: false, browser: false, computer: false } }),
+      cb()
+    );
+    await settle();
+    expect(b.request).toHaveBeenCalledWith(expect.objectContaining({ type: 'outside_workspace', risk: 'high' }));
+  });
+
   it('readonly:写类工具根本不注册给模型(第一道防线)', async () => {
     const f = mockFetchSequence(toolFrames('write_file', '{"path":"a.txt","content":"x"}'), textFrames('换方案'));
     const b = broker(true);
@@ -451,5 +529,122 @@ describe('中止处理', () => {
     ex.abort('t1');
     await settle();
     expect(c.onError).not.toHaveBeenCalled();
+  });
+
+  it('standard:验收员工的 http_request GET 直接执行，不停在 WAITING_APPROVAL', async () => {
+    mockFetchSequence(
+      toolFrames('http_request', '{"url":"http://127.0.0.1:43123/","method":"GET"}'),
+      textFrames('PASS 页面可访问')
+    );
+    const b = broker(true);
+    const c = cb();
+    new LlmApiExecutor(makeDb(), b).start(
+      task({ source: 'team' }),
+      agent({ permissionMode: 'standard', capabilities: { network: true, shell: false, install: false, browser: false, computer: false } }),
+      c
+    );
+    await settle();
+    expect(b.request).not.toHaveBeenCalled();
+    expect(c.onDone).toHaveBeenCalledWith('t1', 'PASS 页面可访问');
+  });
+
+  it('standard:验收员工省略 HTTP method 时按默认 GET 直接执行', async () => {
+    mockFetchSequence(
+      toolFrames('http_request', '{"url":"http://127.0.0.1:43123/"}'),
+      textFrames('PASS 页面可访问')
+    );
+    const b = broker(true);
+    const c = cb();
+    new LlmApiExecutor(makeDb(), b).start(
+      task({ source: 'team' }),
+      agent({ permissionMode: 'standard', capabilities: { network: true, shell: false, install: false, browser: false, computer: false } }),
+      c
+    );
+    await settle();
+    expect(b.request).not.toHaveBeenCalled();
+    expect(c.onDone).toHaveBeenCalledWith('t1', 'PASS 页面可访问');
+  });
+
+  it('standard:验收员工的 browser_navigate 只读检查不请求审批', async () => {
+    mockFetchSequence(
+      toolFrames('browser_navigate', '{"url":"http://127.0.0.1:43123/"}'),
+      textFrames('PASS DOM 可检查')
+    );
+    const b = broker(true);
+    const c = cb();
+    const executor = new LlmApiExecutor(makeDb(), b);
+    executor.setBrowserManager({
+      navigate: vi.fn(async () => '页面标题：OPC-Nexus Studio')
+    });
+    executor.start(
+      task({ source: 'team' }),
+      agent({ permissionMode: 'standard', capabilities: { network: false, shell: false, install: false, browser: true, computer: false } }),
+      c
+    );
+    await settle();
+    expect(b.request).not.toHaveBeenCalled();
+    expect(c.onDone).toHaveBeenCalledWith('t1', 'PASS DOM 可检查');
+  });
+
+  it('standard:验收员工的 http_request 非 GET 仍需网络审批', async () => {
+    mockFetchSequence(
+      toolFrames('http_request', '{"url":"https://example.test/submit","method":"POST","body":"{}"}'),
+      textFrames('已提交')
+    );
+    const b = broker(true);
+    new LlmApiExecutor(makeDb(), b).start(
+      task({ source: 'team' }),
+      agent({ permissionMode: 'standard', capabilities: { network: true, shell: false, install: false, browser: false, computer: false } }),
+      cb()
+    );
+    await settle();
+    expect(b.request).toHaveBeenCalledWith(expect.objectContaining({ type: 'network', risk: 'high' }));
+  });
+
+  it('总超时会报告真实失败并放弃审批,不会停留在 RUNNING', async () => {
+    vi.useFakeTimers();
+    try {
+      globalThis.fetch = vi.fn((_url, init) => new Promise((_resolve, reject) => {
+        const signal = init.signal as AbortSignal;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      })) as never;
+      const b = broker();
+      const c = cb();
+      const ex = new LlmApiExecutor(makeDb(), b);
+
+      ex.start(task(), agent(), c);
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      await Promise.resolve();
+
+      expect(b.abandonTask).toHaveBeenCalledWith('t1');
+      expect(c.onError).toHaveBeenCalledTimes(1);
+      expect(c.onError).toHaveBeenCalledWith('t1', '执行超时（15 分钟）');
+      expect(c.onDone).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('旧执行 finally 不会从运行表删除同任务的恢复执行', async () => {
+    globalThis.fetch = vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      const signal = init.signal as AbortSignal;
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    })) as never;
+    const ex = new LlmApiExecutor(makeDb(), broker());
+    const first = cb();
+    const resumed = cb();
+
+    ex.start(task(), agent(), first);
+    ex.abort('t1');
+    ex.start(task(), agent(), resumed);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ex['running'].has('t1')).toBe(true);
+    ex.abort('t1');
+    await Promise.resolve();
+    expect(first.onError).not.toHaveBeenCalled();
+    expect(resumed.onError).not.toHaveBeenCalled();
   });
 });

@@ -20,7 +20,7 @@ concurrency:
 
 env:
   NODE_VERSION: "22"
-  HARNESS_NPM_VERSION: "11.16.0"
+  HERMES_NPM_VERSION: "11.16.0"
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   ANDROID_SIGNER_SHA256: "ec3f987b968cb7483a0fd08a64a5a1d0944a6d3c88679248b5d70c036226281d"
 
@@ -41,8 +41,16 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
-      - name: Install Harness-compatible npm
-        run: npm install --global npm@${{ env.HARNESS_NPM_VERSION }}
+      - name: Install Hermes-compatible npm
+        run: npm install --global npm@${{ env.HERMES_NPM_VERSION }}
+
+      - name: Set up uv and Python 3.11
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+
+      - name: Install Hermes Python runtime
+        run: uv python install 3.11
 
       - name: Verify tag matches package version
         run: >-
@@ -52,11 +60,14 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit
 
-      - name: Prepare pinned DeepSeek Harness runtime
-        run: npm run harness:prepare
+      - name: Prepare pinned Hermes runtime
+        run: npm run hermes:prepare
 
-      - name: Verify Harness with Electron Node
-        run: npm run harness:verify:electron
+      - name: Verify pinned Hermes runtime
+        run: npm run hermes:verify
+
+      - name: Smoke test Hermes Dashboard and Gateway
+        run: npm run hermes:smoke
 
       - name: Type check
         run: npm run typecheck
@@ -173,17 +184,25 @@ jobs:
       - name: Install Android SDK packages
         run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Install Harness-compatible npm
-        run: npm install --global npm@${{ env.HARNESS_NPM_VERSION }}
+      - name: Install Hermes-compatible npm
+        run: npm install --global npm@${{ env.HERMES_NPM_VERSION }}
+
+      - name: Set up uv and Python 3.11
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+
+      - name: Install Hermes Python runtime
+        run: uv python install 3.11
 
       - name: Install dependencies
         run: npm ci --no-audit
 
-      - name: Prepare pinned DeepSeek Harness runtime
-        run: npm run harness:prepare
+      - name: Prepare pinned Hermes runtime
+        run: npm run hermes:prepare
 
-      - name: Verify Harness with Electron Node
-        run: npm run harness:verify:electron
+      - name: Verify pinned Hermes runtime
+        run: npm run hermes:verify
 
       - name: Download signed Android package
         uses: actions/download-artifact@v4
@@ -201,8 +220,8 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: npm run build && npx electron-builder --win --x64 --publish never
 
-      - name: Verify packaged Windows Harness runtime
-        run: npm run harness:verify:packaged -- release/win-unpacked
+      - name: Verify packaged Windows Hermes runtime
+        run: npm run hermes:verify:packaged -- release/win-unpacked
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
@@ -247,17 +266,25 @@ jobs:
         shell: bash
         run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Install Harness-compatible npm
-        run: npm install --global npm@${{ env.HARNESS_NPM_VERSION }}
+      - name: Install Hermes-compatible npm
+        run: npm install --global npm@${{ env.HERMES_NPM_VERSION }}
+
+      - name: Set up uv and Python 3.11
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+
+      - name: Install Hermes Python runtime
+        run: uv python install 3.11
 
       - name: Install dependencies
         run: npm ci --no-audit
 
-      - name: Prepare pinned DeepSeek Harness runtime
-        run: npm run harness:prepare
+      - name: Prepare pinned Hermes runtime
+        run: npm run hermes:prepare
 
-      - name: Verify Harness with Electron Node
-        run: npm run harness:verify:electron
+      - name: Verify pinned Hermes runtime
+        run: npm run hermes:verify
 
       - name: Download signed Android package
         uses: actions/download-artifact@v4
@@ -271,8 +298,8 @@ jobs:
       - name: Package Linux applications
         run: npm run build && npx electron-builder --linux --x64 --publish never
 
-      - name: Verify packaged Linux Harness runtime
-        run: npm run harness:verify:packaged -- release/linux-unpacked
+      - name: Verify packaged Linux Hermes runtime
+        run: npm run hermes:verify:packaged -- release/linux-unpacked
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4

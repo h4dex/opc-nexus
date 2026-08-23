@@ -3,7 +3,7 @@ import type { Snapshot, ResourcePayload } from '../../preload/index';
 import type { ActionCenterOverview, SearchEntityType, SearchRoute } from '../../shared/types';
 import { appendResourceUpdate, mergeResourceHistory } from './utils/resourceHistory';
 
-export type RouteKey = 'dashboard' | 'projects' | 'office' | 'inbox' | 'deliverables' | 'knowledge' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'mobile' | 'chat' | 'teams' | 'collab' | 'market' | 'engines' | 'channels' | 'mcp' | 'skills' | 'usage' | 'system' | 'settings';
+export type RouteKey = 'dashboard' | 'quest' | 'projects' | 'office' | 'inbox' | 'deliverables' | 'knowledge' | 'agents' | 'tasks' | 'schedules' | 'workflows' | 'console' | 'mobile' | 'teams' | 'collab' | 'market' | 'engines' | 'channels' | 'mcp' | 'skills' | 'plugins' | 'usage' | 'system' | 'settings';
 
 export interface NavigationTarget {
   entityType: SearchEntityType;
@@ -22,8 +22,12 @@ interface AppState {
   appVersion: string;
   actionCenter: ActionCenterOverview | null;
   navigationTarget: NavigationTarget | null;
+  questProjectId: string | null;
+  questEmployeeId: string | null;
 
   setRoute: (r: RouteKey) => void;
+  openQuest: (projectId?: string | null, employeeId?: string | null) => void;
+  clearQuestEmployee: () => void;
   navigate: (route: SearchRoute, target?: Omit<NavigationTarget, 'nonce'>) => void;
   clearNavigationTarget: () => void;
   refreshActionCenter: () => Promise<void>;
@@ -46,17 +50,21 @@ export function disposeAppSubscriptions(): void {
 
 export const useApp = create<AppState>((set) => ({
   snapshot: null,
-  resources: { history: [], health: { runtime: 'healthy', gateway: 'healthy', database: 'healthy' } },
+  resources: { history: [], health: { runtime: 'offline', gateway: 'offline', database: 'offline' } },
   theme: 'dark',
-  route: 'dashboard',
+  route: 'projects',
   wizardOpen: false,
   deviceName: 'Senke AI Box-01',
-  online: true,
-  appVersion: '1.0.0',
+  online: false,
+  appVersion: '2.0.0',
   actionCenter: null,
   navigationTarget: null,
+  questProjectId: null,
+  questEmployeeId: null,
 
   setRoute: (route) => set({ route, navigationTarget: null }),
+  openQuest: (questProjectId = null, questEmployeeId = null) => set({ route: 'quest', questProjectId, questEmployeeId, navigationTarget: null }),
+  clearQuestEmployee: () => set({ questEmployeeId: null }),
   navigate: (route, target) => set({
     route,
     navigationTarget: target ? { ...target, nonce: Date.now() } : null
@@ -106,7 +114,7 @@ export const useApp = create<AppState>((set) => ({
           snapshot: state.snapshot && state.snapshot.version > snapshot.version ? state.snapshot : snapshot,
           resources: mergedResources,
           actionCenter,
-          online: mergedResources.history.at(-1)?.networkOnline ?? true
+          online: mergedResources.history.at(-1)?.networkOnline ?? false
         };
       });
     })().catch((error) => {

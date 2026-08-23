@@ -21,6 +21,10 @@ import { mcpToolsForAgent } from './mcpTools.js';
 import type { ExecutorAdapter, ExecutorCallbacks } from './types.js';
 
 const TIMEOUT_MS = 15 * 60_000;
+/** Provider responses may be slow, but a round must always terminate. The
+ * task-level 15 minute timer remains the first overall deadline. */
+export const PROVIDER_ROUND_TIMEOUT_MS = 20 * 60_000;
+export const PROVIDER_STREAM_IDLE_TIMEOUT_MS = 3 * 60_000;
 const MAX_RESULT_CHARS = 16_000;
 const MAX_ROUNDS = 30;
 
@@ -42,6 +46,78 @@ interface MessageRow {
 }
 
 type ChatMessage = Record<string, unknown>;
+
+interface ProviderCompatibilityState {
+  compactToolHistory: boolean;
+}
+
+const MAX_COMPACT_TOOL_TEXT = 16_000;
+
+function messageText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return '';
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+/**
+ * Some OpenAI-compatible gateways accept tool calls but reject a later request
+ * once several assistant.tool_calls/tool message pairs are present. Preserve
+ * the real execution trace as ordinary conversation text for a same-model
+ * compatibility retry. The persisted audit/session transcript is unchanged.
+ */
+export function compactOpenAiToolHistory(messages: ChatMessage[]): ChatMessage[] {
+  const compacted: ChatMessage[] = [];
+  const trace: string[] = [];
+  const toolNames = new Map<string, string>();
+  let traceChars = 0;
+
+  const appendTrace = (value: string) => {
+    if (traceChars >= MAX_COMPACT_TOOL_TEXT) return;
+    const remaining = MAX_COMPACT_TOOL_TEXT - traceChars;
+    const text = value.slice(0, remaining);
+    trace.push(text);
+    traceChars += text.length;
+  };
+  const flushTrace = () => {
+    if (trace.length === 0) return;
+    compacted.push({
+      role: 'user',
+      content: `以下是本任务已经真实执行的工具记录。请基于这些结果继续，不要重复已经完成的步骤：\n\n${trace.join('\n\n')}`
+    });
+    trace.length = 0;
+  };
+
+  for (const message of messages) {
+    const role = typeof message.role === 'string' ? message.role : '';
+    const calls = role === 'assistant' && Array.isArray(message.tool_calls)
+      ? message.tool_calls as Array<Record<string, unknown>>
+      : [];
+    if (calls.length > 0) {
+      const content = messageText(message.content).trim();
+      if (content) compacted.push({ role: 'assistant', content });
+      for (const call of calls) {
+        const id = typeof call.id === 'string' ? call.id : '';
+        const fn = call.function && typeof call.function === 'object'
+          ? call.function as Record<string, unknown>
+          : {};
+        const name = typeof fn.name === 'string' ? fn.name : 'unknown_tool';
+        if (id) toolNames.set(id, name);
+        appendTrace(`请求工具 ${name}\n参数：${messageText(fn.arguments).slice(0, 4_000) || '{}'}`);
+      }
+      continue;
+    }
+    if (role === 'tool') {
+      const id = typeof message.tool_call_id === 'string' ? message.tool_call_id : '';
+      const name = toolNames.get(id) ?? (id || 'unknown_tool');
+      appendTrace(`工具 ${name} 的真实返回：\n${messageText(message.content).slice(0, 8_000)}`);
+      continue;
+    }
+    flushTrace();
+    compacted.push(message);
+  }
+  flushTrace();
+  return compacted;
+}
 
 export class LlmApiExecutor implements ExecutorAdapter {
   readonly kind: ExecutorKind = 'llm-api';
@@ -143,18 +219,24 @@ export class LlmApiExecutor implements ExecutorAdapter {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => {
-      controller.abort(new Error('执行超时（15 分钟）'));
-    }, TIMEOUT_MS);
-    this.running.set(task.id, { controller, timer });
+    const running: RunningRun = {
+      controller,
+      timer: setTimeout(() => {
+        if (this.running.get(task.id) !== running) return;
+        this.broker.abandonTask(task.id);
+        controller.abort(new Error('执行超时（15 分钟）'));
+        cb.onError(task.id, '执行超时（15 分钟）');
+      }, TIMEOUT_MS)
+    };
+    this.running.set(task.id, running);
 
     cb.onStage(task.id, '理解需求');
     cb.onProgress(task.id, 5);
 
     void this.runLoop(task, agent, { baseUrl, model, key, signal: controller.signal }, cb)
       .finally(() => {
-        clearTimeout(timer);
-        this.running.delete(task.id);
+        clearTimeout(running.timer);
+        if (this.running.get(task.id) === running) this.running.delete(task.id);
       });
   }
 
@@ -214,6 +296,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
     // 编码引擎就绪时才注册 delegate_coding_task（E-2），避免模型调用必然失败的工具
     const builtInTools = toolsForPermission(effectivePermission, agent.capabilities, this.host?.codingEngineReady?.().ready ?? false);
     const mcpTools = await mcpToolsForAgent(this.mcpManager, agent.id, agent.capabilities, effectivePermission);
+    if (opts.signal.aborted) return;
     const tools = [...builtInTools, ...mcpTools];
     const userPrompt = `当前任务：${task.content || task.title}\n请执行该任务并输出结构化结果（Markdown）。`;
 
@@ -237,15 +320,17 @@ export class LlmApiExecutor implements ExecutorAdapter {
     }
 
     const finalParts: string[] = [];
+    const providerCompatibility: ProviderCompatibilityState = { compactToolHistory: false };
 
     for (let round = 1; round <= MAX_ROUNDS; round++) {
       cb.onStage(task.id, round === 1 ? '规划步骤' : '生成产物');
       let turn: { content: string; toolCalls: ToolCallAcc[]; usage?: { input: number; output: number; total: number } };
       try {
-        turn = await this.streamRound(task, messages, tools, opts, cb, round);
+        turn = await this.streamRound(task, messages, tools, opts, cb, round, providerCompatibility);
+        if (opts.signal.aborted) return;
         if (turn.usage) this.recordUsage(task, agent, opts.model, turn.usage);
       } catch (err) {
-        if (isAbort(err)) return;
+        if (opts.signal.aborted || isAbort(err)) return;
         cb.onError(task.id, redactProviderErrorText(errMessage(err), opts.key));
         return;
       }
@@ -280,7 +365,7 @@ export class LlmApiExecutor implements ExecutorAdapter {
       cb.onStage(task.id, '调用工具');
       for (const call of turn.toolCalls) {
         if (opts.signal.aborted) return;
-        const result = await this.execToolCall(task, agent, call, tools, cb);
+        const result = await this.execToolCall(task, agent, call, tools, cb, opts.signal);
         if (result === null) return; // 已中止
         messages.push({ role: 'tool', content: result, tool_call_id: call.id });
         this.persistMessage(task.id, 'tool', result, JSON.stringify({ tool_call_id: call.id, name: call.name }));
@@ -295,8 +380,10 @@ export class LlmApiExecutor implements ExecutorAdapter {
     agent: Agent,
     call: ToolCallAcc,
     tools: ToolDef[],
-    cb: ExecutorCallbacks
+    cb: ExecutorCallbacks,
+    signal: AbortSignal
   ): Promise<string | null> {
+    if (signal.aborted) return null;
     const record = (type: string, payload: Record<string, unknown>) => {
       this.db.raw
         .prepare('INSERT INTO task_events(id, task_id, event_type, payload, created_at) VALUES(?, ?, ?, ?, ?)')
@@ -318,6 +405,8 @@ export class LlmApiExecutor implements ExecutorAdapter {
       return msg;
     }
 
+    const effectiveRisk = tool.riskForArgs ? tool.riskForArgs(args) : tool.risk;
+
     // 审批门禁（四级权限语义）：
     //   readonly  → 禁止写入类工具（上方已拦截）
     //   standard  → write + danger 均需人工批准
@@ -327,25 +416,52 @@ export class LlmApiExecutor implements ExecutorAdapter {
     // A team task does not elevate the employee. Only the employee policy (and
     // the channel safety downgrade below) determines the effective permission.
     const effectivePermission = agent.permissionMode;
-    if (tool.risk !== 'safe' && effectivePermission === 'readonly') {
+    if (effectiveRisk !== 'safe' && effectivePermission === 'readonly') {
       const msg = '当前员工为只读权限模式，禁止执行写入类操作';
       record('tool_result', { name: call.name, error: msg });
       return msg;
     }
     const effectiveMode = task.source === 'channel' && effectivePermission === 'trusted' ? 'standard' : effectivePermission;
-    const needApproval = tool.risk !== 'safe' && effectiveMode !== 'autonomous' && (
-      effectiveMode === 'standard' || (effectiveMode === 'trusted' && tool.risk === 'danger')
-    );
+    const autonomousApproval = typeof tool.autonomousApproval === 'function'
+      ? tool.autonomousApproval(args)
+      : tool.autonomousApproval ?? null;
+    const needApproval = effectiveMode === 'autonomous'
+      ? autonomousApproval !== null
+      : effectiveRisk !== 'safe' && (
+        effectiveMode === 'standard' || (effectiveMode === 'trusted' && effectiveRisk === 'danger')
+      );
+    // Keep the effective gate decision next to the tool call. This is the
+    // durable evidence needed to distinguish a real approval from a model or
+    // UI that merely displays a stale WAITING_APPROVAL state. Do not persist
+    // the full arguments here because URLs and headers may contain secrets.
+    record('tool_gate', {
+      name: call.name,
+      risk: effectiveRisk,
+      permission: effectiveMode,
+      needsApproval: needApproval,
+      ...(call.name === 'http_request'
+        ? { method: String(args.method ?? '').trim().toUpperCase() || 'GET' }
+        : {})
+    });
     if (needApproval) {
-      const approvalType = tool.risk === 'danger' ? 'delete' : call.name === 'delegate_task' ? 'admin' : 'write_workspace';
+      const approvalType = autonomousApproval
+        ?? (call.name === 'install_package'
+          ? 'install'
+          : call.name === 'http_request'
+            ? 'network'
+            : effectiveRisk === 'danger'
+              ? 'delete'
+              : call.name === 'delegate_task'
+                ? 'admin'
+                : 'write_workspace');
       const approved = await this.broker.request({
         taskId: task.id,
         agentId: agent.id,
         type: approvalType,
         request: `${agent.name} 请求执行工具 ${call.name}：${JSON.stringify(args).slice(0, 160)}`,
-        risk: tool.risk === 'danger' ? 'high' : 'medium'
+        risk: effectiveRisk === 'danger' ? 'high' : 'medium'
       });
-      if (this.running.get(task.id)?.controller.signal.aborted) return null;
+      if (signal.aborted) return null;
       if (!approved) {
         const msg = '用户拒绝了该操作，请调整方案或跳过此步骤';
         record('tool_result', { name: call.name, error: msg });
@@ -354,12 +470,24 @@ export class LlmApiExecutor implements ExecutorAdapter {
     }
 
     try {
-      const ctx: ToolContext = { workspace: task.workspaceOverride || agent.workspace, agentId: agent.id, taskId: task.id, host: this.host, browserMgr: this.browserMgr, ocrService: this.ocrService };
+      const workspace = task.projectId ? task.workspaceOverride?.trim() : task.workspaceOverride || agent.workspace;
+      if (!workspace) throw new Error('项目任务没有绑定工作目录，已拒绝执行工具');
+      const ctx: ToolContext = {
+        workspace,
+        agentId: agent.id,
+        taskId: task.id,
+        host: this.host,
+        signal,
+        browserMgr: this.browserMgr,
+        ocrService: this.ocrService
+      };
       const result = await tool.execute(args, ctx);
+      if (signal.aborted) return null;
       record('tool_result', { name: call.name, result: result.slice(0, 2000) });
       cb.onOutput(task.id, `\n[工具 ${call.name}] ${result.slice(0, 400)}\n`);
       return result;
     } catch (err) {
+      if (signal.aborted) return null;
       const msg = `工具执行失败：${errMessage(err)}`;
       record('tool_result', { name: call.name, error: msg });
       return msg;
@@ -373,33 +501,76 @@ export class LlmApiExecutor implements ExecutorAdapter {
     tools: ToolDef[],
     opts: { baseUrl: string; model: string; key: string; signal: AbortSignal },
     cb: ExecutorCallbacks,
-    round: number
+    round: number,
+    compatibility: ProviderCompatibilityState
   ): Promise<{ content: string; toolCalls: ToolCallAcc[]; usage?: { input: number; output: number; total: number } }> {
     const url = `${opts.baseUrl.replace(/\/$/, '')}/chat/completions`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-        Authorization: `Bearer ${opts.key}`
-      },
-      body: JSON.stringify({
-        model: opts.model,
-        stream: true,
-        stream_options: { include_usage: true },
-        messages,
-        tools: toOpenAiTools(tools),
-        tool_choice: 'auto'
-      }),
-      signal: opts.signal,
-      redirect: 'error'
-    }).catch((err) => {
-      if (isAbort(err)) throw err;
-      throw new Error(`网络请求失败：${redactProviderErrorText(errMessage(err), opts.key)}`);
-    });
+    const request = async (wireMessages: ChatMessage[]) => {
+      const controller = new AbortController();
+      let timedOut = false;
+      const forwardAbort = () => controller.abort(opts.signal.reason);
+      if (opts.signal.aborted) forwardAbort();
+      else opts.signal.addEventListener('abort', forwardAbort, { once: true });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort(new Error('供应商请求超时'));
+      }, PROVIDER_ROUND_TIMEOUT_MS);
+      try {
+        return await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            Authorization: `Bearer ${opts.key}`
+          },
+          body: JSON.stringify({
+            model: opts.model,
+            stream: true,
+            stream_options: { include_usage: true },
+            messages: wireMessages,
+            tools: toOpenAiTools(tools),
+            tool_choice: 'auto'
+          }),
+          signal: controller.signal,
+          redirect: 'error'
+        }).catch((err) => {
+          if (opts.signal.aborted) throw err;
+          if (timedOut) throw new Error(`供应商请求超时（${Math.round(PROVIDER_ROUND_TIMEOUT_MS / 60_000)} 分钟）`);
+          if (isAbort(err)) throw err;
+          throw new Error(`网络请求失败：${redactProviderErrorText(errMessage(err), opts.key)}`);
+        });
+      } finally {
+        clearTimeout(timer);
+        opts.signal.removeEventListener('abort', forwardAbort);
+      }
+    };
+
+    let usedCompatibilityRetry = compatibility.compactToolHistory;
+    let res = await request(compatibility.compactToolHistory ? compactOpenAiToolHistory(messages) : messages);
+    let rejectedBody = '';
+    const hasToolHistory = messages.some((message) => message.role === 'tool');
+    if (res.status === 400 && !compatibility.compactToolHistory && hasToolHistory) {
+      rejectedBody = await res.text().catch(() => '');
+      compatibility.compactToolHistory = true;
+      usedCompatibilityRetry = true;
+      cb.onStage(task.id, '兼容多轮工具协议');
+      this.db.audit({
+        id: randomUUID(),
+        actor: 'system',
+        action: 'provider.tool-history.compact',
+        target: task.id,
+        result: `model=${opts.model};round=${round};status=400`,
+        source: task.source
+      });
+      res = await request(compactOpenAiToolHistory(messages));
+    }
 
     if (!res.ok || !res.body) {
       const body = await res.text().catch(() => '');
+      if (res.status === 400 && usedCompatibilityRetry) {
+        const detail = redactProviderErrorText(body || rejectedBody, opts.key).slice(0, 200);
+        throw new Error(`所选模型不兼容多轮工具调用，请在 Quest 项目设置中选择支持工具调用的模型。供应商返回 HTTP 400：${detail}`);
+      }
       throw new Error(`供应商返回 HTTP ${res.status}：${redactProviderErrorText(body, opts.key).slice(0, 200)}`);
     }
 
@@ -412,6 +583,8 @@ export class LlmApiExecutor implements ExecutorAdapter {
     let lastProgress = 0;
     let usage: { input: number; output: number; total: number } | undefined;
     const toolCalls = new Map<number, ToolCallAcc>();
+    let sawDoneMarker = false;
+    let sawFinishReason = false;
 
     const flushOutput = (force: boolean) => {
       if (outBuf && (force || Date.now() - lastFlush >= 300)) {
@@ -421,8 +594,27 @@ export class LlmApiExecutor implements ExecutorAdapter {
       }
     };
 
+    const readChunk = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(
+              `供应商流式响应超过 ${Math.round(PROVIDER_STREAM_IDLE_TIMEOUT_MS / 60_000)} 分钟没有新数据`
+            )), PROVIDER_STREAM_IDLE_TIMEOUT_MS);
+          })
+        ]);
+      } catch (error) {
+        await reader.cancel(error).catch(() => { /* already closed */ });
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readChunk();
       if (done) break;
       sseBuf += decoder.decode(value, { stream: true });
 
@@ -432,12 +624,16 @@ export class LlmApiExecutor implements ExecutorAdapter {
         sseBuf = sseBuf.slice(nl + 1);
         if (!line.startsWith('data:')) continue;
         const data = line.slice(5).trim();
-        if (data === '[DONE]') continue;
+        if (data === '[DONE]') {
+          sawDoneMarker = true;
+          continue;
+        }
 
         let delta: { content?: string; tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[] };
         try {
-          const json = JSON.parse(data) as { choices?: { delta?: typeof delta }[]; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
+          const json = JSON.parse(data) as { choices?: { delta?: typeof delta; finish_reason?: string | null }[]; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
           delta = json.choices?.[0]?.delta ?? {};
+          if (json.choices?.[0]?.finish_reason) sawFinishReason = true;
           if (json.usage) usage = { input: json.usage.prompt_tokens ?? 0, output: json.usage.completion_tokens ?? 0, total: json.usage.total_tokens ?? 0 };
         } catch {
           continue; // 忽略心跳/注释帧
@@ -464,6 +660,9 @@ export class LlmApiExecutor implements ExecutorAdapter {
       }
     }
 
+    if (!sawDoneMarker && !sawFinishReason) {
+      throw new Error('供应商流式响应提前结束，未收到完成标记（请重试或检查中转站协议）');
+    }
     flushOutput(true);
     return {
       content,

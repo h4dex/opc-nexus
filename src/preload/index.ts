@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   Agent, AgentCardView, AgentPersonaPatch, AppConfig, AppMemorySnapshot, Approval, Channel, Conversation, CreateAgentInput, DashboardStats,
   Engine, EngineInstallGuide, EngineInstallResult, EngineRuntimeConfig, ProviderConfig, ProviderTestResult,
-  ApiBridgeStatus, RendererSettingKey, RendererSettingMap, WebAdminStatus,
+  ApiBridgeStatus, RendererSettingKey, RendererSettingMap,
   DeliverableDetail, DeliverableMetaPatch, DeliverableReviewEvent, DeliverableReviewInput, DeliverableSummary, DeliverableVersionInput,
   KnowledgeDetail, KnowledgeInput, KnowledgePatch, KnowledgeQuery, KnowledgeSummary, KnowledgeVersionInput,
   ActionCenterOverview, GlobalSearchResult,
@@ -25,7 +25,14 @@ import type {
   VoiceConfig, VoiceConfigInput, VoiceCommandDraft, VoiceTestResult,
   MobileAdbDevice, MobileAgentConfig, MobileApkInfo, MobileArtifact, MobileCommandLog, MobileDevice, MobileEvent,
   MobileGatewayStatus, MobilePairingOffer, MobileScriptDefinition, MobileToolCatalog, MobileToolName, Utf8TextPayload,
-  WeixinLoginState
+  WeixinLoginState, EmbeddedWorkbenchBounds,
+  OpenQuestWindowInput, QuestWindowStatus,
+  PluginCatalogView, EnvironmentDiagnosticsView, ProjectWorkbenchView, QuestSettings,
+  ProjectArtifactDirectoryView, ProjectArtifactPreviewView,
+  ConversationTimelineInput, ConversationTimelineView,
+  HermesRuntimeStatus, HermesProjectBinding, HermesWorkbenchStatus, HermesEmbeddedWorkbenchStatus, OpenHermesEmbeddedWorkbenchInput, HermesClarifyRequest, HermesPlanProjection, HermesMobileAccessStatus, HermesMobileLanConfigInput, HermesMobileRoute,
+  OcrRecognitionResultView, VisionAttachmentRef, VisionConfigureInput, VisionDescribeInput, VisionDescribeResult, VisionModelBindingView,
+  DebugLogStatus
 } from '../shared/types.js';
 
 export interface Snapshot {
@@ -134,6 +141,72 @@ const api = {
   updateProject: (id: string, patch: ProjectPatch): Promise<Project | null> => ipcRenderer.invoke('aibox:updateProject', id, patch),
   archiveProject: (id: string): Promise<Project | null> => ipcRenderer.invoke('aibox:archiveProject', id),
   getProjectOperations: (): Promise<ProjectOperationsOverview> => ipcRenderer.invoke('aibox:getProjectOperations'),
+  getProjectWorkbench: (projectId: string): Promise<ProjectWorkbenchView> => ipcRenderer.invoke('aibox:getProjectWorkbench', projectId),
+  saveQuestSettings: (projectId: string, patch: Partial<QuestSettings>): Promise<QuestSettings> => ipcRenderer.invoke('aibox:saveQuestSettings', projectId, patch),
+  openProjectWorkspace: (projectId: string): Promise<{ ok: boolean; message: string; workspaceChanged: boolean }> => ipcRenderer.invoke('aibox:openProjectWorkspace', projectId),
+  listProjectArtifacts: (projectId: string, relativeDirectory = ''): Promise<ProjectArtifactDirectoryView> =>
+    ipcRenderer.invoke('aibox:listProjectArtifacts', projectId, relativeDirectory),
+  previewProjectArtifact: (projectId: string, relativePath: string): Promise<ProjectArtifactPreviewView> =>
+    ipcRenderer.invoke('aibox:previewProjectArtifact', projectId, relativePath),
+  hashProjectArtifact: (projectId: string, relativePath: string): Promise<string> =>
+    ipcRenderer.invoke('aibox:hashProjectArtifact', projectId, relativePath),
+  revealProjectArtifact: (projectId: string, relativePath: string): Promise<{ ok: true }> =>
+    ipcRenderer.invoke('aibox:revealProjectArtifact', projectId, relativePath),
+  // ---------- Hermes project workbench ----------
+  getHermesRuntimeStatus: (projectId: string): Promise<HermesRuntimeStatus> =>
+    ipcRenderer.invoke('aibox:getHermesRuntimeStatus', projectId),
+  listHermesProjectBindings: (): Promise<HermesProjectBinding[]> =>
+    ipcRenderer.invoke('aibox:listHermesProjectBindings'),
+  startHermesProject: (projectId: string): Promise<HermesRuntimeStatus> =>
+    ipcRenderer.invoke('aibox:startHermesProject', projectId),
+  stopHermesProject: (projectId: string): Promise<HermesRuntimeStatus> =>
+    ipcRenderer.invoke('aibox:stopHermesProject', projectId),
+  restartHermesProject: (projectId: string): Promise<HermesRuntimeStatus> =>
+    ipcRenderer.invoke('aibox:restartHermesProject', projectId),
+  emergencyStopHermesProject: (projectId: string): Promise<HermesRuntimeStatus> =>
+    ipcRenderer.invoke('aibox:emergencyStopHermesProject', projectId),
+  getHermesMemoryIndex: (projectId: string): Promise<Array<{ name: string; relativePath: string; updatedAt: number }>> =>
+    ipcRenderer.invoke('aibox:getHermesMemoryIndex', projectId),
+  getHermesMobileAccessStatus: (projectId: string): Promise<HermesMobileAccessStatus> =>
+    ipcRenderer.invoke('aibox:getHermesMobileAccessStatus', projectId),
+  createHermesMobilePairing: (
+    projectId: string,
+    input?: HermesMobileLanConfigInput
+  ): Promise<HermesMobileRoute> => ipcRenderer.invoke('aibox:createHermesMobilePairing', projectId, input),
+  listHermesMobileLanAddresses: (): Promise<string[]> =>
+    ipcRenderer.invoke('aibox:listHermesMobileLanAddresses'),
+  stopHermesMobileAccess: (projectId: string): Promise<HermesMobileAccessStatus> =>
+    ipcRenderer.invoke('aibox:stopHermesMobileAccess', projectId),
+  openHermesWorkbench: (projectId: string): Promise<HermesWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:openHermesWorkbench', projectId),
+  closeHermesWorkbench: (): Promise<HermesWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:closeHermesWorkbench'),
+  getHermesWorkbenchStatus: (): Promise<HermesWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:getHermesWorkbenchStatus'),
+  openEmbeddedHermesWorkbench: (input: OpenHermesEmbeddedWorkbenchInput): Promise<HermesEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:openEmbeddedHermesWorkbench', input),
+  setEmbeddedHermesWorkbenchBounds: (bounds: EmbeddedWorkbenchBounds): Promise<HermesEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:setEmbeddedHermesWorkbenchBounds', bounds),
+  setEmbeddedHermesWorkbenchVisible: (visible: boolean): Promise<HermesEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:setEmbeddedHermesWorkbenchVisible', visible),
+  setEmbeddedHermesWorkbenchTheme: (theme: 'dark' | 'light'): Promise<HermesEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:setEmbeddedHermesWorkbenchTheme', theme),
+  closeEmbeddedHermesWorkbench: (): Promise<HermesEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:closeEmbeddedHermesWorkbench'),
+  getEmbeddedHermesWorkbenchStatus: (): Promise<HermesEmbeddedWorkbenchStatus> =>
+    ipcRenderer.invoke('aibox:getEmbeddedHermesWorkbenchStatus'),
+  listHermesClarifications: (projectId: string, conversationId?: string): Promise<HermesClarifyRequest[]> =>
+    ipcRenderer.invoke('aibox:listHermesClarifications', projectId, conversationId),
+  answerHermesClarification: (input: { clarifyId: string; projectId: string; principalId: string; answer: unknown }): Promise<HermesClarifyRequest> =>
+    ipcRenderer.invoke('aibox:answerHermesClarification', input),
+  listHermesPlanProjections: (projectId: string): Promise<HermesPlanProjection[]> =>
+    ipcRenderer.invoke('aibox:listHermesPlanProjections', projectId),
+  approveHermesPlan: (projectId: string, draftId: string): Promise<HermesPlanProjection> =>
+    ipcRenderer.invoke('aibox:approveHermesPlan', projectId, draftId),
+  dispatchHermesPlan: (projectId: string, draftId: string): Promise<HermesPlanProjection> =>
+    ipcRenderer.invoke('aibox:dispatchHermesPlan', projectId, draftId),
+  createHermesProjectConversation: (projectId: string, employeeId?: string) =>
+    ipcRenderer.invoke('aibox:createHermesProjectConversation', projectId, employeeId),
 
   getAutomationOverview: (projectId?: string): Promise<AutomationOverview> => ipcRenderer.invoke('aibox:getAutomationOverview', projectId),
   runAutomationReport: (kind: AutomationReportKind, projectId: string): Promise<AutomationReport> => ipcRenderer.invoke('aibox:runAutomationReport', kind, projectId),
@@ -161,6 +234,16 @@ const api = {
 
   // 数字员工
   createAgent: (input: CreateAgentInput): Promise<Agent> => ipcRenderer.invoke('aibox:createAgent', encodeAgentInput(input)),
+  getPluginCatalog: (): Promise<PluginCatalogView> =>
+    ipcRenderer.invoke('aibox:getPluginCatalog'),
+  setPluginEnabled: (pluginId: string, enabled: boolean): Promise<PluginCatalogView> =>
+    ipcRenderer.invoke('aibox:setPluginEnabled', pluginId, enabled),
+  getEnvironmentDiagnostics: (): Promise<EnvironmentDiagnosticsView> =>
+    ipcRenderer.invoke('aibox:getEnvironmentDiagnostics'),
+  openQuestWindow: (input: OpenQuestWindowInput): Promise<QuestWindowStatus> =>
+    ipcRenderer.invoke('aibox:openQuestWindow', input),
+  openMainSurface: (): Promise<{ ok: true }> =>
+    ipcRenderer.invoke('aibox:openMainSurface'),
   startAgent: (id: string): Promise<void> => ipcRenderer.invoke('aibox:startAgent', id),
   stopAgent: (id: string): Promise<void> => ipcRenderer.invoke('aibox:stopAgent', id),
   /** 助手人设编辑（soul.md / agents.md / user.md / 权限模式） */
@@ -171,8 +254,8 @@ const api = {
   startMobileGateway: (host: string, port?: number): Promise<MobileGatewayStatus> => ipcRenderer.invoke('aibox:mobile:startGateway', host, port),
   stopMobileGateway: (): Promise<void> => ipcRenderer.invoke('aibox:mobile:stopGateway'),
   resetMobileCertificate: (): Promise<void> => ipcRenderer.invoke('aibox:mobile:resetCertificate'),
-  createMobilePairing: (): Promise<MobilePairingOffer> => ipcRenderer.invoke('aibox:mobile:createPairing'),
-  copyMobilePairingConfig: (pairingId: string): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:mobile:copyPairingConfig', pairingId),
+  createAndroidBridgePairing: (): Promise<MobilePairingOffer> => ipcRenderer.invoke('aibox:androidBridge:createPairing'),
+  copyAndroidBridgePairingConfig: (pairingId: string): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:androidBridge:copyPairingConfig', pairingId),
   getMobileToolCatalog: (): Promise<MobileToolCatalog> => ipcRenderer.invoke('aibox:mobile:getToolCatalog'),
   listMobileDevices: (): Promise<MobileDevice[]> => ipcRenderer.invoke('aibox:mobile:listDevices'),
   getMobileAgentConfig: (agentId: string): Promise<MobileAgentConfig | null> => ipcRenderer.invoke('aibox:mobile:getAgentConfig', agentId),
@@ -197,9 +280,12 @@ const api = {
   generatePersona: (description: string): Promise<{ name: string; role: string; soulMd: string; agentsMd: string; systemPrompt: string; permissionMode: string }> => ipcRenderer.invoke('aibox:generatePersona', description),
   /** 会话列表（按助手） */
   listConversations: (agentId: string): Promise<Conversation[]> => ipcRenderer.invoke('aibox:listConversations', agentId),
+  /** Canonical conversation history, scoped by employee and local principal. */
+  getConversationTimeline: (input: ConversationTimelineInput): Promise<ConversationTimelineView> =>
+    ipcRenderer.invoke('aibox:getConversationTimeline', input),
   /** 发送消息给助手（创建/继续会话） */
-  chatWithAgent: (agentId: string, message: string, conversationId?: string): Promise<{ conversationId: string; task: Task }> =>
-    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId, randomUUID()),
+  chatWithAgent: (agentId: string, message: string, conversationId?: string, projectId?: string): Promise<{ conversationId: string; task: Task }> =>
+    ipcRenderer.invoke('aibox:chatWithAgent', agentId, encodeText(message), conversationId, randomUUID(), projectId),
   /** 会话重命名 */
   renameConversation: (id: string, title: string): Promise<void> => ipcRenderer.invoke('aibox:renameConversation', id, encodeText(title)),
   /** 删除会话 */
@@ -260,7 +346,7 @@ const api = {
 
   // 多供应商管理
   listProviders: (): Promise<{ id: string; name: string; baseUrl: string; model: string; isDefault: boolean; hasKey: boolean }[]> => ipcRenderer.invoke('aibox:listProviders'),
-  createProvider: (input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }): Promise<unknown> => ipcRenderer.invoke('aibox:createProvider', input),
+  createProvider: (input: { name: string; baseUrl: string; model: string; apiKey?: string; isDefault?: boolean }): Promise<{ id: string; name: string; baseUrl: string; model: string; isDefault: boolean; hasKey: boolean; createdAt: number }> => ipcRenderer.invoke('aibox:createProvider', input),
   updateProvider: (id: string, patch: { name?: string; baseUrl?: string; model?: string; apiKey?: string; isDefault?: boolean }): Promise<void> => ipcRenderer.invoke('aibox:updateProvider', id, patch),
   removeProvider: (id: string): Promise<void> => ipcRenderer.invoke('aibox:removeProvider', id),
   testProviderById: (id: string): Promise<{ ok: boolean; latencyMs: number; error: string | null }> => ipcRenderer.invoke('aibox:testProviderById', id),
@@ -337,6 +423,14 @@ const api = {
   createFollowUpTask: (parentTaskId: string, title: string): Promise<Task> => ipcRenderer.invoke('aibox:createFollowUpTask', parentTaskId, encodeText(title)),
   getTaskEvents: (taskId: string): Promise<TaskEvent[]> => ipcRenderer.invoke('aibox:getTaskEvents', taskId),
   getTaskResult: (taskId: string): Promise<string | null> => ipcRenderer.invoke('aibox:getTaskResult', taskId),
+  getTaskManifest: (taskId: string): Promise<import('@shared/types').ProjectArtifactManifest | null> => ipcRenderer.invoke('aibox:getTaskManifest', taskId),
+  openTaskDeliveryFolder: (taskId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openTaskDeliveryFolder', taskId),
+  openArtifactPreview: (taskId: string, relativePath: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openArtifactPreview', taskId, relativePath),
+  copyArtifactCommand: (taskId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:copyArtifactCommand', taskId),
+  runArtifactCommand: (taskId: string): Promise<import('@shared/types').ProjectArtifactRuntimeOperationResult> => ipcRenderer.invoke('aibox:runArtifactCommand', taskId),
+  getArtifactRuntimeStatus: (taskId: string): Promise<import('@shared/types').ProjectArtifactRuntimeEvidence | null> => ipcRenderer.invoke('aibox:getArtifactRuntimeStatus', taskId),
+  stopArtifactRuntime: (taskId: string): Promise<import('@shared/types').ProjectArtifactRuntimeOperationResult> => ipcRenderer.invoke('aibox:stopArtifactRuntime', taskId),
+  openArtifactRuntimeUrl: (taskId: string): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:openArtifactRuntimeUrl', taskId),
   setTaskQuality: (taskId: string, quality: 'accepted' | 'rejected' | 'rework' | null): Promise<Task | null> => ipcRenderer.invoke('aibox:setTaskQuality', taskId, quality),
 
   // 定时任务（P3a）
@@ -393,9 +487,9 @@ const api = {
   getWeixinLoginState: (): Promise<WeixinLoginState> => ipcRenderer.invoke('aibox:getWeixinLoginState'),
   submitWeixinVerifyCode: (code: string): Promise<WeixinLoginState> => ipcRenderer.invoke('aibox:submitWeixinVerifyCode', code),
   cancelWeixinLogin: (): Promise<void> => ipcRenderer.invoke('aibox:cancelWeixinLogin'),
-  setupChannel: (id: string, accountName: string): Promise<void> => ipcRenderer.invoke('aibox:setupChannel', id, accountName),
   disconnectChannel: (id: string): Promise<void> => ipcRenderer.invoke('aibox:disconnectChannel', id),
   bindChannel: (channelId: string, agentId: string): Promise<void> => ipcRenderer.invoke('aibox:bindChannel', channelId, agentId),
+  bindChannelProject: (channelId: string, projectId: string): Promise<void> => ipcRenderer.invoke('aibox:bindChannelProject', channelId, projectId),
   unbindChannel: (channelId: string, agentId: string): Promise<void> => ipcRenderer.invoke('aibox:unbindChannel', channelId, agentId),
 
   // 设置 / 目录
@@ -403,19 +497,26 @@ const api = {
     ipcRenderer.invoke('aibox:getSetting', key),
   setSetting: <K extends RendererSettingKey>(key: K, value: RendererSettingMap[K]): Promise<void> =>
     ipcRenderer.invoke('aibox:setSetting', key, value),
-  /** 演示数据残留量（H-3：演示与真实数据同表，需可查可清） */
-  getDemoDataStats: (): Promise<{ agents: number; tasks: number; projects: number }> => ipcRenderer.invoke('aibox:getDemoDataStats'),
-  /** 清空演示数据：只删 is_demo=1 行，真实数据不受影响 */
-  purgeDemoData: (): Promise<{ agents: number; tasks: number; projects: number }> => ipcRenderer.invoke('aibox:purgeDemoData'),
-  getWebAdminStatus: (): Promise<WebAdminStatus> => ipcRenderer.invoke('aibox:getWebAdminStatus'),
-  regenerateWebToken: (): Promise<WebAdminStatus> => ipcRenderer.invoke('aibox:regenerateWebToken'),
-  copyWebToken: (): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:copyWebToken'),
+  getDebugLogStatus: (): Promise<DebugLogStatus> => ipcRenderer.invoke('aibox:getDebugLogStatus'),
+  setDebugMode: (enabled: boolean): Promise<DebugLogStatus> => ipcRenderer.invoke('aibox:setDebugMode', enabled),
+  openDebugLogDirectory: (): Promise<{ ok: true }> => ipcRenderer.invoke('aibox:openDebugLogDirectory'),
+
+  // Vision attachments are opaque references; host paths and provider keys
+  // never cross the preload boundary.
+  getVisionBinding: (): Promise<VisionModelBindingView | null> => ipcRenderer.invoke('aibox:getVisionBinding'),
+  configureVisionBinding: (input: VisionConfigureInput): Promise<VisionModelBindingView> => ipcRenderer.invoke('aibox:configureVisionBinding', input),
+  clearVisionBinding: (): Promise<null> => ipcRenderer.invoke('aibox:clearVisionBinding'),
+  putVisionAttachment: (input: { data: ArrayBuffer; mimeType: string; filename?: string }): Promise<VisionAttachmentRef> => ipcRenderer.invoke('aibox:putVisionAttachment', input),
+  pickVisionAttachment: (): Promise<VisionAttachmentRef | null> => ipcRenderer.invoke('aibox:pickVisionAttachment'),
+  describeVision: (input: VisionDescribeInput): Promise<VisionDescribeResult> => ipcRenderer.invoke('aibox:describeVision', input),
 
   // OCR 文字识别服务
   getOcrStatus: (): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:getOcrStatus'),
   toggleOcr: (enabled: boolean): Promise<{ enabled: boolean; ready: boolean; modelsExist: boolean; modelSize: string; version: string }> => ipcRenderer.invoke('aibox:toggleOcr', enabled),
   downloadOcrModels: (): Promise<{ ok: boolean; message: string }> => ipcRenderer.invoke('aibox:downloadOcrModels'),
-  ocrRecognize: (imagePath: string): Promise<{ ok: boolean; text: string; boxes: { box: [number, number][]; text: string; confidence: number }[]; elapsed: number; error?: string }> => ipcRenderer.invoke('aibox:ocrRecognize', imagePath),
+  /** Local OCR accepts the same opaque attachment contract as Nexus Vision. */
+  ocrRecognize: (attachmentRef: VisionAttachmentRef): Promise<OcrRecognitionResultView> =>
+    ipcRenderer.invoke('aibox:ocrRecognize', attachmentRef),
   /** 数据库完整性检查 */
   integrityCheck: (): Promise<{ ok: boolean; message: string; repaired: number }> => ipcRenderer.invoke('aibox:integrityCheck'),
   /** 手动数据清理 */
@@ -452,6 +553,11 @@ const api = {
     const handler = (_: unknown, r: ResourceUpdatePayload) => fn(r);
     ipcRenderer.on('aibox:resources', handler);
     return () => ipcRenderer.removeListener('aibox:resources', handler);
+  },
+  onQuestWindowClosed: (fn: (projectId: string | null) => void): (() => void) => {
+    const handler = (_: unknown, projectId: string | null) => fn(projectId);
+    ipcRenderer.on('aibox:questWindowClosed', handler);
+    return () => ipcRenderer.removeListener('aibox:questWindowClosed', handler);
   },
   /** 任务输出流式推送（逐字显示） */
   onTaskOutput: (fn: (p: { taskId: string; chunk: string }) => void): (() => void) => {

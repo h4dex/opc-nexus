@@ -80,9 +80,9 @@ src/
 │       ├── approvalBroker.ts   # 人工审批代理
 │       ├── resourceMonitor.ts  # 系统资源监控
 │       ├── browserManager.ts   # 浏览器自动化
-│       ├── webServer.ts        # 局域网 Web 管理服务
+│       ├── hermesMobileGateway.ts # 当前项目 Hermes 手机对话入口
 │       ├── apiBridge.ts        # OpenAI 兼容 API 代理
-│       ├── executor/           # 执行器（LLM/CLI/ACP/模拟）
+│       ├── executor/           # 执行器（真实 LLM/CLI/ACP）
 │       └── channels/           # 渠道实现（飞书/企微/微信）
 ├── preload/            # contextBridge 桥接
 ├── renderer/           # React SPA

@@ -4,11 +4,12 @@
  * - risk 三级：safe（只读）/ write（写入）/ danger（删除等）；审批策略由执行器按 permissionMode 决定
  * - delegate_task（P3b A2A 内部委托）通过 ToolHost 回调编排器，避免循环依赖
  */
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, resolve, sep } from 'node:path';
-import { execFile } from 'node:child_process';
-import type { Task } from '../../../shared/types.js';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { execFile, type ChildProcess } from 'node:child_process';
+import type { ApprovalType, Task } from '../../../shared/types.js';
 import { childProcessEnv } from '../engineEnv.js';
+import { terminateCliProcess } from '../cliLauncher.js';
 
 export type ToolRisk = 'safe' | 'write' | 'danger';
 
@@ -20,6 +21,8 @@ export interface ToolContext {
   agentId: string;
   taskId: string;
   host: ToolHost | null;
+  /** Task cancellation/timeout propagated by the owning executor. */
+  signal?: AbortSignal;
   /** 浏览器管理器（browser 能力工具使用，由执行器注入） */
   browserMgr?: import('../browserManager.js').BrowserManager | null;
   /** OCR 服务（由执行器注入，未启用时为 null） */
@@ -65,8 +68,13 @@ export interface ToolDef {
   name: string;
   description: string;
   risk: ToolRisk;
+  /** Resolve the effective risk from validated call arguments when a tool has
+   * read-only and side-effecting variants (for example HTTP GET vs POST). */
+  riskForArgs?: (args: Record<string, unknown>) => ToolRisk;
   /** 需要员工开启对应能力开关才注册该工具（未设置 = 无额外要求） */
   requiresCapability?: ToolCapability;
+  /** Autonomous mode still confirms operations that cross the project boundary. */
+  autonomousApproval?: ApprovalType | ((args: Record<string, unknown>) => ApprovalType | null);
   inputSchema: Record<string, unknown>;
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<string>;
 }
@@ -88,6 +96,107 @@ function runCommandProcessEnv(): NodeJS.ProcessEnv {
     if (!RUN_COMMAND_HOST_ENV_ALLOWLIST.has(key.toUpperCase())) delete env[key];
   }
   return env;
+}
+
+interface ToolProcessOptions {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  maxBuffer: number;
+  timeoutMs: number;
+  timeoutMessage: string;
+}
+
+interface ToolProcessResult {
+  error: Error | null;
+  stdout: string;
+  stderr: string;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error('工具执行已取消');
+  error.name = 'AbortError';
+  return error;
+}
+
+async function terminateToolProcess(child: ChildProcess): Promise<void> {
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+      return;
+    } catch {
+      // Fall through when the process already exited or could not form a group.
+    }
+  }
+  await terminateCliProcess(child);
+}
+
+/** Execute a local tool process under both the task signal and a tool timeout. */
+function executeToolProcess(
+  file: string,
+  args: string[],
+  options: ToolProcessOptions,
+  parentSignal?: AbortSignal
+): Promise<ToolProcessResult> {
+  if (parentSignal?.aborted) return Promise.reject(abortReason(parentSignal));
+
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error(options.timeoutMessage)), options.timeoutMs);
+
+  return new Promise<ToolProcessResult>((resolveP, rejectP) => {
+    let settled = false;
+    let removeAbortListener: () => void = () => undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener('abort', onParentAbort);
+      removeAbortListener();
+    };
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectP(error);
+    };
+    const resolveOnce = (result: ToolProcessResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveP(result);
+    };
+
+    const execOptions = {
+      cwd: options.cwd,
+      maxBuffer: options.maxBuffer,
+      shell: false,
+      windowsHide: true,
+      env: options.env,
+      encoding: 'utf8' as const,
+      detached: process.platform !== 'win32'
+    };
+    const child = execFile(file, args, execOptions, (error, stdout, stderr) => {
+      // The abort listener owns settlement after terminateToolProcess finishes.
+      // A shell close event can arrive while taskkill is still removing children.
+      if (controller.signal.aborted) return;
+      resolveOnce({
+        error: error instanceof Error ? error : null,
+        stdout: String(stdout ?? ''),
+        stderr: String(stderr ?? '')
+      });
+    });
+
+    if (!settled) {
+      const onAbort = () => {
+        void terminateToolProcess(child)
+          .catch(() => undefined)
+          .finally(() => rejectOnce(abortReason(controller.signal)));
+      };
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+      removeAbortListener = () => controller.signal.removeEventListener('abort', onAbort);
+      if (controller.signal.aborted) onAbort();
+    }
+  });
 }
 
 // ---------- Web 搜索辅助（国内优先：Bing 中国 → DuckDuckGo 回退） ----------
@@ -146,13 +255,33 @@ async function searchDuckDuckGo(query: string): Promise<string | null> {
   }
 }
 
-/** 路径防护：拒绝逃逸 workspace 的任何路径（含 ..、绝对路径指向外部） */
-function resolveInWorkspace(workspace: string, relPath: unknown): string {
+function isInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+function nearestExistingAncestor(path: string): string {
+  let candidate = path;
+  while (!existsSync(candidate)) {
+    const parent = dirname(candidate);
+    if (parent === candidate) throw new Error('工作目录不存在');
+    candidate = parent;
+  }
+  return candidate;
+}
+
+/** 拒绝词法路径和符号链接两种 workspace 逃逸。 */
+export function resolveInWorkspace(workspace: string, relPath: unknown): string {
   const p = typeof relPath === 'string' ? relPath : '';
   const root = resolve(workspace);
   const full = resolve(root, p);
-  if (full !== root && !full.startsWith(root + sep)) {
+  if (!isInside(root, full)) {
     throw new Error(`路径越界：仅允许访问工作目录内文件（${p}）`);
+  }
+  const canonicalRoot = realpathSync.native(root);
+  const canonicalAncestor = realpathSync.native(nearestExistingAncestor(full));
+  if (!isInside(canonicalRoot, canonicalAncestor)) {
+    throw new Error(`路径越界：符号链接指向工作目录外（${p}）`);
   }
   return full;
 }
@@ -349,7 +478,22 @@ export const TOOLS: ToolDef[] = [
   {
     name: 'http_request',
     description: '发起 HTTP/HTTPS 网络请求，返回响应体（最多 16000 字符）。支持 GET/POST/PUT/DELETE。',
-    risk: 'write',
+    // GET is an observation used by validation/research workers and must not
+    // park a standard employee in WAITING_APPROVAL. Mutating HTTP methods
+    // remain danger-level and therefore retain the approval gate.
+    risk: 'safe',
+    riskForArgs: (args) => {
+      // Models often omit method or emit an empty string for the default GET.
+      // Treat both forms as the same read-only request; otherwise a validation
+      // worker is incorrectly parked in WAITING_APPROVAL before the request
+      // even reaches the network.
+      const method = String(args.method ?? '').trim().toUpperCase() || 'GET';
+      return method === 'GET' ? 'safe' : 'danger';
+    },
+    autonomousApproval: (args) => {
+      const method = String(args.method ?? '').trim().toUpperCase() || 'GET';
+      return method === 'GET' ? null : 'network';
+    },
     requiresCapability: 'network',
     inputSchema: {
       type: 'object',
@@ -364,7 +508,10 @@ export const TOOLS: ToolDef[] = [
     async execute(args) {
       const url = String(args.url ?? '');
       if (!/^https?:\/\//i.test(url)) throw new Error('仅允许 http:// 或 https:// 协议的请求');
-      const method = String(args.method ?? 'GET').toUpperCase();
+      const method = String(args.method ?? '').trim().toUpperCase() || 'GET';
+      if (!['GET', 'POST', 'PUT', 'DELETE'].includes(method)) {
+        throw new Error(`不支持的 HTTP 方法：${method}`);
+      }
       const rawHeaders = (args.headers ?? {}) as Record<string, string>;
       // 清洗 header 值：HTTP 规范要求 header 值为 Latin-1（≤255），非 ASCII 字符需剥离或编码
       const headers: Record<string, string> = {};
@@ -388,6 +535,7 @@ export const TOOLS: ToolDef[] = [
     name: 'run_command',
     description: '在工作目录内执行系统命令（shell），返回 stdout+stderr（最多 16000 字符）。超时 5 分钟。',
     risk: 'danger',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'shell',
     inputSchema: {
       type: 'object',
@@ -403,29 +551,24 @@ export const TOOLS: ToolDef[] = [
       const cwd = resolveInWorkspace(ctx.workspace, args.cwd ?? '.');
       const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/bash';
       const shellArg = process.platform === 'win32' ? '/c' : '-c';
-      return new Promise<string>((resolveP, rejectP) => {
-        execFile(shell, [shellArg, command], {
-          cwd,
-          timeout: 5 * 60_000,
-          maxBuffer: 1024 * 1024,
-          shell: false,
-          env: runCommandProcessEnv()
-        }, (err, stdout, stderr) => {
-          const out = (stdout || '') + (stderr ? `\n[stderr]\n${stderr}` : '');
-          const truncated = out.length > 16_000 ? `${out.slice(0, 16_000)}\n…（已截断）` : out;
-          if (err && !stdout && !stderr) {
-            rejectP(new Error(`命令执行失败：${err.message}`));
-          } else {
-            resolveP(truncated || '（无输出）');
-          }
-        });
-      });
+      const { error, stdout, stderr } = await executeToolProcess(shell, [shellArg, command], {
+        cwd,
+        timeoutMs: 5 * 60_000,
+        timeoutMessage: '命令执行超时（5 分钟）',
+        maxBuffer: 1024 * 1024,
+        env: runCommandProcessEnv()
+      }, ctx.signal);
+      const out = stdout + (stderr ? `\n[stderr]\n${stderr}` : '');
+      const truncated = out.length > 16_000 ? `${out.slice(0, 16_000)}\n…（已截断）` : out;
+      if (error && !stdout && !stderr) throw new Error(`命令执行失败：${error.message}`);
+      return truncated || '（无输出）';
     }
   },
   {
     name: 'install_package',
     description: '安装软件包（支持 npm/pip/apt）。用于安装 MCP 工具、Skills 依赖、Python 库等。',
     risk: 'danger',
+    autonomousApproval: 'install',
     requiresCapability: 'install',
     inputSchema: {
       type: 'object',
@@ -462,16 +605,15 @@ export const TOOLS: ToolDef[] = [
         throw new Error(`不支持的包管理器：${manager}（支持 npm/pip/apt）`);
       }
       const cwd = manager === 'npm' ? resolveInWorkspace(ctx.workspace, args.cwd ?? '.') : undefined;
-      return new Promise<string>((resolveP, rejectP) => {
-        execFile(bin, cmdArgs, { cwd, timeout: 10 * 60_000, maxBuffer: 2 * 1024 * 1024, shell: false }, (err, stdout, stderr) => {
-          const out = (stdout || '') + (stderr ? `\n[stderr]\n${stderr.slice(0, 2000)}` : '');
-          if (err) {
-            rejectP(new Error(`安装失败：${err.message}\n${(stderr || '').slice(0, 500)}`));
-          } else {
-            resolveP(`安装完成：${packages.join(', ')}\n${out.slice(0, 4000)}`);
-          }
-        });
-      });
+      const { error, stdout, stderr } = await executeToolProcess(bin, cmdArgs, {
+        cwd,
+        timeoutMs: 10 * 60_000,
+        timeoutMessage: '安装超时（10 分钟）',
+        maxBuffer: 2 * 1024 * 1024
+      }, ctx.signal);
+      const out = stdout + (stderr ? `\n[stderr]\n${stderr.slice(0, 2000)}` : '');
+      if (error) throw new Error(`安装失败：${error.message}\n${stderr.slice(0, 500)}`);
+      return `安装完成：${packages.join(', ')}\n${out.slice(0, 4000)}`;
     }
   },
   // ---------- 本地 Python 工具集 ----------
@@ -479,6 +621,7 @@ export const TOOLS: ToolDef[] = [
     name: 'run_python_tool',
     description: '调用本地 Python 工具集（local-tools/）。可用工具: http_tool(网络请求/下载), sysinfo_tool(系统信息), office_convert(文件格式转换), file_tool(文件批处理), text_tool(文本处理), image_tool(图片处理), webserver_tool(本地Web服务)。返回 JSON 结构化结果。',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'shell',
     inputSchema: {
       type: 'object',
@@ -516,29 +659,26 @@ export const TOOLS: ToolDef[] = [
       // 解析参数为数组（简单按空格拆分，引号内不拆分）
       const argArray = toolArgs.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((a) => a.replace(/^"|"$/g, '')) ?? [];
 
-      return new Promise<string>((resolveP, rejectP) => {
-        execFile(pythonBin, [scriptPath, ...argArray], {
-          cwd: ctx.workspace,
-          timeout: 3 * 60_000,
-          maxBuffer: 2 * 1024 * 1024,
-          shell: false
-        }, (err, stdout, stderr) => {
-          const out = (stdout || '').trim();
-          if (err && !out) {
-            rejectP(new Error(`Python 工具执行失败: ${err.message}\n${(stderr || '').slice(0, 1000)}`));
-          } else {
-            const result = out || (stderr || '').slice(0, 4000) || '（无输出）';
-            resolveP(result.length > 16_000 ? `${result.slice(0, 16_000)}\n…（已截断）` : result);
-          }
-        });
-      });
+      const { error, stdout, stderr } = await executeToolProcess(pythonBin, [scriptPath, ...argArray], {
+        cwd: ctx.workspace,
+        timeoutMs: 3 * 60_000,
+        timeoutMessage: 'Python 工具执行超时（3 分钟）',
+        maxBuffer: 2 * 1024 * 1024
+      }, ctx.signal);
+      const out = stdout.trim();
+      if (error && !out) throw new Error(`Python 工具执行失败: ${error.message}\n${stderr.slice(0, 1000)}`);
+      const result = out || stderr.slice(0, 4000) || '（无输出）';
+      return result.length > 16_000 ? `${result.slice(0, 16_000)}\n…（已截断）` : result;
     }
   },
   // ---------- 浏览器自动化（Playwright / CDP） ----------
   {
     name: 'browser_navigate',
     description: '导航到指定 URL（启动或复用浏览器实例）。返回页面标题。',
-    risk: 'write',
+    // Navigation only observes a page. Click/type/evaluate remain write
+    // operations and keep their approval gates; a validator must be able to
+    // inspect a real preview without an unnecessary human prompt.
+    risk: 'safe',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -557,6 +697,7 @@ export const TOOLS: ToolDef[] = [
     name: 'browser_click',
     description: '点击页面上的元素（CSS 选择器）',
     risk: 'write',
+    autonomousApproval: 'network',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -574,6 +715,7 @@ export const TOOLS: ToolDef[] = [
     name: 'browser_type',
     description: '在页面输入框中填写文本（CSS 选择器定位）',
     risk: 'write',
+    autonomousApproval: 'network',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -601,7 +743,12 @@ export const TOOLS: ToolDef[] = [
     },
     async execute(args, ctx) {
       if (!ctx.browserMgr) throw new Error('浏览器管理器未初始化');
-      const r = await ctx.browserMgr.screenshot(ctx.agentId, args.selector ? String(args.selector) : undefined);
+      const outputDir = resolveInWorkspace(ctx.workspace, '.opc-nexus/screenshots');
+      const r = await ctx.browserMgr.screenshot(
+        ctx.agentId,
+        args.selector ? String(args.selector) : undefined,
+        outputDir
+      );
       return `截图已保存：${r.path}`;
     }
   },
@@ -609,6 +756,7 @@ export const TOOLS: ToolDef[] = [
     name: 'browser_evaluate',
     description: '在页面中执行 JavaScript 代码，返回结果。',
     risk: 'write',
+    autonomousApproval: 'network',
     requiresCapability: 'browser',
     inputSchema: {
       type: 'object',
@@ -667,9 +815,8 @@ export const TOOLS: ToolDef[] = [
     inputSchema: { type: 'object', properties: {} },
     async execute(_args, ctx) {
       const { join: pJoin } = await import('node:path');
-      const { mkdirSync: mk, readFileSync: rf } = await import('node:fs');
-      const { app: electronApp } = await import('electron');
-      const dir = pJoin(electronApp.getPath('userData'), 'aibox-data', 'screenshots');
+      const { mkdirSync: mk } = await import('node:fs');
+      const dir = resolveInWorkspace(ctx.workspace, '.opc-nexus/screenshots');
       mk(dir, { recursive: true });
       const filePath = pJoin(dir, `desktop_${ctx.agentId}_${Date.now()}.png`);
       // Windows: PowerShell 截屏；Linux: scrot/gnome-screenshot
@@ -690,6 +837,7 @@ export const TOOLS: ToolDef[] = [
     name: 'computer_click',
     description: '在桌面指定坐标点击鼠标。',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',
@@ -730,6 +878,7 @@ public class MouseSim {
     name: 'computer_type',
     description: '模拟键盘输入文本（在当前焦点位置）',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',
@@ -760,6 +909,7 @@ public class MouseSim {
     name: 'computer_key',
     description: '模拟按键组合（如 Ctrl+C、Enter、Alt+Tab）',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',
@@ -794,6 +944,7 @@ public class MouseSim {
     name: 'computer_scroll',
     description: '在指定坐标滚动鼠标滚轮',
     risk: 'write',
+    autonomousApproval: 'outside_workspace',
     requiresCapability: 'computer',
     inputSchema: {
       type: 'object',

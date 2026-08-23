@@ -46,8 +46,7 @@ export function Channels() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 650, fontSize: 14.5, display: 'flex', gap: 8, alignItems: 'center' }}>
                     {TYPE_LABEL[c.type]}
-                    {c.type === 'qq' && <span className="tag gray">演示</span>}
-                    {c.type !== 'qq' && <span className="tag blue">真实接入</span>}
+                    <span className="tag blue">真实接入</span>
                   </div>
                   <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 2 }}>{c.accountName}</div>
                 </div>
@@ -71,6 +70,11 @@ export function Channels() {
                 </div>
               )}
 
+              <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 12 }}>
+                绑定项目：{c.boundProjectIds.length
+                  ? c.boundProjectIds.map((id) => snapshot.projects.find((project) => project.id === id)?.name ?? id).join('、')
+                  : '未绑定'}
+              </div>
               <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 12 }}>
                 绑定员工：{c.boundAgentIds.length
                   ? [...new Set(c.boundAgentIds)].map((id) => agentCards.find((a) => a.agent.id === id)?.agent.name ?? id).join('、')
@@ -110,7 +114,6 @@ export function Channels() {
           onClose={closeSetup}
         />
       )}
-      {setupTarget && setupTarget.type === 'qq' && <ChannelSetupModal channel={setupTarget} onClose={closeSetup} />}
     </>
   );
 }
@@ -127,6 +130,7 @@ function WeixinSetupModal({ channel, onClose }: { channel: Channel; onClose: () 
   const { snapshot } = useApp();
   const [login, setLogin] = useState<WeixinLoginState>(EMPTY_WEIXIN_LOGIN);
   const [bindId, setBindId] = useState(channel.boundAgentIds[0] ?? '');
+  const [projectId, setProjectId] = useState(channel.boundProjectIds[0] ?? '');
   const [verifyCode, setVerifyCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -161,6 +165,9 @@ function WeixinSetupModal({ channel, onClose }: { channel: Channel; onClose: () 
     setBusy(true);
     setError('');
     try {
+      if (!projectId || !bindId) throw new Error('请选择项目和数字员工');
+      await window.aibox.bindChannelProject(channel.id, projectId);
+      if (!channel.boundAgentIds.includes(bindId)) await window.aibox.bindChannel(channel.id, bindId);
       polling.current?.accept(await window.aibox.startWeixinLogin(bindId || undefined));
     } catch (cause) {
       if (alive.current) setError(cause instanceof Error ? cause.message : String(cause));
@@ -205,6 +212,15 @@ function WeixinSetupModal({ channel, onClose }: { channel: Channel; onClose: () 
         )}
       </>}>
       <div className="field">
+        <label>绑定项目</label>
+        <select value={projectId} disabled={waiting || busy || login.phase === 'CONNECTED'} onChange={(event) => setProjectId(event.target.value)}>
+          <option value="">请选择项目</option>
+          {snapshot?.projects.filter((project) => project.status !== 'archived').map((project) => (
+            <option key={project.id} value={project.id}>{project.name}</option>
+          ))}
+        </select>
+      </div>
+      <div className="field">
         <label>绑定数字员工</label>
         <select value={bindId} disabled={waiting || busy || login.phase === 'CONNECTED'} onChange={(event) => setBindId(event.target.value)}>
           <option value="">暂不绑定</option>
@@ -244,6 +260,7 @@ function FeishuSetupModal({ channel, onClose }: { channel: Channel; onClose: () 
   const [appId, setAppId] = useState('');
   const [appSecret, setAppSecret] = useState('');
   const [bindId, setBindId] = useState(channel.boundAgentIds[0] ?? '');
+  const [projectId, setProjectId] = useState(channel.boundProjectIds[0] ?? '');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
 
@@ -251,6 +268,8 @@ function FeishuSetupModal({ channel, onClose }: { channel: Channel; onClose: () 
     setBusy(true);
     setMessage(null);
     try {
+      if (!projectId || !bindId) throw new Error('请选择项目和数字员工');
+      await window.aibox.bindChannelProject(channel.id, projectId);
       if (bindId && !channel.boundAgentIds.includes(bindId)) await window.aibox.bindChannel(channel.id, bindId);
       const r = await window.aibox.configureFeishu(appId, appSecret);
       setMessage({ ok: r.ok, text: r.message });
@@ -265,6 +284,15 @@ function FeishuSetupModal({ channel, onClose }: { channel: Channel; onClose: () 
   return (
     <Modal title="配置渠道 · 飞书（真实接入）" onClose={onClose}
       footer={<><button className="btn" onClick={onClose}>取消</button><button className="btn primary" disabled={busy} onClick={() => void confirm()}>{busy ? '连接中…' : '保存并连接'}</button></>}>
+      <div className="field">
+        <label>绑定项目</label>
+        <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+          <option value="">请选择项目</option>
+          {snapshot?.projects.filter((project) => project.status !== 'archived').map((project) => (
+            <option key={project.id} value={project.id}>{project.name}</option>
+          ))}
+        </select>
+      </div>
       <div className="field">
         <label>App ID（飞书开放平台 · 企业自建应用）</label>
         <input value={appId} onChange={(e) => setAppId(e.target.value)} placeholder="cli_xxxxxxxxxxxxxxxxx" />
@@ -307,6 +335,7 @@ function CredentialSetupModal({ channel, title, field1, field2, hint, onSubmit, 
   const [value1, setValue1] = useState('');
   const [value2, setValue2] = useState('');
   const [bindId, setBindId] = useState(channel.boundAgentIds[0] ?? '');
+  const [projectId, setProjectId] = useState(channel.boundProjectIds[0] ?? '');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
 
@@ -314,6 +343,8 @@ function CredentialSetupModal({ channel, title, field1, field2, hint, onSubmit, 
     setBusy(true);
     setMessage(null);
     try {
+      if (!projectId || !bindId) throw new Error('请选择项目和数字员工');
+      await window.aibox.bindChannelProject(channel.id, projectId);
       if (bindId && !channel.boundAgentIds.includes(bindId)) await window.aibox.bindChannel(channel.id, bindId);
       const r = await onSubmit(value1, value2);
       setMessage({ ok: r.ok, text: r.message });
@@ -328,6 +359,15 @@ function CredentialSetupModal({ channel, title, field1, field2, hint, onSubmit, 
   return (
     <Modal title={title} onClose={onClose}
       footer={<><button className="btn" onClick={onClose}>取消</button><button className="btn primary" disabled={busy} onClick={() => void confirm()}>{busy ? '连接中…' : '保存并连接'}</button></>}>
+      <div className="field">
+        <label>绑定项目</label>
+        <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+          <option value="">请选择项目</option>
+          {snapshot?.projects.filter((project) => project.status !== 'archived').map((project) => (
+            <option key={project.id} value={project.id}>{project.name}</option>
+          ))}
+        </select>
+      </div>
       <div className="field">
         <label>{field1.label}</label>
         <input value={value1} onChange={(e) => setValue1(e.target.value)} placeholder={field1.placeholder} />
@@ -351,41 +391,6 @@ function CredentialSetupModal({ channel, title, field1, field2, hint, onSubmit, 
       )}
       <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 10 }}>
         安全基线（10.5）：渠道任务默认低权限，写入/删除类操作一律需在本机控制中心审批（不受受信任模式豁免）。
-      </div>
-    </Modal>
-  );
-}
-
-function ChannelSetupModal({ channel, onClose }: { channel: Channel; onClose: () => void }) {
-  const { snapshot } = useApp();
-  const [account, setAccount] = useState(channel.accountName);
-  const [bindId, setBindId] = useState('');
-
-  const confirm = async () => {
-    await window.aibox.setupChannel(channel.id, account || TYPE_LABEL[channel.type]);
-    if (bindId) await window.aibox.bindChannel(channel.id, bindId);
-    onClose();
-  };
-
-  return (
-    <Modal title={`配置渠道 · ${TYPE_LABEL[channel.type]}`} onClose={onClose}
-      footer={<><button className="btn" onClick={onClose}>取消</button><button className="btn primary" onClick={() => void confirm()}>开始连接</button></>}>
-      <div className="field">
-        <label>账号 / Bot 名称</label>
-        <input value={account} onChange={(e) => setAccount(e.target.value)} placeholder="例如：森科AI助手" />
-        <div className="hint">真实环境将唤起 Gateway 扫码 / WebSocket 配置流程；凭据仅存入系统密钥库。</div>
-      </div>
-      <div className="field">
-        <label>绑定数字员工（路由：精确会话绑定 &gt; 账号默认 &gt; 系统默认）</label>
-        <select value={bindId} onChange={(e) => setBindId(e.target.value)}>
-          <option value="">暂不绑定</option>
-          {snapshot?.agentCards.map((c) => (
-            <option key={c.agent.id} value={c.agent.id}>{c.agent.name}</option>
-          ))}
-        </select>
-      </div>
-      <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.8, background: 'var(--input-bg)', padding: '10px 14px', borderRadius: 10 }}>
-        安全基线：渠道任务默认低权限；安装、提权、目录外访问、删除/覆盖和敏感数据上传只能在本机可信 UI 批准（10.5）。
       </div>
     </Modal>
   );

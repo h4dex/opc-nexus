@@ -5,7 +5,6 @@ const SETTING_KEYS = new Set<RendererSettingKey>([
   'theme',
   'thresholds',
   'notifications',
-  'demoAutoTasks',
   'memory:autoAcceptConversationProposals'
 ]);
 
@@ -24,11 +23,12 @@ export function validateRendererSetting<K extends RendererSettingKey>(
   key: K,
   value: unknown
 ): RendererSettingMap[K] {
+  if (!SETTING_KEYS.has(key)) throw new Error('Renderer setting key is not allowed');
   if (key === 'theme') {
     if (value !== 'dark' && value !== 'light') throw new Error('Invalid theme setting');
     return value as RendererSettingMap[K];
   }
-  if (key === 'notifications' || key === 'demoAutoTasks' || key === 'memory:autoAcceptConversationProposals') {
+  if (key === 'notifications' || key === 'memory:autoAcceptConversationProposals') {
     if (typeof value !== 'boolean') throw new Error(`Invalid ${key} setting`);
     return value as RendererSettingMap[K];
   }

@@ -24,6 +24,7 @@ interface Tables {
   projects: Map<string, Record<string, unknown>>;
   agents: Map<string, Record<string, unknown>>;
   tasks: Map<string, Record<string, unknown>>;
+  task_dependencies: Map<string, Record<string, unknown>>;
   agent_runs: Map<string, Record<string, unknown>>;
   task_events: Map<string, Record<string, unknown>>;
   approvals: Map<string, Record<string, unknown>>;
@@ -57,6 +58,7 @@ export function createMockDb(): MockDb & { tables: Tables } {
     projects: new Map(),
     agents: new Map(),
     tasks: new Map(),
+    task_dependencies: new Map(),
     agent_runs: new Map(),
     task_events: new Map(),
     approvals: new Map(),
@@ -120,6 +122,28 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
   const table = detectTable(sql);
   if (!table) return mode === 'get' ? undefined : [];
   const rows = [...tables[table].values()];
+
+  if (/SELECT dependency_task_id FROM task_dependencies WHERE task_id = \?/.test(sql)) {
+    const result = rows
+      .filter((row) => row.task_id === args[0])
+      .sort((a, b) => String(a.dependency_task_id).localeCompare(String(b.dependency_task_id)))
+      .map((row) => ({ dependency_task_id: row.dependency_task_id }));
+    return mode === 'get' ? result[0] : result;
+  }
+
+  if (/SELECT td\.task_id\s+FROM task_dependencies td/.test(sql)) {
+    const activeOnly = /t\.status IN/.test(sql);
+    const activeStatuses = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'];
+    const result = rows
+      .filter((row) => {
+        const dependent = tables.tasks.get(row.task_id as string);
+        return row.dependency_task_id === args[0]
+          && dependent?.deleted_at == null
+          && (!activeOnly || activeStatuses.includes(String(dependent.status)));
+      })
+      .map((row) => ({ task_id: row.task_id }));
+    return mode === 'get' ? result[0] : result;
+  }
 
   if (/SELECT id, organization_id FROM channels WHERE id = \?/.test(sql)) {
     const row = tables.channels.get(args[0] as string);
@@ -221,13 +245,13 @@ function executeQuery(tables: Tables, sql: string, args: unknown[], mode: 'get' 
     return mode === 'get' ? result : result ? [result] : [];
   }
 
-  if (/SELECT content FROM messages\s+WHERE conversation_id = \? AND direction = 'outbound' AND external_message_key = \?/.test(sql)) {
+  if (/SELECT content(?:, metadata_json)? FROM messages\s+WHERE conversation_id = \? AND direction = 'outbound' AND external_message_key = \?/.test(sql)) {
     const row = [...tables.messages.values()].find((item) =>
       item.conversation_id === args[0]
       && item.direction === 'outbound'
       && item.external_message_key === args[1]
     );
-    const result = row ? { content: row.content } : undefined;
+    const result = row ? { content: row.content, metadata_json: row.metadata_json } : undefined;
     return mode === 'get' ? result : result ? [result] : [];
   }
 
@@ -976,8 +1000,8 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
   if (/INSERT INTO tasks/.test(sql)) {
     const [
       id, agentId, projectId, conversationId, inputMessageId, title, content,
-      source, sourceKey, parentId, status, priority, stage, sessionId,
-      workspaceOverride, engineOverride, now, startedAt
+      source, sourceKey, parentId, status, priority, stage, error, sessionId,
+       workspaceOverride, engineOverride, requiresArtifacts, now, startedAt, endedAt
     ] = args;
     if (sourceKey != null && [...tables.tasks.values()].some(row => row.source === source && row.source_key === sourceKey)) {
       return { changes: 0 };
@@ -985,10 +1009,19 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     tables.tasks.set(id as string, {
       id, agent_id: agentId, project_id: projectId, conversation_id: conversationId,
       input_message_id: inputMessageId, title, content, source, source_key: sourceKey, parent_id: parentId, status,
-      priority, progress: 0, stage, error: null, session_id: sessionId,
-      workspace_override: workspaceOverride, engine_override: engineOverride ?? null,
-      is_demo: 0, created_at: now, started_at: startedAt, ended_at: null, deleted_at: null, result: null, quality: null
+       priority, progress: 0, stage, error: error ?? null, session_id: sessionId,
+       workspace_override: workspaceOverride, engine_override: engineOverride ?? null,
+       artifacts_required: requiresArtifacts ?? 0,
+       is_demo: 0, created_at: now, started_at: startedAt, ended_at: endedAt ?? null, deleted_at: null, result: null, quality: null
     });
+    return { changes: 1 };
+  }
+
+  if (/INSERT INTO task_dependencies/.test(sql)) {
+    const [taskId, dependencyTaskId, createdAt] = args;
+    const key = `${taskId}:${dependencyTaskId}`;
+    if (tables.task_dependencies.has(key)) return { changes: 0 };
+    tables.task_dependencies.set(key, { task_id: taskId, dependency_task_id: dependencyTaskId, created_at: createdAt });
     return { changes: 1 };
   }
 
@@ -1226,6 +1259,17 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     return { changes: 0 };
   }
 
+  if (/UPDATE tasks SET stage = '等待执行取消确认', error = NULL WHERE id = \? AND status = 'RUNNING'/.test(sql)) {
+    const [id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'RUNNING') {
+      task.stage = '等待执行取消确认';
+      task.error = null;
+      return { changes: 1 };
+    }
+    return { changes: 0 };
+  }
+
   if (/UPDATE tasks SET deleted_at = \? WHERE id = \? AND deleted_at IS NULL/.test(sql)) {
     const [deletedAt, id] = args;
     const task = tables.tasks.get(id as string);
@@ -1255,6 +1299,17 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
     const task = tables.tasks.get(id as string);
     if (task && task.status === 'WAITING_APPROVAL') {
       task.status = 'QUEUED'; task.stage = stage; task.started_at = null;
+      return { changes: 1 };
+    }
+    return { changes: 0 };
+  }
+
+  if (/UPDATE tasks SET stage = '依赖失败', error = \? WHERE id = \? AND status = 'CANCELLED'/.test(sql)) {
+    const [error, id] = args;
+    const task = tables.tasks.get(id as string);
+    if (task && task.status === 'CANCELLED') {
+      task.stage = '依赖失败';
+      task.error = error;
       return { changes: 1 };
     }
     return { changes: 0 };
@@ -1388,6 +1443,7 @@ function executeRun(tables: Tables, sql: string, args: unknown[]): { changes: nu
 }
 
 function detectTable(sql: string): keyof Tables | null {
+  if (/\btask_dependencies\b/.test(sql)) return 'task_dependencies';
   if (/\bprojects\b/.test(sql)) return 'projects';
   if (/\bagents\b/.test(sql) && !/agent_runs/.test(sql)) return 'agents';
   if (/\bagent_runs\b/.test(sql)) return 'agent_runs';

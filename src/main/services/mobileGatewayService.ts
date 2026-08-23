@@ -1521,6 +1521,9 @@ export class MobileGatewayService {
       engineId: row.engine_id as string,
       workspace: row.workspace as string,
       permissionMode: row.permission_mode as Agent['permissionMode'],
+      memoryMode: (['long_term', 'short_term', 'none'].includes(String(row.memory_mode))
+        ? row.memory_mode
+        : 'short_term') as Agent['memoryMode'],
       capabilities: {
         network: caps.network === true,
         shell: caps.shell === true,

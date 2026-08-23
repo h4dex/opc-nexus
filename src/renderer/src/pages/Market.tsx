@@ -4,6 +4,7 @@ import { useApp } from '../store';
 import { MARKET_ROLES, DEPARTMENTS, type MarketRole } from '../data/marketRoles';
 import { IconPlus, IconUser } from '../components/icons';
 import { NEXUS_ENGINE_ID } from '../../../shared/types';
+import { isUserVisibleEngine } from '../utils/engineVisibility';
 
 export function Market() {
   const { snapshot } = useApp();
@@ -21,7 +22,9 @@ export function Market() {
   const hire = async (role: MarketRole) => {
     setHiring(role.id);
     try {
-      const engines = snapshot?.engines.filter((e) => ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)) ?? [];
+      const engines = snapshot?.engines.filter((e) =>
+        isUserVisibleEngine(e) && ['HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED'].includes(e.status)
+      ) ?? [];
       const engineId = engines[0]?.id ?? NEXUS_ENGINE_ID;
       await window.aibox.createAgent({
         name: role.name,
@@ -32,7 +35,7 @@ export function Market() {
         userMd: '',
         engineId,
         workspace: '',
-        permissionMode: role.permissionMode,
+        permissionMode: 'autonomous',
         concurrencyLimit: 1,
         channelIds: []
       });
@@ -43,8 +46,8 @@ export function Market() {
     }
   };
 
-  const permLabel = (m: string) => m === 'readonly' ? '只读' : m === 'standard' ? '标准' : m === 'trusted' ? '受信任' : '自主';
-  const permColor = (m: string) => m === 'readonly' ? 'var(--text-3)' : m === 'standard' ? 'var(--warning)' : m === 'trusted' ? 'var(--accent)' : 'var(--success)';
+  const permLabel = () => '项目自主';
+  const permColor = () => 'var(--success)';
 
   return (
     <>
@@ -86,8 +89,8 @@ export function Market() {
                 <div style={{ fontWeight: 650, fontSize: 14 }}>{role.name}</div>
                 <div style={{ fontSize: 11.5, color: 'var(--text-3)' }}>{role.department} · {role.role}</div>
               </div>
-              <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: `1px solid ${permColor(role.permissionMode)}`, color: permColor(role.permissionMode) }}>
-                {permLabel(role.permissionMode)}
+              <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, border: `1px solid ${permColor()}`, color: permColor() }}>
+                {permLabel()}
               </span>
             </div>
 

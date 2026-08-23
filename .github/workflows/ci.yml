@@ -40,17 +40,28 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Install Harness-compatible npm
+      - name: Install Hermes-compatible npm
         run: npm install --global npm@11.16.0
+
+      - name: Set up uv and Python 3.11
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+
+      - name: Install Hermes Python runtime
+        run: uv python install 3.11
 
       - name: Install dependencies
         run: npm ci --no-audit
 
-      - name: Prepare DeepSeek Harness runtime
-        run: npm run harness:prepare
+      - name: Prepare pinned Hermes runtime
+        run: npm run hermes:prepare
 
-      - name: Verify DeepSeek Harness with Electron Node
-        run: npm run harness:verify:electron
+      - name: Verify pinned Hermes runtime
+        run: npm run hermes:verify
+
+      - name: Smoke test Hermes Dashboard and Gateway
+        run: npm run hermes:smoke
 
       - name: Type check
         run: npm run typecheck

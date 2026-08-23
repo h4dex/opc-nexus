@@ -1,5 +1,13 @@
 # 全部功能模块开发文档
 
+## 核心执行路径
+
+老板侧只保留一条生产路径：项目中心打开 Quest，由 Hermes 完成简单请求或提出澄清并生成计划草案；复杂任务经 OPC-Nexus 治理层校验、版本化、批准和派工后，才能创建 Worker 任务。数字员工页只管理员工配置和状态，不提供绕开 Hermes 的直接对话或直接派单。
+
+旧 DSH/Cordis 产品和执行路径已经退役，只保留不可见的一次性数据库迁移识别。用户看见的调度、澄清、审批、手机扫码和项目会话全部归 Quest/Hermes。Quest 右上角生成的二维码只绑定当前项目的 Hermes `/chat` Operator 会话，Android 执行设备配对是另一条仅供实体设备 Worker 使用的链路。
+
+Hermes 不可用时复杂任务直接阻断并显示真实错误，不允许回退到 baseline、Nexus 伪计划或 Mock 完成状态。
+
 ## 目录
 
 1. [数字员工管理](#1-数字员工管理)
@@ -21,7 +29,7 @@
 17. [员工市场](#17-员工市场)
 18. [浏览器自动化](#18-浏览器自动化)
 19. [API Bridge](#19-api-bridge)
-20. [局域网 Web 管理服务](#20-局域网-web-管理服务)
+20. [Hermes 手机对话](#20-hermes-手机对话)
 21. [虚拟办公室](#21-虚拟办公室)
 22. [系统设置](#22-系统设置)
 
@@ -102,7 +110,7 @@ interface Agent {
 
 ### 2.2 核心能力
 
-- **任务创建**: 手动创建、定时触发、渠道消息触发、委派（A2A）、团队分派
+- **任务创建**: Hermes 计划经 OPC-Nexus 治理校验和老板批准后派工、定时触发、受控委派（A2A）和恢复路径
 - **FIFO 调度**: 固定并发数，按优先级和创建时间排序
 - **状态机**: QUEUED → RUNNING → COMPLETED/FAILED/CANCELLED/INTERRUPTED
 - **暂停/恢复**: 运行中任务可暂停和恢复
@@ -134,7 +142,6 @@ interface Agent {
 | `pi-cli` | Pi Agent CLI |
 | `generic-cli` | Hermes Agent / OpenCode CLI |
 | `acp` | ACP 协议外部引擎 |
-| `simulated` | 演示模拟 |
 | `unavailable` | 生产模式下无可用执行器 |
 
 ### 2.5 IPC 接口
@@ -159,15 +166,14 @@ interface Agent {
 
 ### 3.1 功能概述
 
-引擎中心管理所有 AI 执行引擎的安装、检测、真实任务验证和配置。内置 7 个 Runtime，并支持注册自定义 ACP 引擎。
+引擎中心管理所有 AI 执行引擎的安装、检测、真实任务验证和配置。内置 6 个 Runtime，并支持注册自定义 ACP/A2A 引擎。
 
 ### 3.2 支持的引擎
 
 | 引擎 | 类型标识 | 说明 |
 |------|----------|------|
-| Nexus Agent | `nexus` | 内置 LLM/tool-loop Runtime；作为 Hermes 失效时的本地执行回退（需配置供应商） |
-| DeepSeek Harness | `external` | OPC-Nexus 受管 ACP Runtime；可作为 Advisor/Reviewer 或普通 Worker，不具备 Android 手机工具桥 |
-| Hermes Agent | `hermes-cli` | 真实 Hermes Agent CLI；主控制核和 Android 手机操作员的固定执行器 |
+| Nexus Agent | `nexus` | 遗留 Worker Adapter；不能替代 Hermes 生成计划，也不能作为 Hermes 失效回退 |
+| Hermes Agent | `hermes-cli` | 项目级独立本机核心服务；负责对话理解、澄清、记忆、计划内容和分工建议 |
 | Pi Agent | `pi` | Pi Agent CLI Worker |
 | Codex | `codex` | OpenAI Codex CLI Worker |
 | Claude Code | `claude` | Anthropic Claude Code CLI Worker |
@@ -491,7 +497,7 @@ Skills 是可复用的指令模板（Markdown），按助手绑定后注入 syst
 
 ### 10.1 功能概述
 
-连接外部消息平台，使数字员工可通过即时通讯接收和回复消息。
+连接外部消息平台，并把授权消息路由到项目 Hermes 会话。渠道不直接创建绕过 Quest 治理的员工任务。
 
 ### 10.2 支持的渠道
 
@@ -505,8 +511,8 @@ Skills 是可复用的指令模板（Markdown），按助手绑定后注入 syst
 
 - **凭据配置**: 密钥走 safeStorage 加密存储
 - **连接管理**: 连接/断开/重连
-- **Agent 绑定**: 将渠道绑定到指定员工
-- **消息路由**: 收到消息自动创建任务派发给绑定员工
+- **项目绑定**: 每个渠道消息绑定 `projectId`、`principalId` 和 `conversationId`
+- **消息路由**: 收到消息进入同一 Hermes 会话；回答、批准、暂停和取消写入 OPC-Nexus 审计
 - **ASR 语音**: 企微渠道支持语音消息识别
 - **文件收发**: 支持文件类型消息
 
@@ -518,9 +524,9 @@ Skills 是可复用的指令模板（Markdown），按助手绑定后注入 syst
 | `aibox:configureWecom` | 配置企微 |
 | `aibox:startWeixinLogin` / `getWeixinLoginState` | 微信 iLink 扫码连接与状态查询 |
 | `aibox:submitWeixinVerifyCode` / `cancelWeixinLogin` | 微信配对码提交与扫码取消 |
-| `aibox:setupChannel` | 通用渠道设置 |
 | `aibox:disconnectChannel` | 断开渠道 |
 | `aibox:bindChannel` | 绑定员工 |
+| `aibox:bindChannelProject` | 绑定授权项目 |
 | `aibox:unbindChannel` | 解绑员工 |
 
 ---
@@ -799,23 +805,22 @@ api_key = <bridge_key>
 
 ---
 
-## 20. 局域网 Web 管理服务
+## 20. Hermes 手机对话
 
-**服务文件**: `src/main/services/webServer.ts`
+**服务文件**: `src/main/services/hermesMobileGateway.ts`、`secureLanGateway.ts`
 
 ### 20.1 功能概述
 
-支持局域网远程访问的 Web 管理服务，适用于工控机无人值守场景。
+从 Quest 当前项目右上角生成一次性二维码，把手机连接到同一项目的 Hermes `/chat` Operator 会话。
 
 ### 20.2 核心能力
 
-- **复用前端**: 与桌面端完全一致的 UI
-- **REST API**: 镜像关键 IPC 通道
-- **Token 认证**: 首次启动自动生成强随机 Bearer Token；历史弱口令会触发告警
-- **会话管理**: 登录后颁发 session token，24h 过期
-- **频率限制**: 单 IP 每分钟 120 次，认证接口 10 次
-- **监听**: 默认 `127.0.0.1:28889`；需显式开启后才监听局域网
-- **自动启动**: 主进程启动时自动开启
+- **项目隔离**: 二维码只绑定当前 `projectId`，不能访问其他项目会话或文件
+- **固定入口**: 配对成功后只跳转 `/chat`
+- **真实状态**: Hermes 离线时停止共享，不显示伪在线
+- **安全代理**: TLS、一次性验证码、Cookie/CSRF、REST/WS 路由白名单
+- **Operator 权限**: 支持提问、附件、任务队列和项目级控制，不提供全局设置
+- **无第二入口**: 旧 Web 管理和 DSH LAN 手机控制台已删除
 
 ---
 
@@ -848,7 +853,7 @@ api_key = <bridge_key>
 
 | 配置 | 说明 |
 |------|------|
-| 模型供应商 | Nexus、Hermes、Pi、DSH 及其他受管执行器的应用默认 Provider |
+| 模型供应商 | Hermes、Codex、Claude、Pi 及其他受管 Worker 的应用默认 Provider |
 | 多供应商管理 | 添加/管理多个 API 供应商 |
 | API Bridge | 代理服务开关与 Key |
 | npm 下载源 | 引擎安装使用的 registry |
@@ -867,9 +872,6 @@ api_key = <bridge_key>
 | `aibox:setAppConfig` | 保存应用配置 |
 | `aibox:integrityCheck` | 数据库完整性检查 |
 | `aibox:manualCleanup` | 手动数据清理 |
-| `aibox:getWebAdminStatus` | 获取 Web 管理状态，不含 Token |
-| `aibox:regenerateWebToken` | 重新生成 Token，不回传明文 |
-| `aibox:copyWebToken` | 由 Main 进程复制 Token 到剪贴板 |
 | `aibox:pickDirectory` | 选择工作目录 |
 | `aibox:toggleFullscreen` | 全屏切换 |
 

@@ -2,6 +2,40 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [2.0.0] - 2026-08-24
+
+> Hermes v0.19.0 是 Quest 的唯一调度引擎。旧 Nexus/DSH 调度路径不再作为第二套状态机运行；OPC-Nexus Main 保留项目、权限、任务、审批、产物和审计事实。
+
+### Hermes 与 Quest
+
+- Quest 项目工作台内嵌 Hermes Web UI，桌面与 Hermes 手机访问使用同一项目会话和代理边界。
+- Hermes 负责对话理解、澄清、记忆、计划草案和员工委派建议；Main/Orchestrator 负责正式任务状态、权限、预算、审批、取消、恢复和审计。
+- 项目可以使用动态员工池，也可以配置固定员工范围；员工不是项目的强制绑定关系。
+- 每个项目使用独立 `HERMES_HOME`、loopback 服务端口、短期认证租约和工作目录。
+- 所有实际交付均从项目工作目录生成，支持目录打开、文件预览、启动命令和交付摘要。
+
+### 运行时与连接恢复
+
+- 新增 Hermes fork 固定版本、上游 commit、内置 Python 3.11 runtime 和 Web 资源校验。
+- Hermes Dashboard 与 API Gateway 必须分别通过健康检查，任一进程停止都会如实显示离线/错误。
+- 启动前检查项目工作目录和 Provider 的 API Key、Base URL、模型；缺少配置时持久化可恢复错误，并引导到 Quest「连接设置」，不显示伪在线状态。
+- Provider 密钥只由 Main 进程 safeStorage 管理，通过短期子进程环境注入，不进入 Renderer、记忆文件或调试日志。
+- 旧用户数据目录迁移到 `数字员工 AI Box/aibox-data`，项目工作目录、会话和历史任务继续保留。
+
+### UI、手机与能力中心
+
+- Hermes Web UI 支持 OPC-Nexus 亮色/暗色主题和简体中文默认语言。
+- Quest 右侧治理面板展示澄清、计划、员工进度、验收、交付物、项目插件和 Hermes 手机配对。
+- 手机端只代理当前项目的 Hermes 对话、REST 和 WebSocket；viewer/operator 权限与项目范围保持一致。
+- MCP 与 Skill 通过统一插件中心按项目选择，所有执行器使用同一份能力策略。
+
+### 安全与验证
+
+- 保持 `contextIsolation: true`、`nodeIntegration: false`、IPC 白名单和项目路径越界检查。
+- 调试模式日志写入用户数据目录的 `logs/`，字段和文本自动脱敏。
+- CI 现在准备并验证 Hermes runtime，执行 Dashboard/Gateway smoke，并检查 Windows/Linux 打包产物中的 Hermes 版本、Web 资源和 Python import。
+- 本次修复新增 Provider 缺失预检持久化测试；真实中转站验证了 `/v1/models` 和 Hermes 0.19.0 双进程健康检查。
+
 ## [1.8.1] - 2026-08-16
 
 > 配套 Android Bridge 版本保持 `0.4.3`（`versionCode 5`）。本次为嵌套编排安全与调度稳定性补丁，不启用完整的 DSH 子智能体工作流图。

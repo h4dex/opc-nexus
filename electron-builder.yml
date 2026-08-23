@@ -10,6 +10,10 @@ directories:
 electronFuses:
   runAsNode: true
 
+# Packaging is host-platform only (enforced by beforePack), so use the exact
+# Electron distribution installed by the lockfile instead of re-downloading it.
+electronDist: node_modules/electron/dist
+
 beforePack: scripts/before-pack.cjs
 afterPack: scripts/after-pack.cjs
 
@@ -29,21 +33,25 @@ extraResources:
     to: mobile/tool-catalog.json
   - from: THIRD-PARTY-NOTICES.md
     to: mobile/THIRD-PARTY-NOTICES.md
-  - from: runtime/deepseek-harness/dist
-    to: runtime/deepseek-harness
-    filter:
-      - package.json
-      - package-lock.json
-      - opc-acp-entry.mjs
-      - README.md
-      - THIRD-PARTY-NOTICES.md
-      - config/**/*
-  # electron-builder intentionally skips a source-root directory named
-  # node_modules. Make it the FileSet root so the pinned sidecar is copied.
-  - from: runtime/deepseek-harness/dist/node_modules
-    to: runtime/deepseek-harness/node_modules
+  # Pinned Hermes v0.19.0 source fork. Runtime Python is supplied by the
+  # release pipeline under resources/hermes/python; never package a developer
+  # venv or node_modules from the checkout.
+  - from: vendor/hermes-agent
+    to: hermes/hermes-agent
     filter:
       - "**/*"
+      - "!node_modules/**"
+      - "!venv/**"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+      - "!tests/**"
+      - "!tests-js/**"
+  - from: runtime/hermes/python
+    to: hermes/python
+    filter:
+      - "**/*"
+  - from: runtime/hermes/runtime-manifest.json
+    to: hermes/runtime-manifest.json
 
 files:
   - out/**
@@ -127,6 +135,46 @@ files:
   - node_modules/long/**
   - node_modules/@protobufjs/**
   - node_modules/crypto-js/**
+  # Main-process secure LAN and Android worker dependencies. These are externalized
+  # by electron-vite, so every production transitive must remain in app.asar.
+  - node_modules/selfsigned/**
+  - node_modules/@peculiar/**
+  - node_modules/pkijs/**
+  - node_modules/asn1js/**
+  - node_modules/bytestreamjs/**
+  - node_modules/pvtsutils/**
+  - node_modules/pvutils/**
+  - node_modules/reflect-metadata/**
+  - node_modules/tslib/**
+  - node_modules/tsyringe/**
+  - node_modules/qrcode/**
+  - node_modules/dijkstrajs/**
+  - node_modules/pngjs/**
+  - node_modules/string-width/**
+  - node_modules/emoji-regex/**
+  - node_modules/is-fullwidth-code-point/**
+  - node_modules/strip-ansi/**
+  - node_modules/ansi-regex/**
+  - node_modules/ansi-styles/**
+  - node_modules/color-convert/**
+  - node_modules/color-name/**
+  - node_modules/decamelize/**
+  - node_modules/find-up/**
+  - node_modules/locate-path/**
+  - node_modules/p-locate/**
+  - node_modules/p-try/**
+  - node_modules/path-exists/**
+  - node_modules/get-caller-file/**
+  - node_modules/require-directory/**
+  - node_modules/require-main-filename/**
+  - node_modules/set-blocking/**
+  - node_modules/which-module/**
+  - node_modules/camelcase/**
+  - node_modules/ajv/**
+  - node_modules/fast-deep-equal/**
+  - node_modules/fast-uri/**
+  - node_modules/json-schema-traverse/**
+  - node_modules/require-from-string/**
   # OCR（onnxruntime-node + sharp）与浏览器自动化（playwright-core）：
   # 主进程用动态 import() 加载，externalizeDepsPlugin 不会内联进产物，
   # 必须显式打包，否则安装后调用即 MODULE_NOT_FOUND。
@@ -156,6 +204,24 @@ files:
   - node_modules/object-keys/**
   - node_modules/detect-libc/**
   - node_modules/semver/**
+  # electron-builder's npm collector deduplicates package names and can omit
+  # nested versions. FileSet roots preserve the reviewed physical closure.
+  - from: node_modules/pkijs/node_modules
+    to: node_modules/pkijs/node_modules
+    filter:
+      - "**/*"
+  - from: node_modules/qrcode/node_modules
+    to: node_modules/qrcode/node_modules
+    filter:
+      - "**/*"
+  - from: node_modules/p-locate/node_modules
+    to: node_modules/p-locate/node_modules
+    filter:
+      - "**/*"
+  - from: node_modules/tsyringe/node_modules
+    to: node_modules/tsyringe/node_modules
+    filter:
+      - "**/*"
 
 asar: true
 
@@ -179,8 +245,10 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: 数字员工 AI Box
+  include: build/installer.nsh
 
 linux:
+  executableName: aibox-control-center
   target:
     - target: AppImage
       arch: [x64]
@@ -190,6 +258,13 @@ linux:
   maintainer: Senke <dev@senke.local>
   description: 数字员工 AI Box 控制中心 - 本地优先的桌面 Agent 管理器
   artifactName: ${productName}-${version}-${arch}.${ext}
+  desktop:
+    entry:
+      Actions: Quest;
+    desktopActions:
+      Quest:
+        Name: Quest
+        Exec: aibox-control-center --quest-only
 
 # 签名更新（16 非功能：自动更新必须校验签名）在发布渠道配置 publish 后启用
 publish: null

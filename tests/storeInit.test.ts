@@ -6,6 +6,20 @@ afterEach(() => {
 });
 
 describe('renderer store initialization', () => {
+  it('opens the project center by default', async () => {
+    const { useApp } = await import('../src/renderer/src/store.js');
+    expect(useApp.getState().route).toBe('projects');
+  });
+
+  it('carries the selected project into Quest navigation', async () => {
+    const { useApp } = await import('../src/renderer/src/store.js');
+
+    useApp.getState().openQuest('project-1');
+    expect(useApp.getState()).toMatchObject({
+      route: 'quest', questProjectId: 'project-1', navigationTarget: null
+    });
+  });
+
   it('coalesces concurrent initialization and owns one listener pair', async () => {
     const offSnapshot = vi.fn();
     const offResources = vi.fn();

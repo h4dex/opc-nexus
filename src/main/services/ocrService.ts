@@ -45,6 +45,8 @@ const DICT_FILE = 'ppocr_keys_v1.txt';
 
 /** OCR is normally used in bursts; release native model memory after an idle period. */
 export const OCR_SESSION_IDLE_MS = 5 * 60_000;
+/** Keep the local OCR boundary aligned with the managed vision attachment cap. */
+export const MAX_OCR_IMAGE_BYTES = 6 * 1024 * 1024;
 
 /** 模型下载地址（npmmirror CDN / GitHub 回退） */
 const MODEL_SOURCES = [
@@ -213,6 +215,38 @@ export class OcrService {
       return { ok: false, text: '', boxes: [], elapsed: 0, error: `文件不存在：${imagePath}` };
     }
 
+    let imageData: Buffer;
+    try {
+      imageData = readFileSync(imagePath);
+    } catch (error) {
+      return {
+        ok: false,
+        text: '',
+        boxes: [],
+        elapsed: Date.now() - start,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+    return this.recognizeBytes(imageData, start);
+  }
+
+  /**
+   * Recognize a trusted in-memory image. Renderer callers must first resolve a
+   * content-addressed VisionAttachmentRef in Main; no host path crosses IPC.
+   */
+  async recognizeBytes(imageData: Uint8Array, startedAt = Date.now()): Promise<OcrResult> {
+    const start = startedAt;
+    if (!(imageData instanceof Uint8Array) || imageData.byteLength < 1 || imageData.byteLength > MAX_OCR_IMAGE_BYTES) {
+      return {
+        ok: false,
+        text: '',
+        boxes: [],
+        elapsed: Date.now() - start,
+        error: '图片数据无效或超过大小限制'
+      };
+    }
+    const imgBuf = Buffer.from(imageData);
+
     this.clearIdleTimer();
     this.activeRecognitions++;
     try {
@@ -221,8 +255,7 @@ export class OcrService {
       const sharp = (await import('sharp')).default;
       const ort = await import('onnxruntime-node');
 
-      // 1. 读取图片
-      const imgBuf = readFileSync(imagePath);
+      // 1. 解码已通过宿主边界校验的图片数据
       const image = sharp(imgBuf);
       const meta = await image.metadata();
       const origW = meta.width ?? 0;

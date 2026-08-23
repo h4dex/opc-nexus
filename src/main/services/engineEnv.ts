@@ -18,6 +18,7 @@ import type { Agent, EngineProviderMode, EngineRuntimeConfig, ProviderProtocol }
 import type { Database } from './database.js';
 import { getProviderSettings, readProviderKey } from './provider.js';
 import { ProviderManager, type ResolvedProvider } from './providerManager.js';
+import { providerRuntimeBaseUrl } from './providerEndpoint.js';
 
 interface ProviderResolver {
   resolveForAgent(providerId: string | null, modelOverride: string | null): ResolvedProvider | null;
@@ -39,7 +40,6 @@ const REQUIRED_PROVIDER_PROTOCOL: Readonly<Record<string, ProviderProtocol>> = {
   'eng-nexus': 'openai-chat',
   'eng-hermes-cli': 'openai-chat',
   'eng-pi': 'openai-chat',
-  'eng-deepseek-harness': 'openai-chat',
   'eng-opencode': 'openai-chat',
   'eng-codex': 'openai-responses',
   'eng-claude': 'anthropic-messages'
@@ -51,8 +51,7 @@ const NATIVE_AUTH_ENGINES = new Set(['eng-codex', 'eng-claude', 'eng-opencode'])
 const MANAGED_PROVIDER_ENGINES = new Set([
   'eng-nexus',
   'eng-hermes-cli',
-  'eng-pi',
-  'eng-deepseek-harness'
+  'eng-pi'
 ]);
 
 export function engineSupportsNativeAuth(engineId: string): boolean {
@@ -144,7 +143,7 @@ export function resolveEngineProvider(
   const engineRow = db.raw.prepare('SELECT type FROM engines WHERE id = ?').get(engineId) as
     | { type?: string }
     | undefined;
-  const customExternal = engineRow?.type === 'external' && engineId !== 'eng-deepseek-harness';
+  const customExternal = engineRow?.type === 'external';
   const supportsNative = engineSupportsNativeAuth(engineId) || customExternal;
   let providerId = engine?.providerId ?? null;
   let modelOverride = agent?.modelOverride?.trim() || engine?.modelOverride || null;
@@ -208,7 +207,9 @@ export function resolveEngineProvider(
   }
   const legacy = getProviderSettings(db);
   const key = readProviderKey(db)?.trim() || '';
-  const baseUrl = legacy.baseUrl.trim().replace(/\/+$/, '');
+  const baseUrl = legacy.baseUrl.trim()
+    ? providerRuntimeBaseUrl(legacy.baseUrl)
+    : '';
   const model = (modelOverride || legacy.model).trim();
   if (baseUrl && model && key) return { baseUrl, model, key };
   if (explicitManagedBinding) throw new Error('Configured model Provider is incomplete or has no usable credential');
@@ -292,22 +293,61 @@ export function resolveEngineEnv(
   return env;
 }
 
+/** Claude Code appends `/v1/messages` to ANTHROPIC_BASE_URL itself. Provider
+ * resolution supplies an OpenAI-style `/v1` root, so remove only that final
+ * segment to avoid `/v1/v1/messages` while preserving any gateway prefix. */
+export function claudeProviderBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '').replace(/\/v1$/i, '');
+}
+
+export interface ClaudeGatewayRoute {
+  baseUrl: string;
+  key: string;
+}
+
+/** Read the Main-owned Anthropic adapter route without exposing its key to
+ * Renderer. This is used by EngineManager probes as well as task launches. */
+function configuredClaudeGateway(db: Database): ClaudeGatewayRoute | null {
+  if (db.getSetting<string>('bridge_enabled', 'false') !== 'true') return null;
+  // ApiBridge records the port actually bound by the current listener. This
+  // matters when bridge_port is 0 (OS-assigned): using the configured value
+  // here would point Claude Code at port 0 and make it bypass the adapter.
+  const runtimePort = Number(db.getSetting<string>('bridge_runtime_port', ''));
+  const configuredPort = Number.isInteger(runtimePort) && runtimePort > 0
+    ? runtimePort
+    : Number(db.getSetting<string>('bridge_port', '29998'));
+  const encrypted = db.getSetting<unknown>('secret:bridge:key', null);
+  if (!Number.isInteger(configuredPort) || configuredPort < 1 || configuredPort > 65535
+    || typeof encrypted !== 'string' || !encrypted || !safeStorage.isEncryptionAvailable()) return null;
+  try {
+    const key = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
+    return key ? { baseUrl: `http://127.0.0.1:${configuredPort}`, key } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Claude Code uses Anthropic-specific names even when pointed at a gateway. */
 export function resolveClaudeEngineEnv(
   db: Database,
   engineId: string,
-  agent?: Pick<Agent, 'id' | 'modelOverride'> | null
+  agent?: Pick<Agent, 'id' | 'modelOverride'> | null,
+  gateway?: ClaudeGatewayRoute | null
 ): Record<string, string> {
   const env = resolveConfiguredEngineEnv(db, engineId);
   const provider = resolveEngineProvider(db, engineId, agent);
   if (!provider) return env;
+  const adapter = gateway ?? configuredClaudeGateway(db);
   clearManagedProviderEnvironment(env);
   delete env.ANTHROPIC_AUTH_TOKEN;
   delete env.ANTHROPIC_CUSTOM_HEADERS;
+  delete env.AIBOX_ANTHROPIC_ADAPTER;
   const managed: Record<string, string> = {
-    ANTHROPIC_API_KEY: provider.key,
-    ANTHROPIC_BASE_URL: provider.baseUrl.replace(/\/+$/, ''),
-    ANTHROPIC_MODEL: provider.model
+    ANTHROPIC_API_KEY: adapter?.key ?? provider.key,
+    ANTHROPIC_AUTH_TOKEN: adapter?.key ?? provider.key,
+    ANTHROPIC_BASE_URL: adapter?.baseUrl ?? claudeProviderBaseUrl(provider.baseUrl),
+    ANTHROPIC_MODEL: provider.model,
+    ...(adapter ? { AIBOX_ANTHROPIC_ADAPTER: 'anthropic-openai' } : {})
   };
   for (const [key, value] of Object.entries(managed)) env[key] = value;
   return env;

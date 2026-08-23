@@ -60,13 +60,12 @@
 
 | 编号 | 问题 | 位置 | 状态 |
 |---|---|---|---|
-| S-1 | Web 管理面板默认监听 `0.0.0.0`，局域网内任何人可访问派发任务的管理界面 | `webServer.ts` | ✅ 已改为默认 `127.0.0.1`，需显式开启 `webExposeLan` |
-| S-2 | 访问 Token 打印到 console，凭据进入日志 | `webServer.ts` | ✅ 已移除 |
+| S-1 | 旧 Web 管理面板形成第二套局域网任务入口 | 已删除的 `webServer.ts` | ✅ 代码与路由已移除，手机对话统一进入项目 Hermes `/chat` |
+| S-2 | 旧 Web Token 和移动控制台形成重复凭据/会话体系 | 退役迁移 | ✅ 启动迁移删除旧设置与凭据，不再生成 Web Token |
 | S-3 | `~/.hermes/` 目录与真实 hermes-agent 冲突：后者用同目录存 `config.yaml`/`.env`/`skills/`/会话库，导出逻辑会覆盖用户 skills，`.env` 内含 API 密钥 | `hermesSync.ts` | ✅ 已划定归属边界：我方仅写 `mcp_servers.json` 与 `skills/opc-nexus/`，只读不碰 `config.yaml`/`.env`；支持 `HERMES_HOME` 与 Windows `%LOCALAPPDATA%\hermes` |
 | S-4 | 引擎环境变量明文存库，UI 明确提示可填 `API_KEY=sk-...` | `engineManager.ts` `saveConfig` / `Engines.tsx` | ✅ 已拆分：敏感键（`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`）经 `safeStorage` 加密存 `secret:engine:<id>:env`，`config_json` 中只留 `***` 占位符；spawn 时由 `engineEnv.ts` 还原，仅存活于子进程 |
 
-Web 面板的鉴权基线本身不差（Bearer Token、会话 24h 过期、分级频率限制、弱口令审计告警），
-问题集中在默认暴露面与凭据处理。
+旧 Web 管理面的实现虽有认证和限流，但其产品职责与 Quest/Hermes 重复，已整体退役而不是继续维护第二套入口。
 
 ---
 
@@ -205,7 +204,7 @@ WASM SQLite + 防抖全库导出，换来「零原生编译」的部署优势，
 
 现有功能覆盖：数字员工、项目管理、专家团流水线、可视化工作流引擎、多机协同、
 知识库、成果验收、客户交付、经营自动化、预算管理、OCR、浏览器自动化、
-Computer Use、Git HTTP 服务、MCP 服务端、Web 管理面板、四种消息渠道。
+Computer Use、Git HTTP 服务、MCP 服务端、Hermes 手机对话、四种消息渠道。
 
 这已不是单一产品的范围。建议盘点 23 个页面的真实使用率，
 对未验证的模块做降级（标记实验特性）或移除，把研发预算集中到主干路径。

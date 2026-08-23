@@ -47,3 +47,12 @@ export function providerResourceUrl(baseUrl: string, resource: string): string {
   const normalized = normalizeProviderBaseUrl(baseUrl);
   return `${normalized}/${resource.replace(/^\/+/, '')}`;
 }
+
+/** OpenAI-compatible SDKs append `chat/completions` themselves. When a user
+ * supplies only an origin, use the conventional `/v1` API root while keeping
+ * any explicitly configured path unchanged. */
+export function providerRuntimeBaseUrl(baseUrl: string): string {
+  const normalized = normalizeProviderBaseUrl(baseUrl);
+  const url = new URL(normalized);
+  return url.pathname === '/' ? `${url.origin}/v1` : normalized;
+}

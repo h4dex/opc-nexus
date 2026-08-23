@@ -4,7 +4,7 @@ import { useApp } from '../store';
 import { TASK_STATUS_META, Modal, ProgressBar, ContextMenu, type CtxMenuItem } from '../components/common';
 import { IconCheck, IconPause, IconPlay, IconRefresh, IconStop, IconTrash, IconX } from '../components/icons';
 import { toast } from '../components/Toast';
-import type { Task, TaskEvent } from '@shared/types';
+import type { Task, TaskEvent, ProjectArtifactManifest } from '@shared/types';
 
 type TabKey = 'active' | 'approval' | 'done';
 
@@ -246,6 +246,7 @@ export function Tasks() {
 const EVENT_LABEL: Record<string, string> = {
   queued: '进入队列', started: '开始执行', stage: '阶段切换', progress: '进度更新',
   tool_call: '工具调用', tool_result: '工具结果', approval_required: '等待审批',
+  artifact_manifest: '产物已验证', artifact_validation_failed: '产物校验失败',
   result: '产出结果', completed: '执行完成', failed: '执行失败', interrupted: '执行中断',
   cancelled: '执行取消'
 };
@@ -258,11 +259,25 @@ function eventDetail(e: TaskEvent): string {
     case 'tool_call': return `${String(p.name ?? '')} ${JSON.stringify(p.args ?? {}).slice(0, 80)}`;
     case 'tool_result': return `${String(p.name ?? '')}：${String(p.error ?? p.result ?? p.status ?? '').slice(0, 100)}`;
     case 'approval_required': return String(p.request ?? '').slice(0, 100);
+    case 'artifact_manifest': {
+      const manifest = p.manifest && typeof p.manifest === 'object' ? p.manifest as Record<string, unknown> : null;
+      const entries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+      const bytes = typeof manifest?.totalBytes === 'number' ? manifest.totalBytes : 0;
+      return `已验证 ${entries.length} 个项目文件，共 ${formatBytes(bytes)}`;
+    }
+    case 'artifact_validation_failed': return String(p.error ?? '未检测到真实项目产物');
     case 'failed':
     case 'interrupted': return String(p.error ?? '');
     case 'cancelled': return String(p.reason ?? '');
     default: return '';
   }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 /** 任务详情：事件时间线 + 实时输出 + 产物全文 + 父/子任务跳转 + 追问续跑（执行中每 2s 轮询，13.2 可追溯） */
@@ -271,6 +286,7 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
 }) {
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [result, setResult] = useState<string | null>(null);
+  const [manifest, setManifest] = useState<ProjectArtifactManifest | null>(null);
   const [followUp, setFollowUp] = useState('');
   const meta = TASK_STATUS_META[task.status];
   const running = ['RUNNING', 'QUEUED', 'WAITING_APPROVAL', 'PAUSED'].includes(task.status);
@@ -286,13 +302,15 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
   useEffect(() => {
     let alive = true;
     const load = async () => {
-      const [ev, res] = await Promise.all([
+      const [ev, res, mf] = await Promise.all([
         window.aibox.getTaskEvents(task.id),
-        window.aibox.getTaskResult(task.id)
+        window.aibox.getTaskResult(task.id),
+        task.status === 'COMPLETED' ? window.aibox.getTaskManifest(task.id) : Promise.resolve(null)
       ]);
       if (alive) {
         setEvents(ev);
         setResult(res);
+        setManifest(mf);
       }
     };
     void load();
@@ -352,6 +370,10 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
         </div>
       )}
 
+      {manifest && manifest.entries.length > 0 && (
+        <TaskManifestPanel taskId={task.id} manifest={manifest} />
+      )}
+
       <div className="card-title" style={{ marginTop: 16 }}>执行时间线<span className="sub">{timeline.length} 个事件</span></div>
       <div style={{ maxHeight: 180, overflowY: 'auto', fontSize: 12.5, lineHeight: 2 }}>
         {timeline.length === 0 && <div className="empty">暂无事件</div>}
@@ -376,6 +398,187 @@ function TaskDetailModal({ task, tasks, agentName, projectName, onOpen, onClose 
         </>
       )}
     </Modal>
+  );
+}
+
+/** B.5 — 产物 Manifest 面板：展示验证文件列表 + 打开目录 / 文件 / 复制路径 / 预览 / 运行命令 */
+function TaskManifestPanel({ taskId, manifest }: { taskId: string; manifest: ProjectArtifactManifest }) {
+  const [copied, setCopied] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [runtime, setRuntime] = useState(manifest.runtime ?? null);
+  const [screenshotUris, setScreenshotUris] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setRuntime(manifest.runtime ?? null);
+  }, [manifest.generatedAt, manifest.runtime]);
+
+  useEffect(() => {
+    if (!runtime || !['STARTING', 'RUNNING', 'STOPPING'].includes(runtime.state)) return;
+    const poll = setInterval(() => {
+      void window.aibox.getArtifactRuntimeStatus(taskId).then(setRuntime).catch(() => { /* retain last durable evidence */ });
+    }, 1_500);
+    return () => clearInterval(poll);
+  }, [runtime?.state, taskId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const screenshots = runtime?.screenshots ?? [];
+    if (screenshots.length === 0) {
+      setScreenshotUris({});
+      return;
+    }
+    void Promise.all(screenshots.map(async (screenshot) => {
+      const preview = await window.aibox.previewProjectArtifact(manifest.projectId, screenshot.relativePath);
+      return [screenshot.relativePath, preview.uri] as const;
+    })).then((entries) => {
+      if (!cancelled) setScreenshotUris(Object.fromEntries(entries.filter((entry) => entry[1])) as Record<string, string>);
+    }).catch(() => {
+      if (!cancelled) setScreenshotUris({});
+    });
+    return () => { cancelled = true; };
+  }, [manifest.projectId, runtime?.screenshots]);
+
+  const openFolder = async () => {
+    const r = await window.aibox.openTaskDeliveryFolder(taskId);
+    if (!r.ok) toast.err(r.message || '无法打开产物目录');
+  };
+
+  const revealFile = async (projectId: string, relativePath: string) => {
+    await window.aibox.revealProjectArtifact(projectId, relativePath);
+  };
+
+  const openPreview = async (relativePath: string) => {
+    const r = await window.aibox.openArtifactPreview(taskId, relativePath);
+    if (!r.ok) toast.err(r.message || '无法打开预览');
+  };
+
+  const copyPath = (relativePath: string) => {
+    void navigator.clipboard.writeText(relativePath).then(() => {
+      setCopied(relativePath);
+      setTimeout(() => setCopied(null), 1500);
+    });
+  };
+
+  const copyCommand = async () => {
+    const r = await window.aibox.copyArtifactCommand(taskId);
+    if (r.ok) toast.ok('启动命令已复制到剪贴板');
+    else toast.err(r.message || '无法复制启动命令');
+  };
+
+  const runCommand = async () => {
+    setRunning(true);
+    try {
+      const r = await window.aibox.runArtifactCommand(taskId);
+      setRuntime(r.runtime);
+      if (r.ok) {
+        toast.ok(r.runtime?.url ? '预览服务已启动并发现本机地址' : '预览进程已启动，正在等待运行地址');
+      } else {
+        toast.err(`启动命令执行失败：${r.error || '未知错误'}`);
+      }
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const stopRuntime = async () => {
+    setRunning(true);
+    try {
+      const result = await window.aibox.stopArtifactRuntime(taskId);
+      setRuntime(result.runtime);
+      if (result.ok) toast.ok('预览服务已停止');
+      else toast.err(result.error || '无法停止预览服务');
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const openRuntime = async () => {
+    const result = await window.aibox.openArtifactRuntimeUrl(taskId);
+    if (!result.ok) toast.err(result.message || '无法打开预览地址');
+  };
+
+  const formatBytes = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  // 检查是否有启动命令（从任意 entry.run 中提取）
+  const runConfig = manifest.entries.find((e) => e.run)?.run;
+  const runtimeActive = runtime ? ['STARTING', 'RUNNING', 'STOPPING'].includes(runtime.state) : false;
+  const runtimeLabel = runtime ? ({
+    STARTING: '启动中', RUNNING: '运行中', STOPPING: '停止中', STOPPED: '已停止', EXITED: '已退出', FAILED: '启动失败'
+  } as const)[runtime.state] : null;
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="card-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+        <span>验证产物<span className="sub">{manifest.entries.length} 个文件 · {formatBytes(manifest.totalBytes)}{manifest.truncated ? ' (已截断)' : ''}</span></span>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {runConfig && (
+            <>
+              <button className="btn small" onClick={() => void copyCommand()} title={`复制命令：${runConfig.command}`}>
+                复制启动命令
+              </button>
+              <button className="btn small primary" onClick={() => void runCommand()} disabled={running || runtimeActive} title="启动产物预览服务">
+                {running || runtime?.state === 'STARTING' ? '启动中…' : runtimeActive ? '正在运行' : '运行预览'}
+              </button>
+              {runtimeActive && <button className="btn small" onClick={() => void stopRuntime()} disabled={running}>停止</button>}
+            </>
+          )}
+          <button className="btn small" onClick={() => void openFolder()}>打开目录</button>
+        </div>
+      </div>
+      <div style={{ maxHeight: 160, overflowY: 'auto', fontSize: 12, border: '1px solid var(--border)', borderRadius: 8 }}>
+        {manifest.entries.map((entry) => (
+          <div key={entry.relativePath} style={{
+            display: 'flex', gap: 8, alignItems: 'center', padding: '5px 10px',
+            borderBottom: '1px solid var(--border)', fontSize: 12
+          }}>
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: 11.5 }}
+              title={entry.relativePath}>{entry.relativePath}</span>
+            <span style={{ color: 'var(--text-3)', fontSize: 11, minWidth: 52, textAlign: 'right' }}>{formatBytes(entry.size)}</span>
+            <span style={{ color: 'var(--text-3)', fontSize: 11, fontFamily: 'monospace', minWidth: 64 }}
+              title={`SHA-256 ${entry.sha256}`}>{entry.sha256.slice(0, 8)}</span>
+            {entry.previewable && (
+              <button className="btn tiny" title="打开预览"
+                onClick={() => void openPreview(entry.relativePath)}>预览</button>
+            )}
+            <button className="btn tiny" title="在文件管理器中显示"
+              onClick={() => void revealFile(manifest.projectId, entry.relativePath)}>显示</button>
+            <button className="btn tiny" title={copied === entry.relativePath ? '已复制' : '复制路径'}
+              onClick={() => copyPath(entry.relativePath)}>
+              {copied === entry.relativePath ? '✓' : '复制'}
+            </button>
+          </div>
+        ))}
+      </div>
+      {runtime && (
+        <div style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 6, padding: 10, fontSize: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>预览服务：{runtimeLabel}</strong>
+            {runtime.pid !== null && <span style={{ color: 'var(--text-3)' }}>PID {runtime.pid}</span>}
+            {runtime.url && <code style={{ color: 'var(--accent)', overflowWrap: 'anywhere' }}>{runtime.url}</code>}
+            {runtime.url && runtime.state === 'RUNNING' && <button className="btn tiny" onClick={() => void openRuntime()}>打开</button>}
+          </div>
+          {runtime.error && <div style={{ color: 'var(--danger)', marginTop: 6 }}>{runtime.error}</div>}
+          {runtime.screenshotError && <div style={{ color: 'var(--warning)', marginTop: 6 }}>{runtime.screenshotError}</div>}
+          {runtime.screenshots.length > 0 && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8, marginTop: 10 }}>
+              {runtime.screenshots.map((screenshot) => (
+                <button key={screenshot.relativePath} type="button" onClick={() => void openPreview(screenshot.relativePath)}
+                  style={{ border: '1px solid var(--border)', borderRadius: 6, padding: 0, overflow: 'hidden', background: 'var(--input-bg)', color: 'var(--text-2)', textAlign: 'left' }}>
+                  {screenshotUris[screenshot.relativePath]
+                    ? <img src={screenshotUris[screenshot.relativePath]} alt={`${screenshot.viewport === 'desktop' ? '桌面' : '手机'}预览截图`} style={{ width: '100%', height: 118, objectFit: 'contain', display: 'block', background: '#fff' }} />
+                    : <span style={{ height: 118, display: 'grid', placeItems: 'center' }}>截图载入中</span>}
+                  <span style={{ display: 'block', padding: '6px 8px' }}>{screenshot.viewport === 'desktop' ? '桌面截图' : '手机截图'} · {screenshot.width}×{screenshot.height}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 

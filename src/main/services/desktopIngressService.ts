@@ -9,6 +9,7 @@ export interface DesktopIngressInput {
   message: string;
   conversationId?: string;
   messageKey?: string;
+  projectId?: string | null;
   receivedAt?: number;
 }
 
@@ -16,6 +17,7 @@ export interface DesktopIngressResult {
   organizationId: typeof LOCAL_DESKTOP_ORGANIZATION_ID;
   principalId: typeof LOCAL_DESKTOP_PRINCIPAL_ID;
   conversationId: string;
+  projectId: string | null;
   inputMessageId: string;
   messageKey: string;
   taskId: string | null;
@@ -25,6 +27,7 @@ export interface DesktopIngressResult {
 interface ConversationRow {
   id: string;
   agent_id: string;
+  project_id: string | null;
   organization_id: string | null;
   principal_id: string | null;
 }
@@ -65,9 +68,10 @@ export class DesktopIngressService {
     this.db.transaction(() => {
       this.ensureIdentity(now);
       this.assertLocalAgent(agentId);
+      const requestedProjectId = this.resolveProject(input.projectId);
       if (!input.conversationId?.trim()) {
         const replay = this.db.raw.prepare(
-          `SELECT m.id, m.task_id, m.content, m.conversation_id, c.agent_id
+          `SELECT m.id, m.task_id, m.content, m.conversation_id, c.agent_id, c.project_id
            FROM messages m JOIN conversations c ON c.id = m.conversation_id
            WHERE m.organization_id = ? AND m.principal_id = ?
              AND m.channel_id IS NULL AND m.direction = 'inbound'
@@ -83,15 +87,20 @@ export class DesktopIngressService {
           content: string;
           conversation_id: string;
           agent_id: string;
+          project_id: string | null;
         } | undefined;
         if (replay) {
           if (replay.agent_id !== agentId || replay.content !== message) {
             throw new Error('messageKey is already bound to a different desktop request');
           }
+          if (requestedProjectId && replay.project_id !== requestedProjectId) {
+            throw new Error('messageKey is already bound to a different project');
+          }
           result = {
             organizationId: LOCAL_DESKTOP_ORGANIZATION_ID,
             principalId: LOCAL_DESKTOP_PRINCIPAL_ID,
             conversationId: replay.conversation_id,
+            projectId: replay.project_id ?? null,
             inputMessageId: replay.id,
             messageKey,
             taskId: replay.task_id,
@@ -100,7 +109,8 @@ export class DesktopIngressService {
           return;
         }
       }
-      const conversationId = this.resolveConversation(agentId, input.conversationId, message, now);
+      const conversation = this.resolveConversation(agentId, input.conversationId, requestedProjectId, message, now);
+      const conversationId = conversation.id;
       const identity = messageIdentity(conversationId, messageKey);
       const existing = this.db.raw.prepare(
         `SELECT id, task_id, content FROM messages
@@ -118,6 +128,7 @@ export class DesktopIngressService {
           organizationId: LOCAL_DESKTOP_ORGANIZATION_ID,
           principalId: LOCAL_DESKTOP_PRINCIPAL_ID,
           conversationId,
+          projectId: conversation.projectId,
           inputMessageId: existing.id,
           messageKey,
           taskId: existing.task_id,
@@ -164,6 +175,7 @@ export class DesktopIngressService {
         organizationId: LOCAL_DESKTOP_ORGANIZATION_ID,
         principalId: LOCAL_DESKTOP_PRINCIPAL_ID,
         conversationId,
+        projectId: conversation.projectId,
         inputMessageId: persisted.id,
         messageKey,
         taskId: persisted.task_id,
@@ -199,6 +211,39 @@ export class DesktopIngressService {
       input.conversationId
     ) as { task_id: string | null } | undefined;
     if (linked?.task_id !== normalizedTaskId) throw new Error('desktop message is already linked to another task');
+  }
+
+  /** Remove an inbound message when canonical dispatch fails before a Task is
+   * committed. This keeps retry/idempotency records honest and prevents an
+   * empty conversation from looking like accepted work. */
+  discardUnlinked(input: DesktopIngressResult): boolean {
+    let removed = false;
+    this.db.transaction(() => {
+      removed = this.db.raw.prepare(
+        `DELETE FROM messages
+         WHERE id = ? AND organization_id = ? AND principal_id = ? AND conversation_id = ?
+           AND direction = 'inbound' AND task_id IS NULL`
+      ).run(
+        input.inputMessageId,
+        input.organizationId,
+        input.principalId,
+        input.conversationId
+      ).changes > 0;
+      if (!removed) return;
+      const now = Date.now();
+      this.db.raw.prepare(
+        `UPDATE conversations
+         SET message_count = MAX(0, message_count - 1), updated_at = ?
+         WHERE id = ? AND organization_id = ? AND principal_id = ?`
+      ).run(now, input.conversationId, input.organizationId, input.principalId);
+      this.db.raw.prepare(
+        `DELETE FROM conversations
+         WHERE id = ? AND organization_id = ? AND principal_id = ?
+           AND NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id = conversations.id)
+           AND NOT EXISTS (SELECT 1 FROM tasks WHERE conversation_id = conversations.id)`
+      ).run(input.conversationId, input.organizationId, input.principalId);
+    });
+    return removed;
   }
 
   recordTaskOutcome(taskId: string): void {
@@ -272,18 +317,37 @@ export class DesktopIngressService {
     }
   }
 
-  private resolveConversation(agentId: string, requestedId: string | undefined, message: string, now: number): string {
+  private resolveProject(projectId: string | null | undefined): string | null {
+    if (projectId === undefined || projectId === null || projectId.trim() === '') return null;
+    const id = required(projectId, 'projectId', 200);
+    const project = this.db.raw.prepare(
+      'SELECT organization_id FROM projects WHERE id = ? LIMIT 1'
+    ).get(id) as { organization_id: string | null } | undefined;
+    if (!project || project.organization_id !== LOCAL_DESKTOP_ORGANIZATION_ID) {
+      throw new Error('project does not belong to the local organization');
+    }
+    return id;
+  }
+
+  private resolveConversation(
+    agentId: string,
+    requestedId: string | undefined,
+    requestedProjectId: string | null,
+    message: string,
+    now: number
+  ): { id: string; projectId: string | null } {
     const existingId = requestedId?.trim() ?? '';
     if (!existingId) {
       const id = randomUUID();
       this.db.raw.prepare(
         `INSERT INTO conversations(
-          id, agent_id, organization_id, principal_id, channel_id, channel_identity_id,
+          id, agent_id, project_id, organization_id, principal_id, channel_id, channel_identity_id,
           external_conversation_key, title, last_message_at, message_count, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, NULL, NULL, NULL, ?, ?, 0, ?, ?)`
+        ) VALUES(?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, 0, ?, ?)`
       ).run(
         id,
         agentId,
+        requestedProjectId,
         LOCAL_DESKTOP_ORGANIZATION_ID,
         LOCAL_DESKTOP_PRINCIPAL_ID,
         message.slice(0, 60),
@@ -291,17 +355,18 @@ export class DesktopIngressService {
         now,
         now
       );
-      return id;
+      return { id, projectId: requestedProjectId };
     }
 
     const id = required(existingId, 'conversationId', 200);
     const row = this.db.raw.prepare(
-      'SELECT id, agent_id, organization_id, principal_id FROM conversations WHERE id = ? LIMIT 1'
+      'SELECT id, agent_id, project_id, organization_id, principal_id FROM conversations WHERE id = ? LIMIT 1'
     ).get(id) as ConversationRow | undefined;
     if (!row) throw new Error('会话不存在');
     if (row.agent_id !== agentId) throw new Error('会话不属于所选数字员工');
     if (row.organization_id && row.organization_id !== LOCAL_DESKTOP_ORGANIZATION_ID) throw new Error('会话不属于本地组织');
     if (row.principal_id && row.principal_id !== LOCAL_DESKTOP_PRINCIPAL_ID) throw new Error('会话不属于当前用户');
+    if (requestedProjectId && row.project_id !== requestedProjectId) throw new Error('会话不属于所选项目');
     this.db.raw.prepare(
       `UPDATE conversations SET organization_id = ?, principal_id = ?, updated_at = ?
        WHERE id = ? AND (organization_id IS NULL OR organization_id = ?)
@@ -314,6 +379,6 @@ export class DesktopIngressService {
       LOCAL_DESKTOP_ORGANIZATION_ID,
       LOCAL_DESKTOP_PRINCIPAL_ID
     );
-    return id;
+    return { id, projectId: row.project_id ?? null };
   }
 }

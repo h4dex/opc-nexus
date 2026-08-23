@@ -16,6 +16,7 @@ vi.mock('node:child_process', () => ({ execFile }));
 vi.mock('node:fs/promises', () => ({ statfs }));
 
 const { ResourceMonitor, collectGpuSample, hasActiveNetworkInterface, parseNvidiaSmiSample } = await import('../src/main/services/resourceMonitor.js');
+const { app } = await import('electron');
 
 afterEach(() => {
   vi.useRealTimers();
@@ -86,7 +87,29 @@ describe('ResourceMonitor memory boundaries', () => {
 
     monitor.start(10);
     await vi.advanceTimersByTimeAsync(1);
-    expect(statfs).toHaveBeenCalledWith(join('/tmp/test-userData', 'aibox-data'));
+    expect(statfs).toHaveBeenCalledWith(join(app.getPath('userData'), 'aibox-data'));
+    monitor.stop();
+  });
+
+  it('emits a dispatch guard recovery edge after memory pressure clears', async () => {
+    vi.useFakeTimers();
+    currentLoad.mockResolvedValue({ currentLoad: 12, cpus: [{}, {}] });
+    mem
+      .mockResolvedValueOnce({ active: 9_600, total: 10_000 })
+      .mockResolvedValue({ active: 8_000, total: 10_000 });
+    statfs.mockResolvedValue({ bavail: 20 * 1024 ** 3, bsize: 1, blocks: 40 * 1024 ** 3 });
+    const monitor = new ResourceMonitor('win32', vi.fn().mockResolvedValue(null));
+    const transitions: Array<[string | null, string | null]> = [];
+    monitor.onGuardChange((current, previous) => transitions.push([current, previous]));
+
+    monitor.start(10);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(transitions).toEqual([
+      ['内存占用 ≥95%，暂停派发新任务', null],
+      [null, '内存占用 ≥95%，暂停派发新任务']
+    ]);
     monitor.stop();
   });
 });
