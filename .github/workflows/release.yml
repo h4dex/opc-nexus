@@ -66,6 +66,12 @@ jobs:
       - name: Verify pinned Hermes runtime
         run: npm run hermes:verify
 
+      - name: Prepare bundled Codex and Pi runtimes
+        run: npm run agents:prepare
+
+      - name: Verify bundled Codex and Pi runtimes
+        run: npm run agents:verify
+
       - name: Smoke test Hermes Dashboard and Gateway
         run: npm run hermes:smoke
 
@@ -204,6 +210,12 @@ jobs:
       - name: Verify pinned Hermes runtime
         run: npm run hermes:verify
 
+      - name: Prepare bundled Codex and Pi runtimes
+        run: npm run agents:prepare
+
+      - name: Verify bundled Codex and Pi runtimes
+        run: npm run agents:verify
+
       - name: Download signed Android package
         uses: actions/download-artifact@v4
         with:
@@ -222,6 +234,9 @@ jobs:
 
       - name: Verify packaged Windows Hermes runtime
         run: npm run hermes:verify:packaged -- release/win-unpacked
+
+      - name: Verify packaged Windows worker runtimes
+        run: npm run agents:verify:packaged -- release/win-unpacked
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
@@ -286,6 +301,12 @@ jobs:
       - name: Verify pinned Hermes runtime
         run: npm run hermes:verify
 
+      - name: Prepare bundled Codex and Pi runtimes
+        run: npm run agents:prepare
+
+      - name: Verify bundled Codex and Pi runtimes
+        run: npm run agents:verify
+
       - name: Download signed Android package
         uses: actions/download-artifact@v4
         with:
@@ -300,6 +321,9 @@ jobs:
 
       - name: Verify packaged Linux Hermes runtime
         run: npm run hermes:verify:packaged -- release/linux-unpacked
+
+      - name: Verify packaged Linux worker runtimes
+        run: npm run agents:verify:packaged -- release/linux-unpacked
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4

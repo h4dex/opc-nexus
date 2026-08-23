@@ -41,6 +41,21 @@ describe('commandNameOf：取可执行命令名', () => {
 });
 
 describe('resolveLaunch：按形态决定启动方式', () => {
+  it('application-owned JavaScript runtime entry uses the Electron/Node executable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'opc-cli-runtime-'));
+    const scriptPath = join(dir, 'runtime-entry.mjs');
+    try {
+      writeFileSync(scriptPath, 'process.stdout.write(process.env.ELECTRON_RUN_AS_NODE === "1" ? "runtime-ready" : "runtime-env-missing")\n', 'utf8');
+      const resolved = resolveLaunch(scriptPath, ['--version']);
+      expect(resolved.bin).toBe(process.execPath);
+      expect(resolved.args).toEqual([scriptPath, '--version']);
+      const result = await runCli(scriptPath, [], { timeoutMs: 10_000 });
+      expect(result).toMatchObject({ ok: true, code: 0, stdout: 'runtime-ready' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('.exe 可直接 spawn，不加包装', () => {
     const r = resolveLaunch('C:\\tools\\codex.exe', ['--version']);
     expect(r.bin).toBe('C:\\tools\\codex.exe');

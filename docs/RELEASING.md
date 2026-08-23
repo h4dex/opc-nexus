@@ -7,6 +7,7 @@ GitHub Actions 负责验证、跨平台打包和 Release 发布。正常发布�
 - `.github/workflows/ci.yml`：推送到 `main` / `master` 或向 `main` 提交 Pull Request 时，在 Windows 与 Ubuntu 上执行依赖安装、类型检查、单元测试和生产构建。
 - `.github/workflows/release.yml`：推送 `v*` 标签后，验证标签与 `package.json` 版本一致；先构建一次生产签名 Android Bridge，再由 Windows 与 Linux 任务下载同一 APK 并内置到桌面安装包，最后统一发布到 GitHub Release。
 - Release 校验会准备固定版本的 Hermes v0.19.0 fork 和 Python 3.11 runtime，执行 Dashboard/Gateway smoke，并在 Windows/Linux 打包后检查 Hermes Web 资源、上游 commit 和 Python import。
+- Release 校验会在打包前准备并验证固定版本的 Codex CLI 与 Pi Agent 应用内运行时；不会把开发机的全局 npm 目录或凭据复制进安装包。
 - Release 同时包含 `SHA256SUMS.txt`，用于校验下载文件完整性。
 
 ## 发布新版本
@@ -18,9 +19,9 @@ GitHub Actions 负责验证、跨平台打包和 Release 发布。正常发布�
 
 ```bash
 git switch -c release/hermes-v2
-git tag -a v2.0.0 -m "OPC-Nexus 2.0.0"
+git tag -a v2.0.1 -m "OPC-Nexus 2.0.1"
 git push github release/hermes-v2
-git push github v2.0.0
+git push github v2.0.1
 ```
 
 标签必须严格等于 `v` 加 `package.json` 的版本，例如 `package.json` 为 `2.0.0` 时只能发布 `v2.0.0`。不匹配时 Release 工作流会在打包前失败。Hermes v2 的大版本变更应先通过 Pull Request 合并，再创建标签。

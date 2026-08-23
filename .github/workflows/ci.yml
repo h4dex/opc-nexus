@@ -60,6 +60,12 @@ jobs:
       - name: Verify pinned Hermes runtime
         run: npm run hermes:verify
 
+      - name: Prepare bundled Codex and Pi runtimes
+        run: npm run agents:prepare
+
+      - name: Verify bundled Codex and Pi runtimes
+        run: npm run agents:verify
+
       - name: Smoke test Hermes Dashboard and Gateway
         run: npm run hermes:smoke
 

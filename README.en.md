@@ -10,11 +10,13 @@
 
 | Component | Version | Notes |
 | --- | --- | --- |
-| OPC-Nexus desktop | `2.0.0` | Windows 10/11 and Ubuntu 22.04+ |
+| OPC-Nexus desktop | `2.0.1` | Windows 10/11 and Ubuntu 22.04+ |
 | Hermes Runtime | `0.19.0` | The only Quest orchestrator, pinned fork and upstream commit |
 | Android Bridge | `0.4.3` | Optional mobile execution worker, not a Quest orchestrator |
 
-Version 2.0.0 is the Hermes architecture release and is intentionally different from the Nexus orchestration architecture in 1.x. Back up user data before upgrading. The application migrates the legacy data directory, but it does not re-enable DSH as a second control plane.
+Version 2.0.1 is the runtime enhancement after the Hermes architecture release and is intentionally different from the Nexus orchestration architecture in 1.x. Back up user data before upgrading. The application migrates the legacy data directory, but it does not re-enable DSH as a second control plane.
+
+Release packages may carry pinned Codex CLI and Pi Agent runtimes under the application resources directory. The Main process prefers these application-owned runtimes and only falls back to PATH when no bundled or managed copy exists. The source tree does not commit `node_modules` or native binaries; run `npm run agents:prepare` before packaging and `npm run agents:verify` after preparation.
 
 ## How It Works
 
@@ -117,4 +119,3 @@ GitHub Actions repeats type checking, unit tests, Hermes runtime preparation, he
 ## License
 
 [MIT](./LICENSE) © Senke
-

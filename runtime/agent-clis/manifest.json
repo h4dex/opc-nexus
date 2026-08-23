@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "runtimes": {
+    "eng-codex": {
+      "directory": "codex",
+      "package": "@openai/codex",
+      "version": "0.149.0",
+      "entry": "node_modules/@openai/codex/bin/codex.js",
+      "license": "Apache-2.0",
+      "platforms": ["win32-x64", "linux-x64", "darwin-x64", "darwin-arm64"]
+    },
+    "eng-pi": {
+      "directory": "pi",
+      "package": "@earendil-works/pi-coding-agent",
+      "version": "0.84.2",
+      "entry": "node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+      "license": "MIT",
+      "platforms": ["win32-x64", "linux-x64", "darwin-x64", "darwin-arm64"]
+    }
+  }
+}

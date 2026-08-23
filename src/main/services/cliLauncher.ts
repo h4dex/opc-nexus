@@ -123,6 +123,13 @@ function directNpmShimLaunch(scriptPath: string, args: string[]): { bin: string;
  * shell 命令字符串。没有安全伴生入口的 batch 文件直接拒绝执行。
  */
 export function resolveLaunch(binPath: string, args: string[], env: NodeJS.ProcessEnv = process.env): { bin: string; args: string[] } {
+  // Packaged Codex/Pi runtimes expose a JavaScript entry point rather than a
+  // PATH shim. Electron's executable can run that entry point when
+  // ELECTRON_RUN_AS_NODE is set; plain Node processes ignore the variable.
+  const scriptExt = extname(binPath).toLowerCase();
+  if (isAbsolute(binPath) && ['.js', '.mjs', '.cjs'].includes(scriptExt) && existsSync(binPath)) {
+    return { bin: process.execPath, args: [binPath, ...args] };
+  }
   if (!isWin) return { bin: binPath, args };
   if (/[\\/]WindowsApps[\\/]/i.test(binPath)) {
     return { bin: `${commandNameOf(binPath)}.exe`, args };
@@ -150,15 +157,23 @@ export function commandNameOf(binPath: string): string {
 /** 按平台正确启动 CLI；其余 spawn 选项原样透传（cwd / env / windowsHide 等） */
 export function spawnCli(binPath: string, args: string[], opts: SpawnOptions = {}): ChildProcess {
   const { bin, args: finalArgs } = resolveLaunch(binPath, args, opts.env as NodeJS.ProcessEnv | undefined);
+  const scriptLaunch = bin === process.execPath
+    && finalArgs.length > 0
+    && typeof finalArgs[0] === 'string'
+    && ['.js', '.mjs', '.cjs'].includes(extname(finalArgs[0]).toLowerCase());
+  const env = scriptLaunch
+    ? { ...(opts.env ?? process.env), ELECTRON_RUN_AS_NODE: '1' }
+    : opts.env;
   // npm-generated PowerShell shims inspect stdin and pipe `$input` into Node
   // when it is open. A never-written parent pipe therefore blocks the CLI
   // before it can even process `--version`. Interactive protocols explicitly
   // override this default with stdio: ['pipe', 'pipe', 'pipe'].
   return spawn(bin, finalArgs, {
-    shell: false,
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...opts
+    ...opts,
+    shell: opts.shell ?? false,
+    windowsHide: opts.windowsHide ?? true,
+    stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
+    ...(env ? { env } : {})
   });
 }
 

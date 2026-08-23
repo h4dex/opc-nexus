@@ -6,6 +6,9 @@ dist/
 /runtime/hermes/.python-stage-*/
 /runtime/hermes/.python-backup-*/
 /runtime/hermes/runtime-manifest.json
+/runtime/agent-clis/*
+!/runtime/agent-clis/manifest.json
+!/runtime/agent-clis/NOTICE.md
 /runtime/deepseek-harness/
 /runtime/deepseek-harness-managed/
 release/

@@ -10,11 +10,13 @@
 
 | 组件 | 版本 | 说明 |
 | --- | --- | --- |
-| OPC-Nexus 桌面端 | `2.0.0` | Windows 10/11、Ubuntu 22.04+ |
+| OPC-Nexus 桌面端 | `2.0.1` | Windows 10/11、Ubuntu 22.04+ |
 | Hermes Runtime | `0.19.0` | Quest 唯一调度引擎，固定 fork 和上游 commit |
 | Android Bridge | `0.4.3` | 可选手机执行员工，不参与 Quest 调度 |
 
-2.0.0 是 Hermes 架构版本，与 1.x 的 Nexus 调度架构不兼容。升级时请先备份用户数据；应用会迁移旧数据目录，不会把旧 DSH 调度状态重新启用为第二套控制面。
+2.0.1 是 Hermes 架构后的运行时增强版本，与 1.x 的 Nexus 调度架构不兼容。升级时请先备份用户数据；应用会迁移旧数据目录，不会把旧 DSH 调度状态重新启用为第二套控制面。
+
+发布包可携带固定版本的 Codex CLI 与 Pi Agent 运行时，放在应用资源目录并由主进程优先调用。源码仓库不提交 `node_modules` 或原生二进制；发布前运行 `npm run agents:prepare`，安装后运行 `npm run agents:verify`。
 
 ## 工作方式
 
@@ -117,4 +119,3 @@ GitHub Actions 会在 Windows 和 Ubuntu 上重复运行类型检查、单元测
 ## License
 
 [MIT](./LICENSE) © Senke
-

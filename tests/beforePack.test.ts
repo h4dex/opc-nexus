@@ -10,10 +10,11 @@ describe('release beforePack guard', () => {
     expect(existsSync(join(process.cwd(), 'node_modules', 'electron', 'dist', executable))).toBe(true);
   });
 
-  it('verifies only the Android artifact and Hermes runtime before packaging', () => {
+  it('verifies the Android artifact, Hermes runtime, and bundled worker runtimes before packaging', () => {
     const source = readFileSync(join(process.cwd(), 'scripts', 'before-pack.cjs'), 'utf8');
     expect(source).toContain('verifyDist({ requireRelease: true })');
     expect(source).toContain('verifyHermesRuntime({ platform: targetPlatform, arch: targetArch })');
+    expect(source).toContain('verifyAgentRuntime(id, spec)');
     expect(source).not.toMatch(/deepseek|harness|dsh/i);
   });
 });

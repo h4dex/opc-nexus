@@ -52,6 +52,15 @@ extraResources:
       - "**/*"
   - from: runtime/hermes/runtime-manifest.json
     to: hermes/runtime-manifest.json
+  # Optional Codex CLI and Pi Agent package closures. The source checkout only
+  # carries the pinned manifest; pack scripts materialize platform-native
+  # packages here before electron-builder runs.
+  - from: runtime/agent-clis
+    to: agent-runtimes
+    filter:
+      - "**/*"
+      - "!**/.cache/**"
+      - "!**/package-lock.json"
 
 files:
   - out/**

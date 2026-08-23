@@ -2,6 +2,22 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。每次功能变更须在此记录,并同步更新 `package.json` 的 `version` 字段。
 
+## [2.0.1] - 2026-08-24
+
+> Hermes 仍是 Quest 的唯一调度引擎。本版本只增强执行运行时和真实能力验收，不恢复 DSH 调度器或任何 Mock fallback。
+
+### 内置执行运行时
+
+- 发布包可携带固定版本 `@openai/codex@0.149.0` 与 `@earendil-works/pi-coding-agent@0.84.2`，放入应用资源目录 `agent-runtimes/`。
+- 引擎检测优先使用安装包运行时，其次使用应用用户目录受管副本，最后才读取 PATH；每一级都必须经过 `--version` 和真实模型探活。
+- Windows 的 JavaScript CLI 入口通过 Electron/Node 受控启动，不再依赖易失效的全局 npm `.cmd` shim。
+- 源码不提交 `node_modules`、密钥或原生二进制；`npm run agents:prepare` 与 `npm run agents:verify` 负责发布前准备和完整性门禁。
+
+### MCP 与 Skills 验收
+
+- 保留并明确项目级 MCP/Skill 共享链路：Skill 文件同步到当前 Hermes 项目，MCP 工具必须经过 Main 项目选择、能力和审计策略。
+- 增加真实插件验收入口，覆盖动态 Skill 内容、stdio MCP 工具调用、Hermes `/skill`、`/mcp`、项目隔离和审计记录。
+
 ## [2.0.0] - 2026-08-24
 
 > Hermes v0.19.0 是 Quest 的唯一调度引擎。旧 Nexus/DSH 调度路径不再作为第二套状态机运行；OPC-Nexus Main 保留项目、权限、任务、审批、产物和审计事实。

@@ -11,7 +11,9 @@
  */
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { safeStorage } from 'electron';
+import { app, safeStorage } from 'electron';
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Database } from './database.js';
 import { loadConfig, sanitizeRegistry } from './config.js';
 import { runCli } from './cliLauncher.js';
@@ -68,6 +70,7 @@ import {
   type ProviderProtocol
 } from '../../shared/types.js';
 import { engineDisplayName } from '../../shared/engineVisibility.js';
+import { builtinAgentRuntimeSpec, locateBuiltinAgentRuntime } from './builtinAgentRuntime.js';
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const CLI_MODEL_PROBE_TIMEOUT_MS = 120_000;
@@ -276,6 +279,23 @@ function effective(entry: CatalogEntry): { bin: string | null; npmPackage: strin
   const override = loadConfig().engines[entry.id] ?? {};
   const bin = override.bin && /^[\w.-]+$/.test(override.bin) ? override.bin : entry.bin;
   return { bin, npmPackage: entry.npmPackage };
+}
+
+/** Built-in packaged runtimes take precedence over a user's global PATH. */
+async function locateEngineBin(entry: CatalogEntry): Promise<{ path: string; version: string | null; source: 'builtin' | 'path' } | null> {
+  if (entry.id === 'eng-codex' || entry.id === PI_ENGINE_ID) {
+    const builtin = locateBuiltinAgentRuntime(entry.id);
+    if (builtin) return { path: builtin.entryPath, version: builtin.version, source: 'builtin' };
+  }
+  const { bin } = effective(entry);
+  const found = bin ? await locateBin(bin) : null;
+  return found ? { path: found, version: null, source: 'path' } : null;
+}
+
+function builtinAgentInstallRoot(engineId: string): string | null {
+  const spec = builtinAgentRuntimeSpec(engineId);
+  if (!spec) return null;
+  return join(app.getPath('userData'), 'aibox-data', 'agent-runtimes', spec.directory);
 }
 
 export class EngineManager {
@@ -521,12 +541,13 @@ export class EngineManager {
       if (!entry.bin) continue;
       if (this.installing.has(entry.id)) continue; // 安装中不覆盖 INSTALLING 状态
       const { bin } = effective(entry);
-      const found = bin ? await locateBin(bin) : null;
+      const located = await locateEngineBin(entry);
+      const found = located?.path ?? null;
       if (!found) {
         this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(entry.id);
         this.db.setSetting(healthSignalsKey(entry.id), {
           detected: false, launchable: false, authenticated: false, taskVerified: false,
-          detail: `未在 PATH 中找到 ${bin}`, checkedAt: Date.now()
+          detail: `未找到 ${bin} 或应用内受管运行时`, checkedAt: Date.now()
         });
         continue;
       }
@@ -538,7 +559,7 @@ export class EngineManager {
         timeoutMs: cliLaunchProbeTimeoutMs(entry.id, launchEnv),
         env: launchEnv
       });
-      const version = (ver.stdout || ver.stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80) || null;
+      const version = (ver.stdout || ver.stderr || '').trim().split(/\r?\n/)[0]?.slice(0, 80) || located?.version || null;
       const launchable = !(ver.error && !ver.stdout && !ver.stderr);
 
       if (!launchable) {
@@ -607,12 +628,16 @@ export class EngineManager {
     if (this.installing.has(id)) return { ok: false, message: '该引擎正在安装中' };
 
     const registry = sanitizeRegistry(loadConfig().npmRegistry) ?? 'https://registry.npmmirror.com';
+    const builtinSpec = builtinAgentRuntimeSpec(id);
+    const localRoot = builtinAgentInstallRoot(id);
     this.installing.add(id);
     this.db.raw.prepare("UPDATE engines SET status = 'INSTALLING' WHERE id = ?").run(id);
     this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.install.start', target: `${npmPackage} @ ${registry}`, result: 'ok' });
 
     try {
-      const r = await npmInstallGlobal(npmPackage, registry, id === PI_ENGINE_ID);
+      const r = builtinSpec && localRoot
+        ? await npmInstallLocal(builtinSpec.packageName, builtinSpec.version, localRoot, registry)
+        : await npmInstallGlobal(npmPackage, registry, id === PI_ENGINE_ID);
       if (!r.ok) {
         this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED' WHERE id = ?").run(id);
         this.db.audit({ id: randomUUID(), actor: 'admin', action: 'engine.install', target: npmPackage, result: `failed: ${r.message.slice(0, 120)}` });
@@ -634,7 +659,7 @@ export class EngineManager {
     if (detected) {
       return { ok: true, message: `${entry.name} 安装成功并已确认可启动；请运行“验证可用性”完成凭据与模型任务探测` };
     }
-    return { ok: false, message: '安装命令已完成，但未检测到可执行文件；请检查 npm 全局 bin 目录是否在 PATH 中后点击"重新检测"' };
+    return { ok: false, message: '安装命令已完成，但未检测到应用内运行时或 PATH 可执行文件；请点击“重新检测”并查看引擎日志' };
   }
 
   /**
@@ -689,8 +714,8 @@ export class EngineManager {
         : { ok: false, message: `${entry.name} 未就绪：请先在设置页完成模型供应商配置` };
     }
 
-    const { bin } = effective(entry);
-    const found = bin ? await locateBin(bin) : null;
+    const located = await locateEngineBin(entry);
+    const found = located?.path ?? null;
     if (!found) {
       this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(id);
       return { ok: false, message: `未检测到 ${entry.name} 可执行文件，请先完成安装` };
@@ -782,7 +807,11 @@ export class EngineManager {
     const { npmPackage } = effective(entry);
     if (!npmPackage) return { ok: false, message: `${entry.name} 不支持自动更新` };
     const registry = sanitizeRegistry(loadConfig().npmRegistry) ?? 'https://registry.npmmirror.com';
-    const r = await npmCommand(['update', '-g', npmPackage, '--registry', registry]);
+    const builtinSpec = builtinAgentRuntimeSpec(id);
+    const localRoot = builtinAgentInstallRoot(id);
+    const r = builtinSpec && localRoot
+      ? await npmInstallLocal(builtinSpec.packageName, builtinSpec.version, localRoot, registry)
+      : await npmCommand(['update', '-g', npmPackage, '--registry', registry]);
     if (!r.ok) return { ok: false, message: `更新失败：${r.message}` };
     await this.detect();
     return { ok: true, message: `${entry.name} 已更新到最新版本` };
@@ -794,7 +823,11 @@ export class EngineManager {
     if (!entry) return { ok: false, message: '未知引擎' };
     const { npmPackage } = effective(entry);
     if (!npmPackage) return { ok: false, message: `${entry.name} 不支持自动卸载` };
-    const r = await npmCommand(['uninstall', '-g', npmPackage]);
+    const builtinSpec = builtinAgentRuntimeSpec(id);
+    const localRoot = builtinAgentInstallRoot(id);
+    const r = builtinSpec && localRoot
+      ? await npmCommand(['uninstall', '--prefix', localRoot, npmPackage])
+      : await npmCommand(['uninstall', '-g', npmPackage]);
     if (!r.ok) return { ok: false, message: `卸载失败：${r.message}` };
     this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(id);
     return { ok: true, message: `${entry.name} 已卸载` };
@@ -824,10 +857,11 @@ export class EngineManager {
     // CLI 引擎：重新定位二进制 + 取版本
     const { bin } = effective(entry);
     if (!bin) return { ok: false, message: `${entry.name} 不支持重启操作` };
-    const found = await locateBin(bin);
+    const located = await locateEngineBin(entry);
+    const found = located?.path ?? null;
     if (!found) {
       this.db.raw.prepare("UPDATE engines SET status = 'NOT_INSTALLED', version = NULL, path = NULL WHERE id = ?").run(id);
-      return { ok: false, message: `${entry.name} 未检测到可执行文件，请确认已安装并在 PATH 中` };
+      return { ok: false, message: `${entry.name} 未检测到应用内运行时或 PATH 可执行文件，请先完成安装` };
     }
     const version = await binVersion(found);
     this.db.raw.prepare(
@@ -1185,6 +1219,18 @@ export class EngineManager {
 /** npm 全局安装（Windows 下 npm 为 .cmd，须经 cmd.exe /c 拉起；参数均已白名单校验，无注入面） */
 function npmInstallGlobal(pkg: string, registry: string, ignoreScripts = false): Promise<{ ok: boolean; message: string }> {
   return npmCommand(['install', '-g', ...(ignoreScripts ? ['--ignore-scripts'] : []), pkg, '--registry', registry]);
+}
+
+/** Install an optional worker into the application-owned profile, never into
+ * the user's global npm tree. Release packages already contain this closure;
+ * this path is used by the Engines page when a developer build has no bundle.
+ */
+function npmInstallLocal(pkg: string, version: string, target: string, registry: string): Promise<{ ok: boolean; message: string }> {
+  mkdirSync(target, { recursive: true });
+  return npmCommand([
+    'install', '--prefix', target, '--no-save', '--ignore-scripts', '--no-audit', '--no-fund',
+    `${pkg}@${version}`, '--registry', registry
+  ]);
 }
 
 /** 通用 npm 命令执行（install/update/uninstall） */
