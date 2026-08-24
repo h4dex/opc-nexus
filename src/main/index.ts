@@ -27,7 +27,7 @@ import {
   purgeRetiredProductState,
   purgeRetiredRuntimeDirectories,
   seedMcpServers,
-  seedSkills
+  ensureBuiltinSkills
 } from './services/seed.js';
 import { importCredentialsBootstrap, importProviderFromUserConfig } from './services/bootstrap.js';
 import { migrateLegacyProvider } from './services/provider.js';
@@ -87,10 +87,10 @@ import {
   ArtifactRuntimeManager,
   type ArtifactRuntimeCaptureInput
 } from './services/artifactRuntimeManager.js';
-import type { ProjectArtifactScreenshotEvidence } from '../shared/types.js';
+import { NEXUS_ENGINE_ID, type AgentCapabilities, type AgentMemoryMode, type PermissionMode, type ProjectArtifactScreenshotEvidence } from '../shared/types.js';
 import { QuestWindowManager } from './services/questWindowManager.js';
 import { parseQuestLaunchRequest, QuestLaunchCoordinator } from './services/questLaunch.js';
-import { HermesServiceManager } from './services/hermesServiceManager.js';
+import { HermesServiceManager, resolveHermesRuntimeLaunch } from './services/hermesServiceManager.js';
 import { HermesWorkbenchWindowManager } from './services/hermesWorkbenchWindow.js';
 import { HermesEmbeddedWorkbenchManager } from './services/hermesEmbeddedWorkbench.js';
 import { HermesGovernanceBridge } from './services/hermesGovernanceBridge.js';
@@ -103,6 +103,7 @@ import { AgentMentionResolver } from './services/agentMentionResolver.js';
 import { HermesEmployeeDispatcher } from './services/hermesEmployeeDispatcher.js';
 import { HermesAcceptanceCoordinator } from './services/hermesAcceptanceCoordinator.js';
 import { HermesProjectPluginBridge } from './services/hermesProjectPluginBridge.js';
+import { HermesToolBridge } from './services/hermesToolBridge.js';
 import { DebugLogService } from './services/debugLogService.js';
 import { parseHermesValidationVerdict } from './services/hermesDeliveryGate.js';
 import { isLegacyBootstrappedCordisAgent } from './services/legacyCordisMigration.js';
@@ -688,6 +689,7 @@ app.whenReady().then(async () => {
     operation: string,
     payload: unknown
   ) => Promise<unknown> = async () => { throw new Error('Hermes host contract is not ready'); };
+  let hermesToolBridge: HermesToolBridge | null = null;
   let hermesAcceptanceCoordinator: HermesAcceptanceCoordinator | null = null;
   let handleHermesProjectRequest: (
     projectId: string,
@@ -826,6 +828,114 @@ app.whenReady().then(async () => {
     (projectId) => projectWorkbench.getExplicitWorkspacePath(projectId)
   );
   handleHermesHostRequest = async (projectId, operation, payload) => {
+    if (operation === 'create-employee') {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        throw new Error('Hermes employee profile is invalid');
+      }
+      const input = payload as Record<string, unknown>;
+      if (input.ownerConfirmed !== true) {
+        throw new Error('Hermes employee creation requires explicit owner confirmation');
+      }
+      const text = (value: unknown, field: string, min: number, max: number): string => {
+        if (typeof value !== 'string' || value.trim().length < min || value.trim().length > max
+          || /[\u0000-\u001f\u007f]/.test(value)) throw new Error(`Hermes employee ${field} is invalid`);
+        return value.trim();
+      };
+      const name = text(input.name, 'name', 2, 30);
+      const role = text(input.role, 'role', 2, 500);
+      const systemPrompt = typeof input.systemPrompt === 'string' ? input.systemPrompt.trim() : '';
+      const soulMd = typeof input.soulMd === 'string' ? input.soulMd.trim() : '';
+      const agentsMd = typeof input.agentsMd === 'string' ? input.agentsMd.trim() : '';
+      const userMd = typeof input.userMd === 'string' ? input.userMd.trim() : '';
+      for (const value of [systemPrompt, soulMd, agentsMd, userMd]) {
+        if (value.length > 100_000 || /[\u0000]/.test(value)) throw new Error('Hermes employee persona is invalid');
+      }
+      const permissionMode = input.permissionMode === undefined ? 'autonomous' : input.permissionMode;
+      if (!['readonly', 'standard', 'trusted', 'autonomous'].includes(String(permissionMode))) {
+        throw new Error('Hermes employee permission mode is invalid');
+      }
+      const memoryMode = input.memoryMode === undefined ? 'short_term' : input.memoryMode;
+      if (!['long_term', 'short_term', 'none'].includes(String(memoryMode))) {
+        throw new Error('Hermes employee memory mode is invalid');
+      }
+      const concurrencyLimit = input.concurrencyLimit === undefined ? 1 : Number(input.concurrencyLimit);
+      if (!Number.isSafeInteger(concurrencyLimit) || concurrencyLimit < 1 || concurrencyLimit > 8) {
+        throw new Error('Hermes employee concurrency limit is invalid');
+      }
+      const capabilityNames: (keyof AgentCapabilities)[] = ['network', 'shell', 'install', 'browser', 'computer'];
+      const rawCapabilities = input.capabilities === undefined ? {} : input.capabilities;
+      if (!rawCapabilities || typeof rawCapabilities !== 'object' || Array.isArray(rawCapabilities)) {
+        throw new Error('Hermes employee capabilities are invalid');
+      }
+      const capabilities: Partial<AgentCapabilities> = {};
+      for (const capability of capabilityNames) {
+        const value = (rawCapabilities as Record<string, unknown>)[capability];
+        if (value !== undefined && typeof value !== 'boolean') throw new Error(`Hermes employee capability ${capability} is invalid`);
+        if (value !== undefined) capabilities[capability] = value;
+      }
+      const requestedEngine = input.engineId === undefined ? '' : text(input.engineId, 'engineId', 1, 100);
+      const engineId = requestedEngine || (db.raw.prepare(`
+        SELECT id FROM engines
+        WHERE status IN ('HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED')
+        ORDER BY CASE WHEN id = ? THEN 0 WHEN status = 'HEALTHY' THEN 1 ELSE 2 END, id
+        LIMIT 1
+      `).get(NEXUS_ENGINE_ID) as { id?: string } | undefined)?.id;
+      if (!engineId) throw new Error('没有可用于创建数字员工的已配置引擎，请先完成引擎中心配置');
+      const engine = db.raw.prepare(
+        "SELECT id FROM engines WHERE id = ? AND status IN ('HEALTHY', 'SETUP_REQUIRED', 'AUTH_REQUIRED')"
+      ).get(engineId) as { id?: string } | undefined;
+      if (engine?.id !== engineId) throw new Error('所选数字员工引擎尚未配置或不可用');
+      const agent = orchestrator.createAgent({
+        name,
+        role,
+        systemPrompt: systemPrompt || `你是${name}，负责${role}。严格按工作目录和验收标准交付真实结果。`,
+        soulMd,
+        agentsMd,
+        userMd,
+        engineId,
+        workspace: '',
+        permissionMode: permissionMode as PermissionMode,
+        memoryMode: memoryMode as AgentMemoryMode,
+        concurrencyLimit,
+        channelIds: []
+      });
+      const updated = orchestrator.updateAgentPersona(agent.id, { capabilities });
+      const addToProjectPool = input.addToProjectPool === true;
+      if (addToProjectPool) {
+        const current = projectWorkbench.getSettings(projectId);
+        projectWorkbench.saveSettings(projectId, {
+          workerAgentIds: [...new Set([...current.workerAgentIds, updated.id])]
+        });
+      }
+      hermesServices?.refreshProjectContext(projectId);
+      db.audit({
+        id: randomUUID(), actor: 'hermes', action: 'hermes.employee.create', target: updated.id,
+        result: `${updated.name}:${updated.engineId}:${updated.memoryMode}:pool=${addToProjectPool}`, source: 'hermes'
+      });
+      pushSnapshot();
+      return {
+        id: updated.id,
+        name: updated.name,
+        role: updated.role,
+        engineId: updated.engineId,
+        memoryMode: updated.memoryMode,
+        permissionMode: updated.permissionMode,
+        capabilities: updated.capabilities,
+        addedToProjectPool: addToProjectPool
+      };
+    }
+    if (hermesToolBridge) {
+      const hermesToolOperations = new Set([
+        'web-search', 'web-search-aggregate', 'research-search', 'http-request', 'browser-navigate', 'browser-snapshot', 'browser-get-content',
+        'browser-click', 'browser-type', 'browser-screenshot', 'browser-evaluate',
+        'computer-screenshot', 'computer-click', 'computer-type', 'computer-key',
+        'audio-synthesize', 'video-probe', 'video-trim', 'video-concat',
+        'video-extract-audio', 'video-thumbnail', 'image-generate'
+      ]);
+      if (hermesToolOperations.has(operation)) {
+        return hermesToolBridge.execute(projectId, operation, payload);
+      }
+    }
     if (operation === 'delegate') return hermesEmployeeDispatcher.dispatch(projectId, payload);
     if (operation === 'task-status') return hermesEmployeeDispatcher.status(projectId, payload);
     if (operation === 'mcp-call') return hermesProjectPlugins.call(projectId, payload);
@@ -1382,6 +1492,21 @@ app.whenReady().then(async () => {
   const browserMgr = new BrowserManager();
   browserRef = browserMgr;
   executors.setBrowserManager(browserMgr);
+  hermesToolBridge = new HermesToolBridge({
+    browserManager: browserMgr,
+    resolveRuntime: resolveHermesRuntimeLaunch,
+    getHermesHome: (projectId) => hermesServices.getStatus(projectId).homePath,
+    getWorkspace: (projectId) => projectWorkbench.getExplicitWorkspacePath(projectId),
+    getImageProvider: (projectId) => resolveHermesProjectProvider(projectId),
+    getPolicy: (projectId) => {
+      const settings = projectWorkbench.getSettings(projectId);
+      return { permissionMode: settings.permissionMode, sandbox: settings.sandbox };
+    },
+    audit: ({ projectId, operation, result }) => db.audit({
+      id: randomUUID(), actor: 'hermes', action: `hermes.tool.${operation}`,
+      target: projectId, result, source: 'hermes'
+    })
+  });
   // OCR 服务（PaddleOCR WASM）注入
   const { OcrService } = await import('./services/ocrService.js');
   const ocrService = new OcrService(db);
@@ -1428,7 +1553,7 @@ app.whenReady().then(async () => {
     });
     if (failed) console.error('[LegacyCleanup] 旧 DSH 运行时目录清理失败:', failed);
   }
-  seedSkills(db);
+  ensureBuiltinSkills(db);
   skillManager.ensureVisionUnderstanding();
   knowledgeManager.syncAcceptedDeliverables(deliverableManager);
   // 凭据引导文件自动导入（credentials.bootstrap.json → safeStorage，导入后重命名）

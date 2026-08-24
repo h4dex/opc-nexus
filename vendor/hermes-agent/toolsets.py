@@ -51,7 +51,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory", "nexus_submit_plan", "nexus_delegate_task", "nexus_task_status", "nexus_mcp_call",
+    "todo", "memory", "nexus_submit_plan", "nexus_create_employee", "nexus_delegate_task", "nexus_task_status", "nexus_mcp_call",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the

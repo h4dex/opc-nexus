@@ -27,6 +27,332 @@ def _available() -> bool:
     return _host_config() is not None
 
 
+def _call_host_tool(operation: str, args: dict, *, write: bool = False) -> str:
+    """Invoke one real OPC-Nexus capability through Main's host contract.
+
+    Hermes never receives a filesystem/browser credential and never starts a
+    second browser or desktop controller.  The authenticated Main process
+    owns capability checks, workspace boundaries, audit records and failures.
+    """
+    config = _host_config()
+    if config is None:
+        return tool_error("OPC-Nexus 工具桥接不可用：Hermes 项目服务尚未绑定")
+    if write and args.get("ownerConfirmed") is not True:
+        return tool_error("写入工具需要 ownerConfirmed=true；只有老板明确要求该动作时才允许调用")
+    origin, token = config
+    payload = json.dumps(args, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{origin}/{operation}",
+        data=payload,
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "x-opc-nexus-host-token": token,
+        },
+    )
+    try:
+        with urlopen(request, timeout=180) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw else None
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                detail = parsed["error"].strip()
+            elif raw.strip():
+                detail = raw.strip()
+        except Exception:
+            detail = ""
+        suffix = f": {detail[:4000]}" if detail else ""
+        return tool_error(f"OPC-Nexus 工具被阻断（HTTP {exc.code}）{suffix}")
+    except Exception as exc:
+        return tool_error(f"OPC-Nexus 工具调用失败：{exc}")
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        return tool_error(str(body.get("error", "OPC-Nexus 工具调用失败")))
+    return json.dumps({"status": "executed_by_opc_nexus", "operation": operation, "result": body.get("result")}, ensure_ascii=False)
+
+
+def _nexus_http_request(args: dict, parent_agent=None) -> str:
+    method = str(args.get("method") or "GET").strip().upper()
+    return _call_host_tool("http-request", args, write=method != "GET")
+
+
+def _nexus_web_search(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("web-search", args)
+
+
+def _nexus_web_search_aggregate(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("web-search-aggregate", args)
+
+
+def _nexus_research_search(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("research-search", args)
+
+
+def _nexus_browser_navigate(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-navigate", args)
+
+
+def _nexus_browser_snapshot(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-snapshot", args)
+
+
+def _nexus_browser_get_content(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-get-content", args)
+
+
+def _nexus_browser_click(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-click", args, write=True)
+
+
+def _nexus_browser_type(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-type", args, write=True)
+
+
+def _nexus_browser_screenshot(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-screenshot", args)
+
+
+def _nexus_browser_evaluate(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("browser-evaluate", args, write=True)
+
+
+def _nexus_computer_screenshot(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("computer-screenshot", args)
+
+
+def _nexus_computer_click(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("computer-click", args, write=True)
+
+
+def _nexus_computer_type(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("computer-type", args, write=True)
+
+
+def _nexus_computer_key(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("computer-key", args, write=True)
+
+
+def _nexus_audio_synthesize(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("audio-synthesize", args, write=True)
+
+
+def _nexus_video_probe(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("video-probe", args)
+
+
+def _nexus_video_trim(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("video-trim", args, write=True)
+
+
+def _nexus_video_concat(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("video-concat", args, write=True)
+
+
+def _nexus_video_extract_audio(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("video-extract-audio", args, write=True)
+
+
+def _nexus_video_thumbnail(args: dict, parent_agent=None) -> str:
+    return _call_host_tool("video-thumbnail", args, write=True)
+
+
+def _nexus_image_generate(args: dict, parent_agent=None) -> str:
+    """Generate or edit an image through the project-scoped OPC-Nexus Provider."""
+    return _call_host_tool("image-generate", args, write=True)
+
+
+def _register_nexus_tool(name: str, description: str, properties: dict, required: list[str], handler, *, write: bool = False):
+    schema = {
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties,
+            "required": required,
+        },
+    }
+    registry.register(name=name, toolset="planning", schema=schema,
+                      handler=lambda args, **kw: handler(args, kw.get("parent_agent")),
+                      check_fn=_available, emoji="N")
+
+
+_register_nexus_tool(
+    "nexus_web_search", "通过 OPC-Nexus 主进程执行真实联网搜索并返回来源 URL。", {"query": {"type": "string"}}, ["query"], _nexus_web_search)
+_register_nexus_tool(
+    "nexus_web_search_aggregate",
+    "并行查询 Bing 与 DuckDuckGo，去重并返回带搜索引擎标记的真实结果；不可达引擎会明确标记 unavailable。",
+    {"query": {"type": "string"}, "maxResults": {"type": "integer", "minimum": 1, "maximum": 12}},
+    ["query"], _nexus_web_search_aggregate)
+_register_nexus_tool(
+    "nexus_research_search",
+    "先聚合多个搜索引擎，再抓取有限数量的正文，返回 S1/S2 来源编号、URL、HTTP 状态、抓取时间和引用文本；禁止把 failed/skipped 来源当作事实依据。",
+    {"query": {"type": "string"}, "maxResults": {"type": "integer", "minimum": 1, "maximum": 12},
+     "maxSources": {"type": "integer", "minimum": 1, "maximum": 8},
+     "domains": {"type": "array", "items": {"type": "string"}}},
+    ["query"], _nexus_research_search)
+_register_nexus_tool(
+    "nexus_http_request", "通过 OPC-Nexus 主进程发起真实 HTTP/HTTPS 请求。GET 只读；POST/PUT/DELETE 必须 ownerConfirmed=true。",
+    {"url": {"type": "string"}, "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
+     "headers": {"type": "object"}, "body": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["url"], _nexus_http_request)
+_register_nexus_tool("nexus_browser_navigate", "通过 OPC-Nexus 真实浏览器导航到 http/https 页面。", {"url": {"type": "string"}, "cdp_url": {"type": "string"}}, ["url"], _nexus_browser_navigate)
+_register_nexus_tool("nexus_browser_snapshot", "读取当前真实浏览器页面文本。", {}, [], _nexus_browser_snapshot)
+_register_nexus_tool("nexus_browser_get_content", "读取当前真实浏览器页面正文文本。", {}, [], _nexus_browser_get_content)
+_register_nexus_tool("nexus_browser_click", "在真实浏览器中点击 CSS 元素；必须 ownerConfirmed=true。", {"selector": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["selector", "ownerConfirmed"], _nexus_browser_click, write=True)
+_register_nexus_tool("nexus_browser_type", "在真实浏览器输入文本；必须 ownerConfirmed=true。", {"selector": {"type": "string"}, "text": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["selector", "text", "ownerConfirmed"], _nexus_browser_type, write=True)
+_register_nexus_tool("nexus_browser_screenshot", "保存真实浏览器页面截图到项目工作目录。", {"selector": {"type": "string"}}, [], _nexus_browser_screenshot)
+_register_nexus_tool("nexus_browser_evaluate", "在真实浏览器页面执行 JavaScript；必须 ownerConfirmed=true。", {"script": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["script", "ownerConfirmed"], _nexus_browser_evaluate, write=True)
+_register_nexus_tool("nexus_computer_screenshot", "截取真实主机桌面截图；项目必须使用主机沙箱。", {}, [], _nexus_computer_screenshot)
+_register_nexus_tool("nexus_computer_click", "控制真实主机鼠标；项目必须使用主机沙箱且 ownerConfirmed=true。", {"x": {"type": "number"}, "y": {"type": "number"}, "button": {"type": "string", "enum": ["left", "right"]}, "ownerConfirmed": {"type": "boolean"}}, ["x", "y", "ownerConfirmed"], _nexus_computer_click, write=True)
+_register_nexus_tool("nexus_computer_type", "向真实主机当前焦点输入文本；必须 ownerConfirmed=true。", {"text": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["text", "ownerConfirmed"], _nexus_computer_type, write=True)
+_register_nexus_tool("nexus_computer_key", "向真实主机发送按键组合；必须 ownerConfirmed=true。", {"keys": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["keys", "ownerConfirmed"], _nexus_computer_key, write=True)
+_register_nexus_tool("nexus_audio_synthesize", "使用真实 Edge TTS 或已配置的 Hermes TTS provider 合成音频并保存到项目目录；依赖未安装时明确失败。", {"text": {"type": "string"}, "voice": {"type": "string", "description": "Edge TTS voice；使用 Hermes provider 时以其项目配置为准"}, "outputPath": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["text", "ownerConfirmed"], _nexus_audio_synthesize, write=True)
+_register_nexus_tool("nexus_video_probe", "使用真实 FFmpeg 探测视频流和时长。", {"inputPath": {"type": "string"}}, ["inputPath"], _nexus_video_probe)
+_register_nexus_tool("nexus_video_trim", "使用真实 FFmpeg 剪切视频；必须 ownerConfirmed=true。", {"inputPath": {"type": "string"}, "outputPath": {"type": "string"}, "startSec": {"type": "number"}, "durationSec": {"type": "number"}, "ownerConfirmed": {"type": "boolean"}}, ["inputPath", "outputPath", "ownerConfirmed"], _nexus_video_trim, write=True)
+_register_nexus_tool("nexus_video_concat", "使用真实 FFmpeg 拼接视频；必须 ownerConfirmed=true。", {"inputPaths": {"type": "array", "items": {"type": "string"}}, "outputPath": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["inputPaths", "outputPath", "ownerConfirmed"], _nexus_video_concat, write=True)
+_register_nexus_tool("nexus_video_extract_audio", "使用真实 FFmpeg 从视频抽取音频；必须 ownerConfirmed=true。", {"inputPath": {"type": "string"}, "outputPath": {"type": "string"}, "ownerConfirmed": {"type": "boolean"}}, ["inputPath", "outputPath", "ownerConfirmed"], _nexus_video_extract_audio, write=True)
+_register_nexus_tool("nexus_video_thumbnail", "使用真实 FFmpeg 生成视频缩略图；必须 ownerConfirmed=true。", {"inputPath": {"type": "string"}, "outputPath": {"type": "string"}, "timeSec": {"type": "number"}, "ownerConfirmed": {"type": "boolean"}}, ["inputPath", "outputPath", "ownerConfirmed"], _nexus_video_thumbnail, write=True)
+_register_nexus_tool(
+    "nexus_image_generate",
+    "通过当前项目配置的真实图片 Provider 进行文生图或图生图；结果写入项目目录并返回 SHA-256 产物信息。必须 ownerConfirmed=true。",
+    {
+        "prompt": {"type": "string"},
+        "model": {"type": "string"},
+        "size": {"type": "string", "enum": ["1024x1024", "1536x1024", "1024x1536", "auto"]},
+        "quality": {"type": "string", "enum": ["auto", "low", "medium", "high"]},
+        "count": {"type": "integer", "minimum": 1, "maximum": 4},
+        "imagePath": {"type": "string"},
+        "imagePaths": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+        "outputPath": {"type": "string"},
+        "ownerConfirmed": {"type": "boolean"},
+    },
+    ["prompt", "ownerConfirmed"],
+    _nexus_image_generate,
+    write=True,
+)
+
+
+def _create_employee(args: dict, parent_agent=None) -> str:
+    """Create a real OPC-Nexus employee through the authenticated Main host.
+
+    Hermes may propose the employee profile, but Main owns validation, engine
+    readiness, organization scope, persistence, and audit. The tool never
+    creates an implicit employee: it is called only when the owner explicitly
+    asks Hermes to staff the project.
+    """
+    config = _host_config()
+    if config is None:
+        return tool_error("OPC-Nexus employee provisioning is unavailable in this Hermes service.")
+    origin, token = config
+    body = {
+        "ownerConfirmed": args.get("ownerConfirmed", False),
+        "name": args.get("name"),
+        "role": args.get("role"),
+        "systemPrompt": args.get("systemPrompt", ""),
+        "soulMd": args.get("soulMd", ""),
+        "agentsMd": args.get("agentsMd", ""),
+        "userMd": args.get("userMd", ""),
+        "permissionMode": args.get("permissionMode", "autonomous"),
+        "memoryMode": args.get("memoryMode", "short_term"),
+        "concurrencyLimit": args.get("concurrencyLimit", 1),
+        "capabilities": args.get("capabilities", {}),
+        "addToProjectPool": args.get("addToProjectPool", False),
+    }
+    if args.get("engineId"):
+        body["engineId"] = args.get("engineId")
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{origin}/create-employee",
+        data=payload,
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "x-opc-nexus-host-token": token,
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw else None
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                detail = parsed["error"].strip()
+            elif raw.strip():
+                detail = raw.strip()
+        except Exception:
+            detail = ""
+        suffix = f": {detail[:4000]}" if detail else ""
+        return tool_error(f"OPC-Nexus rejected employee provisioning (HTTP {exc.code}){suffix}")
+    except Exception as exc:
+        return tool_error(f"OPC-Nexus rejected employee provisioning: {exc}")
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        return tool_error(str(body.get("error", "OPC-Nexus rejected employee provisioning")))
+    return json.dumps(
+        {
+            "status": "created_by_opc_nexus",
+            "employee": body.get("result"),
+            "note": "The employee is real and persisted. Use the returned exact id for later delegation; do not claim task execution until nexus_delegate_task returns a receipt.",
+        },
+        ensure_ascii=False,
+    )
+
+
+NEXUS_CREATE_EMPLOYEE_SCHEMA = {
+    "name": "nexus_create_employee",
+    "description": (
+        "Create one real OPC-Nexus digital employee from the owner's staffing request. "
+        "Use only when the owner explicitly asks to create or staff an employee. "
+        "Main validates the engine, permissions, memory policy, organization scope and audit. "
+        "Do not invent an employee id; use the id returned by this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ownerConfirmed": {"type": "boolean", "description": "Must be true only when the owner explicitly requested this employee"},
+            "name": {"type": "string", "description": "Display name, 2-30 characters"},
+            "role": {"type": "string", "description": "Concrete responsibility, 2-500 characters"},
+            "systemPrompt": {"type": "string"},
+            "soulMd": {"type": "string"},
+            "agentsMd": {"type": "string"},
+            "userMd": {"type": "string"},
+            "engineId": {"type": "string", "description": "Exact configured engine id; omit to use the healthy default"},
+            "permissionMode": {"type": "string", "enum": ["readonly", "standard", "trusted", "autonomous"]},
+            "memoryMode": {"type": "string", "enum": ["long_term", "short_term", "none"]},
+            "concurrencyLimit": {"type": "integer", "minimum": 1, "maximum": 8},
+            "capabilities": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "network": {"type": "boolean"},
+                    "shell": {"type": "boolean"},
+                    "install": {"type": "boolean"},
+                    "browser": {"type": "boolean"},
+                    "computer": {"type": "boolean"},
+                },
+            },
+            "addToProjectPool": {"type": "boolean", "description": "Only set true when the owner explicitly wants a restricted project employee pool"},
+        },
+        "required": ["ownerConfirmed", "name", "role"],
+    },
+}
+
+
+registry.register(
+    name="nexus_create_employee",
+    toolset="planning",
+    schema=NEXUS_CREATE_EMPLOYEE_SCHEMA,
+    handler=lambda args, **kw: _create_employee(args, kw.get("parent_agent")),
+    check_fn=_available,
+    emoji="N",
+)
+
+
 def _session_id(parent_agent) -> str:
     try:
         from gateway.session_context import get_session_env
@@ -294,6 +620,22 @@ def _delegate_task(args: dict, parent_agent=None) -> str:
     try:
         with urlopen(request, timeout=30) as response:
             body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        # Preserve the host's bounded policy reason.  A bare ``HTTP 422`` is
+        # not actionable when the request was rejected by governance (for
+        # example, a validation task whose related task is still FAILED).
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw else None
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                detail = parsed["error"].strip()
+            elif raw.strip():
+                detail = raw.strip()
+        except Exception:
+            detail = ""
+        suffix = f": {detail[:4000]}" if detail else ""
+        return tool_error(f"OPC-Nexus rejected employee dispatch (HTTP {exc.code}){suffix}")
     except Exception as exc:
         return tool_error(f"OPC-Nexus rejected employee dispatch: {exc}")
     if not isinstance(body, dict) or body.get("ok") is not True:

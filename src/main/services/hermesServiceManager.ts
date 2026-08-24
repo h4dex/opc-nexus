@@ -35,7 +35,11 @@ const HOST = '127.0.0.1' as const;
 // Leave room for the project governance prompt and tool schemas on
 // OpenAI-compatible gateways that reject max_tokens + prompt > context.
 const HERMES_MAX_OUTPUT_TOKENS = 16_384;
-const START_TIMEOUT_MS = 45_000;
+// Hermes performs a one-time plugin discovery and Python import pass on a
+// cold install. On Windows that can exceed the old 45 second gate even when
+// the dashboard is healthy moments later. Keep the runtime explicitly in
+// `starting-*` during that window instead of reporting a false offline state.
+const START_TIMEOUT_MS = 120_000;
 const HEALTH_INTERVAL_MS = 15_000;
 const MAX_LOG_CHARS = 32_000;
 
@@ -1521,11 +1525,17 @@ export class HermesServiceManager {
         '- After clarification, call nexus_submit_plan and wait for the owner approval.',
         '- In every complex plan, assign each plan-level expected artifact to exactly one DAG node through that node expectedArtifacts. Never give every worker the whole delivery list.',
         '- When the owner explicitly @mentions an employee, use nexus_delegate_task with the exact validated employee id.',
+        '- When the owner explicitly asks to create or staff a digital employee, call nexus_create_employee with ownerConfirmed=true and a bounded profile. Never create employees implicitly from a task description.',
+        '- Keep the project worker pool dynamic unless the owner explicitly asks for a fixed pool; do not set addToProjectPool for ordinary staffing.',
         '- For a simple delegated task, use nexus_delegate_task without forcing a multi-step plan.',
         '- Classify each employee request as execution, status_inquiry, or validation. A progress/status inquiry must use status_inquiry with no expected artifacts.',
         '- For independent acceptance, assign a different qualified employee with intent validation and include related task ids when known.',
         '- A validation task returns a factual verdict in its task result. Require a new file only when the owner explicitly requested a report artifact.',
         '- After dispatch, use nexus_task_status to obtain the real terminal state and result before summarizing. Accepted, queued, and running are not completion.',
+        '- For real project tools, use the governed nexus_* tools through OPC-Nexus Main: nexus_web_search for a single search, nexus_web_search_aggregate for multi-engine result comparison, and nexus_research_search for bounded page retrieval with S1/S2 citations; nexus_http_request for network access, nexus_browser_* for browser research/interaction, nexus_computer_* only for explicitly requested host control, nexus_audio_synthesize for configured TTS, and nexus_video_* for FFmpeg media operations. If a tool is not shown directly, use tool_search/tool_describe to load its schema; never substitute a made-up result.',
+        '- Research answers must preserve the returned source IDs and URLs. Do not present a claim as verified when every supporting source is failed, skipped, or unavailable; report the search-engine failure instead.',
+        '- Read-only network/browser inspection may run directly when the project capability is available. Browser writes, host control, audio generation, video edits, and image generation require ownerConfirmed=true and must report the real output or the real dependency error.',
+        '- For product images use nexus_image_generate. It supports real text-to-image and image-to-image requests through the project Provider, including GPT Image 2 when that model is available; keep all reference and output paths inside the project workspace and never claim success without the returned artifact hash.',
         '- Do not use native delegate_task for OPC-Nexus business delegation.',
         '- OPC-Nexus Main owns approval, task state, execution state, permissions, budget, and audit facts.',
         '- Never claim approval or completion, create fictional employees, or bypass the approved project workspace.'
@@ -1684,6 +1694,14 @@ export class HermesServiceManager {
       '5. Report delivery complete only when validationVerdict is PASS. Keep FAIL unaccepted and propose bounded rework; report BLOCKED honestly.',
       ''
     ].join('\n');
+  }
+
+  /** Refresh the generated host context after Main creates or archives an employee. */
+  refreshProjectContext(projectId: string): void {
+    const instance = this.instances.get(projectId);
+    if (!instance || instance.status.state !== 'healthy') return;
+    const workspace = this.requireProjectWorkspace(projectId);
+    this.atomicWrite(join(instance.homePath, 'NEXUS-CONTEXT.md'), this.projectContext(projectId, workspace));
   }
 
   private seedFile(path: string, content: string): void {

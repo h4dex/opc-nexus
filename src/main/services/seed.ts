@@ -81,6 +81,8 @@ const SEED_MCP_SERVERS: SeedMcpServer[] = [
 // ==================== 常用技能预置 ====================
 
 interface SeedSkill {
+  /** Stable ids are used for built-ins so upgrades can add missing skills without duplicates. */
+  id?: string;
   name: string;
   description: string;
   content: string;
@@ -133,16 +135,19 @@ const SEED_SKILLS: SeedSkill[] = [
     content: `## PDF 文档处理技能\n\n### 能力范围\n- **文本提取**：从 PDF 中提取纯文本，保留段落结构\n- **表格识别**：识别 PDF 中的表格并转为结构化数据（CSV/JSON）\n- **图片提取**：导出 PDF 内嵌图片\n- **合并/拆分**：多 PDF 合并、按页拆分\n- **格式转换**：PDF → Word/Markdown/HTML\n- **信息摘要**：长文档自动生成摘要\n\n### 工具链\n- Python: PyMuPDF(fitz) / pdfplumber / PyPDF2\n- Node: pdf-parse / pdf-lib\n- CLI: qpdf / pdftotext\n\n### 输出规范\n- 提取文本保留原始段落编号\n- 表格输出为 Markdown 表格或 CSV\n- 标注页码来源便于溯源\n- 扫描件需提示用户启用 OCR`
   },
   {
+    id: 'skill-office-docx',
     name: 'Word 文档生成',
     description: '根据模板或自然语言生成 Word(.docx) 文档，支持格式排版和批量生成',
     content: `## Word 文档生成技能\n\n### 能力范围\n- **文档生成**：根据内容大纲生成带格式的 .docx\n- **模板填充**：基于 Word 模板批量替换变量生成文档\n- **格式排版**：标题层级、页眉页脚、目录、页码\n- **内容改写**：对已有 Word 内容进行润色/扩写/缩写\n- **格式转换**：Markdown/HTML → Word\n\n### 工具链\n- Python: python-docx / docxtpl（模板引擎）\n- Node: docx / officegen\n- 模板变量语法：{{变量名}}\n\n### 排版规范\n- 标题：一级标题 16pt 加粗，二级 14pt，三级 12pt\n- 正文：宋体/微软雅黑 11pt，行距 1.5 倍\n- 页边距：上下 2.54cm，左右 3.17cm\n- 表格：带边框，表头加粗灰底\n\n### 输出\n- 生成文件路径\n- 文档结构大纲预览\n- 如需用户确认的内容标注高亮`
   },
   {
+    id: 'skill-office-xlsx',
     name: 'Excel 数据处理',
     description: '读写 Excel 文件，数据清洗、公式生成、图表建议与报表自动化',
     content: `## Excel 数据处理技能\n\n### 能力范围\n- **数据读取**：解析 .xlsx/.csv，识别表头与数据类型\n- **数据清洗**：去重、空值填充、格式统一、异常值标记\n- **公式生成**：根据需求生成 VLOOKUP/SUMIFS/INDEX-MATCH 等公式\n- **透视分析**：按维度汇总，生成透视表结构建议\n- **图表推荐**：根据数据特征推荐合适图表类型\n- **报表生成**：自动生成带格式的 Excel 报表\n- **宏/VBA**：编写自动化宏代码\n\n### 工具链\n- Python: openpyxl / pandas / xlsxwriter\n- Node: exceljs / xlsx(SheetJS)\n\n### 输出规范\n- 数据预览（前 10 行）\n- 清洗/转换逻辑说明\n- 公式附带中文注释\n- 大文件（>10万行）提示分块处理\n- 生成文件注明 sheet 命名和列含义`
   },
   {
+    id: 'skill-office-pptx',
     name: 'PPT 演示制作',
     description: '根据主题/大纲自动生成 PPT 演示文稿，支持排版设计和内容组织',
     content: `## PPT 演示制作技能\n\n### 能力范围\n- **大纲生成**：根据主题生成演示逻辑大纲\n- **内容编排**：每页标题 + 要点（不超过 5 条）\n- **演讲稿**：为每页生成配套演讲备注\n- **设计建议**：配色方案、版式布局、字体搭配\n- **文件生成**：输出 .pptx 文件\n\n### 工具链\n- Python: python-pptx\n- Node: pptxgenjs / officegen\n\n### 设计原则\n- 每页一个核心观点\n- 文字精简：标题 ≤ 10 字，要点 ≤ 15 字/条\n- 数据用图表代替文字堆砌\n- 配色不超过 3 种主色\n- 留白充足，避免信息过载\n\n### 输出结构\n1. 演示大纲（逻辑线）\n2. 逐页内容（标题 + 要点 + 备注）\n3. 设计建议（配色/版式/动画）\n4. 生成 .pptx 文件路径`
@@ -184,20 +189,41 @@ export function seedMcpServers(db: Database) {
   });
 }
 
-/** 预置常用技能（表为空时写入） */
-export function seedSkills(db: Database) {
-  const count = (db.raw.prepare('SELECT COUNT(*) c FROM skills').get() as { c: number }).c;
-  if (count > 0) return;
-
+/**
+ * Ensure the built-in skill catalogue is present on every upgrade.
+ *
+ * Older releases returned early as soon as any user skill existed, which
+ * meant an upgraded installation could silently miss Word/Excel/PPT.  This
+ * migration is deliberately additive: it never deletes or overwrites a
+ * user's existing skill (including a disabled one), and only inserts a
+ * missing built-in or a missing built-in name.
+ */
+export function ensureBuiltinSkills(db: Database): { inserted: string[] } {
+  const inserted: string[] = [];
   const now = Date.now();
   db.transaction(() => {
     const insert = db.raw.prepare(
       'INSERT INTO skills(id, name, description, content, enabled, created_at) VALUES(?,?,?,?,1,?)'
     );
-    for (const s of SEED_SKILLS) {
-      insert.run(`skill-${randomUUID().slice(0, 8)}`, s.name, s.description, s.content, now);
+    const byName = db.raw.prepare('SELECT id FROM skills WHERE name = ? LIMIT 1');
+    for (const skill of SEED_SKILLS) {
+      const stableId = skill.id ?? `skill-${randomUUID().slice(0, 8)}`;
+      const existingStable = db.raw.prepare('SELECT id FROM skills WHERE id = ? LIMIT 1').get(stableId) as { id: string } | undefined;
+      if (existingStable) continue;
+      // A pre-v2 database may already contain a same-name built-in with a
+      // random id. Preserve that row instead of creating a duplicate.
+      const existingName = byName.get(skill.name) as { id: string } | undefined;
+      if (existingName) continue;
+      insert.run(stableId, skill.name, skill.description, skill.content, now);
+      inserted.push(stableId);
     }
   });
+  return { inserted };
+}
+
+/** Backwards-compatible entry point used by older bootstrap callers. */
+export function seedSkills(db: Database): void {
+  ensureBuiltinSkills(db);
 }
 
 /** 历史样例数据统计：只用于升级后清理旧版 `is_demo=1` 行。 */

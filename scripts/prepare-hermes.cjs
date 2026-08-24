@@ -12,6 +12,9 @@ const runtimeManifestPath = path.join(runtimeRoot, 'runtime-manifest.json');
 const expectedVersion = '0.19.0';
 const expectedPython = '3.11';
 const expectedAiohttp = '3.14.1';
+// These packages are required by the bundled productivity skills. Keep them
+// in the Hermes runtime rather than relying on a user's global Python.
+const officePackages = ['python-docx==1.1.2', 'openpyxl==3.1.5', 'python-pptx==1.0.2'];
 const pinnedCommit = '2b0fb72acae67f51652de5c51db556bc15a68f0e';
 const requiredSource = [
   'LICENSE',
@@ -110,9 +113,13 @@ function prepareRuntime() {
       'pip', 'install', '--python', stagePython, '--system', '--break-system-packages', '--no-cache',
       '--link-mode', 'copy', `aiohttp==${expectedAiohttp}`
     ], { cwd: root, stdio: 'inherit', windowsHide: true });
+    execFileSync('uv', [
+      'pip', 'install', '--python', stagePython, '--system', '--break-system-packages', '--no-cache',
+      '--link-mode', 'copy', ...officePackages
+    ], { cwd: root, stdio: 'inherit', windowsHide: true });
     execFileSync(stagePython, [
       '-c',
-      `import aiohttp, fastapi, hermes_cli, openai, uvicorn; assert hermes_cli.__version__ == "${expectedVersion}"; assert aiohttp.__version__ == "${expectedAiohttp}"`
+      `import aiohttp, fastapi, hermes_cli, openai, uvicorn, docx, openpyxl, pptx; assert hermes_cli.__version__ == "${expectedVersion}"; assert aiohttp.__version__ == "${expectedAiohttp}"`
     ], { cwd: source, stdio: 'inherit', windowsHide: true });
     if (fs.existsSync(runtimePythonRoot)) fs.renameSync(runtimePythonRoot, backup);
     fs.renameSync(stage, runtimePythonRoot);
@@ -156,7 +163,7 @@ function verifyRuntime(options = {}) {
   if (info.major_minor !== expectedPython) throw new Error(`Hermes bundled Python is ${info.version}, expected ${expectedPython}.x`);
   execFileSync(pythonPath, [
     '-c',
-    `import aiohttp, fastapi, hermes_cli, openai, uvicorn; assert hermes_cli.__version__ == "${expectedVersion}"; assert aiohttp.__version__ == "${expectedAiohttp}"`
+    `import aiohttp, fastapi, hermes_cli, openai, uvicorn, docx, openpyxl, pptx; assert hermes_cli.__version__ == "${expectedVersion}"; assert aiohttp.__version__ == "${expectedAiohttp}"`
   ], { cwd: source, stdio: 'pipe', windowsHide: true });
   return manifest;
 }

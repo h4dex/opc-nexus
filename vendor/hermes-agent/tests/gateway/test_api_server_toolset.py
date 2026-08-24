@@ -118,12 +118,42 @@ class TestApiServerPlatformConfig:
 
 
 class TestApiServerAdapterToolset:
+    def test_nexus_project_mode_removes_native_image_generation_toolset(self):
+        """Project mode must fail closed to the OPC-Nexus image bridge."""
+        from gateway.platforms.api_server import _get_api_server_toolsets
+        from model_tools import get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        project_env = {
+            "HERMES_NEXUS_PROJECT_ID": "project-test",
+            "HERMES_NEXUS_HOST_URL": "http://127.0.0.1:9",
+            "HERMES_NEXUS_HOST_TOKEN": "test-host-token",
+        }
+        with patch.dict(os.environ, project_env), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"image_gen", "terminal"}):
+            enabled = _get_api_server_toolsets({})
+
+        assert "image_gen" not in enabled
+        assert "planning" in enabled
+        with patch.dict(os.environ, project_env):
+            invalidate_check_fn_cache()
+            names = {
+                item["function"]["name"]
+                for item in get_tool_definitions(
+                    enabled_toolsets=sorted(enabled), quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+            }
+        assert "nexus_image_generate" in names
+        assert "image_generate" not in names
+
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_nexus_project_mode_force_enables_host_planning_tools(self):
         """Managed project turns must receive real Nexus tools even after a UI tool toggle."""
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.config import PlatformConfig
         from model_tools import get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
 
         adapter = APIServerAdapter(PlatformConfig())
         project_env = {
@@ -148,11 +178,22 @@ class TestApiServerAdapterToolset:
 
             enabled = mock_agent_cls.call_args.kwargs["enabled_toolsets"]
             assert enabled == ["clarify", "planning"]
+            invalidate_check_fn_cache()
             names = {
                 item["function"]["name"]
-                for item in get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+                for item in get_tool_definitions(
+                    enabled_toolsets=enabled, quiet_mode=True, skip_tool_search_assembly=True
+                )
             }
-            assert {"clarify", "nexus_delegate_task", "nexus_mcp_call", "nexus_submit_plan"} <= names
+            assert {
+                "clarify", "nexus_create_employee", "nexus_delegate_task", "nexus_mcp_call", "nexus_submit_plan",
+                "nexus_web_search", "nexus_http_request", "nexus_browser_navigate", "nexus_browser_snapshot",
+                "nexus_browser_click", "nexus_browser_type", "nexus_browser_screenshot",
+                "nexus_computer_screenshot", "nexus_computer_click", "nexus_audio_synthesize",
+                "nexus_video_probe", "nexus_video_trim", "nexus_video_concat",
+                "nexus_image_generate",
+            } <= names
+            assert "image_generate" not in names
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reads_config_toolsets(self):

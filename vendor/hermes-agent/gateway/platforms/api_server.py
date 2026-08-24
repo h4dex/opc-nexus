@@ -112,6 +112,13 @@ def _get_api_server_toolsets(config: dict, *, include_default_mcp_servers: bool 
         include_default_mcp_servers=include_default_mcp_servers,
     ))
     if nexus_project:
+        # OPC-Nexus owns provider selection, workspace admission, artifact
+        # hashing and audit for project-scoped image generation.  Hermes'
+        # native image_gen tool talks to its own provider configuration and
+        # can therefore bypass the project Host Contract.  Keep exactly one
+        # governed image entry point in project mode: nexus_image_generate,
+        # registered below by the mandatory planning toolset.
+        enabled.discard("image_gen")
         # A project conversation has a durable owner-facing clarification
         # channel. Keep it alongside the Nexus planning bridge even when the
         # global API tool toggles are empty; otherwise Hermes can only describe

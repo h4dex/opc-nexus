@@ -90,7 +90,7 @@ async function verifyGatewayToken(port, token) {
   if (!toolsetsResponse.ok) throw new Error(`Hermes toolset probe failed (HTTP ${toolsetsResponse.status})`);
   const toolsets = await toolsetsResponse.json();
   const planning = toolsets?.data?.find((item) => item?.name === 'planning');
-  const expected = ['nexus_delegate_task', 'nexus_mcp_call', 'nexus_submit_plan'];
+  const expected = ['nexus_delegate_task', 'nexus_mcp_call', 'nexus_submit_plan', 'nexus_image_generate'];
   if (!planning?.enabled || expected.some((name) => !planning.tools?.includes(name))) {
     throw new Error('Hermes project mode did not expose the OPC-Nexus planning tools');
   }

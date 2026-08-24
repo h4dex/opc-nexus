@@ -53,6 +53,7 @@ type ReviewerResolver = (projectId: string, excludedAgentIds: ReadonlySet<string
 
 const VALIDATION_MARKER = '[OPC-NEXUS-AUTO-VALIDATION]';
 const VALIDATION_STATUS_MARKER = '[OPC-NEXUS-AUTO-VALIDATION-STATUS]';
+const FOLLOWUP_MARKER = '[OPC-NEXUS-AUTO-FOLLOWUP]';
 // Give Main-owned artifact startup a brief chance to persist its real URL
 // before the secretary is prompted. A missing URL still fails closed.
 const ACCEPTANCE_TRIGGER_DELAY_MS = 1_500;
@@ -76,6 +77,7 @@ function relatedTaskIds(content: unknown): string[] {
  */
 export class HermesAcceptanceCoordinator {
   private readonly requested = new Set<string>();
+  private readonly followupsRequested = new Set<string>();
 
   constructor(
     private readonly db: Database,
@@ -84,7 +86,15 @@ export class HermesAcceptanceCoordinator {
   ) {}
 
   onTaskFinished(info: HermesAcceptanceTaskFinished): void {
-    if (info.status !== 'COMPLETED') return;
+    if (info.status !== 'COMPLETED') {
+      // A failed worker must not disappear from the owner's workflow. Wake
+      // the primary secretary so it can read the authoritative failure and
+      // ask the worker for a factual status before proposing a bounded retry.
+      if (['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(info.status)) {
+        setTimeout(() => this.considerFailedTask(info.taskId), ACCEPTANCE_TRIGGER_DELAY_MS);
+      }
+      return;
+    }
     // Plan-job rows are committed immediately after task creation. Deferring
     // one turn also covers a very fast worker finishing before that insert.
     // The project scan is a compensating read: it covers a missed/late
@@ -121,6 +131,107 @@ export class HermesAcceptanceCoordinator {
     } catch {
       // Older databases may not have the Hermes plan tables until the bridge
       // has initialized. The next task completion/health event retries it.
+    }
+  }
+
+  private considerFailedTask(taskId: string): void {
+    let task: {
+      id?: string;
+      project_id?: string;
+      conversation_id?: string;
+      agent_id?: string | null;
+      title?: string;
+      status?: string;
+      content?: string | null;
+      result?: string | null;
+      error?: string | null;
+    } | undefined;
+    try {
+      task = this.db.raw.prepare(`
+        SELECT id, project_id, conversation_id, agent_id, title, status, content, result, error
+        FROM tasks
+        WHERE id = ? AND deleted_at IS NULL
+        LIMIT 1
+      `).get(taskId) as typeof task;
+    } catch {
+      return;
+    }
+    if (!task?.id || !task.project_id || !task.conversation_id || !task.status) return;
+    if (!['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(task.status)) return;
+    // Validation/status-inquiry tasks are already follow-up work. Do not
+    // recursively wake the secretary for their own terminal state.
+    if (typeof task.content === 'string' && /^Task intent: (status_inquiry|validation)$/m.test(task.content)) return;
+
+    let plan: PlanRow | undefined;
+    try {
+      plan = this.db.raw.prepare(`
+        SELECT d.draft_id, d.conversation_id, c.principal_id, p.employee_id
+        FROM hermes_plan_jobs j
+        JOIN hermes_plan_drafts d ON d.draft_id = j.draft_id
+        JOIN hermes_plan_projections g
+          ON g.draft_id = d.draft_id AND g.project_id = d.project_id
+         AND g.status IN ('APPROVED', 'DISPATCHED')
+        JOIN conversations c ON c.id = d.conversation_id AND c.project_id = d.project_id
+        LEFT JOIN hermes_conversation_profiles p
+          ON p.project_id = c.project_id AND p.conversation_id = c.id
+        WHERE j.task_id = ?
+        LIMIT 1
+      `).get(taskId) as PlanRow | undefined;
+    } catch {
+      return;
+    }
+    if (!plan?.draft_id || !plan.conversation_id || !plan.principal_id || !task.agent_id) return;
+    // A pinned employee conversation is not the owner-facing coordinator.
+    if (plan.employee_id) return;
+    const key = `${plan.draft_id}:${task.id}`;
+    if (this.followupsRequested.has(key)) return;
+
+    const runtimeStatus = this.runtime.getStatus(task.project_id);
+    if (runtimeStatus.state !== 'healthy') {
+      this.audit('hermes.followup.auto-blocked', task.project_id, `${plan.draft_id}:${task.id}:runtime=${runtimeStatus.state}`);
+      return;
+    }
+
+    const marker = `${FOLLOWUP_MARKER} plan=${plan.draft_id} task=${task.id}`;
+    try {
+      const queued = this.db.raw.prepare(`
+        SELECT id FROM hermes_chat_queue
+        WHERE project_id = ? AND conversation_id = ? AND message LIKE ?
+        ORDER BY created_at DESC LIMIT 1
+      `).get(task.project_id, plan.conversation_id, `%${marker}%`) as { id?: string } | undefined;
+      if (queued?.id) {
+        this.followupsRequested.add(key);
+        return;
+      }
+    } catch {
+      return;
+    }
+
+    this.followupsRequested.add(key);
+    const detail = String(task.error || task.result || '没有可用的终态产出').replace(/[\r\n]+/g, ' ').slice(0, 2_000);
+    const message = [
+      marker,
+      `你是本项目主秘书。数字员工“${task.title || task.agent_id}”的真实任务已进入 ${task.status}，不能把它当作完成。`,
+      `第一步必须调用 nexus_task_status，taskId=${task.id}，waitSeconds=0，读取权威 status、result 和 failureReason。Main 记录的错误摘要：${detail}`,
+      `如果没有真实产出或原因需要员工解释，再调用 nexus_delegate_task：workerAgentId=${task.agent_id}，intent=status_inquiry，relatedTaskIds=["${task.id}"]，expectedArtifacts=[]，询问它实际做到了哪一步、缺少什么和是否可恢复。`,
+      '收到真实回执后，只有在预算、权限和项目目录仍然有效时，才能向老板提出一次有界的 execution 重派建议；不得静默无限重试、复制占位文件或把失败改写为成功。向老板汇总时必须保留 FAILED、CANCELLED 或 INTERRUPTED 原因。'
+    ].join('\n');
+    try {
+      const queued = this.runtime.enqueueProjectTurn(task.project_id, {
+        conversationId: plan.conversation_id,
+        principalId: plan.principal_id,
+        message,
+        title: '主秘书追问失败员工',
+        systemMessage: '这是 Main 在数字员工没有真实产出后发出的治理跟进。必须先读 nexus_task_status，再通过 status_inquiry 询问原员工；禁止伪造完成。'
+      });
+      this.audit('hermes.followup.auto-request', task.project_id, `${plan.draft_id}:${task.id}:queue=${queued.id}`);
+    } catch (error) {
+      this.followupsRequested.delete(key);
+      this.audit(
+        'hermes.followup.auto-error',
+        task.project_id,
+        `${plan.draft_id}:${task.id}:${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000)
+      );
     }
   }
 

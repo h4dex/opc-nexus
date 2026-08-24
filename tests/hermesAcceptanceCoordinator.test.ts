@@ -9,6 +9,7 @@ interface FixtureOptions {
   runtimeState?: string;
   runtimeUrl?: string;
   reviewers?: HermesAcceptanceReviewer[];
+  failedTask?: { id: string; project_id: string; conversation_id: string; agent_id: string; title: string; status: string; content: string; error?: string };
 }
 
 function fixture(options: FixtureOptions = {}) {
@@ -18,6 +19,7 @@ function fixture(options: FixtureOptions = {}) {
   ];
   const validation = options.validation ?? [];
   let statusFollowupQueued = false;
+  let failureFollowupQueued = false;
   const prepare = vi.fn((sql: string) => ({
     get: vi.fn((...args: unknown[]) => {
       if (sql.includes("content LIKE 'Task intent: validation%'") && validation[0]) {
@@ -35,7 +37,12 @@ function fixture(options: FixtureOptions = {}) {
       if (sql.includes('SELECT id FROM hermes_chat_queue')) {
         return statusFollowupQueued && String(args[2] ?? '').includes('AUTO-VALIDATION-STATUS')
           ? { id: 'hermes-chat-validation-status-1' }
-          : undefined;
+          : failureFollowupQueued && String(args[2] ?? '').includes('AUTO-FOLLOWUP')
+            ? { id: 'hermes-chat-followup-1' }
+            : undefined;
+      }
+      if (sql.includes('SELECT id, project_id, conversation_id, agent_id, title, status, content, result, error')) {
+        return options.failedTask;
       }
       void args;
       return undefined;
@@ -59,7 +66,14 @@ function fixture(options: FixtureOptions = {}) {
   const db = { raw: { prepare }, audit: vi.fn() };
   const enqueueProjectTurn = vi.fn((_projectId: string, input: { title?: string }) => {
     if (input.title === '主秘书读取独立验收结果') statusFollowupQueued = true;
-    return { id: input.title === '主秘书读取独立验收结果' ? 'hermes-chat-validation-status-1' : 'hermes-chat-validation-1' };
+    if (input.title === '主秘书追问失败员工') failureFollowupQueued = true;
+    return {
+      id: input.title === '主秘书读取独立验收结果'
+        ? 'hermes-chat-validation-status-1'
+        : input.title === '主秘书追问失败员工'
+          ? 'hermes-chat-followup-1'
+          : 'hermes-chat-validation-1'
+    };
   });
   const runtime = {
     getStatus: vi.fn(() => ({ state: options.runtimeState ?? 'healthy' })),
@@ -200,6 +214,30 @@ describe('HermesAcceptanceCoordinator', () => {
     expect(f.db.audit).toHaveBeenCalledWith(expect.objectContaining({
       action: 'hermes.acceptance.auto-blocked',
       result: 'draft-1:no-independent-ready-reviewer'
+    }));
+  });
+
+  it('wakes the primary secretary when an implementation worker has no real output', async () => {
+    const f = fixture({
+      failedTask: {
+        id: 'task-b', project_id: 'project-1', conversation_id: 'conversation-root',
+        agent_id: 'agent-b', title: '章节写手', status: 'FAILED',
+        content: 'Task intent: execution\n\n写入 draft/chapter-01.md', error: '上游 Provider 返回 502'
+      }
+    });
+    f.coordinator.onTaskFinished({ taskId: 'task-b', agentId: 'agent-b', status: 'FAILED' });
+    await waitForCoordinator();
+
+    expect(f.enqueueProjectTurn).toHaveBeenCalledOnce();
+    const input = f.enqueueProjectTurn.mock.calls[0]?.[1];
+    expect(input).toMatchObject({ conversationId: 'conversation-root', principalId: 'owner-1', title: '主秘书追问失败员工' });
+    expect(input?.message).toContain('[OPC-NEXUS-AUTO-FOLLOWUP] plan=draft-1 task=task-b');
+    expect(input?.message).toContain('nexus_task_status');
+    expect(input?.message).toContain('intent=status_inquiry');
+    expect(input?.message).toContain('502');
+    expect(f.db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'hermes.followup.auto-request',
+      result: 'draft-1:task-b:queue=hermes-chat-followup-1'
     }));
   });
 });

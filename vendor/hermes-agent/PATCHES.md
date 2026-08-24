@@ -28,6 +28,28 @@ credentials belong in this fork.
   `nexus_task_status` read. Progress questions never require artifacts;
   independent validation identifies completed Nexus task ids and cannot be
   treated as complete until Main returns an authoritative PASS verdict.
+- `tools/nexus_tool.py`: explicit owner staffing requests can call
+  `nexus_create_employee`. Main validates the real engine, organization scope,
+  memory policy and capability flags before persisting the employee; no worker
+  is created implicitly from an ordinary task request.
+- `tools/nexus_tool.py` and `src/main/services/hermesToolBridge.ts`: expose
+  project-scoped network, browser, computer, audio and FFmpeg media tools via
+  the authenticated Main Host Contract. Main reuses the existing BrowserManager
+  and executor implementations, enforces workspace/sandbox/owner-confirmation
+  policy, records audit facts, and returns real failures when a dependency is
+  unavailable. Hermes never starts a second browser or desktop controller.
+- `tools/nexus_tool.py` and `src/main/services/hermesToolBridge.ts`: add
+  `nexus_web_search_aggregate` and `nexus_research_search`. Main queries Bing
+  and DuckDuckGo in parallel, de-duplicates URLs, bounds page retrieval, and
+  returns engine status plus numbered source citations and fetch status. No
+  source is silently replaced with a fabricated result.
+- `tools/nexus_tool.py`, `src/main/services/hermesToolBridge.ts`, and
+  `src/main/index.ts`: add the project-governed `nexus_image_generate` tool
+  for real OpenAI-compatible `images/generations` and `images/edits` calls.
+  Main keeps Provider credentials out of Hermes and Renderer, validates image
+  paths and sizes, downloads or decodes returned images, writes atomic project
+  artifacts, and returns media metadata plus SHA-256. Unsupported or failed
+  image endpoints remain explicit failures; no placeholder image is created.
 - `gateway/platforms/api_server.py` and `tools/nexus_tool.py`: managed project
   API sessions persist `clarify` questions through the authenticated Main Host
   Contract and return immediately. Project mode also force-enables the
@@ -106,3 +128,8 @@ credentials belong in this fork.
   Main-owned) and follow the host's explicit light/dark theme contract. This
   prevents a stalled plugin endpoint from blocking chat and prevents Hermes'
   saved machine theme from overriding the OPC-Nexus project surface.
+- `gateway/platforms/api_server.py`: managed project sessions remove Hermes'
+  native `image_gen` from the API toolset. Image creation must use the
+  project-scoped `nexus_image_generate` Host Contract so Provider selection,
+  workspace admission, atomic artifact writes, hashes, and audit policy cannot
+  be bypassed by a stale Hermes tool toggle.
