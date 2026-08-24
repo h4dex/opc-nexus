@@ -1,7 +1,7 @@
 # 创作团队真实验收报告
 
-日期：2026-08-24  
-分支：`codex/v2.0.1-builtin-runtimes`  
+日期：2026-08-24
+分支：`codex/v2.0.1-builtin-runtimes`
 测试命令：`npm run acceptance:creative-studios`
 
 ## 结论
@@ -35,7 +35,7 @@ run16 还证明了独立验收员工能真实读取三个文件并输出一致�
 
 ## 当前放行边界
 
-已可以依赖：Hermes 通过自然语言创建真实数字员工、记忆策略持久化、动态项目组队、真实 DAG 执行、项目目录写入和 Manifest。  
+已可以依赖：Hermes 通过自然语言创建真实数字员工、记忆策略持久化、动态项目组队、真实 DAG 执行、项目目录写入和 Manifest。
 尚不能宣称：本轮小说和影视两个场景均完成独立 `PASS` 验收；需要在 Provider 稳定、Hermes runtime 无启动竞态后重新执行 run19+，并确认独立验收结论、交付目录和手机状态。
 
 ## 最新复测补充
