@@ -5,7 +5,7 @@
  * - 提供页面操作原语：导航、点击、输入、截图、JS 执行、等待
  * - 空闲超时自动关闭（5 分钟无操作释放资源）
  */
-import { join } from 'node:path';
+import { join, win32 } from 'node:path';
 import { existsSync, mkdirSync } from 'node:fs';
 
 /** 延迟加载 playwright-core（避免未安装时阻塞启动） */
@@ -38,14 +38,17 @@ export function resolveBrowserExecutable(
   env: NodeJS.ProcessEnv = process.env,
   pathExists: (path: string) => boolean = existsSync
 ): string | null {
+  // Use the path syntax of the target platform. This keeps the resolver
+  // deterministic when tests exercise a platform different from the host.
+  const pathJoin = platform === 'win32' ? win32.join : join;
   const candidates = platform === 'win32'
     ? [
-        env.PROGRAMFILES && join(env.PROGRAMFILES, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-        env['PROGRAMFILES(X86)'] && join(env['PROGRAMFILES(X86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-        env.LOCALAPPDATA && join(env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-        env.PROGRAMFILES && join(env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        env['PROGRAMFILES(X86)'] && join(env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        env.LOCALAPPDATA && join(env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe')
+        env.PROGRAMFILES && pathJoin(env.PROGRAMFILES, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        env['PROGRAMFILES(X86)'] && pathJoin(env['PROGRAMFILES(X86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        env.LOCALAPPDATA && pathJoin(env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        env.PROGRAMFILES && pathJoin(env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        env['PROGRAMFILES(X86)'] && pathJoin(env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        env.LOCALAPPDATA && pathJoin(env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe')
       ]
     : platform === 'darwin'
       ? [
