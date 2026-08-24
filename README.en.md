@@ -69,6 +69,36 @@ Failures show the real cause and a recovery path to Connection settings. The app
 - Real WeCom, Feishu and WeChat iLink channels can bind to project conversations; remote approve, pause and cancel actions are audited.
 - Debug mode writes redacted JSONL to the user data `logs/` directory for runtime, proxy, gateway, task and channel diagnosis.
 
+## v2.0.1 Workflow
+
+Use this sequence for a complete task:
+
+```text
+Project -> Provider -> Quest -> Clarify (when needed) -> Plan -> Approve -> Dispatch -> Verify -> Deliver
+```
+
+1. Select a real project workspace. A project does not have to bind to one employee. Simple tasks may `@` a specific employee; complex tasks let Hermes assemble a team from capability, permission and budget policies.
+2. In Quest connection settings, configure the Base URL, API key and model, then use **Fetch models** and **Test**. Dispatch is blocked when a real Provider or execution runtime is unavailable.
+3. Send the owner's instruction. Hermes asks persistent clarification questions when needed and creates a draft plan. After approval, Main creates the authoritative version and dispatches to Codex, Pi, Claude, Hermes Worker or a mobile worker.
+4. Use the Quest governance panel to inspect employee progress, tool calls, acceptance and the delivery manifest. Delivered files can be previewed, revealed in the workspace, launched with the reported command or sent through a bound channel.
+5. Mobile pairing connects only to the current project's Hermes conversation. It does not open the Android control console or expose another project. Mobile viewer/operator permissions match the desktop policy.
+
+Simple questions can return directly. Complex work must pass through plan and approval. When a service, Provider, employee or permission is unavailable, the UI reports the real error and recovery action; it never creates Mock employees, fake success or fictional artifacts.
+
+## Screenshots
+
+These images are from real Quest/Hermes acceptance runs and show staffing, delivery and mobile conversation flows:
+
+![Quest Hermes staffing](./docs/screenshots/quest-hermes-staffing.png)
+
+![Quest Hermes delivery](./docs/screenshots/quest-hermes-delivery.png)
+
+![Hermes mobile chat](./docs/screenshots/hermes-mobile-chat.png)
+
+## Acceptance Boundary
+
+Version 2.0.1 passes type checking, unit tests, production build, Hermes runtime smoke and desktop UI smoke. The complete "owner order -> Hermes staffing -> Codex/Pi multi-worker execution -> independent acceptance -> complex delivery" remains a release gate. The full writing of two 300,000-character novels is not complete, so that scenario must not be described as delivered. Release notes record actual artifacts, elapsed time and blocking causes for each scenario.
+
 ## Development and Verification
 
 Requirements: Node.js 20+, npm 10+ and Python 3.11. The Hermes preparation scripts use `uv` to obtain the pinned Python runtime.

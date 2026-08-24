@@ -18,6 +18,12 @@
 - 保留并明确项目级 MCP/Skill 共享链路：Skill 文件同步到当前 Hermes 项目，MCP 工具必须经过 Main 项目选择、能力和审计策略。
 - 增加真实插件验收入口，覆盖动态 Skill 内容、stdio MCP 工具调用、Hermes `/skill`、`/mcp`、项目隔离和审计记录。
 
+### 发布与文档
+
+- 修复 Ubuntu CI 中 uv 管理的 Python 3.11 runtime 路径，确保 Hermes 打包和 smoke 使用稳定的 `bin/python3` 入口。
+- 修复 Windows checkout 使用 CRLF 时 Quest 手机访问静态源码测试的换行差异。
+- README 中补充 v2.0.1 的完整使用闭环、验收边界和真实 Quest/Hermes 截图。
+
 ## [2.0.0] - 2026-08-24
 
 > Hermes v0.19.0 是 Quest 的唯一调度引擎。旧 Nexus/DSH 调度路径不再作为第二套状态机运行；OPC-Nexus Main 保留项目、权限、任务、审批、产物和审计事实。

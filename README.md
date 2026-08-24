@@ -69,6 +69,36 @@ Hermes 启动前会检查：
 - 企业微信、飞书、微信 iLink Bot 等真实渠道可绑定到项目会话；远程批准、暂停和取消都会审计。
 - 调试模式将脱敏 JSONL 写入用户数据目录 `logs/`，用于排查启动、代理、Gateway、任务和渠道问题。
 
+## v2.0.1 使用闭环
+
+推荐按下面的顺序操作一次完整任务：
+
+```text
+项目 -> Provider -> Quest -> 澄清（必要时） -> 计划 -> 批准 -> 派工 -> 验收 -> 交付
+```
+
+1. 在项目设置中选择真实工作目录。项目不强制绑定某一个员工；简单任务可以 `@` 指定员工，复杂任务由 Hermes 根据能力、权限和预算动态组队。
+2. 在 Quest 的连接设置中配置 Base URL、API Key 和模型并执行“读取模型”和“测试”。没有真实 Provider 或执行引擎时，派工会被阻止。
+3. 发送老板指令。Hermes 会在需要时提出可持久化的澄清问题，随后生成计划草案；确认计划后由 Main 创建正式版本并派发到 Codex、Pi、Claude、Hermes Worker 或手机 Worker。
+4. 在 Quest 右侧治理面板查看员工进度、工具调用、验收和交付 Manifest。交付目录中的文件可以预览、打开目录、复制启动命令或发送到已绑定渠道。
+5. 手机扫码只连接当前项目的 Hermes 对话，不会打开 Android 控制台或访问其他项目。手机端的 viewer/operator 权限和桌面端一致。
+
+简单问答可以直接返回；复杂任务必须经过计划和审批。任何服务、Provider、员工或权限不可用时，界面显示真实错误和恢复入口，不生成 Mock 员工、伪成功或虚构产物。
+
+## 界面预览
+
+以下截图来自真实 Quest/Hermes 验收运行，用于展示组队、交付和手机会话的实际界面：
+
+![Quest Hermes staffing](./docs/screenshots/quest-hermes-staffing.png)
+
+![Quest Hermes delivery](./docs/screenshots/quest-hermes-delivery.png)
+
+![Hermes mobile chat](./docs/screenshots/hermes-mobile-chat.png)
+
+## 验收边界
+
+v2.0.1 已通过类型检查、单元测试、生产构建、Hermes runtime smoke 和桌面 UI smoke。完整的“老板下令 -> Hermes 组队 -> Codex/Pi 多员工执行 -> 独立验收 -> 复杂交付”仍是发布门禁；两部 30 万字小说的全量写作尚未完成，因此不能把该场景宣称为已交付。发布说明会记录每个场景的实际产物、耗时和阻断原因。
+
 ## 开发与验证
 
 要求 Node.js 20+、npm 10+、Python 3.11（Hermes 准备脚本使用 uv）。

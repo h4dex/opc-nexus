@@ -27,7 +27,14 @@ const requiredSource = [
 ];
 
 function bundledPython(platform = process.platform) {
-  return path.join(runtimePythonRoot, platform === 'win32' ? 'python.exe' : path.join('bin', 'python3'));
+  if (platform === 'win32') return path.join(runtimePythonRoot, 'python.exe');
+  const canonical = path.join(runtimePythonRoot, 'bin', 'python3');
+  if (fs.existsSync(canonical)) return canonical;
+  const bin = path.dirname(canonical);
+  const candidate = fs.existsSync(bin)
+    ? fs.readdirSync(bin).find((name) => /^python3(?:\.\d+)?$/.test(name))
+    : undefined;
+  return candidate ? path.join(bin, candidate) : canonical;
 }
 
 function runNpm(argumentsText) {
@@ -85,6 +92,31 @@ function locateStandalonePython() {
   }
 }
 
+function standalonePythonRoot(pythonPath) {
+  const parent = path.dirname(pythonPath);
+  // uv-managed Unix installations place the executable in <root>/bin. The
+  // Windows distribution keeps python.exe directly under its root.
+  return process.platform !== 'win32' && path.basename(parent) === 'bin'
+    ? path.dirname(parent)
+    : parent;
+}
+
+function ensureCanonicalUnixPython(rootPath) {
+  if (process.platform === 'win32') return path.join(rootPath, 'python.exe');
+  const bin = path.join(rootPath, 'bin');
+  const canonical = path.join(bin, 'python3');
+  if (fs.existsSync(canonical)) return canonical;
+  const candidateName = fs.existsSync(bin)
+    ? fs.readdirSync(bin).find((name) => /^python3(?:\.\d+)?$/.test(name))
+    : undefined;
+  if (!candidateName) throw new Error(`Python 3.11 executable is missing from ${bin}`);
+  // Keep a stable path for Electron, smoke scripts and electron-builder. A
+  // copied executable is more reliable than a symlink in packaged archives.
+  fs.copyFileSync(path.join(bin, candidateName), canonical);
+  fs.chmodSync(canonical, 0o755);
+  return canonical;
+}
+
 function prepareRuntime() {
   const sourcePython = locateStandalonePython();
   if (!fs.existsSync(sourcePython)) throw new Error(`Standalone Python was not found: ${sourcePython}`);
@@ -97,9 +129,9 @@ function prepareRuntime() {
   const requirements = path.join(runtimeRoot, `.requirements-${process.pid}.txt`);
   fs.rmSync(stage, { recursive: true, force: true });
   fs.rmSync(backup, { recursive: true, force: true });
-  const sourcePythonRoot = fs.realpathSync.native(path.dirname(sourcePython));
+  const sourcePythonRoot = fs.realpathSync.native(standalonePythonRoot(sourcePython));
   fs.cpSync(sourcePythonRoot, stage, { recursive: true, dereference: true });
-  const stagePython = path.join(stage, process.platform === 'win32' ? 'python.exe' : path.join('bin', 'python3'));
+  const stagePython = ensureCanonicalUnixPython(stage);
   try {
     execFileSync('uv', [
       'export', '--locked', '--no-dev', '--no-default-groups', '--no-emit-project',

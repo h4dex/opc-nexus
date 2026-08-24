@@ -54,15 +54,15 @@ describe('Quest mobile Web access', () => {
     const workbench = readFileSync(
       join(process.cwd(), 'src', 'renderer', 'src', 'pages', 'QuestWorkbench.tsx'),
       'utf8'
-    );
+    ).replace(/\r\n/g, '\n');
     expect(workbench).toContain('if (visible && !sameBounds(lastBoundsRef.current, bounds))');
   });
 
   it('renders a top-toolbar phone trigger and a secret-free Hermes pairing modal', () => {
     const root = join(process.cwd(), 'src', 'renderer', 'src', 'pages');
-    const workbench = readFileSync(join(root, 'QuestWorkbench.tsx'), 'utf8');
-    const access = readFileSync(join(root, 'QuestMobileAccess.tsx'), 'utf8');
-    const styles = readFileSync(join(root, 'questWorkbench.css'), 'utf8');
+    const workbench = readFileSync(join(root, 'QuestWorkbench.tsx'), 'utf8').replace(/\r\n/g, '\n');
+    const access = readFileSync(join(root, 'QuestMobileAccess.tsx'), 'utf8').replace(/\r\n/g, '\n');
+    const styles = readFileSync(join(root, 'questWorkbench.css'), 'utf8').replace(/\r\n/g, '\n');
 
     expect(workbench).toContain('className={`quest-toolbar-icon${mobileOpen ? \' active\' : \'\'}`}');
     expect(workbench).toContain('aria-label={mobileOpen ? \'关闭手机 Hermes 对话\' : \'连接手机 Hermes 对话\'}');
