@@ -1174,9 +1174,19 @@ export function registerIpc(deps: IpcDeps) {
   // conversation. Keep its pairing namespace explicit so a QR scan cannot be
   // mistaken for the Quest project chat pairing.
   handle('aibox:androidBridge:createPairing', () => mobile.createPairing());
-  handle('aibox:androidBridge:copyPairingConfig', (_e, pairingId: string) => {
-    clipboard.writeText(mobile.getPairingConfigForCopy(assertId(pairingId, 'pairingId')));
-    return { ok: true as const };
+  handle('aibox:androidBridge:copyPairingConfig', async (_e, pairingId: string) => {
+    const payload = mobile.getPairingConfigForCopy(assertId(pairingId, 'pairingId'));
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (attempt % 2 === 0) {
+        clipboard.writeText(payload);
+      } else {
+        clipboard.clear();
+        clipboard.write({ text: payload });
+      }
+      if (clipboard.readText() === payload) return { ok: true as const };
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('Android Worker 配对配置未能写入系统剪贴板，请关闭占用剪贴板的程序后重试');
   });
   handle('aibox:mobile:getToolCatalog', () => getMobileToolCatalog());
   handle('aibox:mobile:listDevices', () => mobile.listDevices());
@@ -1601,7 +1611,17 @@ export function registerIpc(deps: IpcDeps) {
   handle('aibox:createFollowUpTask', (_e, parentTaskId: string, title: string) => orchestrator.createFollowUpTask(assertId(parentTaskId, 'parentTaskId'), assertString(title, 'title', 1, 500)));
   // 任务详情：事件时间线 + 产物全文（13.2 审计可追溯）
   handle('aibox:getTaskEvents', (_e, taskId: string) => orchestrator.taskEvents(taskId));
-  handle('aibox:getTaskResult', (_e, taskId: string) => orchestrator.taskResult(taskId));
+  // Desktop reads must share the Hermes delivery gate used by channels. This
+  // keeps unaccepted plan work from appearing as a completed deliverable.
+  const deliveryAllowed = (taskId: string): boolean => {
+    const gate = hermesGovernance?.getDeliveryGate(taskId);
+    return !gate || !gate.required || gate.allowed;
+  };
+  handle('aibox:getTaskResult', (_e, taskId: string) => {
+    const id = assertId(taskId, 'taskId');
+    if (!deliveryAllowed(id)) return null;
+    return orchestrator.taskResult(id);
+  });
   /** B.4/B.5 — 任务绑定的项目 workspace，是产物操作的唯一边界 */
   const manifestWorkspace = (taskId: string): string | null => {
     const taskRow = db.raw.prepare('SELECT project_id FROM tasks WHERE id = ?').get(taskId) as { project_id: string | null } | undefined;
@@ -1610,10 +1630,15 @@ export function registerIpc(deps: IpcDeps) {
     return projectWorkbench.getExplicitWorkspacePath(projectId) ?? null;
   };
   // B.5 — 产物 Manifest 提取（从 task_events 取最后一条 artifact_manifest）
-  handle('aibox:getTaskManifest', (_e, taskId: string) => readTaskArtifactManifest(db, assertId(taskId, 'taskId')));
+  handle('aibox:getTaskManifest', (_e, taskId: string) => {
+    const id = assertId(taskId, 'taskId');
+    if (!deliveryAllowed(id)) return null;
+    return readTaskArtifactManifest(db, id);
+  });
   // B.5 — 打开项目产物目录（与任务绑定的项目 workspace）
   handle('aibox:openTaskDeliveryFolder', async (_e, taskId: string) => {
     const id = assertId(taskId, 'taskId');
+    if (!deliveryAllowed(id)) return { ok: false, message: '该任务尚未通过独立验收，暂不可打开交付目录' };
     const taskRow = db.raw.prepare('SELECT project_id FROM tasks WHERE id = ?').get(id) as { project_id: string | null } | undefined;
     const projectId = taskRow?.project_id;
     if (projectId && projectWorkbench) {
@@ -1632,6 +1657,7 @@ export function registerIpc(deps: IpcDeps) {
   // B.5 — 打开产物预览：仅允许打开出现在已验证 manifest 中的文件
   handle('aibox:openArtifactPreview', async (_e, taskId: string, relativePath: string) => {
     const id = assertId(taskId, 'taskId');
+    if (!deliveryAllowed(id)) return { ok: false, message: '该任务尚未通过独立验收，暂不可预览产物' };
     const target = assertString(relativePath, 'relativePath', 1, 512);
     const manifest = readTaskArtifactManifest(db, id);
     const isVerifiedEntry = manifest?.entries.some((entry) => entry.relativePath === target) === true;
@@ -2121,7 +2147,11 @@ function buildSnapshot(deps: IpcDeps) {
     projects: deps.projects.list(),
     // 结果正文由 getTaskResult 按需读取，避免每次状态变化都通过 IPC
     // 克隆 200 份任务产物到 Renderer。
-    tasks: deps.orchestrator.listTasks({ includeResult: false }),
+    tasks: deps.orchestrator.listTasks({ includeResult: false }).filter((task) => {
+      if (task.status !== 'COMPLETED') return true;
+      const gate = deps.hermesGovernance?.getDeliveryGate(task.id);
+      return !gate || !gate.required || gate.allowed;
+    }),
     todos: [...systemTodos, ...todos].slice(0, 12),
     approvals: deps.orchestrator.listApprovals(),
     // Retired engine identities remain hidden while historical task rows are

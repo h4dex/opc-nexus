@@ -1,6 +1,7 @@
 const { _electron: electron } = require('playwright');
 const {
   existsSync,
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -20,6 +21,7 @@ const SERIAL = process.env.OPCNEXUS_E2E_SERIAL || 'emulator-5554';
 const ANDROID_HOME = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
 const ADB = ANDROID_HOME && join(ANDROID_HOME, 'platform-tools', process.platform === 'win32' ? 'adb.exe' : 'adb');
 const KEEP = process.env.OPCNEXUS_E2E_KEEP === '1';
+const SEED_USER_DATA = String(process.env.OPCNEXUS_E2E_SEED_USER_DATA || '').trim();
 // The debug APK exposes an ADB-only receiver so CI can inject JSON without
 // relying on `adb shell input text`, which cannot faithfully carry JSON punctuation.
 // Release APKs do not declare this receiver. The default path remains the real UI.
@@ -268,11 +270,16 @@ async function main() {
   check(existsSync(join(ROOT, 'out', 'main', 'index.js')), 'Run npm run build before mobile E2E');
   mkdirSync(ARTIFACTS, { recursive: true });
   const userData = mkdtempSync(join(tmpdir(), 'opcnexus-mobile-e2e-'));
+  if (SEED_USER_DATA) {
+    const seedPath = resolve(SEED_USER_DATA);
+    check(existsSync(seedPath), `OPCNEXUS_E2E_SEED_USER_DATA does not exist: ${seedPath}`);
+    cpSync(seedPath, userData, { recursive: true, force: true });
+  }
   const resultPath = join(ARTIFACTS, 'result.json');
   let app;
   let profileHome = null;
   let mockLocationActive = false;
-  const result = { host: HOST, port: PORT, serial: SERIAL, startedAt: Date.now(), steps: [] };
+  const result = { host: HOST, port: PORT, serial: SERIAL, startedAt: Date.now(), steps: [], warnings: [] };
   const record = (step, value = {}) => {
     result.steps.push({ step, at: Date.now(), ...value });
     writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
@@ -283,63 +290,111 @@ async function main() {
     prepareEmulator();
     record('emulator_prepared');
     app = await electron.launch({
-      args: ['.', `--user-data-dir=${userData}`],
+      args: ['.', `--aibox-user-data=${userData}`],
       cwd: ROOT,
       env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: 'true' },
       timeout: 60_000,
     });
     const page = await app.firstWindow({ timeout: 60_000 });
     await page.waitForLoadState('domcontentloaded');
-    await page.getByRole('button', { name: '手机控制台' }).click();
-    await page.getByRole('heading', { name: '手机控制台' }).waitFor();
+    await page.getByRole('button', { name: 'Android 执行设备' }).click();
+    await page.getByRole('heading', { name: 'Android 执行设备' }).waitFor();
     const api = await page.evaluateHandle(() => window.aibox);
     const call = (name, ...args) => api.evaluate((bridge, input) => bridge[input.name](...input.args), { name, args });
 
-    const status = await call('startMobileGateway', HOST, PORT);
+    // Exercise the owner-visible recovery flow before first pairing. The
+    // isolated profile may contain a certificate copied from another LAN.
+    await page.getByRole('button', { name: '连接修复与证书重置' }).click();
+    await page.getByRole('dialog', { name: '重置 Android Worker 连接证书' }).waitFor();
+    await page.getByRole('button', { name: '确认重置证书' }).click();
+    await page.getByRole('dialog', { name: '重置 Android Worker 连接证书' }).waitFor({ state: 'detached' });
+    record('desktop_certificate_reset');
+
+    await page.getByLabel('局域网地址').selectOption(HOST);
+    await page.getByLabel('网关端口').fill(String(PORT));
+    await page.getByRole('button', { name: '启动 Android 网关' }).click();
+    await page.getByText(`wss://${HOST}:${PORT}/v1/device`).waitFor();
+    const status = await call('getMobileStatus');
     check(status.running && status.host === HOST, 'Mobile Gateway did not start on the requested LAN address');
     record('gateway_started', { status });
 
-    await page.getByRole('button', { name: /配对手机/ }).click();
-    const qr = page.getByAltText('OPC-Nexus 手机配对二维码');
-    await qr.waitFor();
+    await page.getByRole('button', { name: '配对 Android Worker' }).click();
+    const pairingDialog = page.getByRole('dialog', { name: '配对 Android Worker' });
+    await pairingDialog.waitFor();
+    const pairingImage = pairingDialog.getByRole('img', { name: 'Android Worker 配对二维码' });
+    await pairingImage.waitFor();
     const qrPath = join(ARTIFACTS, 'pairing-qr.png');
-    const renderedQr = await qr.screenshot();
-    check(renderedQr.length > 1_000, 'Pairing QR did not render in the desktop UI');
-    const qrUri = await qr.getAttribute('src');
-    check(qrUri?.startsWith('aibox-mobile://pairing/'), 'Pairing image did not use the restricted mobile protocol');
-    const rawQr = await app.evaluate(async ({ net }, url) => {
-      const response = await net.fetch(url, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`Pairing image returned HTTP ${response.status}`);
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      return {
-        bytes: Array.from(bytes),
-        contentType: response.headers.get('content-type'),
-        cacheControl: response.headers.get('cache-control'),
-      };
-    }, qrUri);
-    check(rawQr.contentType === 'image/png', 'Pairing protocol did not return a PNG');
-    check(rawQr.cacheControl === 'no-store', 'Pairing protocol response is cacheable');
     let pairing;
-    try {
-      writeFileSync(qrPath, Buffer.from(rawQr.bytes));
-      pairing = JSON.parse(decodeQr(qrPath));
-    } finally {
-      rmSync(qrPath, { force: true });
+    let qrUri = '';
+    let rawQr;
+    for (let scanAttempt = 1; scanAttempt <= 3 && !pairing; scanAttempt += 1) {
+      const previousUri = qrUri;
+      if (scanAttempt > 1) {
+        await pairingDialog.getByRole('button', { name: '重新生成' }).click();
+        const refreshDeadline = Date.now() + 10_000;
+        do {
+          qrUri = await pairingImage.getAttribute('src') || '';
+          if (qrUri && qrUri !== previousUri) break;
+          await delay(100);
+        } while (Date.now() < refreshDeadline);
+        check(qrUri !== previousUri, 'Pairing QR did not refresh after regeneration');
+      } else {
+        qrUri = await pairingImage.getAttribute('src') || '';
+      }
+      check(qrUri.startsWith('aibox-mobile://pairing/'), 'Pairing image did not use the restricted mobile protocol');
+      rawQr = await app.evaluate(async ({ net }, url) => {
+        const response = await net.fetch(url, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Pairing image returned HTTP ${response.status}`);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        return {
+          bytes: Array.from(bytes),
+          contentType: response.headers.get('content-type'),
+          cacheControl: response.headers.get('cache-control'),
+        };
+      }, qrUri);
+      check(rawQr.contentType === 'image/png', 'Pairing protocol did not return a PNG');
+      check(rawQr.cacheControl === 'no-store', 'Pairing protocol response is cacheable');
+      try {
+        writeFileSync(qrPath, Buffer.from(rawQr.bytes));
+        pairing = JSON.parse(decodeQr(qrPath));
+      } catch (error) {
+        if (scanAttempt === 3) throw error;
+        record('pairing_qr_scan_retry', { attempt: scanAttempt });
+      } finally {
+        rmSync(qrPath, { force: true });
+      }
     }
+    const pairingOfferId = qrUri.slice('aibox-mobile://pairing/'.length);
+    check(pairing && rawQr, 'Pairing QR could not be decoded');
     check(pairing.url === `wss://${HOST}:${PORT}/v1/device`, 'QR gateway URL does not match the requested endpoint');
     check(typeof pairing.secret === 'string' && pairing.secret.length >= 40, 'QR pairing secret is missing');
     record('pairing_qr_decoded', {
       pairingId: pairing.pairingId,
       expiresAt: pairing.expiresAt,
       spki: pairing.spki,
-      renderedBytes: renderedQr.length,
+      offerId: pairingOfferId,
       protocolBytes: rawQr.bytes.length,
     });
 
-    await page.getByRole('button', { name: '复制完整配置' }).click();
-    await page.getByText('完整配对配置已复制').waitFor();
+    await pairingDialog.getByRole('button', { name: '复制完整配置' }).click();
+    const copyError = page.getByText(/Android Worker 配对配置未能写入系统剪贴板/);
+    const copyOutcome = await Promise.race([
+      page.getByText('完整配对配置已复制', { exact: true }).waitFor().then(() => ({ ok: true })),
+      copyError.waitFor().then(async () => ({
+        ok: false,
+        error: await copyError.textContent(),
+      })),
+    ]);
+    // Main verifies the system clipboard before resolving the typed preload
+    // call. Clipboard access can be unavailable for the whole Windows desktop
+    // session; QR scanning remains the primary pairing route in that case.
     const copiedPayload = JSON.stringify(pairing);
-    record('pairing_config_copied', { pairingId: pairing.pairingId, bytes: Buffer.byteLength(copiedPayload), ipc: 'ok' });
+    if (copyOutcome.ok) {
+      record('pairing_config_copied', { pairingId: pairing.pairingId, bytes: Buffer.byteLength(copiedPayload), ipc: 'ok' });
+    } else {
+      result.warnings.push({ code: 'SYSTEM_CLIPBOARD_UNAVAILABLE', message: copyOutcome.error });
+      record('pairing_copy_blocked', { pairingId: pairing.pairingId, error: copyOutcome.error });
+    }
 
     if (DEBUG_PAIR) {
       submitDebugPairingPayload(copiedPayload);
@@ -352,7 +407,6 @@ async function main() {
 
     const device = await waitForDevice({ listMobileDevices: () => call('listMobileDevices') });
     record('device_paired', { deviceId: device.id, apiLevel: device.apiLevel, status: device.status, permissions: device.permissions });
-    await page.getByRole('button', { name: '完成' }).click();
 
     const catalog = await call('getMobileToolCatalog');
     const allowedTools = catalog.tools.map((tool) => tool.name);

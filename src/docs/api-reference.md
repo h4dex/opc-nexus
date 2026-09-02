@@ -352,7 +352,7 @@ Renderer 通过 `window.aibox.*` 调用（由 `src/preload/index.ts` 暴露）�
 | `aibox:listHermesPlanProjections` | `projectId` | `HermesPlanProjection[]` | 读取宿主治理的 Hermes 计划投影 |
 | `aibox:approveHermesPlan` | `projectId, draftId` | `HermesPlanProjection` | 批准指定版本和哈希 |
 | `aibox:dispatchHermesPlan` | `projectId, draftId` | `HermesPlanProjection` | 通过宿主策略校验并派工 |
-| `aibox:createHermesMobilePairing` | `projectId, role` | `HermesMobileRoute` | 创建项目级 viewer/operator 配对 |
+| `aibox:createHermesMobilePairing` | `projectId, input?: { bindHost, port, publicHost, publicPort }` | `HermesMobileRoute` | 创建项目级 operator 配对；切换项目时返回 `stoppedProjectIds` |
 
 Workbench 只接触 Main 代理签发的短期租约；Hermes 上游服务 Token 不进入 URL、localStorage 或普通 Renderer 状态。`importFromHermes` / `exportToHermes` 仅是旧 MCP 配置兼容工具，不属于项目记忆或核心执行路径。
 

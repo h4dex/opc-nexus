@@ -820,6 +820,12 @@ app.whenReady().then(async () => {
           && (!allowed || allowed.has(row.id))
         ))
         .map((row) => ({ id: row.id!, name: row.name ?? row.id!, role: row.role ?? null }));
+    },
+    {
+      start: async (taskId) => {
+        const result = await artifactRuntimeRef?.start(taskId);
+        return result ?? { ok: false, error: 'artifact runtime unavailable' };
+      }
     }
   );
   const hermesProjectPlugins = new HermesProjectPluginBridge(db, projectWorkbench, mcpManager, skillManager);
@@ -1364,19 +1370,33 @@ app.whenReady().then(async () => {
     if (operation === 'answer-clarify') {
       const clarifyId = typeof input.clarifyId === 'string' ? input.clarifyId.trim() : '';
       if (!clarifyId) throw new Error('Hermes clarification identity is invalid');
+      const principalId = audience === 'desktop'
+        ? 'principal-local-admin'
+        : (() => {
+            const conversationId = payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).conversationId === 'string' ? String((payload as Record<string, unknown>).conversationId) : '';
+            return (db.raw.prepare('SELECT principal_id FROM conversations WHERE id = ? AND project_id = ?').get(conversationId, projectId) as { principal_id?: string } | undefined)?.principal_id
+              ?? 'principal-mobile-operator';
+          })();
       return hermesGovernance.answerClarify({
         clarifyId,
         projectId,
-        principalId: 'principal-local-admin',
+        principalId,
         answer: input.answer
       });
     }
     if (operation === 'approve-plan' || operation === 'dispatch-plan') {
       const draftId = typeof input.draftId === 'string' ? input.draftId : '';
       if (!/^hermes-draft-[A-Za-z0-9-]{1,80}$/.test(draftId)) throw new Error('Hermes draft identity is invalid');
+      const principalId = audience === 'desktop'
+        ? 'principal-local-admin'
+        : (() => {
+            const conversationId = payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).conversationId === 'string' ? String((payload as Record<string, unknown>).conversationId) : '';
+            return (db.raw.prepare('SELECT principal_id FROM conversations WHERE id = ? AND project_id = ?').get(conversationId, projectId) as { principal_id?: string } | undefined)?.principal_id
+              ?? 'principal-mobile-operator';
+          })();
       return operation === 'approve-plan'
-        ? hermesGovernance.approvePlan(draftId, projectId, 'principal-local-admin')
-        : hermesGovernance.dispatchPlan(draftId, projectId, 'principal-local-admin');
+        ? hermesGovernance.approvePlan(draftId, projectId, principalId)
+        : hermesGovernance.dispatchPlan(draftId, projectId, principalId);
     }
     if (operation === 'open-project-directory') {
       const workspace = projectWorkbench.getExplicitWorkspacePath(projectId);

@@ -268,15 +268,16 @@ async function main() {
     spec.startedAt = new Date().toISOString();
     try {
       const { project, workspace } = await createProject(spec);
+      const teamLabel = `${spec.slug}-${project.id.slice(-4)}`;
       const before = await state();
       const staffing = await runTurn(spec, [
         '老板要建立一支真实的长篇小说创作团队。请现在调用 nexus_create_employee 创建 6 名真实数字员工，ownerConfirmed=true，不要虚构返回：',
-        '1. 总编秘书：长期记忆，负责统筹、澄清、计划和向子员工询问验收；',
-        '2. 世界观架构师：长期记忆，负责世界观圣经；',
-        '3. 人物与关系设计师：长期记忆，负责角色卡和关系图；',
-        '4. 长篇大纲编辑：长期记忆，负责三幕/分卷/章节清单；',
-        '5. 章节写手：短期记忆，按设定写试产章节；',
-        '6. 独立文学验收编辑：无记忆，只做单次验收。',
+        `1. 总编秘书 ${teamLabel}：长期记忆，负责统筹、澄清、计划和向子员工询问验收；`,
+        `2. 世界观架构师 ${teamLabel}：长期记忆，负责世界观圣经；`,
+        `3. 人物与关系设计师 ${teamLabel}：长期记忆，负责角色卡和关系图；`,
+        `4. 长篇大纲编辑 ${teamLabel}：长期记忆，负责三幕/分卷/章节清单；`,
+        `5. 章节写手 ${teamLabel}：短期记忆，按设定写试产章节；`,
+        `6. 独立文学验收编辑 ${teamLabel}：无记忆，只做单次验收。`,
         '所有员工必须填写具体中文 role、systemPrompt、agentsMd，使用当前已配置的真实执行引擎；不要把员工加入固定项目池（addToProjectPool=false）；此轮只建档，不执行创作。完成后列出 Main 返回的真实员工 ID。'
       ].join('\n'));
       spec.turns = [staffing._timing];

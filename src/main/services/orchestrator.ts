@@ -2211,7 +2211,10 @@ export class Orchestrator {
 
   pauseTask(taskId: string) {
     const changed = this.db.raw.prepare("UPDATE tasks SET status = 'PAUSED' WHERE id = ? AND status = 'RUNNING'").run(taskId).changes;
-    if (changed > 0) this.executors.abort(taskId);
+    if (changed > 0) {
+      this.executors.abort(taskId);
+      this.db.audit({ id: randomUUID(), actor: 'system', action: 'task.pause', target: taskId, result: 'ok', source: 'orchestrator' });
+    }
     this.emit();
   }
 
@@ -2224,6 +2227,7 @@ export class Orchestrator {
       return;
     }
     this.resumePausedTask(taskId);
+    this.db.audit({ id: randomUUID(), actor: 'system', action: 'task.resume', target: taskId, result: 'ok', source: 'orchestrator' });
     this.emit();
   }
 

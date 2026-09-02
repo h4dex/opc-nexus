@@ -7,6 +7,7 @@ import type {
   MobileCommandLog,
   MobileDevice,
   MobileGatewayStatus,
+  MobilePairingOffer,
   MobileScriptDefinition,
   MobileScriptStep,
   MobileToolCatalog,
@@ -24,6 +25,9 @@ import {
   IconPlay,
   IconPlus,
   IconRefresh,
+  IconSettings,
+  IconCopy,
+  IconAlert,
   IconStop,
   IconTrash,
   IconUpload
@@ -43,6 +47,19 @@ const PERMISSION_LABEL: Record<string, string> = {
   accessibility: '无障碍', screen_capture: '屏幕读取', media_projection: '屏幕投影', notification_access: '通知',
   location: '定位', contacts: '联系人', sms: '短信', phone: '电话', microphone: '麦克风', clipboard: '剪贴板', tts: '语音合成'
 };
+
+const PERMISSION_VALUE_LABEL: Record<string, string> = {
+  granted: '已授权',
+  denied: '已拒绝',
+  restricted: '受限制',
+  unknown: '未知'
+};
+
+export function isMobileCertificateRecoveryError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /(?:certificate|TLS identity|证书)/i.test(message)
+    && /(?:reset|pair devices again|重新配对|重置)/i.test(message);
+}
 
 function errorText(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
@@ -80,6 +97,12 @@ export function Mobile() {
   const [packageName, setPackageName] = useState('');
   const [apk, setApk] = useState<MobileApkInfo | null>(null);
   const [adbDevices, setAdbDevices] = useState<MobileAdbDevice[]>([]);
+  const [pairingOpen, setPairingOpen] = useState(false);
+  const [pairing, setPairing] = useState<MobilePairingOffer | null>(null);
+  const [pairingError, setPairingError] = useState('');
+  const [pairingNow, setPairingNow] = useState(Date.now());
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [certificateRecoveryError, setCertificateRecoveryError] = useState('');
   const observationInFlight = useRef(false);
   const activityInFlight = useRef(false);
   const activityPending = useRef<{ deviceId?: string; includeScripts: boolean } | null>(null);
@@ -148,6 +171,11 @@ export function Mobile() {
       if (event.type.startsWith('gateway_')) void loadGateway();
       if (event.type.startsWith('device_') || event.type === 'binding_changed' || event.type.startsWith('session_')) void loadDevices();
       if (event.type.startsWith('command_') || event.type === 'artifact_created') scheduleActivityRefresh(event.deviceId || undefined);
+      if (event.type === 'device_paired') {
+        setPairingOpen(false);
+        setPairing(null);
+        toast.ok('Android Worker 配对成功');
+      }
     });
   }, [loadDevices, loadGateway, scheduleActivityRefresh]);
 
@@ -203,6 +231,12 @@ export function Mobile() {
     if (activityTimer.current !== null) window.clearTimeout(activityTimer.current);
   }, []);
 
+  useEffect(() => {
+    if (!pairingOpen || !pairing) return;
+    const timer = window.setInterval(() => setPairingNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [pairing, pairingOpen]);
+
   const runTool = useCallback(async (toolName: MobileToolName, args: Record<string, unknown> = {}) => {
     if (!selectedId || readOnly) return;
     setBusy(toolName);
@@ -221,9 +255,51 @@ export function Mobile() {
     setBusy('gateway');
     try {
       setGateway(await window.aibox.startMobileGateway(host, port));
+      setCertificateRecoveryError('');
       toast.ok('Android Worker 网关已启动');
-    } catch (error) { toast.err(errorText(error, 'Gateway 启动失败')); }
+    } catch (error) {
+      const message = errorText(error, 'Gateway 启动失败');
+      if (isMobileCertificateRecoveryError(error)) setCertificateRecoveryError(message);
+      toast.err(message);
+    }
     finally { setBusy(''); }
+  };
+
+  const createPairing = async () => {
+    if (!gateway?.running) {
+      toast.err('请先启动 Android Worker 网关');
+      return;
+    }
+    setPairingOpen(true);
+    setPairingError('');
+    setBusy('pairing');
+    try {
+      const offer = await window.aibox.createAndroidBridgePairing();
+      setPairing(offer);
+      setPairingNow(Date.now());
+    } catch (error) {
+      setPairing(null);
+      setPairingError(errorText(error, 'Android Worker 配对码生成失败'));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const resetCertificate = async () => {
+    setBusy('certificate');
+    try {
+      await window.aibox.resetMobileCertificate();
+      setResetConfirmOpen(false);
+      setPairingOpen(false);
+      setPairing(null);
+      setCertificateRecoveryError('');
+      await Promise.all([loadGateway(), loadDevices()]);
+      toast.ok('移动证书已重置，请重新启动网关并配对设备');
+    } catch (error) {
+      toast.err(errorText(error, '移动证书重置失败'));
+    } finally {
+      setBusy('');
+    }
   };
 
   const refreshInstall = async () => {
@@ -244,6 +320,7 @@ export function Mobile() {
         <h2>Android 执行设备</h2>
         <span className="desc">{devices.length} 台设备 · Android worker 控制与媒体采集 · 协议 v{catalog?.protocolVersion ?? '-'}</span>
         <div className="right">
+          <button className="btn" type="button" disabled={!gateway?.running || busy === 'pairing'} onClick={() => void createPairing()} title="为 Android Worker 首次配对或重新配对"><IconPhone size={14} />配对 Android Worker</button>
           {gateway?.running
             ? <button className="btn danger" disabled={busy === 'gateway'} onClick={() => void window.aibox.stopMobileGateway().then(loadGateway)}><IconStop size={14} />停止 Android 网关</button>
             : <button className="btn primary" disabled={busy === 'gateway' || !host} onClick={() => void startGateway()}><IconPlay size={14} />启动 Android 网关</button>}
@@ -261,7 +338,14 @@ export function Mobile() {
         <input aria-label="网关端口" type="number" min={1024} max={65535} value={port} disabled={gateway?.running} onChange={(event) => setPort(Number(event.target.value))} />
         <span className="mobile-gateway-endpoint">{gateway?.running ? `wss://${gateway.host}:${gateway.wssPort}/v1/device` : 'Android Worker 网关未运行'}</span>
         {gateway?.certificateFingerprint && <span className="mobile-fingerprint" title={gateway.certificateFingerprint}>{gateway.certificateFingerprint}</span>}
+        <button className="icon-btn" type="button" disabled={busy === 'certificate'} onClick={() => setResetConfirmOpen(true)} title="连接修复与证书重置" aria-label="连接修复与证书重置"><IconSettings size={15} /></button>
       </div>
+
+      {certificateRecoveryError && <div className="mobile-gateway-recovery" role="alert">
+        <IconAlert size={15} />
+        <span><b>现有证书不适用于当前局域网地址</b><small>{certificateRecoveryError}</small></span>
+        <button className="btn small danger" type="button" onClick={() => setResetConfirmOpen(true)}>重置证书并重新配对</button>
+      </div>}
 
       <div className="mobile-workspace">
         <aside className="mobile-device-rail">
@@ -324,7 +408,7 @@ export function Mobile() {
           <div className="mobile-section-label">权限</div>
           {selected ? Object.entries(PERMISSION_LABEL).map(([key, label]) => {
             const value = selected.permissions[key as keyof typeof selected.permissions] ?? 'unknown';
-            return <div key={key} className="mobile-permission-row"><span>{label}</span><span className={`tag ${value === 'granted' ? 'green' : value === 'denied' || value === 'restricted' ? 'red' : 'gray'}`}>{value}</span></div>;
+            return <div key={key} className="mobile-permission-row"><span>{label}</span><span className={`tag ${value === 'granted' ? 'green' : value === 'denied' || value === 'restricted' ? 'red' : 'gray'}`}>{PERMISSION_VALUE_LABEL[value] ?? value}</span></div>;
           }) : <div className="mobile-muted">未选择设备</div>}
           {selected && <button className="btn danger mobile-emergency" onClick={() => void window.aibox.emergencyStopMobile(selected.id).then(() => toast.info('已停止该设备的控制会话'))}><IconStop size={14} />紧急停止</button>}
         </aside>
@@ -339,6 +423,44 @@ export function Mobile() {
           toast.ok('手机脚本已保存');
         }}
       />}
+
+      {pairingOpen && <Modal title="配对 Android Worker" width={520} onClose={() => { setPairingOpen(false); setPairing(null); setPairingError(''); }} footer={(
+        <>
+          <button className="btn" type="button" onClick={() => { setPairingOpen(false); setPairing(null); }}>关闭</button>
+          <button className="btn" type="button" disabled={!pairing || pairing.expiresAt <= pairingNow || busy === 'pairing'} onClick={() => {
+            if (!pairing) return;
+            void window.aibox.copyAndroidBridgePairingConfig(pairing.id)
+              .then(() => toast.ok('完整配对配置已复制'))
+              .catch((error) => toast.err(errorText(error, '配对配置复制失败')));
+          }}><IconCopy size={14} />复制完整配置</button>
+          <button className="btn primary" type="button" disabled={busy === 'pairing'} onClick={() => void createPairing()}><IconRefresh size={14} />{pairing ? '重新生成' : '生成配对码'}</button>
+        </>
+      )}>
+        <div className="mobile-pairing-dialog" aria-busy={busy === 'pairing'}>
+          <div className="mobile-pairing-note"><IconPhone size={18} /><span><b>这是 Android Worker 执行设备连接</b><small>用于让数字员工操作 Android 手机，与 Quest 右上角的 Hermes 手机对话扫码相互独立。</small></span></div>
+          {pairingError && <div className="mobile-pairing-error" role="alert"><IconAlert size={14} />{pairingError}</div>}
+          {busy === 'pairing' && !pairing && <div className="mobile-pairing-loading">正在生成一次性配对码...</div>}
+          {pairing && pairing.expiresAt > pairingNow && <div className="mobile-pairing-offer">
+            <img src={pairing.qrUri} alt="Android Worker 配对二维码" />
+            <div>
+              <span>局域网地址</span><code>{pairing.host}:{pairing.port}</code>
+              <span>有效时间</span><b>{Math.max(0, Math.ceil((pairing.expiresAt - pairingNow) / 1_000))} 秒</b>
+              <span>协议版本</span><b>v{pairing.protocolVersion}</b>
+            </div>
+          </div>}
+          {pairing && pairing.expiresAt <= pairingNow && <div className="mobile-pairing-expired"><IconAlert size={16} /><span><b>配对码已过期</b><small>请重新生成，旧配对配置已失效。</small></span></div>}
+          <small className="mobile-pairing-security">配对密钥只存在于受保护的二维码和“复制完整配置”操作中，不会显示在页面或写入浏览器存储。</small>
+        </div>
+      </Modal>}
+
+      {resetConfirmOpen && <Modal title="重置 Android Worker 连接证书" width={500} onClose={() => setResetConfirmOpen(false)} footer={(
+        <>
+          <button className="btn" type="button" disabled={busy === 'certificate'} onClick={() => setResetConfirmOpen(false)}>取消</button>
+          <button className="btn danger" type="button" disabled={busy === 'certificate'} onClick={() => void resetCertificate()}>{busy === 'certificate' ? '正在重置...' : '确认重置证书'}</button>
+        </>
+      )}>
+        <div className="mobile-reset-warning"><IconAlert size={20} /><div><b>重置后网关会停止</b><p>当前控制连接将断开，所有 Android Worker 都必须扫描新二维码重新配对。仅在更换局域网地址、证书校验失败或手机提示指纹不匹配时执行。</p></div></div>
+      </Modal>}
     </div>
   );
 }

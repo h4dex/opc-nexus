@@ -15,13 +15,13 @@ function statementDb() {
         const id = String(args[0]);
         return id === 'agent-builder'
           ? { id, engine_id: 'eng-codex', lifecycle: 'READY', archived: 0 }
-          : id === 'agent-dsh'
-            ? { id, engine_id: 'eng-deepseek-harness-managed', lifecycle: 'READY', archived: 0 }
+          : id === 'agent-dsh' || id === 'agent-reviewer'
+            ? { id, engine_id: 'eng-deepseek-harness-managed', lifecycle: 'READY', archived: 0, capabilities_json: JSON.stringify({ network: true, browser: true }) }
             : undefined;
       }
       if (sql.includes('SELECT id, agent_id, status FROM tasks')) {
-        return args[0] === 'task-implementation'
-          ? { id: 'task-implementation', agent_id: 'agent-builder', status: 'COMPLETED' }
+        return ['task-implementation', 'task-implementation-2'].includes(String(args[0]))
+          ? { id: String(args[0]), agent_id: 'agent-builder', status: 'COMPLETED' }
           : undefined;
       }
       return undefined;
@@ -151,6 +151,7 @@ describe('Hermes employee and shared plugin boundaries', () => {
     expect(result).toMatchObject({ intent: 'validation', task: { id: 'task-validation', agentId: 'agent-dsh' } });
     expect(createTask).toHaveBeenCalledWith('agent-dsh', '独立验收官网', 'team', expect.objectContaining({
       requiresArtifacts: false,
+      sourceKey: expect.stringMatching(/^hermes-validation:project-1:agent-dsh:[a-f0-9]{40}$/),
       content: expect.any(String)
     }));
     const validationContent = String(createTask.mock.calls.at(-1)?.[3]?.content ?? '');
@@ -158,6 +159,49 @@ describe('Hermes employee and shared plugin boundaries', () => {
     expect(validationContent).toContain('http_request');
     expect(validationContent).toContain('browser_navigate');
     expect(validationContent).toContain('browser_get_content');
+  });
+
+  it('atomically deduplicates validation by worker and unordered related task set', async () => {
+    const db = statementDb();
+    const tasks = new Map<string, { id: string; agentId: string; projectId: string; title: string; status: 'QUEUED'; deduplicated?: boolean }>();
+    let serial = 0;
+    const createTask = vi.fn((agentId: string, title: string, _source: string, options: { sourceKey: string }) => {
+      const existing = tasks.get(options.sourceKey);
+      if (existing) return { ...existing, deduplicated: true };
+      const task = { id: `task-validation-${++serial}`, agentId, projectId: 'project-1', title, status: 'QUEUED' as const };
+      tasks.set(options.sourceKey, task);
+      return task;
+    });
+    const dispatcher = new HermesEmployeeDispatcher(db as never, { createTask } as never, {
+      getWorkerSelection: () => ({ mode: 'restricted', workerAgentIds: ['agent-dsh', 'agent-reviewer'] }),
+      getExplicitWorkspacePath: () => 'E:/opc/project-1'
+    });
+    const base = {
+      hermesSessionId: 'session-1', workerAgentId: 'agent-dsh', intent: 'validation' as const,
+      relatedTaskIds: ['task-implementation', 'task-implementation-2'], expectedArtifacts: []
+    };
+
+    const [first, duplicate] = await Promise.all([
+      Promise.resolve(dispatcher.dispatch('project-1', {
+        ...base, requestId: 'validation-a', title: '自动独立验收', description: '检查真实交付'
+      })),
+      Promise.resolve(dispatcher.dispatch('project-1', {
+        ...base, requestId: 'validation-b', title: '老板要求人工验收', description: '再次核对验收证据',
+        relatedTaskIds: ['task-implementation-2', 'task-implementation', 'task-implementation']
+      }))
+    ]);
+
+    expect(first.task.id).toBe('task-validation-1');
+    expect(duplicate).toMatchObject({ task: { id: 'task-validation-1' }, deduplicated: true });
+    expect(createTask.mock.calls[0]?.[3].sourceKey).toBe(createTask.mock.calls[1]?.[3].sourceKey);
+    expect(tasks.size).toBe(1);
+
+    const otherReviewer = dispatcher.dispatch('project-1', {
+      ...base, requestId: 'validation-c', workerAgentId: 'agent-reviewer',
+      title: '第二验收人复核', description: '由另一位独立员工复核'
+    });
+    expect(otherReviewer.task.id).toBe('task-validation-2');
+    expect(tasks.size).toBe(2);
   });
 
   it('lets the secretary retrieve a real employee verdict from the bound project conversation', async () => {

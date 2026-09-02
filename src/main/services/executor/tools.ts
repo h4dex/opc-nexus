@@ -382,8 +382,9 @@ export const TOOLS: ToolDef[] = [
         agent_name: { type: 'string', description: '目标数字员工名称（必须已存在且在岗）' },
         title: { type: 'string', description: '子任务标题（含足够的执行说明）' }
       },
-      required: ['agent_name', 'title']
+    required: ['agent_name', 'title']
     },
+    autonomousApproval: 'admin',
     async execute(args, ctx) {
       if (!ctx.host) throw new Error('委托能力未启用');
       const name = String(args.agent_name ?? '');

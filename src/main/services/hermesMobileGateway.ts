@@ -270,7 +270,8 @@ export class HermesMobileGatewayService {
       pairingUrl: offer.pairingUrl,
       code: offer.code,
       expiresAt: offer.expiresAt,
-      certificateFingerprint: offer.certificateFingerprint
+      certificateFingerprint: offer.certificateFingerprint,
+      stoppedProjectIds: [...otherProjects]
     };
   }
 
