@@ -9,7 +9,9 @@ interface FixtureOptions {
   runtimeState?: string;
   runtimeUrl?: string;
   reviewers?: HermesAcceptanceReviewer[];
+  activeValidationTurns?: Array<{ id: string; title: string; message: string; status: string }>;
   failedTask?: { id: string; project_id: string; conversation_id: string; agent_id: string; title: string; status: string; content: string; error?: string };
+  artifactStart?: (taskId: string) => Promise<{ ok: boolean; error?: string | null }>;
 }
 
 function fixture(options: FixtureOptions = {}) {
@@ -51,6 +53,9 @@ function fixture(options: FixtureOptions = {}) {
       if (sql.includes('SELECT DISTINCT d.draft_id')) {
         return [{ draft_id: 'draft-1', conversation_id: 'conversation-root', principal_id: 'owner-1' }];
       }
+      if (sql.includes('FROM hermes_chat_queue') && sql.includes("status IN ('QUEUED', 'RUNNING')")) {
+        return options.activeValidationTurns ?? [];
+      }
       if (sql.includes("WHERE t.status = 'COMPLETED'")) return planTasks;
       if (sql.includes('SELECT j.task_id, t.agent_id, t.status')) return planTasks;
       if (sql.includes('content LIKE \'Task intent: validation%\'')) return validation;
@@ -77,7 +82,8 @@ function fixture(options: FixtureOptions = {}) {
   });
   const runtime = {
     getStatus: vi.fn(() => ({ state: options.runtimeState ?? 'healthy' })),
-    enqueueProjectTurn
+    enqueueProjectTurn,
+    start: options.artifactStart
   };
   return {
     db,
@@ -86,7 +92,8 @@ function fixture(options: FixtureOptions = {}) {
     coordinator: new HermesAcceptanceCoordinator(
       db as never,
       runtime,
-      () => options.reviewers ?? [{ id: 'agent-reviewer', name: '验收校对员', role: '独立验收' }]
+      () => options.reviewers ?? [{ id: 'agent-reviewer', name: '验收校对员', role: '独立验收' }],
+      options.artifactStart ? { start: options.artifactStart } : undefined
     )
   };
 }
@@ -122,6 +129,15 @@ describe('HermesAcceptanceCoordinator', () => {
     expect(planQuery).toContain('hermes_plan_projections');
     expect(planQuery).not.toContain("d.status IN ('APPROVED', 'DISPATCHED')");
     expect(f.db.raw.prepare.mock.calls.some(([sql]) => sql.includes('SELECT project_id FROM tasks'))).toBe(true);
+  });
+
+  it('starts completed artifact runtimes before requesting acceptance', async () => {
+    const artifactStart = vi.fn(async () => ({ ok: true, error: null }));
+    const f = fixture({ runtimeUrl: 'http://127.0.0.1:43123/', artifactStart });
+    f.coordinator.onTaskFinished({ taskId: 'task-b', agentId: 'agent-b', status: 'COMPLETED' });
+    await waitForCoordinator();
+    expect(artifactStart).toHaveBeenCalledWith('task-a');
+    expect(artifactStart).toHaveBeenCalledWith('task-b');
   });
 
   it('deduplicates repeated completion events for the same plan', async () => {
@@ -160,6 +176,25 @@ describe('HermesAcceptanceCoordinator', () => {
     f.coordinator.scanProject('project-1');
     await waitForCoordinator();
     expect(f.enqueueProjectTurn).not.toHaveBeenCalled();
+  });
+
+  it('does not enqueue automatic validation while an equivalent owner validation turn is active', async () => {
+    const f = fixture({
+      activeValidationTurns: [{
+        id: 'hermes-chat-owner-validation',
+        title: '老板要求独立验收',
+        message: '请对 task-b 和 task-a 执行 validation，必须返回权威结论。',
+        status: 'RUNNING'
+      }]
+    });
+    f.coordinator.onTaskFinished({ taskId: 'task-b', agentId: 'agent-b', status: 'COMPLETED' });
+    await waitForCoordinator();
+
+    expect(f.enqueueProjectTurn).not.toHaveBeenCalled();
+    expect(f.db.audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'hermes.acceptance.auto-deduplicated',
+      result: 'draft-1:queue=hermes-chat-owner-validation'
+    }));
   });
 
   it('asks the primary secretary to read the authoritative validation result after completion', async () => {

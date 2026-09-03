@@ -36,6 +36,24 @@ const IDEMPOTENCY_WINDOW_MS = 5 * 60_000;
 const TERMINAL_STATUSES = new Set<TaskStatus>(['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED']);
 const TASK_INTENTS = new Set<HermesEmployeeTaskIntent>(['execution', 'status_inquiry', 'validation']);
 
+function relatedTaskIdsFromContent(content: unknown): string[] {
+  if (typeof content !== 'string') return [];
+  const marker = 'Related project tasks:';
+  const start = content.indexOf(marker);
+  if (start < 0) return [];
+  const block = content.slice(start + marker.length).split(/\r?\n\s*\r?\n/, 1)[0] ?? '';
+  return [...new Set(block
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter((value) => /^[A-Za-z0-9._:-]{1,128}$/.test(value)))]
+    .sort();
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
 function taskIntent(content: unknown): HermesEmployeeTaskIntent {
   if (typeof content !== 'string') return 'execution';
   const match = /^Task intent: (execution|status_inquiry|validation)$/m.exec(content);
@@ -123,7 +141,7 @@ export class HermesEmployeeDispatcher {
     if (!Array.isArray(input.relatedTaskIds) || input.relatedTaskIds.length > 32) {
       throw new Error('Hermes employee task relatedTaskIds are invalid');
     }
-    const relatedTaskIds = input.relatedTaskIds.map((value) => boundedText(value, 'relatedTaskId', 128));
+    const requestedRelatedTaskIds = input.relatedTaskIds.map((value) => boundedText(value, 'relatedTaskId', 128));
     if (!Array.isArray(input.expectedArtifacts) || input.expectedArtifacts.length > 128) {
       throw new Error('Hermes employee task expectedArtifacts are invalid');
     }
@@ -131,6 +149,9 @@ export class HermesEmployeeDispatcher {
     if (intent === 'status_inquiry' && expectedArtifacts.length > 0) {
       throw new Error('Hermes status inquiry cannot require a new artifact');
     }
+    const relatedTaskIds = intent === 'validation'
+      ? [...new Set(requestedRelatedTaskIds)].sort()
+      : requestedRelatedTaskIds;
     if (intent === 'validation' && relatedTaskIds.length === 0) {
       throw new Error('Hermes validation must identify at least one related execution task');
     }
@@ -150,16 +171,24 @@ export class HermesEmployeeDispatcher {
       throw new Error('Hermes validation must be assigned to an independent employee, not an implementation worker');
     }
     const worker = this.db.raw.prepare(`
-      SELECT id, engine_id, lifecycle, archived
+      SELECT id, engine_id, lifecycle, archived, capabilities_json
       FROM agents WHERE id = ? AND organization_id = ?
     `).get(workerAgentId, binding.organizationId) as {
       id?: string;
       engine_id?: string;
       lifecycle?: string;
       archived?: number;
+      capabilities_json?: string;
     } | undefined;
     if (worker?.id !== workerAgentId || worker.archived === 1 || worker.lifecycle !== 'READY') {
       throw new Error('Hermes employee task worker is unavailable');
+    }
+    if (intent === 'validation') {
+      let capabilities: Record<string, unknown> = {};
+      try { capabilities = JSON.parse(String(worker.capabilities_json ?? '{}')) as Record<string, unknown>; } catch { capabilities = {}; }
+      if (capabilities.network !== true || capabilities.browser !== true) {
+        throw new Error('Hermes validation worker lacks required network/browser tools');
+      }
     }
     const selection = this.workbench.getWorkerSelection(projectId);
     if (selection.mode === 'restricted' && !selection.workerAgentIds.includes(workerAgentId)) {
@@ -185,18 +214,58 @@ export class HermesEmployeeDispatcher {
         : '',
       expectedArtifacts.length ? `Expected artifacts:\n${expectedArtifacts.join('\n')}` : ''
     ].filter(Boolean).join('\n\n');
-    const fingerprint = createHash('sha256').update(JSON.stringify({
-      projectId,
-      hermesSessionId,
-      workerAgentId,
-      title,
-      intent,
-      relatedTaskIds,
-      content
-    })).digest('hex').slice(0, 40);
+    if (intent === 'validation') {
+      const semanticExisting = (this.db.raw.prepare(`
+        SELECT id, agent_id, project_id, title, status, content
+        FROM tasks
+        WHERE project_id = ? AND agent_id = ? AND deleted_at IS NULL
+          AND content LIKE 'Task intent: validation%'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 128
+      `).all(projectId, workerAgentId) as Array<{
+        id?: string;
+        agent_id?: string;
+        project_id?: string | null;
+        title?: string;
+        status?: Task['status'];
+        content?: string | null;
+      }>).find((row) => sameStringSet(relatedTaskIds, relatedTaskIdsFromContent(row.content)));
+      if (semanticExisting?.id && semanticExisting.agent_id && semanticExisting.project_id
+        && semanticExisting.title && semanticExisting.status) {
+        this.db.audit({
+          id: randomUUID(),
+          actor: binding.principalId,
+          action: 'hermes.employee.dispatch.deduplicated',
+          target: semanticExisting.id,
+          result: `${workerAgentId}:${semanticExisting.status}:${requestId}:validation-semantic`,
+          source: 'hermes'
+        });
+        return {
+          intent,
+          task: {
+            id: semanticExisting.id,
+            agentId: semanticExisting.agent_id,
+            projectId: semanticExisting.project_id,
+            title: semanticExisting.title,
+            status: semanticExisting.status
+          },
+          deduplicated: true
+        };
+      }
+    }
+    const fingerprint = createHash('sha256').update(JSON.stringify(intent === 'validation'
+      ? { projectId, intent, workerAgentId, relatedTaskIds }
+      : { projectId, hermesSessionId, workerAgentId, title, intent, relatedTaskIds, content }
+    )).digest('hex').slice(0, 40);
     const windowId = Math.floor(Date.now() / IDEMPOTENCY_WINDOW_MS);
-    const sourceKey = `hermes:${projectId}:${hermesSessionId}:${windowId}:${fingerprint}`;
-    const previousSourceKey = `hermes:${projectId}:${hermesSessionId}:${windowId - 1}:${fingerprint}`;
+    // Validation identity is permanent and wording-independent. Orchestrator's
+    // unique (source, source_key) index makes concurrent tool calls atomic.
+    const sourceKey = intent === 'validation'
+      ? `hermes-validation:${projectId}:${workerAgentId}:${fingerprint}`
+      : `hermes:${projectId}:${hermesSessionId}:${windowId}:${fingerprint}`;
+    const previousSourceKey = intent === 'validation'
+      ? sourceKey
+      : `hermes:${projectId}:${hermesSessionId}:${windowId - 1}:${fingerprint}`;
     const existing = this.db.raw.prepare(`
       SELECT id, agent_id, project_id, title, status
       FROM tasks

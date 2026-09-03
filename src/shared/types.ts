@@ -862,6 +862,8 @@ export interface HermesMobileRoute {
   code: string;
   expiresAt: number;
   certificateFingerprint: string;
+  /** Projects stopped because the gateway is single-project at a time. */
+  stoppedProjectIds?: string[];
 }
 
 export interface HermesMobileAccessStatus {

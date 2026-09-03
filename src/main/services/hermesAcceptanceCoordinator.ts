@@ -18,6 +18,10 @@ interface HermesAcceptanceRuntime {
   }): { id: string };
 }
 
+export interface HermesAcceptanceArtifactRuntime {
+  start(taskId: string): Promise<{ ok: boolean; error?: string | null }>;
+}
+
 interface PlanRow {
   draft_id?: string;
   conversation_id?: string;
@@ -41,6 +45,13 @@ interface ValidationRow {
 interface RuntimeRow {
   task_id?: string;
   payload?: string | null;
+}
+
+interface ChatQueueRow {
+  id?: string;
+  title?: string | null;
+  message?: string | null;
+  status?: string;
 }
 
 export interface HermesAcceptanceReviewer {
@@ -83,6 +94,7 @@ export class HermesAcceptanceCoordinator {
     private readonly db: Database,
     private readonly runtime: HermesAcceptanceRuntime,
     private readonly reviewerResolver?: ReviewerResolver,
+    private readonly artifactRuntime?: HermesAcceptanceArtifactRuntime,
   ) {}
 
   onTaskFinished(info: HermesAcceptanceTaskFinished): void {
@@ -100,7 +112,7 @@ export class HermesAcceptanceCoordinator {
     // The project scan is a compensating read: it covers a missed/late
     // completion callback without creating a second acceptance state machine.
     setTimeout(() => {
-      this.considerTask(info.taskId);
+      void this.considerTask(info.taskId);
       this.considerValidationCompletion(info.taskId);
       const projectId = this.projectForTask(info.taskId);
       if (projectId) this.scanProject(projectId);
@@ -117,7 +129,7 @@ export class HermesAcceptanceCoordinator {
         ORDER BY t.ended_at DESC, t.id DESC
         LIMIT 32
       `).all(projectId) as Array<{ task_id?: string }>;
-      for (const row of rows) if (row.task_id) this.considerTask(row.task_id);
+      for (const row of rows) if (row.task_id) void this.considerTask(row.task_id);
       const completedValidations = this.db.raw.prepare(`
         SELECT id
         FROM tasks
@@ -235,7 +247,7 @@ export class HermesAcceptanceCoordinator {
     }
   }
 
-  private considerTask(taskId: string): void {
+  private async considerTask(taskId: string): Promise<void> {
     let plan: PlanRow | undefined;
     try {
       plan = this.db.raw.prepare(`
@@ -285,6 +297,14 @@ export class HermesAcceptanceCoordinator {
 
     const projectId = this.projectForPlan(plan.draft_id);
     if (!projectId) return;
+    // Main owns preview startup. Starting every completed artifact here makes
+    // runtime evidence available for unattended acceptance; failures remain
+    // fail-closed and are reflected in the subsequent runtime gate.
+    if (this.artifactRuntime) {
+      for (const taskId of taskIds) {
+        try { await this.artifactRuntime.start(taskId); } catch { /* gate below records the missing evidence */ }
+      }
+    }
     const reviewers = this.availableReviewers(projectId, implementationWorkers);
     if (reviewers.length === 0) {
       this.audit('hermes.acceptance.auto-blocked', projectId, `${plan.draft_id}:no-independent-ready-reviewer`);
@@ -312,6 +332,31 @@ export class HermesAcceptanceCoordinator {
       return taskIds.every((id) => related.has(id));
     });
     if (existing) return;
+
+    // An owner-triggered validation turn may already be waiting for or using
+    // this exact implementation set. Suppress the automatic prompt before it
+    // reaches Hermes; the dispatcher remains the final atomic dedupe boundary.
+    try {
+      const activeTurns = this.db.raw.prepare(`
+        SELECT id, title, message, status
+        FROM hermes_chat_queue
+        WHERE project_id = ? AND conversation_id = ?
+          AND status IN ('QUEUED', 'RUNNING')
+        ORDER BY created_at, id
+        LIMIT 128
+      `).all(projectId, plan.conversation_id) as ChatQueueRow[];
+      const equivalentTurn = activeTurns.find((row) => {
+        const text = `${row.title ?? ''}\n${row.message ?? ''}`;
+        return /(?:validation|验收)/i.test(text) && taskIds.every((id) => text.includes(id));
+      });
+      if (equivalentTurn?.id) {
+        this.requested.add(key);
+        this.audit('hermes.acceptance.auto-deduplicated', projectId, `${plan.draft_id}:queue=${equivalentTurn.id}`);
+        return;
+      }
+    } catch {
+      return;
+    }
 
     const runtimeStatus = this.runtime.getStatus(projectId);
     if (runtimeStatus.state !== 'healthy') {
